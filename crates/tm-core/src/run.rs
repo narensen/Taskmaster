@@ -93,6 +93,8 @@ pub enum Event {
     FindingsVerified { confirmed: Vec<Finding> },
     /// Whole-project verification. `failing` maps a page to the errors attributed to it.
     VerifyFinished { failing: BTreeMap<PageId, String>, ok: bool },
+    /// The page's citations still match the last build, so it was not rebuilt.
+    PageFresh { page: PageId },
     Cancelled,
 }
 
@@ -183,6 +185,17 @@ impl Run {
                 self.phase = RunPhase::Planning;
                 self.plan = None;
                 self.pages.clear();
+            }
+            (RunPhase::Building, Event::PageFresh { page }) => {
+                let Some(p) = self.pages.get_mut(&page) else { return out };
+                if p.state != PageState::Building {
+                    return out;
+                }
+                // Not a rebuild, so the page drops out of the review set.
+                p.stale = false;
+                p.state = PageState::Passed;
+                self.dirty.remove(&page);
+                self.settle(&mut out);
             }
             (RunPhase::Building, Event::WorkerFinished { page, outcome }) => {
                 let Some(p) = self.pages.get_mut(&page) else { return out };
@@ -539,6 +552,16 @@ mod tests {
         // `b` was mid-build when the entry changed, so its pass does not count.
         let cmds = run.step(finished("b", WorkerOutcome::Passed));
         assert_eq!(cmds, vec![spawn("b", Tier::Worker, None)]);
+    }
+
+    #[test]
+    fn an_unchanged_page_is_not_reviewed() {
+        let (mut run, _) = started(&[("a", &["auth"]), ("b", &["nav"])], 4);
+        run.step(Event::PageFresh { page: "a".into() });
+        assert_eq!(run.pages["a"].state, PageState::Passed);
+        let cmds = run.step(finished("b", WorkerOutcome::Passed));
+        assert_eq!(cmds, vec![review(vec![scope("nav", &["b"])], &["b"])]);
+        assert!(!run.dirty.contains("a"));
     }
 
     #[test]

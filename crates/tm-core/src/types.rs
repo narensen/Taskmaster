@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 pub type PageId = String;
 pub type DictKey = String;
 
+/// Dictionary keys and page ids become directory names, so they stay one path segment.
+pub fn valid_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 64 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DictTier {
@@ -24,6 +29,12 @@ pub enum EntryKind {
 pub struct EntryStats {
     pub reuses: u64,
     pub pass_rate: f32,
+    /// Successful uses of this Commons entry.
+    #[serde(default)]
+    pub passes: u64,
+    /// Uses that failed their page.
+    #[serde(default)]
+    pub fails: u64,
 }
 
 /// One immutable Dictionary entry. A change is published as a new entry with a new hash.

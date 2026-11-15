@@ -1,6 +1,6 @@
-//! Read-only MCP server (streamable HTTP, JSON responses). Tools: `cite` and `index`.
+//! Read-only MCP server (streamable HTTP, JSON responses). Tools: `cite`, `index`, and `search`.
 //! Every call is authenticated by a run-scoped bearer token and recorded, which is what
-//! builds the citation graph from actual use.
+//! builds the citation graph from actual use. `search` lists Commons entries first.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,14 +28,24 @@ pub struct CiteRecord {
 }
 
 pub struct McpState {
-    store: LocalStore,
+    local: LocalStore,
+    commons: Option<LocalStore>,
     tokens: Mutex<HashMap<String, Grant>>,
     cites: Mutex<Vec<CiteRecord>>,
 }
 
 impl McpState {
     pub fn new(store: LocalStore) -> Arc<Self> {
-        Arc::new(McpState { store, tokens: Mutex::default(), cites: Mutex::default() })
+        Arc::new(McpState { local: store, commons: None, tokens: Mutex::default(), cites: Mutex::default() })
+    }
+
+    pub fn with_commons(local: LocalStore, commons: LocalStore) -> Arc<Self> {
+        Arc::new(McpState {
+            local,
+            commons: Some(commons),
+            tokens: Mutex::default(),
+            cites: Mutex::default(),
+        })
     }
 
     pub fn grant(&self, token: &str, grant: Grant) {
@@ -92,11 +102,14 @@ fn dispatch(state: &McpState, grant: &Grant, msg: &Value) -> Result<Value, (i32,
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": [
-            { "name": "cite", "description": "Read a Dictionary entry by key. Read-only.",
+            { "name": "cite", "description": "Read a Dictionary entry by key. The project entry wins; otherwise the Commons entry is returned. Read-only.",
               "inputSchema": { "type": "object", "properties": { "key": { "type": "string" } },
                                "required": ["key"] } },
-            { "name": "index", "description": "List every key with its one-line summary.",
+            { "name": "index", "description": "List Commons keys, then this project's keys, each with a one-line summary.",
               "inputSchema": { "type": "object", "properties": {} } },
+            { "name": "search", "description": "Search the Commons before the project dictionary. Use this before inventing a contract.",
+              "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } },
+                               "required": ["query"] } },
         ]})),
         "tools/call" => call_tool(state, grant, params),
         other => Err((-32601, format!("method not found: {other}"))),
@@ -108,7 +121,7 @@ fn call_tool(state: &McpState, grant: &Grant, params: &Value) -> Result<Value, (
     match params["name"].as_str().unwrap_or_default() {
         "cite" => {
             let key = params["arguments"]["key"].as_str().unwrap_or_default();
-            let entry = state.store.get(key).map_err(|e| (-32602, e.to_string()))?;
+            let entry = resolve(state, key).map_err(|e| (-32602, e.to_string()))?;
             state.cites.lock().unwrap().push(CiteRecord {
                 grant: grant.clone(),
                 key: key.into(),
@@ -120,11 +133,69 @@ fn call_tool(state: &McpState, grant: &Grant, params: &Value) -> Result<Value, (
             })
         }
         "index" => {
-            let index = state.store.index().map_err(|e| (-32603, e.to_string()))?;
+            let index = merged_index(state).map_err(|e| (-32603, e.to_string()))?;
             Ok(text(serde_json::to_string(&index).unwrap(), false))
+        }
+        "search" => {
+            let query = params["arguments"]["query"].as_str().unwrap_or_default();
+            let hits = search(state, query).map_err(|e| (-32603, e.to_string()))?;
+            Ok(text(serde_json::to_string(&hits).unwrap(), false))
         }
         other => Err((-32602, format!("unknown tool: {other}"))),
     }
+}
+
+fn resolve(state: &McpState, key: &str) -> anyhow::Result<Option<tm_core::DictionaryEntry>> {
+    if let Some(entry) = state.local.get(key)? {
+        return Ok(Some(entry));
+    }
+    let Some(commons) = &state.commons else { return Ok(None) };
+    let entry = commons.get(key)?;
+    if entry.is_some() {
+        crate::Catalog::open(state.local.root().to_path_buf(), commons.root().to_path_buf())?.note_reuse(key)?;
+    }
+    Ok(entry)
+}
+
+fn merged_index(state: &McpState) -> anyhow::Result<Vec<crate::store::IndexLine>> {
+    let mut lines = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(commons) = &state.commons {
+        for line in commons.index()? {
+            seen.insert(line.key.clone());
+            lines.push(line);
+        }
+    }
+    for line in state.local.index()? {
+        if seen.insert(line.key.clone()) {
+            lines.push(line);
+        }
+    }
+    Ok(lines)
+}
+
+fn search(state: &McpState, query: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let Some(commons) = &state.commons else {
+        return Ok(state
+            .local
+            .entries()?
+            .into_iter()
+            .filter(|entry| query.is_empty() || entry.summary.to_lowercase().contains(&query.to_lowercase()) || entry.key.contains(query))
+            .take(20)
+            .map(hit)
+            .collect());
+    };
+    let catalog = crate::Catalog::open(state.local.root().to_path_buf(), commons.root().to_path_buf())?;
+    Ok(catalog.search(query)?.into_iter().map(hit).collect())
+}
+
+fn hit(entry: tm_core::DictionaryEntry) -> serde_json::Value {
+    json!({
+        "key": entry.key,
+        "tier": entry.tier,
+        "summary": entry.summary,
+        "content": entry.content,
+    })
 }
 
 #[cfg(test)]
@@ -195,9 +266,35 @@ mod tests {
         let (_, r) = rpc(&app, Some("tok-a"), init).await;
         assert_eq!(r["result"]["protocolVersion"], "2025-11-25");
         let (_, r) = rpc(&app, Some("tok-a"), json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).await;
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 3);
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert_eq!(rpc(&app, Some("tok-a"), note).await.0, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn search_reads_the_commons_before_the_project() {
+        let root = std::env::temp_dir().join(format!("tm-mcp-commons-{}-search", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = LocalStore::open(root.join("local")).unwrap();
+        let commons = LocalStore::open(root.join("commons")).unwrap();
+        local.publish("auth", EntryKind::Hint, "local roles", "export const LOCAL = 1;\n", "next").unwrap();
+        commons.publish("theme", EntryKind::Pattern, "shared colors", "export const INK = '#fff';\n", "next").unwrap();
+        let mut theme = commons.get("theme").unwrap().unwrap();
+        theme.tier = tm_core::DictTier::Commons;
+        theme.stats = Some(tm_core::EntryStats { reuses: 0, pass_rate: 1.0, passes: 0, fails: 0 });
+        commons.put(&theme).unwrap();
+        let state = McpState::with_commons(local, commons);
+        state.grant("tok-a", Grant { run: "r1".into(), page: "dashboard".into() });
+        let app = router(state.clone());
+        let search = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search", "arguments": { "query": "color" } } });
+        let (_, reply) = rpc(&app, Some("tok-a"), search).await;
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("theme"));
+        let (_, cited) = rpc(&app, Some("tok-a"), call("theme")).await;
+        assert_eq!(cited["result"]["content"][0]["text"], "export const INK = '#fff';\n");
+        assert_eq!(state.cites()[0].found, true);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

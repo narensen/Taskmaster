@@ -16,6 +16,7 @@ pub struct LocalStore {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct IndexLine {
     pub key: String,
+    pub tier: tm_core::DictTier,
     pub kind: EntryKind,
     pub summary: String,
 }
@@ -84,11 +85,41 @@ impl LocalStore {
         for dir in fs::read_dir(&self.root)? {
             let name = dir?.file_name().to_string_lossy().into_owned();
             if let Some(e) = self.get(&name)? {
-                lines.push(IndexLine { key: e.key, kind: e.kind, summary: e.summary });
+                lines.push(IndexLine { key: e.key, tier: e.tier, kind: e.kind, summary: e.summary });
             }
         }
         lines.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(lines)
+    }
+
+    /// Every current entry.
+    pub fn entries(&self) -> anyhow::Result<Vec<DictionaryEntry>> {
+        let mut out = Vec::new();
+        let Ok(dirs) = fs::read_dir(&self.root) else { return Ok(out) };
+        for dir in dirs {
+            let name = dir?.file_name().to_string_lossy().into_owned();
+            if let Some(entry) = self.get(&name)? {
+                out.push(entry);
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    /// Write an entry whose hash already matches its content, and point HEAD at it.
+    pub fn put(&self, entry: &DictionaryEntry) -> anyhow::Result<()> {
+        check_key(&entry.key)?;
+        if hex(&Sha256::digest(entry.content.as_bytes())) != entry.hash {
+            bail!("entry {} does not match its hash", entry.key);
+        }
+        if !entry.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("invalid hash");
+        }
+        let dir = self.root.join(&entry.key);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(format!("{}.json", entry.hash)), serde_json::to_vec_pretty(entry)?)?;
+        fs::write(dir.join("HEAD"), &entry.hash)?;
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -98,13 +129,11 @@ impl LocalStore {
 
 /// Keys become directory names, so they must not be able to name anything else.
 fn check_key(key: &str) -> anyhow::Result<()> {
-    let ok = !key.is_empty()
-        && key.len() <= 64
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !ok {
+    if tm_core::valid_key(key) {
+        Ok(())
+    } else {
         bail!("invalid key `{key}`: use letters, digits, `_` and `-`");
     }
-    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

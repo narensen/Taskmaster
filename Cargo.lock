@@ -543,6 +543,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tm-core",
+ "tm-dictionary",
+ "tm-harness",
+ "tm-verify",
+ "tokio",
+]
+
+[[package]]
 name = "tm-dictionary"
 version = "0.1.0"
 dependencies = [

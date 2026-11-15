@@ -9,6 +9,7 @@ pub mod acp;
 pub mod claude;
 pub mod codex;
 pub mod gate;
+pub mod providers;
 pub mod sandbox;
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate};
+pub use providers::{ModelChoice, ProviderReport, provider_report, provider_reports, require_model};
 
 /// Every harness Taskmaster can drive, by the name used on the command line.
 pub const HARNESSES: [&str; 5] = ["claude", "agy", "grok", "codex", "opencode"];

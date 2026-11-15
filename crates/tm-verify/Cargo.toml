@@ -1,0 +1,11 @@
+[package]
+name = "tm-verify"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tm-core = { path = "../tm-core" }
+anyhow.workspace = true
+globset = "0.4"
+regex = "1"

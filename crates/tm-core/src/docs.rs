@@ -110,6 +110,39 @@ pub fn review_brief(scope: &ReviewScope) -> String {
     )
 }
 
+/// The brief for the one reviewer per run that looks only for security problems.
+pub fn security_brief(pages: &[String]) -> String {
+    format!(
+        "You are reviewing this project for security problems only. You cannot edit anything.\n\n\
+         Read `{ARCHITECTURE_FILE}` and `{CHANGES_FILE}` first.\n\n\
+         Pages to check: {pages}.\n\n\
+         Look for: user input reaching HTML, a query, a file path or a redirect unchecked; data \
+         shown or changed without the access check the contracts require; secrets or tokens in \
+         client code; routes that trust an id from the request. Ignore everything else.\n\n\
+         Reply with only a JSON array. Each item: {{\"page\", \"file\", \"line\", \"failure\"}}, where \
+         `failure` states what an attacker sends and what they gain. An empty array means you \
+         found nothing.",
+        pages = pages.join(", "),
+    )
+}
+
+/// The brief for the agent that checks one finding before any worker is asked to fix it.
+pub fn verify_brief(finding: &crate::types::Finding) -> String {
+    format!(
+        "Another reviewer reported a problem. Decide whether it is real. You cannot edit anything.\n\n\
+         Claim: in `{file}` at line {line} (page {page}): {failure}\n\n\
+         Read that file and whatever it depends on. Try to disprove the claim: check whether the \
+         code already handles the case, whether the line says what the claim says, and whether \
+         the failure can actually happen.\n\n\
+         Reply with only `{{\"real\": true}}` or `{{\"real\": false, \"why\": \"...\"}}`. If you are \
+         unsure, answer false.",
+        file = finding.file,
+        line = finding.line,
+        page = finding.page,
+        failure = finding.failure,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

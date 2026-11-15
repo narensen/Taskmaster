@@ -19,10 +19,30 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    pub fn antigravity() -> anyhow::Result<Self> {
+    /// A sandbox whose only writable places, besides the worktree, are `state_dirs`
+    /// (given relative to the home directory). Directories that do not exist are left out.
+    pub fn with_state_dirs(state_dirs: &[&str]) -> anyhow::Result<Self> {
         let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-        let state_dirs = vec![home.join(".gemini"), home.join(".config/antigravity")];
+        let state_dirs = state_dirs.iter().map(|d| home.join(d)).filter(|d| d.exists()).collect();
         Ok(Sandbox { home, state_dirs })
+    }
+
+    pub fn antigravity() -> anyhow::Result<Self> {
+        Self::with_state_dirs(&[".gemini", ".config/antigravity"])
+    }
+
+    pub fn grok() -> anyhow::Result<Self> {
+        Self::with_state_dirs(&[".grok"])
+    }
+
+    pub fn opencode() -> anyhow::Result<Self> {
+        Self::with_state_dirs(&[
+            ".opencode",
+            ".config/opencode",
+            ".local/share/opencode",
+            ".local/state/opencode",
+            ".cache/opencode",
+        ])
     }
 
     /// Arguments for `bwrap` that run `binary args...` confined to `worktree`.

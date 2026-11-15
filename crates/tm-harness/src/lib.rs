@@ -7,6 +7,7 @@
 
 pub mod acp;
 pub mod claude;
+pub mod codex;
 pub mod gate;
 pub mod sandbox;
 
@@ -20,6 +21,25 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate};
+
+/// Every harness Taskmaster can drive, by the name used on the command line.
+pub const HARNESSES: [&str; 5] = ["claude", "agy", "grok", "codex", "opencode"];
+
+/// Build the adapter for a harness named in [`HARNESSES`].
+pub fn harness(name: &str) -> anyhow::Result<Arc<dyn Harness>> {
+    Ok(match name {
+        "claude" => Arc::new(claude::ClaudeCode::default()),
+        "agy" => Arc::new(acp::AcpHarness::antigravity()?),
+        "grok" => Arc::new(acp::AcpHarness::grok()?),
+        "opencode" => Arc::new(acp::AcpHarness::opencode()?),
+        "codex" => Arc::new(codex::Codex::default()),
+        other => anyhow::bail!("unknown harness `{other}`: use one of {}", HARNESSES.join(", ")),
+    })
+}
+
+/// Directories under the home directory that harnesses keep their own state in. Reads
+/// there are allowed, because an agent consults its own session files.
+pub const HARNESS_STATE_DIRS: [&str; 3] = [".gemini", ".grok", ".opencode"];
 
 /// Rules every worker is told first. Harnesses that end their turn on the first refused call
 /// need to know up front which tools do not exist.

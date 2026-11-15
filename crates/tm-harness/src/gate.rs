@@ -7,6 +7,9 @@ pub enum ToolKind {
     Read,
     Edit,
     Execute,
+    /// A call to the Dictionary's MCP server. The adapter recognises it, because each
+    /// harness names MCP tools differently.
+    Dictionary,
     Other,
 }
 
@@ -82,6 +85,7 @@ impl PermissionGate for WorktreeGate {
             return Decision::Allow;
         }
         match request.kind {
+            ToolKind::Dictionary => Decision::Allow,
             ToolKind::Read
                 if !request.paths.is_empty() && request.paths.iter().all(|p| self.readable(p)) =>
             {
@@ -159,6 +163,9 @@ mod tests {
         assert_eq!(g.decide(&request("browser", ToolKind::Other, &[])), Decision::Deny);
         assert_eq!(g.decide(&request("view_file", ToolKind::Read, &[])), Decision::Deny);
         assert_eq!(g.decide(&request("mcp_dict_cite", ToolKind::Other, &[])), Decision::Allow);
+        assert_eq!(g.decide(&request("dict__cite", ToolKind::Dictionary, &[])), Decision::Allow);
+        let strict = WorktreeGate::new("/nonexistent/tm/work-a", vec![]);
+        assert_eq!(strict.decide(&request("other__tool", ToolKind::Other, &[])), Decision::Deny);
     }
 
     #[test]

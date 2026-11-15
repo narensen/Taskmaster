@@ -1,4 +1,4 @@
-//! Agent Client Protocol adapter, used for Antigravity (`agy acp`).
+//! Agent Client Protocol adapter, used for Antigravity, Grok Build and Opencode.
 //!
 //! ACP is JSON-RPC over the agent's stdio. The session is created with its working
 //! directory and MCP servers, so nothing is written to the user's global configuration.
@@ -26,6 +26,9 @@ pub struct AcpHarness {
     pub args: Vec<String>,
     /// Required for agents that touch files without asking. `None` runs the agent unconfined.
     pub sandbox: Option<Sandbox>,
+    /// How this harness names an MCP server's tools, with `{server}` for the server name.
+    /// A tool whose name starts with this, for the Dictionary server, is a Dictionary call.
+    pub mcp_tool_prefix: &'static str,
 }
 
 impl AcpHarness {
@@ -35,6 +38,29 @@ impl AcpHarness {
             binary: "agy".into(),
             args: vec!["acp".into()],
             sandbox: Some(Sandbox::antigravity()?),
+            mcp_tool_prefix: "mcp_{server}_",
+        })
+    }
+
+    /// Grok Build (`grok agent stdio`).
+    pub fn grok() -> anyhow::Result<Self> {
+        Ok(AcpHarness {
+            id: "grok-build",
+            binary: "grok".into(),
+            args: vec!["agent".into(), "stdio".into()],
+            sandbox: Some(Sandbox::grok()?),
+            mcp_tool_prefix: "{server}__",
+        })
+    }
+
+    /// Opencode (`opencode acp`). Written from its documented interface; not yet run here.
+    pub fn opencode() -> anyhow::Result<Self> {
+        Ok(AcpHarness {
+            id: "opencode",
+            binary: "opencode".into(),
+            args: vec!["acp".into()],
+            sandbox: Some(Sandbox::opencode()?),
+            mcp_tool_prefix: "{server}_",
         })
     }
 
@@ -76,6 +102,10 @@ impl Harness for AcpHarness {
             lines: BufReader::new(child.stdout.take().context("agent stdout was not captured")?)
                 .lines(),
             next_id: 0,
+            dictionary_prefix: task
+                .dictionary
+                .as_ref()
+                .map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
             gate,
             events,
             denied: 0,
@@ -93,6 +123,7 @@ struct Session {
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
+    dictionary_prefix: Option<String>,
     gate: Arc<dyn PermissionGate>,
     events: mpsc::Sender<HarnessEvent>,
     denied: u32,
@@ -141,16 +172,9 @@ impl Session {
             "prompt": [{ "type": "text", "text": task.framed_brief() }],
         });
         let result = self.call("session/prompt", prompt).await?;
-        let usage = &result["usage"];
-        let count = |key: &str| usage[key].as_u64().unwrap_or(0);
         Ok(RunSummary {
             ok: result["stopReason"] == "end_turn",
-            usage: Usage {
-                input: count("inputTokens"),
-                output: count("outputTokens"),
-                cache_read: count("cachedReadTokens"),
-                cache_write: count("cachedWriteTokens"),
-            },
+            usage: read_usage(&result),
             cost_usd: None,
             denied: self.denied,
         })
@@ -189,7 +213,11 @@ impl Session {
                 }
             }
             Some("session/request_permission") => {
-                let request = permission_request(&params["toolCall"]);
+                let mut request = permission_request(&params["toolCall"]);
+                let prefix = self.dictionary_prefix.as_deref();
+                if prefix.is_some_and(|p| request.tool.starts_with(p)) {
+                    request.kind = ToolKind::Dictionary;
+                }
                 let allowed = self.gate.decide(&request) == Decision::Allow;
                 if !allowed {
                     self.denied += 1;
@@ -248,8 +276,28 @@ fn update_event(update: &Value) -> Option<HarnessEvent> {
     }
 }
 
+/// Token counts from the prompt result. Harnesses put them in different places, and some
+/// count cached tokens inside the input figure.
+fn read_usage(result: &Value) -> Usage {
+    let usage = if result["usage"].is_object() { &result["usage"] } else { &result["_meta"]["usage"] };
+    let count = |keys: &[&str]| keys.iter().find_map(|k| usage[*k].as_u64()).unwrap_or(0);
+    let (mut input, output) = (count(&["inputTokens"]), count(&["outputTokens"]));
+    let cache_read = count(&["cachedReadTokens"]);
+    // When input + output already equals the total, the cached tokens are inside the input.
+    if usage["totalTokens"].as_u64() == Some(input + output) {
+        input = input.saturating_sub(cache_read);
+    }
+    Usage { input, output, cache_read, cache_write: count(&["cachedWriteTokens", "cacheCreationTokens"]) }
+}
+
+/// The tool being called. Antigravity gives a `name`; Grok Build puts an MCP tool's name in
+/// its input and a built-in's name in its metadata; the title is the last resort.
 fn tool_name(tool_call: &Value) -> String {
-    let name = tool_call["name"].as_str().or_else(|| tool_call["title"].as_str());
+    let name = tool_call["name"]
+        .as_str()
+        .or_else(|| tool_call["rawInput"]["tool_name"].as_str())
+        .or_else(|| tool_call["_meta"]["x.ai/tool"]["name"].as_str())
+        .or_else(|| tool_call["title"].as_str());
     name.unwrap_or_default().to_string()
 }
 
@@ -260,12 +308,20 @@ fn permission_request(tool_call: &Value) -> PermissionRequest {
         Some("execute") => ToolKind::Execute,
         _ => ToolKind::Other,
     };
+    let raw = &tool_call["rawInput"];
     let locations = tool_call["locations"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut paths: Vec<PathBuf> =
+        locations.iter().filter_map(|l| l["path"].as_str()).map(PathBuf::from).collect();
+    if paths.is_empty() {
+        // Not every harness fills `locations`; fall back to the tool's own path argument.
+        let keys = ["file_path", "path", "Path", "filePath", "AbsolutePath"];
+        paths.extend(keys.iter().find_map(|k| raw[*k].as_str()).map(PathBuf::from));
+    }
     PermissionRequest {
         tool: tool_name(tool_call),
         kind,
-        paths: locations.iter().filter_map(|l| l["path"].as_str()).map(PathBuf::from).collect(),
-        command: tool_call["rawInput"]["CommandLine"].as_str().map(str::to_string),
+        paths,
+        command: raw["CommandLine"].as_str().or_else(|| raw["command"].as_str()).map(str::to_string),
     }
 }
 
@@ -308,6 +364,39 @@ mod tests {
         let request = permission_request(&call);
         assert_eq!(request.kind, ToolKind::Edit);
         assert_eq!(request.paths, vec![PathBuf::from("/work/a/greeting.ts")]);
+    }
+
+    // Shapes recorded from Grok Build 1.0.77.
+    #[test]
+    fn reads_grok_build_tool_calls() {
+        let mcp = json!({
+            "kind": "other", "title": "dict__cite",
+            "rawInput": { "variant": "UseTool", "tool_name": "dict__cite", "tool_input": { "key": "k" } },
+            "_meta": { "x.ai/tool": { "name": "use_tool", "kind": "use_tool" } }
+        });
+        assert_eq!(permission_request(&mcp).tool, "dict__cite");
+        let write = json!({
+            "kind": "edit", "title": "Write `/w/greeting.ts`",
+            "rawInput": { "variant": "Write", "file_path": "/w/greeting.ts", "content": "x" },
+            "_meta": { "x.ai/tool": { "name": "write", "kind": "write" } }
+        });
+        let request = permission_request(&write);
+        assert_eq!((request.tool.as_str(), request.kind), ("write", ToolKind::Edit));
+        assert_eq!(request.paths, vec![PathBuf::from("/w/greeting.ts")]);
+    }
+
+    #[test]
+    fn usage_is_read_from_either_place_without_double_counting_cache() {
+        // Antigravity: top-level usage, input excludes cached tokens.
+        let agy = json!({ "usage": { "inputTokens": 46413, "outputTokens": 2879,
+            "cachedReadTokens": 200132, "cachedWriteTokens": 0, "totalTokens": 249424 } });
+        assert_eq!(read_usage(&agy).total(), 249424);
+        // Grok Build: under _meta, input includes cached tokens.
+        let grok = json!({ "_meta": { "usage": { "inputTokens": 75528, "outputTokens": 507,
+            "totalTokens": 76035, "cachedReadTokens": 58368, "cacheCreationTokens": 0 } } });
+        let usage = read_usage(&grok);
+        assert_eq!((usage.input, usage.cache_read), (17160, 58368));
+        assert_eq!(usage.total(), 76035);
     }
 
     #[test]

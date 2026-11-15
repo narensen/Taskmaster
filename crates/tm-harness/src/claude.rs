@@ -41,11 +41,16 @@ impl Harness for ClaudeCode {
         let mut cmd = Command::new(&self.binary);
         cmd.current_dir(&task.cwd)
             .arg("-p")
-            .arg(format!("{}{}", crate::WORKER_RULES, task.brief))
+            .arg(task.framed_brief())
             .args(["--output-format", "stream-json", "--verbose"])
-            .args(["--permission-mode", "acceptEdits"])
-            .args(["--disallowedTools", "Bash"])
             .args(["--strict-mcp-config", "--no-session-persistence"]);
+        if task.read_only {
+            // With no edit tools and nobody to approve a prompt, the session can only read.
+            cmd.args(["--permission-mode", "default"])
+                .args(["--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit"]);
+        } else {
+            cmd.args(["--permission-mode", "acceptEdits"]).args(["--disallowedTools", "Bash"]);
+        }
         if let Some(model) = &task.model {
             cmd.args(["--model", model]);
         }

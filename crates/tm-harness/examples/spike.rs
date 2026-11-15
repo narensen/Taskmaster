@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         model,
         dictionary,
         timeout: Duration::from_secs(240),
+        read_only: false,
     };
 
     let (tx, mut rx) = mpsc::channel(64);

@@ -569,6 +569,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-review"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tm-harness",
+ "tm-verify",
+ "tokio",
+]
+
+[[package]]
 name = "tm-verify"
 version = "0.1.0"
 dependencies = [

@@ -26,7 +26,13 @@ impl Sandbox {
     }
 
     /// Arguments for `bwrap` that run `binary args...` confined to `worktree`.
-    pub fn bwrap_args(&self, binary: &Path, args: &[String], worktree: &Path) -> Vec<OsString> {
+    pub fn bwrap_args(
+        &self,
+        binary: &Path,
+        args: &[String],
+        worktree: &Path,
+        read_only: bool,
+    ) -> Vec<OsString> {
         let mut out: Vec<OsString> = Vec::new();
         let mut push = |parts: &[&dyn AsRef<std::ffi::OsStr>]| {
             out.extend(parts.iter().map(|p| p.as_ref().to_os_string()));
@@ -39,7 +45,8 @@ impl Sandbox {
         for dir in &self.state_dirs {
             push(&[&"--bind", dir, dir]);
         }
-        push(&[&"--bind", &worktree, &worktree]);
+        let mount = if read_only { "--ro-bind" } else { "--bind" };
+        push(&[&mount, &worktree, &worktree]);
         push(&[&"--die-with-parent", &"--chdir", &worktree, &"--", &binary]);
         out.extend(args.iter().map(OsString::from));
         out
@@ -74,7 +81,8 @@ mod tests {
             state_dirs: vec!["/home/u/.gemini".into()],
         };
         let worktree = Path::new("/home/u/.taskmaster/worktrees/a");
-        let args = sandbox.bwrap_args(Path::new("/home/u/.local/bin/agy"), &["acp".into()], worktree);
+        let args =
+            sandbox.bwrap_args(Path::new("/home/u/.local/bin/agy"), &["acp".into()], worktree, false);
         let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let position = |needle: &[&str]| {
             args.windows(needle.len()).position(|w| w == needle).expect("argument present")
@@ -91,7 +99,16 @@ mod tests {
     #[test]
     fn the_root_filesystem_is_read_only() {
         let sandbox = Sandbox { home: "/home/u".into(), state_dirs: vec![] };
-        let args = sandbox.bwrap_args(Path::new("/bin/agy"), &[], Path::new("/w"));
+        let args = sandbox.bwrap_args(Path::new("/bin/agy"), &[], Path::new("/w"), false);
         assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
+    }
+
+    #[test]
+    fn a_reviewer_gets_its_worktree_read_only() {
+        let sandbox = Sandbox { home: "/home/u".into(), state_dirs: vec![] };
+        let args = sandbox.bwrap_args(Path::new("/bin/agy"), &[], Path::new("/w"), true);
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert!(args.windows(3).any(|w| w == ["--ro-bind", "/w", "/w"]));
+        assert!(!args.windows(2).any(|w| w == ["--bind", "/w"]));
     }
 }

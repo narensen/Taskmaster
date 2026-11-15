@@ -37,13 +37,20 @@ pub struct WorktreeGate {
     allowed_tool_prefixes: Vec<String>,
     /// Extra read-only locations, e.g. the harness's own state directory.
     readable: Vec<PathBuf>,
+    read_only: bool,
 }
 
 impl WorktreeGate {
     pub fn new(root: impl Into<PathBuf>, allowed_tool_prefixes: Vec<String>) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root));
-        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new() }
+        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new(), read_only: false }
+    }
+
+    /// Refuse every edit, for reviewers and verifiers.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// Allow reads (never writes) under `dir`.
@@ -81,7 +88,9 @@ impl PermissionGate for WorktreeGate {
                 Decision::Allow
             }
             ToolKind::Edit
-                if !request.paths.is_empty() && request.paths.iter().all(|p| self.inside(p)) =>
+                if !self.read_only
+                    && !request.paths.is_empty()
+                    && request.paths.iter().all(|p| self.inside(p)) =>
             {
                 Decision::Allow
             }
@@ -150,6 +159,15 @@ mod tests {
         assert_eq!(g.decide(&request("browser", ToolKind::Other, &[])), Decision::Deny);
         assert_eq!(g.decide(&request("view_file", ToolKind::Read, &[])), Decision::Deny);
         assert_eq!(g.decide(&request("mcp_dict_cite", ToolKind::Other, &[])), Decision::Allow);
+    }
+
+    #[test]
+    fn a_read_only_gate_refuses_edits_inside_the_worktree() {
+        let g = gate().read_only();
+        let edit = request("write_file", ToolKind::Edit, &["/nonexistent/tm/work-a/app/page.tsx"]);
+        assert_eq!(g.decide(&edit), Decision::Deny);
+        let read = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/app/page.tsx"]);
+        assert_eq!(g.decide(&read), Decision::Allow);
     }
 
     #[test]

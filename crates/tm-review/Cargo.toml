@@ -1,0 +1,13 @@
+[package]
+name = "tm-review"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tm-harness = { path = "../tm-harness" }
+tm-verify = { path = "../tm-verify" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

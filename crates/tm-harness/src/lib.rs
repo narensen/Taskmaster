@@ -27,6 +27,11 @@ pub const WORKER_RULES: &str = "Rules: you have no shell. Never try to run comma
 file reading and editing tools and the Dictionary tools. Work only inside the current directory. \
 If any call is refused, stop and state what was refused.\n\nTask: ";
 
+/// Rules for agents that only read: reviewers and verifiers.
+pub const REVIEWER_RULES: &str = "Rules: you can only read files in the current directory. You have \
+no shell and cannot edit, create or delete anything; do not try. Answer from what you read.\n\n\
+Task: ";
+
 /// The Dictionary MCP server a worker may read from, with its run-scoped token.
 #[derive(Debug, Clone)]
 pub struct DictionaryAccess {
@@ -44,6 +49,16 @@ pub struct WorkerTask {
     pub model: Option<String>,
     pub dictionary: Option<DictionaryAccess>,
     pub timeout: Duration,
+    /// Reviewers and verifiers: the worktree is mounted read-only and edit tools are removed.
+    pub read_only: bool,
+}
+
+impl WorkerTask {
+    /// The brief with the standing rules for this kind of task in front of it.
+    pub fn framed_brief(&self) -> String {
+        let rules = if self.read_only { REVIEWER_RULES } else { WORKER_RULES };
+        format!("{rules}{}", self.brief)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]

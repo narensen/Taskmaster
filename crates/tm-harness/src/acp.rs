@@ -46,7 +46,7 @@ impl AcpHarness {
         };
         let binary = resolve_binary(&self.binary)?;
         let mut cmd = Command::new("bwrap");
-        cmd.args(sandbox.bwrap_args(&binary, &self.args, &task.cwd));
+        cmd.args(sandbox.bwrap_args(&binary, &self.args, &task.cwd, task.read_only));
         Ok(cmd)
     }
 }
@@ -138,7 +138,7 @@ impl Session {
 
         let prompt = json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": format!("{}{}", crate::WORKER_RULES, task.brief) }],
+            "prompt": [{ "type": "text", "text": task.framed_brief() }],
         });
         let result = self.call("session/prompt", prompt).await?;
         let usage = &result["usage"];

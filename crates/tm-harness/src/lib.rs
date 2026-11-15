@@ -1,0 +1,87 @@
+//! Harness adapters: run a coding agent headless inside one directory and report what it did.
+//!
+//! Two shapes of harness exist. Claude Code is a one-way event stream whose permissions are
+//! fixed by launch flags. Antigravity speaks the Agent Client Protocol, where the agent asks
+//! before shell commands and the daemon answers through a [`PermissionGate`]; its file access
+//! is confined by an OS sandbox, because it does not ask before reading or writing files.
+
+pub mod acp;
+pub mod claude;
+pub mod gate;
+pub mod sandbox;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate};
+
+/// The Dictionary MCP server a worker may read from, with its run-scoped token.
+#[derive(Debug, Clone)]
+pub struct DictionaryAccess {
+    /// MCP server name as the harness will see it.
+    pub name: String,
+    pub url: String,
+    pub bearer_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerTask {
+    pub brief: String,
+    /// The worker's worktree. It is the only place the worker may read or write.
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub dictionary: Option<DictionaryAccess>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl Usage {
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HarnessEvent {
+    Text { text: String },
+    Thought { text: String },
+    ToolCall { id: String, name: String, input: Value },
+    PermissionDecided { tool: String, allowed: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunSummary {
+    pub ok: bool,
+    pub usage: Usage,
+    /// Only some harnesses report a price.
+    pub cost_usd: Option<f64>,
+    /// Tool calls the gate refused.
+    pub denied: u32,
+}
+
+#[async_trait]
+pub trait Harness: Send + Sync {
+    fn id(&self) -> &'static str;
+
+    /// Run one task to completion, streaming events as they happen.
+    async fn run(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> anyhow::Result<RunSummary>;
+}

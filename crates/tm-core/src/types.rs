@@ -89,3 +89,58 @@ pub enum FlagResolution {
     /// The Taskmaster published a successor entry.
     Amended,
 }
+
+/// One connection to review: a Dictionary entry and the pages that consume it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewScope {
+    pub key: DictKey,
+    pub consumers: Vec<PageId>,
+}
+
+/// A reviewer's claim that something is broken. Reviewers never edit; a finding is routed
+/// to the page's owning worker as a repair.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Finding {
+    pub page: PageId,
+    /// The connection the reviewer was looking at, if any.
+    pub key: Option<DictKey>,
+    pub file: String,
+    pub line: u32,
+    /// The concrete failure: what input or state leads to what wrong result.
+    pub failure: String,
+}
+
+impl Finding {
+    /// A finding without a location and a concrete failure is dropped: acting on a vague
+    /// one costs a repair round for nothing.
+    pub fn is_actionable(&self) -> bool {
+        !self.file.trim().is_empty() && self.line > 0 && self.failure.trim().len() >= 10
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    ContractsLocked,
+    PageBuilt,
+    PageRepaired,
+    EntryAmended,
+    ReviewFinding,
+    VerifyFailed,
+}
+
+/// One line of the change log: what changed, where, and who changed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeEntry {
+    /// RFC 3339 timestamp, supplied by the executor.
+    pub at: String,
+    pub kind: ChangeKind,
+    pub page: Option<PageId>,
+    pub commit: Option<String>,
+    /// Model that made the change.
+    pub model: Option<String>,
+    pub files: Vec<String>,
+    /// Dictionary keys the change touches or depends on.
+    pub keys: Vec<DictKey>,
+    pub summary: String,
+}

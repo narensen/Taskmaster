@@ -4,16 +4,18 @@
 //! executor must carry out. Replaying a run's event log through `step` rebuilds its state,
 //! which is how a run resumes after a crash.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{DictKey, Flag, FlagResolution, PageId, Plan};
+use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, Plan, ReviewScope};
 
 /// Repair rounds a page gets on one tier before it escalates.
 pub const MAX_REPAIRS: u8 = 2;
 /// Dictionary amendments allowed per run. This cap is what bounds fix-and-revert loops.
 pub const MAX_AMENDMENTS: u8 = 1;
+/// Review rounds per run. After the last one the run goes straight to verification.
+pub const MAX_REVIEW_ROUNDS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +23,7 @@ pub enum RunPhase {
     Planning,
     AwaitingApproval,
     Building,
+    Reviewing,
     Verifying,
     Done,
     Failed,
@@ -84,6 +87,8 @@ pub enum Event {
     PlanRejected,
     WorkerFinished { page: PageId, outcome: WorkerOutcome },
     FlagResolved { page: PageId, key: DictKey, resolution: FlagResolution },
+    /// Reviewers report; they never edit. Findings without evidence are dropped.
+    ReviewFinished { findings: Vec<Finding> },
     /// Whole-project verification. `failing` maps a page to the errors attributed to it.
     VerifyFinished { failing: BTreeMap<PageId, String>, ok: bool },
     Cancelled,
@@ -97,6 +102,8 @@ pub enum Command {
     LockContracts,
     SpawnWorker { page: PageId, tier: Tier, errors: Option<String> },
     ArbitrateFlag(Flag),
+    /// One read-only reviewer per connection, on a different model than the author.
+    RunReview { scopes: Vec<ReviewScope> },
     RunVerify,
     Finish { ok: bool },
 }
@@ -107,6 +114,9 @@ pub struct Run {
     pub plan: Option<Plan>,
     pub pages: BTreeMap<PageId, PageRun>,
     pub amendments: u8,
+    pub review_rounds: u8,
+    /// Pages built since the last review; only connections touching them are re-reviewed.
+    pub dirty: BTreeSet<PageId>,
     pub max_parallel: usize,
 }
 
@@ -117,6 +127,8 @@ impl Run {
             plan: None,
             pages: BTreeMap::new(),
             amendments: 0,
+            review_rounds: 0,
+            dirty: BTreeSet::new(),
             max_parallel: max_parallel.max(1),
         }
     }
@@ -203,6 +215,25 @@ impl Run {
                 }
                 self.settle(&mut out);
             }
+            (RunPhase::Reviewing, Event::ReviewFinished { findings }) => {
+                let mut by_page: BTreeMap<PageId, Vec<String>> = BTreeMap::new();
+                for f in findings.iter().filter(|f| f.is_actionable()) {
+                    let line = format!("review: {}:{} {}", f.file, f.line, f.failure);
+                    by_page.entry(f.page.clone()).or_default().push(line);
+                }
+                by_page.retain(|page, _| self.pages.contains_key(page));
+                if by_page.is_empty() {
+                    self.phase = RunPhase::Verifying;
+                    out.push(Command::RunVerify);
+                } else {
+                    self.phase = RunPhase::Building;
+                    for (page, lines) in by_page {
+                        let p = self.pages.get_mut(&page).expect("filtered to known pages");
+                        Self::fail_page(p, lines.join("\n"));
+                    }
+                    self.settle(&mut out);
+                }
+            }
             (RunPhase::Verifying, Event::VerifyFinished { ok: true, .. }) => {
                 self.phase = RunPhase::Done;
                 out.push(Command::Finish { ok: true });
@@ -275,6 +306,7 @@ impl Run {
             let p = self.pages.get_mut(&id).expect("every planned page has a PageRun");
             if p.state == PageState::Queued {
                 p.state = PageState::Building;
+                self.dirty.insert(id.clone());
                 running += 1;
                 out.push(Command::SpawnWorker {
                     page: id,
@@ -286,13 +318,43 @@ impl Run {
         let open = running + self.count(PageState::Flagged);
         if open == 0 {
             if self.count(PageState::Failed) == 0 {
-                self.phase = RunPhase::Verifying;
-                out.push(Command::RunVerify);
+                self.after_build(out);
             } else {
                 self.phase = RunPhase::Failed;
                 out.push(Command::Finish { ok: false });
             }
         }
+    }
+
+    /// Every page passed its own checks: review the connections that changed, then verify.
+    fn after_build(&mut self, out: &mut Vec<Command>) {
+        let scopes =
+            if self.review_rounds < MAX_REVIEW_ROUNDS { self.review_scopes() } else { Vec::new() };
+        self.dirty.clear();
+        if scopes.is_empty() {
+            self.phase = RunPhase::Verifying;
+            out.push(Command::RunVerify);
+        } else {
+            self.review_rounds += 1;
+            self.phase = RunPhase::Reviewing;
+            out.push(Command::RunReview { scopes });
+        }
+    }
+
+    /// One scope per Dictionary entry that a rebuilt page consumes.
+    fn review_scopes(&self) -> Vec<ReviewScope> {
+        let Some(plan) = &self.plan else { return Vec::new() };
+        let mut by_key: BTreeMap<&DictKey, Vec<PageId>> = BTreeMap::new();
+        for page in &plan.pages {
+            for key in &page.cites {
+                by_key.entry(key).or_default().push(page.id.clone());
+            }
+        }
+        by_key
+            .into_iter()
+            .filter(|(_, consumers)| consumers.iter().any(|c| self.dirty.contains(c)))
+            .map(|(key, consumers)| ReviewScope { key: key.clone(), consumers })
+            .collect()
     }
 
     fn count(&self, state: PageState) -> usize {
@@ -460,6 +522,66 @@ mod tests {
         }
         assert_eq!(Run::replay(2, events), live);
         assert_eq!(live.phase, RunPhase::Verifying);
+    }
+
+    fn finding(page: &str, file: &str, line: u32, failure: &str) -> Finding {
+        Finding { page: page.into(), key: None, file: file.into(), line, failure: failure.into() }
+    }
+
+    fn scope(key: &str, consumers: &[&str]) -> ReviewScope {
+        ReviewScope { key: key.into(), consumers: consumers.iter().map(|c| c.to_string()).collect() }
+    }
+
+    fn built(pages: &[(&str, &[&str])]) -> (Run, Vec<Command>) {
+        let (mut run, _) = started(pages, 8);
+        let mut last = Vec::new();
+        for (id, _) in pages {
+            last = run.step(finished(id, WorkerOutcome::Passed));
+        }
+        (run, last)
+    }
+
+    #[test]
+    fn review_covers_each_connection_and_a_clean_one_proceeds_to_verify() {
+        let pages: &[(&str, &[&str])] = &[("a", &["auth", "nav"]), ("b", &["auth"]), ("c", &[])];
+        let (mut run, cmds) = built(pages);
+        let scopes = vec![scope("auth", &["a", "b"]), scope("nav", &["a"])];
+        assert_eq!(cmds, vec![Command::RunReview { scopes }]);
+        assert_eq!(run.phase, RunPhase::Reviewing);
+        assert_eq!(run.step(Event::ReviewFinished { findings: vec![] }), vec![Command::RunVerify]);
+    }
+
+    #[test]
+    fn finding_repairs_the_page_then_only_its_connections_are_reviewed_again() {
+        let pages: &[(&str, &[&str])] = &[("a", &["auth"]), ("b", &["auth"]), ("c", &["nav"])];
+        let (mut run, _) = built(pages);
+        let f = finding("c", "app/c/page.tsx", 12, "links to /settings, which is not a route");
+        let cmds = run.step(Event::ReviewFinished { findings: vec![f] });
+        let errors = "review: app/c/page.tsx:12 links to /settings, which is not a route";
+        assert_eq!(cmds, vec![spawn("c", Tier::Worker, Some(errors))]);
+        assert_eq!(run.pages["c"].repairs, 1, "a finding counts against the repair cap");
+
+        // Only `nav` is re-reviewed: `auth` and its consumers were not rebuilt.
+        let cmds = run.step(finished("c", WorkerOutcome::Passed));
+        assert_eq!(cmds, vec![Command::RunReview { scopes: vec![scope("nav", &["c"])] }]);
+
+        // The second round is the last: after its repair the run goes straight to verify.
+        let f = finding("c", "app/c/page.tsx", 3, "still links to /settings");
+        run.step(Event::ReviewFinished { findings: vec![f] });
+        assert_eq!(run.step(finished("c", WorkerOutcome::Passed)), vec![Command::RunVerify]);
+    }
+
+    #[test]
+    fn findings_without_evidence_are_dropped() {
+        let (mut run, _) = built(&[("a", &["auth"])]);
+        let vague = vec![
+            finding("a", "", 4, "something looks off in this page"),
+            finding("a", "app/a/page.tsx", 0, "something looks off in this page"),
+            finding("a", "app/a/page.tsx", 4, "bad"),
+            finding("ghost", "app/x.tsx", 4, "unknown page reported by reviewer"),
+        ];
+        assert_eq!(run.step(Event::ReviewFinished { findings: vague }), vec![Command::RunVerify]);
+        assert_eq!(run.pages["a"].repairs, 0);
     }
 
     #[test]

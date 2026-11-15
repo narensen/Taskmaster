@@ -138,7 +138,7 @@ impl Session {
 
         let prompt = json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": task.brief }],
+            "prompt": [{ "type": "text", "text": format!("{}{}", crate::WORKER_RULES, task.brief) }],
         });
         let result = self.call("session/prompt", prompt).await?;
         let usage = &result["usage"];

@@ -41,7 +41,7 @@ impl Harness for ClaudeCode {
         let mut cmd = Command::new(&self.binary);
         cmd.current_dir(&task.cwd)
             .arg("-p")
-            .arg(&task.brief)
+            .arg(format!("{}{}", crate::WORKER_RULES, task.brief))
             .args(["--output-format", "stream-json", "--verbose"])
             .args(["--permission-mode", "acceptEdits"])
             .args(["--disallowedTools", "Bash"])

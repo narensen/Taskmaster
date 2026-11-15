@@ -35,20 +35,37 @@ pub trait PermissionGate: Send + Sync {
 pub struct WorktreeGate {
     root: PathBuf,
     allowed_tool_prefixes: Vec<String>,
+    /// Extra read-only locations, e.g. the harness's own state directory.
+    readable: Vec<PathBuf>,
 }
 
 impl WorktreeGate {
     pub fn new(root: impl Into<PathBuf>, allowed_tool_prefixes: Vec<String>) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root));
-        WorktreeGate { root, allowed_tool_prefixes }
+        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new() }
+    }
+
+    /// Allow reads (never writes) under `dir`.
+    pub fn with_readable(mut self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        self.readable.push(std::fs::canonicalize(&dir).unwrap_or_else(|_| normalize(&dir)));
+        self
     }
 
     fn inside(&self, path: &Path) -> bool {
+        self.resolve(path).starts_with(&self.root)
+    }
+
+    fn readable(&self, path: &Path) -> bool {
+        let resolved = self.resolve(path);
+        resolved.starts_with(&self.root) || self.readable.iter().any(|r| resolved.starts_with(r))
+    }
+
+    fn resolve(&self, path: &Path) -> PathBuf {
         let absolute = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
         // Resolve symlinks where the path exists, so a link cannot point out of the worktree.
-        let resolved = std::fs::canonicalize(&absolute).unwrap_or_else(|_| normalize(&absolute));
-        resolved.starts_with(&self.root)
+        std::fs::canonicalize(&absolute).unwrap_or_else(|_| normalize(&absolute))
     }
 }
 
@@ -58,7 +75,12 @@ impl PermissionGate for WorktreeGate {
             return Decision::Allow;
         }
         match request.kind {
-            ToolKind::Read | ToolKind::Edit
+            ToolKind::Read
+                if !request.paths.is_empty() && request.paths.iter().all(|p| self.readable(p)) =>
+            {
+                Decision::Allow
+            }
+            ToolKind::Edit
                 if !request.paths.is_empty() && request.paths.iter().all(|p| self.inside(p)) =>
             {
                 Decision::Allow
@@ -128,6 +150,15 @@ mod tests {
         assert_eq!(g.decide(&request("browser", ToolKind::Other, &[])), Decision::Deny);
         assert_eq!(g.decide(&request("view_file", ToolKind::Read, &[])), Decision::Deny);
         assert_eq!(g.decide(&request("mcp_dict_cite", ToolKind::Other, &[])), Decision::Allow);
+    }
+
+    #[test]
+    fn extra_readable_dirs_are_read_only() {
+        let g = gate().with_readable("/nonexistent/state");
+        let read = request("view_file", ToolKind::Read, &["/nonexistent/state/brain/x.md"]);
+        assert_eq!(g.decide(&read), Decision::Allow);
+        let write = request("write_file", ToolKind::Edit, &["/nonexistent/state/brain/x.md"]);
+        assert_eq!(g.decide(&write), Decision::Deny);
     }
 
     #[cfg(unix)]

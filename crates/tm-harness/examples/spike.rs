@@ -34,7 +34,11 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
     let cwd = std::fs::canonicalize(cwd).with_context(|| format!("no such directory: {cwd}"))?;
-    let gate = Arc::new(WorktreeGate::new(&cwd, vec!["mcp_dict_".into()]));
+    let home = std::env::var("HOME")?;
+    let gate = Arc::new(
+        WorktreeGate::new(&cwd, vec!["mcp_dict_".into()])
+            .with_readable(format!("{home}/.gemini")),
+    );
     let task = WorkerTask {
         brief: prompt.clone(),
         cwd,

@@ -21,6 +21,12 @@ use tokio::sync::mpsc;
 
 pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate};
 
+/// Rules every worker is told first. Harnesses that end their turn on the first refused call
+/// need to know up front which tools do not exist.
+pub const WORKER_RULES: &str = "Rules: you have no shell. Never try to run commands; use only your \
+file reading and editing tools and the Dictionary tools. Work only inside the current directory. \
+If any call is refused, stop and state what was refused.\n\nTask: ";
+
 /// The Dictionary MCP server a worker may read from, with its run-scoped token.
 #[derive(Debug, Clone)]
 pub struct DictionaryAccess {

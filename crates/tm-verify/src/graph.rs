@@ -11,10 +11,16 @@ use std::sync::LazyLock;
 use regex::Regex;
 use tm_core::PageId;
 
+use crate::languages;
 use crate::ownership::Owners;
 
-const EXTENSIONS: [&str; 4] = ["ts", "tsx", "js", "jsx"];
-const SKIP_DIRS: [&str; 5] = ["node_modules", ".next", ".git", "dist", ".taskmaster"];
+const SCRIPTS: [&str; 6] = ["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+const EXTENSIONS: [&str; 26] = [
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java", "kt", "kts", "c", "h", "cc", "cpp",
+    "cxx", "hh", "hpp", "hxx", "rb", "php", "cs", "css", "scss", "sass",
+];
+const SKIP_DIRS: [&str; 10] =
+    ["node_modules", ".next", ".git", "dist", ".taskmaster", "target", "vendor", "__pycache__", ".venv", "venv"];
 
 /// `import x from "y"`, `export * from "y"`, `import "y"`, `import("y")`, `require("y")`.
 static IMPORT: LazyLock<Regex> = LazyLock::new(|| {
@@ -35,13 +41,26 @@ impl ImportGraph {
     /// use `/`. `alias_root` is what `@/` resolves to (`""` for the project root).
     pub fn build(sources: &BTreeMap<String, String>, alias_root: &str) -> Self {
         let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (file, source) in sources {
-            for capture in IMPORT.captures_iter(&strip_comments(source)) {
-                let spec = capture.iter().skip(1).flatten().next().map(|m| m.as_str());
-                let target = spec.and_then(|s| resolve(file, s, alias_root, sources));
-                if let Some(target) = target {
-                    edges.entry(file.clone()).or_default().insert(target);
+        let parsed: BTreeMap<String, String> =
+            sources.iter().map(|(file, source)| (file.clone(), strip_for(file, source))).collect();
+        let rust = languages::rust_modules(&parsed);
+        let csharp = languages::csharp_namespaces(&parsed);
+        for (file, source) in &parsed {
+            if file == "go.mod" || file.ends_with("/go.mod") {
+                continue;
+            }
+            let mut targets = BTreeSet::new();
+            if is_javascript(file) {
+                for capture in IMPORT.captures_iter(source) {
+                    let spec = capture.iter().skip(1).flatten().next().map(|m| m.as_str());
+                    if let Some(target) = spec.and_then(|s| resolve(file, s, alias_root, &parsed)) {
+                        targets.insert(target);
+                    }
                 }
+            }
+            targets.extend(languages::connections(file, source, &parsed, &rust, &csharp));
+            if !targets.is_empty() {
+                edges.insert(file.clone(), targets);
             }
         }
         ImportGraph { edges }
@@ -105,9 +124,7 @@ pub fn load_sources(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
                 if !SKIP_DIRS.contains(&name.as_str()) {
                     walk(root, &path, out)?;
                 }
-            } else if kind.is_file()
-                && path.extension().is_some_and(|e| EXTENSIONS.iter().any(|x| e == *x))
-            {
+            } else if kind.is_file() && is_loaded(&name, &path) {
                 let relative = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
                 out.insert(relative, std::fs::read_to_string(&path)?);
             }
@@ -119,9 +136,30 @@ pub fn load_sources(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
-/// Blank out `//` and `/* */` comments so a commented-out import is not counted. String
-/// contents are kept, because import specifiers are strings.
-fn strip_comments(source: &str) -> String {
+fn is_javascript(file: &str) -> bool {
+    matches!(extension_of(file), Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs"))
+}
+
+fn extension_of(path: &str) -> Option<&str> {
+    path.rsplit_once('.').map(|(_, ext)| ext)
+}
+
+fn is_loaded(name: &str, path: &Path) -> bool {
+    name == "go.mod" || path.extension().is_some_and(|e| EXTENSIONS.iter().any(|x| e == *x))
+}
+
+fn strip_for(file: &str, source: &str) -> String {
+    match extension_of(file) {
+        Some("py" | "rb") => strip_comments(source, true, file.ends_with(".py")),
+        Some("php") => strip_comments(source, true, false),
+        _ => strip_comments(source, false, false),
+    }
+}
+
+/// Blank out comments so a commented-out import is not counted. String contents are kept,
+/// because import specifiers are strings. `hash` treats `#` as a comment. `triple` keeps
+/// Python docstrings intact.
+fn strip_comments(source: &str, hash: bool, triple: bool) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
@@ -134,11 +172,26 @@ fn strip_comments(source: &str) -> String {
                 out.push_str("  ");
                 continue;
             }
-            if c == q {
+            if triple && i + 2 < bytes.len() && bytes[i] == q && bytes[i + 1] == q && bytes[i + 2] == q {
+                quote = None;
+                i += 3;
+                out.push_str("   ");
+                continue;
+            }
+            if c == q && !(triple && bytes.get(i + 1) == Some(&q)) {
                 quote = None;
             }
+        } else if triple && (source[i..].starts_with("\"\"\"") || source[i..].starts_with("'''")) {
+            quote = Some(bytes[i]);
+            i += 2;
+            out.push_str("  ");
         } else if matches!(c, b'"' | b'\'' | b'`') {
             quote = Some(c);
+        } else if hash && c == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
         } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
@@ -178,8 +231,8 @@ fn resolve(
     };
     let base = normalize(&base)?;
     let mut candidates = vec![base.clone()];
-    candidates.extend(EXTENSIONS.iter().map(|e| format!("{base}.{e}")));
-    candidates.extend(EXTENSIONS.iter().map(|e| format!("{base}/index.{e}")));
+    candidates.extend(SCRIPTS.iter().map(|e| format!("{base}.{e}")));
+    candidates.extend(SCRIPTS.iter().map(|e| format!("{base}/index.{e}")));
     candidates.into_iter().find(|c| sources.contains_key(c))
 }
 
@@ -321,5 +374,51 @@ mod tests {
         let loaded = load_sources(&root).unwrap();
         assert_eq!(loaded.keys().collect::<Vec<_>>(), vec!["app/a/page.tsx", "app/a/x.ts"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn connects_rust_python_go_and_the_other_languages() {
+        let src = sources(&[
+            ("src/lib.rs", "mod foo;\npub mod bar;\n// mod hidden;"),
+            ("src/foo.rs", "use super::bar::Item;\nmod baz;\ninclude!(\"./foo/extra.rs\");"),
+            ("src/foo/baz.rs", ""),
+            ("src/foo/extra.rs", ""),
+            ("src/bar.rs", "use crate::foo::baz::Thing;"),
+            ("src/hidden.rs", ""),
+            ("pkg/a.py", "from . import b\nfrom .c import d\nimport pkg.sub.e"),
+            ("pkg/b.py", ""),
+            ("pkg/c.py", ""),
+            ("pkg/sub/e.py", ""),
+            ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+            ("main.go", "import \"example.com/app/util\"\n"),
+            ("util/util.go", "package util\n"),
+            ("src/com/acme/A.java", "import com.acme.B;"),
+            ("src/com/acme/B.java", ""),
+            ("src/a.c", "#include \"b.h\"\n#include <stdio.h>\n"),
+            ("src/b.h", ""),
+            ("lib/a.rb", "require_relative \"b\"\nrequire \"c\""),
+            ("lib/b.rb", ""),
+            ("lib/c.rb", ""),
+            ("src/a.php", "require 'b.php';\nuse App\\Model;"),
+            ("src/b.php", ""),
+            ("src/App/Model.php", ""),
+            ("src/A.cs", "namespace App.One;\nusing App.Two;"),
+            ("src/B.cs", "namespace App.Two;"),
+            ("web/a.css", "@import \"./b.css\";"),
+            ("web/b.css", ""),
+        ]);
+        let graph = ImportGraph::build(&src, "");
+        assert_eq!(imports(&graph, "src/lib.rs"), vec!["src/bar.rs", "src/foo.rs"]);
+        assert_eq!(imports(&graph, "src/foo.rs"), vec!["src/bar.rs", "src/foo/baz.rs", "src/foo/extra.rs"]);
+        assert_eq!(imports(&graph, "src/bar.rs"), vec!["src/foo/baz.rs"]);
+        assert!(graph.edges.get("src/hidden.rs").is_none());
+        assert_eq!(imports(&graph, "pkg/a.py"), vec!["pkg/b.py", "pkg/c.py", "pkg/sub/e.py"]);
+        assert_eq!(imports(&graph, "main.go"), vec!["util/util.go"]);
+        assert_eq!(imports(&graph, "src/com/acme/A.java"), vec!["src/com/acme/B.java"]);
+        assert_eq!(imports(&graph, "src/a.c"), vec!["src/b.h"]);
+        assert_eq!(imports(&graph, "lib/a.rb"), vec!["lib/b.rb", "lib/c.rb"]);
+        assert_eq!(imports(&graph, "src/a.php"), vec!["src/App/Model.php", "src/b.php"]);
+        assert_eq!(imports(&graph, "src/A.cs"), vec!["src/B.cs"]);
+        assert_eq!(imports(&graph, "web/a.css"), vec!["web/b.css"]);
     }
 }

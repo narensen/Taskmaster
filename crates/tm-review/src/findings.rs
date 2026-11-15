@@ -10,6 +10,8 @@ pub enum Kind {
     Security,
     /// Breaks one of the project's own review rules.
     Rule,
+    /// Produced by a linter (clippy, eslint, ruff), not by a reviewer.
+    Lint,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +43,7 @@ pub fn parse_findings(reply: &str, default_kind: Kind) -> Option<Vec<Finding>> {
                     Some("security") => Kind::Security,
                     Some("rule") => Kind::Rule,
                     Some("bug") => Kind::Bug,
+                    Some("lint") => Kind::Lint,
                     _ => default_kind,
                 };
                 // Models write the line as a number or as a string.

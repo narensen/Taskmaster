@@ -99,9 +99,29 @@ pub fn render_architecture(tracked: &[String], graph: &ImportGraph, existing: Op
         out.push_str("- none found\n");
     }
     out.push_str(
-        "\nImports are read from TypeScript and JavaScript files only. For other languages the \
-         module table is complete but the import columns are empty.\n",
+        "\nConnections are read from TypeScript, JavaScript, Rust, Python, Go, Java, Kotlin, \
+         C, C++, C#, Ruby, PHP and CSS. A file with no recognised import is listed in the module \
+         table only.\n",
     );
+    out
+}
+
+/// Uncommitted work on top of `head`.
+pub fn render_working_tree(head: &str, changes: &[Change]) -> String {
+    let short: String = head.chars().take(10).collect();
+    let mut out = format!(
+        "# Changes under review\n\nUncommitted changes on `{short}`: {} file(s).\n\n## Files\n\n",
+        changes.len()
+    );
+    for change in changes {
+        let what = match change.status {
+            'A' => "added",
+            'D' => "deleted",
+            _ => "modified",
+        };
+        let _ = writeln!(out, "- {what}: `{}`", change.path);
+    }
+    out.push_str("\n## Commits\n\nNo commits: this review is the working tree.\n");
     out
 }
 
@@ -183,6 +203,7 @@ mod tests {
         assert!(doc.contains("| `web` | 2 | lib |"));
         assert!(doc.contains("| `(root)` | 1 | - |"));
         assert!(doc.contains("- `lib/money.ts` is imported by 2 file(s)"));
+        assert!(doc.contains("Rust") && doc.contains("Go") && doc.contains("CSS"));
     }
 
     #[test]

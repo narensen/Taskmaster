@@ -25,6 +25,7 @@ pub fn review(scope: &Scope, diff_file: &str) -> String {
          - `{CONTEXT_DIR}/CHANGES.md`: everything that changed\n\
          - `{CONTEXT_DIR}/RULES.md`: this project's review rules\n\
          - `{CONTEXT_DIR}/HISTORY.md`: what earlier reviews found in these files\n\
+         - `{CONTEXT_DIR}/LINT.md`: mechanical lint already run on this change; do not repeat it\n\
          - `{CONTEXT_DIR}/{diff_file}`: the diff for your part of the change\n\n\
          Your part of the change:\n{files}\n\
          Unchanged files that import them, and so may be broken by the change:\n{dependents}\n\
@@ -43,8 +44,8 @@ pub fn security(files: &[String]) -> String {
     format!(
         "You are reviewing a code change for security problems only. This directory is a checkout \
          of the code after the change.\n\n\
-         Read `{CONTEXT_DIR}/ARCHITECTURE.md`, `{CONTEXT_DIR}/CHANGES.md`, `{CONTEXT_DIR}/RULES.md` and \
-         `{CONTEXT_DIR}/DIFF.patch` first.\n\n\
+         Read `{CONTEXT_DIR}/ARCHITECTURE.md`, `{CONTEXT_DIR}/CHANGES.md`, `{CONTEXT_DIR}/RULES.md`, \
+         `{CONTEXT_DIR}/LINT.md` and `{CONTEXT_DIR}/DIFF.patch` first. Do not repeat `LINT.md`.\n\n\
          Changed files:\n{files}\n\
          Look for: input reaching HTML, a query, a shell, a file path or a redirect unchecked; data \
          read or changed without an access check; secrets or tokens in code or logs; an id from the \
@@ -84,7 +85,7 @@ mod tests {
             dependents: vec!["web/cart.tsx".into()],
         };
         let brief = review(&scope, "diff-1.patch");
-        for file in ["ARCHITECTURE.md", "CHANGES.md", "RULES.md", "HISTORY.md", "diff-1.patch"] {
+        for file in ["ARCHITECTURE.md", "CHANGES.md", "RULES.md", "HISTORY.md", "LINT.md", "diff-1.patch"] {
             assert!(brief.contains(&format!("{CONTEXT_DIR}/{file}")), "{file}");
         }
         assert!(brief.contains("- `lib/money.ts`") && brief.contains("- `web/cart.tsx`"));

@@ -8,8 +8,10 @@
 pub mod brief;
 pub mod context;
 pub mod findings;
+pub mod forge;
 pub mod git;
 pub mod history;
+pub mod lint;
 pub mod rules;
 
 /// Directory inside the review checkout that holds the context files.

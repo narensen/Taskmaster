@@ -39,12 +39,105 @@ pub struct Change {
 
 pub fn changed_files(repo: &Path, base: &str, head: &str) -> anyhow::Result<Vec<Change>> {
     let out = git(repo, &["diff", "--no-renames", "--name-status", "-z", base, head])?;
+    Ok(parse_name_status(&out))
+}
+
+/// Staged and unstaged edits, plus untracked files, against `HEAD`.
+pub fn working_tree_changes(repo: &Path) -> anyhow::Result<Vec<Change>> {
+    let mut changes = parse_name_status(&git(repo, &["diff", "--no-renames", "--name-status", "-z", "HEAD"])?);
+    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        if !changes.iter().any(|c| c.path == path) {
+            changes.push(Change { status: 'A', path: path.into() });
+        }
+    }
+    Ok(changes)
+}
+
+fn parse_name_status(out: &str) -> Vec<Change> {
     let mut parts = out.split('\0').filter(|p| !p.is_empty());
     let mut changes = Vec::new();
     while let (Some(status), Some(path)) = (parts.next(), parts.next()) {
         changes.push(Change { status: status.chars().next().unwrap_or('M'), path: path.into() });
     }
-    Ok(changes)
+    changes
+}
+
+/// Copy uncommitted work into a detached checkout without touching the user's tree.
+pub fn apply_working_tree(repo: &Path, worktree: &Path) -> anyhow::Result<()> {
+    let patch = git(repo, &["diff", "--binary", "HEAD"])?;
+    if !patch.trim().is_empty() {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["apply", "--binary", "--whitespace=nowarn"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to start git apply")?;
+        use std::io::Write;
+        child.stdin.take().context("git apply stdin")?.write_all(patch.as_bytes())?;
+        let out = child.wait_with_output().context("git apply")?;
+        if !out.status.success() {
+            bail!("could not apply uncommitted changes: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+    }
+    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        let from = repo.join(path);
+        if !from.is_file() {
+            continue;
+        }
+        let to = worktree.join(path);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&from, &to).with_context(|| format!("failed to copy untracked file {path}"))?;
+    }
+    Ok(())
+}
+
+/// Diff of the working tree. Untracked files are appended as their contents.
+pub fn working_tree_diff(repo: &Path, paths: &[String]) -> anyhow::Result<String> {
+    let mut args = vec!["diff", "--no-renames", "HEAD", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let mut out = git(repo, &args)?;
+    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        if !paths.is_empty() && !paths.iter().any(|p| p == path) {
+            continue;
+        }
+        out.push_str(&format!("\n# untracked {path}\n"));
+        if let Ok(text) = std::fs::read_to_string(repo.join(path)) {
+            let clipped: String = text.chars().take(8_000).collect();
+            out.push_str(&clipped);
+            if text.chars().count() > 8_000 {
+                out.push_str("\n# …\n");
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn merge_base(repo: &Path, a: &str, b: &str) -> anyhow::Result<String> {
+    Ok(git(repo, &["merge-base", a, b])?.trim().to_string())
+}
+
+/// The branch a request is most likely based on: the remote default, then `main` or `master`.
+pub fn default_base(repo: &Path) -> anyhow::Result<String> {
+    if let Ok(link) = git(repo, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]) {
+        let name = link.trim().trim_start_matches("refs/remotes/");
+        if let Ok(commit) = resolve(repo, name) {
+            return Ok(commit);
+        }
+    }
+    for name in ["origin/main", "origin/master", "main", "master", "HEAD"] {
+        if let Ok(commit) = resolve(repo, name) {
+            return Ok(commit);
+        }
+    }
+    bail!("could not find a default branch")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,5 +288,30 @@ mod tests {
         assert!(resolve(&repo.0, "--upload-pack=x").is_err());
         assert!(resolve(&repo.0, "no-such-branch").is_err());
         assert_eq!(resolve(&repo.0, "HEAD").unwrap().len(), 40);
+    }
+
+    #[test]
+    fn uncommitted_work_is_copied_into_a_detached_checkout() {
+        let repo = TestRepo::new("dirty");
+        let head = repo.commit("first", &[("a.txt", Some("one\n"))]);
+        std::fs::write(repo.0.join("a.txt"), "two\n").unwrap();
+        std::fs::write(repo.0.join("new.txt"), "fresh\n").unwrap();
+        let changes = working_tree_changes(&repo.0).unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                Change { status: 'M', path: "a.txt".into() },
+                Change { status: 'A', path: "new.txt".into() }
+            ]
+        );
+        let tree = repo.0.with_extension("tree");
+        add_worktree(&repo.0, &tree, &head).unwrap();
+        apply_working_tree(&repo.0, &tree).unwrap();
+        assert_eq!(std::fs::read_to_string(tree.join("a.txt")).unwrap(), "two\n");
+        assert_eq!(std::fs::read_to_string(tree.join("new.txt")).unwrap(), "fresh\n");
+        assert_eq!(std::fs::read_to_string(repo.0.join("a.txt")).unwrap(), "two\n");
+        let diff = working_tree_diff(&repo.0, &["a.txt".into()]).unwrap();
+        assert!(diff.contains("+two"));
+        remove_worktree(&repo.0, &tree).unwrap();
     }
 }

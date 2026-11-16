@@ -833,6 +833,27 @@ async fn a_run_keeps_its_records_wherever_the_store_puts_them() {
     }
 }
 
+#[tokio::test]
+async fn a_run_can_keep_its_records_in_a_database() {
+    let tmp = repo("sqlite");
+    let world = World::new(Mode::Write);
+    let db = tmp.0.join(".taskmaster/taskmaster.db");
+    let store: Arc<dyn crate::Store> = Arc::new(crate::SqliteStore::open(&db).unwrap());
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg.store = Some(store.clone());
+    assert_eq!(run(cfg, &world).await.unwrap(), Outcome::Finished { ok: true });
+    assert!(db.is_file() && !tmp.0.join(".taskmaster/runs").exists());
+    let records = Records::new(store);
+    assert_eq!(records.run_ids().unwrap(), vec!["current".to_string()]);
+    let spent = records.ledger("current").unwrap();
+    assert!(spent.len() >= 2);
+    // Another process opens the same file and sees the same run.
+    let again = Records::new(Arc::new(crate::SqliteStore::open(&db).unwrap()));
+    assert_eq!(again.ledger("current").unwrap(), spent);
+    assert_eq!(again.events("current").unwrap(), records.events("current").unwrap());
+    assert!(again.status("current").unwrap().is_some());
+}
+
 #[derive(Default)]
 struct Shared {
     pulls: AtomicUsize,
@@ -1191,6 +1212,7 @@ mod http {
         let done = client.settled("web", "done").await;
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
+        assert_eq!(done["cancelled"], false);
         assert_eq!(done["estimate"]["tokens"], 2 * 17_000 + 2 * 500);
         let calls = done["spent"]["calls"].as_u64().unwrap();
         assert!(calls >= 3 && done["spent"]["tokens"] == calls * 120, "{done}");
@@ -1224,6 +1246,7 @@ mod http {
         assert_eq!(client.get("/api/dictionary/nope").await.0, 404);
         assert_eq!(client.get("/api/runs/nope").await.0, 404);
         assert_eq!(client.get("/api/errorography").await.0, 200);
+        assert_eq!(client.get("/api/templates").await.1, json!({ "templates": ["next"] }));
         assert_eq!(client.get("/api/providers?harness=nope").await.0, 400);
     }
 
@@ -1258,7 +1281,7 @@ mod http {
         client.settled(&id, "planning").await;
         assert_eq!(client.post(&format!("/api/runs/{id}/approve"), json!({})).await.0, 409);
         assert_eq!(client.post(&format!("/api/runs/{id}/cancel"), json!({})).await.0, 202);
-        client.settled(&id, "failed").await;
+        assert_eq!(client.settled(&id, "failed").await["cancelled"], true);
         assert!(!tmp.0.join("app/a/page.ts").exists());
     }
 
@@ -1355,5 +1378,86 @@ mod http {
         assert!(run["error"].as_str().unwrap().contains("no pages"), "{run}");
         let (_, listed) = client.get("/api/runs").await;
         assert_eq!(listed["runs"][0]["id"], "bad");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_is_a_commons_hub_other_machines_push_to_and_pull_from() {
+        use crate::commons::HttpCommons;
+        use tm_dictionary::CommonsRemote;
+        let tmp = repo("api-commons");
+        let world = World::new(Mode::Write);
+        let (server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        let token = paired["token"].as_str().unwrap().to_string();
+        assert_eq!(client.get("/api/commons/entries").await.0, 401);
+        client.token = Some(token.clone());
+        assert_eq!(client.get("/api/commons/entries").await.1, json!({ "entries": [] }));
+
+        // One machine promotes an entry and sends it to the hub.
+        let sender = repo("commons-sender");
+        let local = LocalStore::open(sender.0.join("commons")).unwrap();
+        local.publish("card", EntryKind::Pattern, "a card", "export const Card = 1;\n", "next").unwrap();
+        let mut entry = local.get("card").unwrap().unwrap();
+        entry.stats = Some(EntryStats { reuses: 40, pass_rate: 1.0, passes: 40, fails: 0 });
+        let hub = HttpCommons::new(&server.url, &token);
+        let sent = entry.clone();
+        let hub = tokio::task::spawn_blocking(move || hub.push(&sent).map(|_| hub)).await.unwrap().unwrap();
+
+        // The hub keeps it in its Commons, with counts it has not earned yet.
+        let (_, listed) = client.get("/api/commons/entries").await;
+        assert_eq!(listed["entries"][0]["key"], "card");
+        assert_eq!(listed["entries"][0]["tier"], "commons");
+        assert_eq!(listed["entries"][0]["stats"]["passes"], 0);
+        let (_, again) = client.post("/api/commons/entries", serde_json::to_value(&entry).unwrap()).await;
+        assert_eq!(again["added"], false);
+
+        // Content that does not match its hash, or a key that is a path, is refused.
+        let mut forged = entry.clone();
+        forged.content = "export const Card = 2;\n".into();
+        assert_eq!(client.post("/api/commons/entries", serde_json::to_value(&forged).unwrap()).await.0, 400);
+        let mut escape = entry.clone();
+        escape.key = "../card".into();
+        assert_eq!(client.post("/api/commons/entries", serde_json::to_value(&escape).unwrap()).await.0, 400);
+
+        // Another machine pulls it once.
+        let receiver = repo("commons-receiver");
+        let (first, second) = tokio::task::spawn_blocking(move || {
+            let theirs = LocalStore::open(receiver.0.join("commons")).unwrap();
+            let first = hub.pull(&theirs).unwrap();
+            let second = hub.pull(&theirs).unwrap();
+            assert_eq!(theirs.get("card").unwrap().unwrap().content, "export const Card = 1;\n");
+            (first, second)
+        })
+        .await
+        .unwrap();
+        assert_eq!((first, second), (1, 0));
+
+        let nowhere = HttpCommons::new("http://127.0.0.1:9", "x");
+        let error = tokio::task::spawn_blocking(move || nowhere.pull(&local).unwrap_err()).await.unwrap();
+        assert!(format!("{error:#}").contains("cannot reach the Commons"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn the_built_frontend_is_served_beside_the_api() {
+        let tmp = repo("api-web");
+        let web = tmp.0.join("web-dist");
+        std::fs::create_dir_all(web.join("assets")).unwrap();
+        std::fs::write(web.join("index.html"), "<div id=app></div>").unwrap();
+        std::fs::write(web.join("assets/app-1.js"), "console.log(1)").unwrap();
+        std::fs::write(tmp.0.join("secret.txt"), "no").unwrap();
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        options.web = Some(web);
+        let server = Server::serve(options).await.unwrap();
+        let client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
+
+        assert_eq!(client.text("/").await, (200, "<div id=app></div>".into()));
+        // A page the app routes itself gets the app.
+        assert_eq!(client.text("/runs/web").await, (200, "<div id=app></div>".into()));
+        assert_eq!(client.text("/assets/app-1.js").await, (200, "console.log(1)".into()));
+        assert_eq!(client.text("/assets/gone.js").await.0, 404);
+        assert_eq!(client.text("/../secret.txt").await.1, "<div id=app></div>");
+        assert_eq!(client.text("/api/nope").await.0, 404);
+        assert_eq!(client.get("/api/health").await.0, 200);
     }
 }

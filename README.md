@@ -116,27 +116,57 @@ POST /api/runs/{id}/reject      {prompt?} plans again when a prompt is given
 POST /api/runs/{id}/resume
 POST /api/runs/{id}/cancel
 GET  /api/providers
+GET  /api/templates
 GET  /api/dictionary            ?q=<text>
 GET  /api/dictionary/{key}
 GET  /api/errorography
 GET  /api/reviews
 POST /api/reviews               {target?, base?, head?, pr?, dirty?}
 GET  /api/reviews/{id}
+GET  /api/commons/entries       this daemon's Commons, for another daemon to pull
+POST /api/commons/entries       an entry another daemon promoted
 ```
 
 `stream` is server-sent events: one `event` per entry in the run's log, then `idle` with the phase once nothing is driving the run. A browser's `EventSource` cannot send a header, so this one route also takes `?token=`.
 
-Each run is on its own branch, so several can build at once. `GET /` is a small page for a phone: it pairs, lists the runs, and approves a waiting plan. `--pair` on a run serves the same API on the tailnet for as long as that run lasts.
+Each run is on its own branch, so several can build at once. `--pair` on a run serves the same API on the tailnet for as long as that run lasts.
 
-## Left open on purpose
+## The app
 
-Three parts are behind traits, so each can be replaced without touching the engine.
+`web/` is the frontend: React and TypeScript, built with Vite. The daemon serves it, so there is nothing else to run. It works the same on a phone and on a desktop, and a phone can add it to the home screen.
 
-| Trait | Today | Later |
-| --- | --- | --- |
-| `Store` | Files under `.taskmaster/` | A database. Five operations on named records. |
-| `Auth` | A pairing code and one token per device | Accounts. `enroll` takes what a sign-in returns, `identify` says whose token it is. |
-| `CommonsRemote` | Nothing. The Commons is a directory on this machine. | A Commons shared between people. The daemon already pulls before it plans and pushes each entry it promotes. |
+- Pair with the code, or sign in with an account when accounts are set up.
+- Start a run: the prompt, a template, how many pages at once, and the harness and model for each role.
+- Read the plan, then approve it, change it, or cancel. Follow a run as it happens.
+- See what a run cost by role, by model, and by call, with cache reads apart.
+- Read what each run committed, search the Dictionary, read the Errorography, and start and read reviews.
+
+```bash
+cd web && npm ci && npm run build
+tm-daemon serve . --web web/dist
+```
+
+Without `--web`, the daemon serves `$TASKMASTER_WEB` or `~/.local/share/taskmaster/web`, where the install script puts the build. With neither, `/` is a small built-in page that pairs, lists runs, and approves a plan.
+
+To work on the app, run `npm run dev` in `web/` next to `tm-daemon serve`. Vite sends `/api` to `127.0.0.1:8737`, or to `$TASKMASTER_DAEMON`. A build served from somewhere else can name the daemon on its sign-in screen; the API allows any origin, because it authenticates with tokens, not cookies.
+
+## Storage, accounts and a shared Commons
+
+Each of these is behind a trait, and each is set in `.taskmaster/config.json` in the project, or in `~/.taskmaster/config.json`. Without the file nothing changes. `config.example.json` lists every field with a placeholder. A placeholder counts as not set: the daemon says so and keeps the default. You can therefore copy the file as it is and fill in one part at a time.
+
+```bash
+cp config.example.json .taskmaster/config.json
+```
+
+| Part | Trait | Default | Set up |
+| --- | --- | --- | --- |
+| Records | `Store` | Files under `.taskmaster/` | `"store": {"kind": "sqlite"}` keeps them in one SQLite file, `.taskmaster/taskmaster.db` unless `path` says otherwise. |
+| Sign-in | `Auth` | A pairing code, and one token per device | `"auth": {"issuer", "secret"}` also accepts accounts. A sign-in service issues an HS256 JWT with `iss` set to the issuer, a `sub`, and an `exp`, signed with the shared secret (32 characters or more). The daemon checks the signature, the issuer and the expiry, and stores nothing. Pairing keeps working. |
+| Shared Commons | `CommonsRemote` | The Commons is a directory on this machine | `"commons": {"remote", "token"}` names another daemon as the hub. Before it plans, this daemon pulls the hub's entries. It sends the hub each entry it promotes. The token is one the hub issued when this machine paired with it. |
+
+Any daemon can be a hub. `GET /api/commons/entries` lists its Commons. `POST /api/commons/entries` adds an entry only if its content matches its hash. The pass and fail counts start over on the hub, so a sender cannot claim a track record.
+
+The sign-in service itself does not exist yet. The app sends the browser to `<issuer>/authorize?redirect_uri=<app>/signed-in` and expects to come back to `/signed-in#token=<jwt>`. That contract is in `web/src/api.ts`, ready to change when the service is built.
 
 ## Review any repository
 
@@ -156,7 +186,7 @@ Rules for the whole project live in `.taskmaster/REVIEW.md`. A `REVIEW.md` furth
 ```text
 tm-daemon providers [--harness <h>]
 
-tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
+tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>] [--web <dir>]
 
 tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
           [--worker <h>] [--mid <h>] [--master <h>]
@@ -186,13 +216,15 @@ Commits the daemon makes need `user.name` and `user.email` on that repository. T
 | `tm-verify` | Ownership globs and the import graph. |
 | `tm-review` | Review of any git repository. The binary is `tm-review`. |
 
+`web/` is the app, which is not a crate.
+
 ## Install
 
 ```bash
 scripts/install.sh
 ```
 
-This builds both binaries and copies them to `~/.local/bin`, or to the directory you pass. It needs `cargo` and `git`. Antigravity, Grok Build and OpenCode are confined with bubblewrap, so those three also need `bwrap`. A tag starting with `v` builds a Linux release on GitHub.
+This builds both binaries and copies them to `~/.local/bin`, or to the directory you pass. It needs `cargo` and `git`. With `npm` present it also builds the app into `~/.local/share/taskmaster/web`, where `serve` finds it. Antigravity, Grok Build and OpenCode are confined with bubblewrap, so those three also need `bwrap`. A tag starting with `v` builds a Linux release on GitHub.
 
 To build without installing:
 

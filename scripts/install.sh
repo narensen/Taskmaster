@@ -15,6 +15,20 @@ cargo build --release --locked -p tm-daemon -p tm-review
 mkdir -p "$dir"
 install -m 755 target/release/tm-daemon target/release/tm-review "$dir/"
 echo "installed tm-daemon and tm-review in $dir"
+
+# The app. `tm-daemon serve` finds it here.
+web="${XDG_DATA_HOME:-$HOME/.local/share}/taskmaster/web"
+if command -v npm >/dev/null; then
+  (cd web && npm ci --no-audit --no-fund && npm run build)
+  rm -rf "$web.new"
+  mkdir -p "$(dirname "$web")"
+  cp -R web/dist "$web.new"
+  rm -rf "$web"
+  mv "$web.new" "$web"
+  echo "installed the app in $web"
+else
+  echo "npm is not installed, so the app was not built; serve shows its small built-in page" >&2
+fi
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "add $dir to your PATH to run them by name" ;;

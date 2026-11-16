@@ -18,13 +18,19 @@
 //! POST /api/runs/{id}/cancel
 //!
 //! GET  /api/providers             ?harness=<h> installed harnesses and their models
+//! GET  /api/templates             the built-in templates; a directory path works as well
 //! GET  /api/dictionary            ?q=<text> Commons first, then the project
 //! GET  /api/dictionary/{key}
 //! GET  /api/errorography          recurring mistakes, per model
 //! GET  /api/reviews               reviews started here
 //! POST /api/reviews               {target?, base?, head?, pr?, dirty?, reviewer?, verifier?, ...}
 //! GET  /api/reviews/{id}
+//! GET  /api/commons/entries       this daemon's Commons, for another daemon to pull
+//! POST /api/commons/entries       an entry another daemon promoted
 //! ```
+//!
+//! `health` also says how to sign in: with a pairing code, an account, or either. When a
+//! built frontend is given (`web`), every path that is not under `/api` serves it.
 //!
 //! Everything under `/api` except `health` and `pair` needs `Authorization: Bearer <token>`.
 //! A browser's `EventSource` cannot send that header, so `stream` also takes `?token=`.
@@ -46,7 +52,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use axum::extract::{Path as UrlPath, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -55,8 +61,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use futures_util::stream::{self, Stream};
-use tm_core::{Plan, Run, RunPhase, totals, valid_key};
-use tm_dictionary::{Catalog, CommonsRemote};
+use tm_core::{DictTier, DictionaryEntry, EntryStats, Plan, Run, RunPhase, totals, valid_key};
+use tm_dictionary::{Catalog, CommonsRemote, LocalStore};
 use tm_harness::{HARNESSES, Harness, provider_report, provider_reports};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
@@ -82,6 +88,9 @@ pub struct ServerOptions {
     pub dictionary: Option<PathBuf>,
     pub commons: Option<PathBuf>,
     pub harness: HarnessFactory,
+    /// A built frontend: a directory with an `index.html`. `None` serves the small
+    /// built-in page.
+    pub web: Option<PathBuf>,
 }
 
 impl ServerOptions {
@@ -95,6 +104,7 @@ impl ServerOptions {
             dictionary: None,
             commons: None,
             harness: Arc::new(tm_harness::harness),
+            web: None,
         }
     }
 }
@@ -136,6 +146,7 @@ struct App {
     dictionary: PathBuf,
     commons: PathBuf,
     harness: HarnessFactory,
+    web: Option<PathBuf>,
     active: Mutex<HashMap<String, Active>>,
 }
 
@@ -161,6 +172,7 @@ impl Server {
             store: options.store,
             remote: options.remote,
             harness: options.harness,
+            web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
         });
         app.close_interrupted_reviews();
@@ -189,18 +201,20 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/providers", get(providers))
+        .route("/api/templates", get(templates))
         .route("/api/dictionary", get(search_dictionary))
         .route("/api/dictionary/{key}", get(show_entry))
         .route("/api/errorography", get(errorography))
         .route("/api/reviews", get(list_reviews).post(create_review))
         .route("/api/reviews/{id}", get(show_review))
+        .route("/api/commons/entries", get(commons_entries).post(commons_add))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
         .route("/api/runs/{id}/stream", get(run_stream))
-        .route("/", get(|| async { Html(PAGE) }))
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
         .merge(private)
+        .fallback(frontend)
         .layer(middleware::from_fn(cors))
         .with_state(app)
 }
@@ -258,8 +272,47 @@ fn accepted(body: Value) -> Reply {
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
+async fn health(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "auth": app.auth.describe() }))
+}
+
+/// Everything that is not the API: the built frontend, or the small built-in page.
+async fn frontend(State(app): State<Arc<App>>, method: Method, uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if method != Method::GET || path == "api" || path.starts_with("api/") {
+        return fail(StatusCode::NOT_FOUND, "no such route").into_response();
+    }
+    let Some(web) = &app.web else {
+        return if path.is_empty() { Html(PAGE).into_response() } else { StatusCode::NOT_FOUND.into_response() };
+    };
+    let rel = std::path::Path::new(path);
+    let inside = rel.components().all(|part| matches!(part, std::path::Component::Normal(_)));
+    let file = web.join(rel);
+    if path.starts_with("assets/") && !(inside && file.is_file()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // A path the app routes itself, such as `/runs/web`, gets the app.
+    let (file, cache) = if inside && !path.is_empty() && file.is_file() {
+        (file, if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" })
+    } else {
+        (web.join("index.html"), "no-cache")
+    };
+    let Ok(bytes) = tokio::fs::read(&file).await else { return StatusCode::NOT_FOUND.into_response() };
+    let kind = match file.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" | "webmanifest" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "txt" => "text/plain; charset=utf-8",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, cache)], bytes).into_response()
 }
 
 #[derive(Deserialize)]
@@ -325,9 +378,12 @@ impl App {
                 })
             })
             .collect();
+        // A cancelled run ends in the failed phase; the log says which it was.
+        let cancelled = run.phase == RunPhase::Failed && self.records.events(id)?.last() == Some(&tm_core::Event::Cancelled);
         Ok(json!({
             "id": id,
             "phase": run.phase,
+            "cancelled": cancelled,
             "active": self.is_active(id),
             "error": status.get("error"),
             "branch": status.get("branch"),
@@ -634,6 +690,10 @@ async fn providers(Query(query): Query<HashMap<String, String>>) -> Reply {
     ok(json!({ "providers": reports }))
 }
 
+async fn templates() -> Json<Value> {
+    Json(json!({ "templates": crate::template::BUILT_IN }))
+}
+
 async fn search_dictionary(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
     let catalog = Catalog::open(&app.dictionary, &app.commons)?;
     let found = catalog.search(query.get("q").map(String::as_str).unwrap_or(""))?;
@@ -652,6 +712,32 @@ async fn show_entry(State(app): State<Arc<App>>, UrlPath(key): UrlPath<String>) 
 
 async fn errorography(State(app): State<Arc<App>>) -> Reply {
     ok(json!(app.records.book()?))
+}
+
+// The Commons, for other daemons.
+
+async fn commons_entries(State(app): State<Arc<App>>) -> Reply {
+    ok(json!({ "entries": LocalStore::open(&app.commons)?.entries()? }))
+}
+
+async fn commons_add(State(app): State<Arc<App>>, Json(mut entry): Json<DictionaryEntry>) -> Reply {
+    let commons = LocalStore::open(&app.commons)?;
+    if !valid_key(&entry.key) {
+        return Err(fail(StatusCode::BAD_REQUEST, "an entry key uses letters, digits, `_` and `-`"));
+    }
+    if !tm_dictionary::matches_hash(&entry) {
+        return Err(fail(StatusCode::BAD_REQUEST, format!("entry {} does not match its hash", entry.key)));
+    }
+    // The same content is already here, with the pass and fail counts made here.
+    if commons.get(&entry.key)?.is_some_and(|have| have.hash == entry.hash) {
+        return ok(json!({ "key": entry.key, "hash": entry.hash, "added": false }));
+    }
+    // Counts are earned on this hub, not taken from whoever sent the entry.
+    entry.tier = DictTier::Commons;
+    entry.stats = Some(EntryStats { reuses: 0, pass_rate: 1.0, passes: 0, fails: 0 });
+    // `put` refuses content that does not match its hash.
+    commons.put(&entry).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    ok(json!({ "key": entry.key, "hash": entry.hash, "added": true }))
 }
 
 // Reviews.

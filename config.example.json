@@ -1,0 +1,14 @@
+{
+  "store": {
+    "kind": "files",
+    "path": ".taskmaster/taskmaster.db"
+  },
+  "auth": {
+    "issuer": "https://auth.example.invalid",
+    "secret": "replace-me-with-the-secret-your-sign-in-service-signs-with"
+  },
+  "commons": {
+    "remote": "https://commons.example.invalid",
+    "token": "replace-me-with-a-token-the-commons-daemon-issued"
+  }
+}

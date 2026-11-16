@@ -10,18 +10,21 @@
 //! skips that and locks the file as given.
 //!
 //! Three things are behind traits so they can be replaced without touching the engine:
-//! [`Store`] (files today, a database later), [`Auth`] (a pairing code today, accounts
-//! later), and [`tm_dictionary::CommonsRemote`] (nothing today, a shared Commons later).
+//! [`Store`] (files or SQLite), [`Auth`] (a pairing code, accounts, or both), and
+//! [`tm_dictionary::CommonsRemote`] (another daemon over HTTP). [`settings`] chooses.
 //! [`api`] is the HTTP surface a frontend talks to.
 
 pub mod api;
 pub mod auth;
+pub mod commons;
 mod engine;
 mod eval;
 mod git;
 mod reply;
 mod resume;
 mod secret;
+pub mod settings;
+pub mod sqlite;
 pub mod store;
 pub mod template;
 mod time;
@@ -41,7 +44,10 @@ use tm_harness::{HARNESSES, Harness, provider_report, require_model};
 use tokio::sync::watch;
 
 pub use api::{Server, ServerOptions, is_tailscale, tailscale_ipv4};
-pub use auth::{Auth, PairingAuth, Principal};
+pub use auth::{AccountAuth, AnyAuth, Auth, PairingAuth, Principal};
+pub use commons::HttpCommons;
+pub use settings::Settings;
+pub use sqlite::SqliteStore;
 pub use engine::drive;
 pub use eval::{EvalReport, EvalSide, evaluate};
 pub use store::{FileStore, Records, Store};

@@ -3,6 +3,7 @@
 //! ```text
 //! tm-daemon providers [--harness <h>]
 //! tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
+//!                 [--web <dir>]
 //! tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
 //!           [--worker <h>] [--mid <h>] [--master <h>]
 //!           [--reviewer <h>] [--verifier <h>]
@@ -34,11 +35,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use std::sync::Arc;
 
 use tm_daemon::{
-    Config, Harnesses, Models, Outcome, PairingAuth, Records, Roles, Server, ServerOptions, check_models, evaluate,
-    tailscale_ipv4,
+    Config, Harnesses, Models, Outcome, Roles, Server, ServerOptions, Settings, check_models, evaluate, tailscale_ipv4,
 };
 use tm_harness::{harness, provider_report, provider_reports, HARNESSES};
 
@@ -67,6 +66,7 @@ struct ServeArgs {
     tailscale: bool,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
+    web: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -121,6 +121,9 @@ async fn run() -> anyhow::Result<Outcome> {
     config.run_id = args.run_id.clone();
     config.template = args.template.clone();
     config.models = args.models;
+    let settings = Settings::load(&args.project.canonicalize().unwrap_or_else(|_| args.project.clone()))?;
+    config.store = settings.store(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone()))?;
+    config.remote = settings.remote();
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;
         let options = ServeArgs {
@@ -129,6 +132,7 @@ async fn run() -> anyhow::Result<Outcome> {
             tailscale: false,
             dictionary: config.dictionary.clone(),
             commons: config.commons.clone(),
+            web: None,
         };
         let primary = SocketAddr::from((IpAddr::V4(ip), 8737));
         Some(match start_server(&options, primary).await {
@@ -189,14 +193,27 @@ fn home_commons() -> Option<PathBuf> {
 /// Start the API and print where it is and the code that pairs a device with it.
 async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Server> {
     let project = args.project.canonicalize().with_context(|| format!("cannot open {}", args.project.display()))?;
-    let auth = Arc::new(PairingAuth::new(Records::files(&project))?);
-    let code = auth.code().to_string();
-    let mut options = ServerOptions::new(project, bind, auth);
+    let settings = Settings::load(&project)?;
+    let (auth, code) = settings.auth(settings.records(&project)?)?;
+    let mut options = ServerOptions::new(project.clone(), bind, auth);
+    options.store = settings.store(&project)?;
+    options.remote = settings.remote();
     options.dictionary = args.dictionary.clone();
     options.commons = args.commons.clone().or_else(home_commons);
+    options.web = args.web.clone().or_else(installed_web);
     let server = Server::serve(options).await?;
     println!("taskmaster: api {}  code {code}", server.url);
     Ok(server)
+}
+
+/// Where `scripts/install.sh` puts the built frontend.
+fn installed_web() -> Option<PathBuf> {
+    let from_env = std::env::var_os("TASKMASTER_WEB").map(PathBuf::from);
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    let installed = data.map(|dir| dir.join("taskmaster/web"));
+    [from_env, installed].into_iter().flatten().find(|dir| dir.join("index.html").is_file())
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -231,11 +248,12 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
 }
 
 fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
-    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]";
+    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] \
+                 [--commons <dir>] [--web <dir>]";
     let mut argv = argv.iter().cloned();
     let project = argv.next().filter(|arg| !arg.starts_with('-')).context(usage)?;
     let mut args =
-        ServeArgs { project: PathBuf::from(project), bind: None, tailscale: false, dictionary: None, commons: None };
+        ServeArgs { project: PathBuf::from(project), bind: None, tailscale: false, dictionary: None, commons: None, web: None };
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--tailscale" => args.tailscale = true,
@@ -245,6 +263,7 @@ fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
             }
             "--dictionary" => args.dictionary = Some(need(&mut argv, "--dictionary", usage)?.into()),
             "--commons" => args.commons = Some(need(&mut argv, "--commons", usage)?.into()),
+            "--web" => args.web = Some(need(&mut argv, "--web", usage)?.into()),
             other => bail!("unknown argument `{other}`\n{usage}"),
         }
     }

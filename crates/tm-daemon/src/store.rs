@@ -380,7 +380,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn exercise(records: &Records) {
+    pub(crate) fn exercise(records: &Records) {
         assert!(records.events("r1").unwrap().is_empty());
         assert!(records.inflight("r1").unwrap().is_none());
         records.save_events("r1", &[Event::PlanApproved, Event::Cancelled]).unwrap();

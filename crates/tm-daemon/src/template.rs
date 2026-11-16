@@ -35,6 +35,9 @@ const NEXT: [(&str, &str); 7] = [
     ("app/globals.css", include_str!("../templates/next/app/globals.css")),
 ];
 
+/// The templates every daemon has. Any directory with the same layout works too.
+pub const BUILT_IN: [&str; 1] = ["next"];
+
 pub fn load(name: &str) -> anyhow::Result<Template> {
     if name == "next" {
         return Ok(Template {

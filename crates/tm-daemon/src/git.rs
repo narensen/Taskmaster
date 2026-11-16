@@ -65,6 +65,9 @@ pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {
         ".taskmaster/citations.json",
         ".taskmaster/pairing.json",
         ".taskmaster/devices.json",
+        ".taskmaster/config.json",
+        ".taskmaster/taskmaster.db*",
+        ".taskmaster/reviews/jobs/",
     ] {
         if !next.lines().any(|have| have == line) {
             if !changed {

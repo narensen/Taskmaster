@@ -109,7 +109,7 @@ impl LocalStore {
     /// Write an entry whose hash already matches its content, and point HEAD at it.
     pub fn put(&self, entry: &DictionaryEntry) -> anyhow::Result<()> {
         check_key(&entry.key)?;
-        if hex(&Sha256::digest(entry.content.as_bytes())) != entry.hash {
+        if !matches_hash(entry) {
             bail!("entry {} does not match its hash", entry.key);
         }
         if !entry.hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -134,6 +134,12 @@ fn check_key(key: &str) -> anyhow::Result<()> {
     } else {
         bail!("invalid key `{key}`: use letters, digits, `_` and `-`");
     }
+}
+
+/// Whether an entry's content is what its hash says. Check this before trusting an entry
+/// that came from another machine.
+pub fn matches_hash(entry: &DictionaryEntry) -> bool {
+    hex(&Sha256::digest(entry.content.as_bytes())) == entry.hash
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -1402,7 +1402,7 @@ mod http {
         assert_eq!(client.post("/api/open", json!({ "path": "src/nope.rs", "line": 3 })).await.0, 404);
         assert_eq!(client.post("/api/open", json!({ "path": "src/main.rs", "editor": "nope" })).await.0, 400);
         let (_, editors) = client.get("/api/editors").await;
-        assert_eq!(editors["editors"].as_array().unwrap().len(), 21);
+        assert!(editors["editors"].as_array().unwrap().len() >= 21);
         // An editor that is not installed is named, with the full path, for the toast.
         let missing = editors["editors"].as_array().unwrap().iter().find(|e| e["installed"] == false && e["id"] != "files");
         if let Some(missing) = missing {
@@ -1824,6 +1824,112 @@ mod http {
         let before = live.read("r1", 0).0;
         assert_eq!(gate.decide_async(&read).await, Decision::Deny);
         assert_eq!(live.read("r1", 0).0, before);
+    }
+
+    fn script(dir: &Path, name: &str, log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> {}\n", log.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_editor_comes_from_the_settings_then_visual_then_editor_even_off_the_path() {
+        use crate::api::choose_editor;
+        let tmp = repo("editors");
+        let (bin, log) = (tmp.0.join("bin"), tmp.0.join("log"));
+        let zed = script(&bin, "zed", &log);
+        let mine = script(&bin, "mything", &log);
+        let vim = script(&bin, "vim", &log);
+        let cursor = script(&bin, "cursor", &log);
+        let (zed, mine, vim, cursor) = (zed.display().to_string(), mine.display().to_string(), vim.display().to_string(), cursor.display().to_string());
+
+        // The settings file wins, by path: a known editor keeps its way of taking a line.
+        let chosen = choose_editor(&cursor, Some(&zed), Some(&mine)).unwrap();
+        assert_eq!((chosen.id.as_str(), chosen.source), ("cursor", "settings"));
+        assert_eq!(chosen.style, crate::api::Style::Goto);
+        // Then $VISUAL.
+        let chosen = choose_editor("", Some(&zed), Some(&mine)).unwrap();
+        assert_eq!((chosen.id.as_str(), chosen.source), ("zed", "$VISUAL"));
+        // A terminal editor cannot be opened from here, so $VISUAL is passed over for $EDITOR,
+        // and an unknown program with flags is kept as it is, minus the wait flag.
+        let chosen = choose_editor("", Some(&vim), Some(&format!("{mine} --reuse -w"))).unwrap();
+        assert_eq!((chosen.id.as_str(), chosen.source, chosen.terminal), ("custom", "$EDITOR", false));
+        assert_eq!(chosen.extra, vec!["--reuse"]);
+        // A setting that names nothing installed is ignored rather than breaking Open.
+        let chosen = choose_editor("/nonexistent/editor", Some(&zed), None).unwrap();
+        assert_eq!(chosen.source, "$VISUAL");
+        // An explicit terminal editor in the settings is kept, and flagged.
+        assert!(choose_editor(&vim, None, None).unwrap().terminal);
+        // Nothing set: whatever is installed, which is a program or the file manager, never an error.
+        assert!(choose_editor("", None, Some("/nonexistent/x")).is_none_or(|c| matches!(c.source, "installed" | "files")));
+    }
+
+    #[tokio::test]
+    async fn open_uses_the_editor_from_the_settings_and_remaps_worktree_paths() {
+        let tmp = repo("api-paths-2");
+        let project = tmp.0.canonicalize().unwrap();
+        std::fs::create_dir_all(project.join("app/home")).unwrap();
+        std::fs::write(project.join("app/home/page.tsx"), "in the project\n").unwrap();
+        let (bin, log) = (project.join("bin"), project.join("editor.log"));
+        let mine = script(&bin, "mything", &log);
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        // An agent reports a path in its worktree; it means the file in the project.
+        let tree = crate::git::worktree_dir(&project, "run1", "page-home");
+        std::fs::create_dir_all(tree.join("app/home")).unwrap();
+        std::fs::write(tree.join("app/home/page.tsx"), "in the worktree\n").unwrap();
+        std::fs::write(tree.join("only-here.ts"), "x\n").unwrap();
+        let raw = tree.join("app/home/page.tsx").display().to_string();
+        let only = tree.join("only-here.ts").display().to_string();
+        let up = format!("{}/../../etc/passwd", tree.display());
+        let (_, found) = client.post("/api/paths", json!({ "paths": [raw, only, up] })).await;
+        assert_eq!(found["paths"][&raw], project.join("app/home/page.tsx").display().to_string().as_str(), "{found}");
+        assert_eq!(found["relative"][&raw], "app/home/page.tsx");
+        // Not merged yet: the worktree's own file, reported by its path in the project.
+        assert_eq!(found["relative"][&only], "only-here.ts");
+        assert!(found["paths"][&only].as_str().unwrap().ends_with("only-here.ts"));
+        assert!(found["paths"][&up].is_null(), "{found}");
+        let (status, preview) = client.get(&format!("/api/file?path={}", raw.replace('/', "%2F"))).await;
+        assert_eq!((status, preview["content"].as_str(), preview["relative"].as_str()), (200, Some("in the project\n"), Some("app/home/page.tsx")));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", tree.join("link")).unwrap();
+            let link = tree.join("link").display().to_string();
+            let (_, found) = client.post("/api/paths", json!({ "paths": [link] })).await;
+            assert!(found["paths"].as_object().unwrap().values().all(|v| v.is_null()), "a link out of a worktree is not followed: {found}");
+        }
+        assert_eq!(
+            crate::git::unroot_worktrees(&project, &format!("--- a/{0}/app/x.ts\n+++ b/{0}/app/x.ts\n", tree.display())),
+            "--- a/app/x.ts\n+++ b/app/x.ts\n"
+        );
+        std::fs::remove_dir_all(&tree).unwrap();
+
+        // The settings file's editor is used, and survives in the file.
+        assert_eq!(client.post("/api/settings", json!({ "editor": "/nonexistent/ed" })).await.0, 400);
+        let (status, saved) = client.post("/api/settings", json!({ "editor": mine.display().to_string() })).await;
+        assert_eq!((status, saved["editor"].as_str()), (200, Some(mine.display().to_string().as_str())), "{saved}");
+        let (_, editors) = client.get("/api/editors").await;
+        assert_eq!((editors["default"].as_str(), editors["source"].as_str(), editors["override_found"].as_bool()), (Some("custom"), Some("settings"), Some(true)));
+        assert!(editors["editors"].as_array().unwrap().iter().any(|e| e["id"] == "custom" && e["name"] == "mything"));
+        let (status, opened) = client.post("/api/open", json!({ "path": "app/home/page.tsx", "line": 3 })).await;
+        assert_eq!(status, 202, "{opened}");
+        for _ in 0..200 {
+            if log.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.starts_with("mything ") && logged.contains("app/home/page.tsx"), "{logged}");
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(project.join(".taskmaster/config.json")).unwrap()).unwrap();
+        assert_eq!(config["editor"], mine.display().to_string().as_str());
+        assert_eq!(client.post("/api/settings", json!({ "editor": "" })).await.1["editor"], "");
     }
 
 }

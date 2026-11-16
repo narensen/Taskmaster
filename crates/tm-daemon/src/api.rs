@@ -80,6 +80,9 @@ use tokio::sync::{oneshot, watch};
 
 mod desk;
 
+#[cfg(test)]
+pub(crate) use desk::{Style, choose_editor};
+
 use crate::auth::Auth;
 use crate::live::Live;
 use crate::secret::random_hex;

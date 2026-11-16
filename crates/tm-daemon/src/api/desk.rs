@@ -13,7 +13,7 @@
 //! GET  /api/approvals             ?run=<id> risky tool calls waiting for a person
 //! POST /api/approvals/{id}/{approve|deny}   answer one
 //! GET  /api/settings              where this daemon keeps things, and the approval policy
-//! POST /api/settings              {approvals?: always|risky|never, approval_timeout_secs?}
+//! POST /api/settings              {approvals?: always|risky|never, approval_timeout_secs?, editor?}
 //! GET  /api/editors               the editors this machine can launch, and the default
 //! POST /api/open                  {path, line?, column?, editor?, reveal?}
 //! POST /api/paths                 {paths: [..]} -> {paths: {raw: full path or null}}
@@ -54,7 +54,9 @@ fn home() -> Option<PathBuf> {
 }
 
 /// The file `raw` names, if it is a real file this daemon may show. A line suffix is
-/// the caller's to strip.
+/// the caller's to strip. A path inside one of the project's run worktrees means the same
+/// file in the project; while the run still has its worktree, a file that is not in the
+/// project yet is found there.
 pub fn resolve(project: &Path, raw: &str) -> Option<PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains('\0') {
@@ -67,12 +69,45 @@ pub fn resolve(project: &Path, raw: &str) -> Option<PathBuf> {
     } else {
         project.join(raw.strip_prefix("./").unwrap_or(raw))
     };
+    // `..` is resolved by the filesystem below, so a path cannot leave by it.
+    let lexical = normalize(&path);
+    if let Some((tree, inner)) = crate::git::in_worktree(project, &lexical) {
+        let in_project = project.join(&inner).canonicalize().ok().filter(|full| full.is_file() && full.starts_with(project));
+        let in_tree = || tree.join(&inner).canonicalize().ok().filter(|full| full.is_file() && full.starts_with(tree.canonicalize().unwrap_or(tree.clone())));
+        return in_project.or_else(in_tree);
+    }
     let full = path.canonicalize().ok()?;
     if !full.is_file() {
         return None;
     }
     let allowed = full.starts_with(project) || home().and_then(|h| h.canonicalize().ok()).is_some_and(|h| full.starts_with(h));
     allowed.then_some(full)
+}
+
+/// `.` and `..` folded away without touching the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The project-relative form of a file `resolve` found, or its full path when it is outside the project.
+pub fn relative(project: &Path, full: &Path) -> String {
+    if let Ok(rest) = full.strip_prefix(project) {
+        return rest.display().to_string();
+    }
+    if let Some((_, inner)) = crate::git::in_worktree(project, full) {
+        return inner.display().to_string();
+    }
+    full.display().to_string()
 }
 
 // Agents and notes.
@@ -237,6 +272,7 @@ pub async fn diff(
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = git(&app.project, &refs).map_err(|err| fail(StatusCode::CONFLICT, err))?;
+    let text = crate::git::unroot_worktrees(&app.project, &text);
     ok(json!({ "scope": scope, "base": base, "branch": branch, "diff": text }))
 }
 
@@ -366,6 +402,8 @@ pub enum Style {
     Suffix,
     /// `idea --line L --column C file`.
     JetBrains,
+    /// `program file`, for an editor this daemon knows nothing more about.
+    Plain,
     /// The file manager, at the folder.
     Files,
 }
@@ -405,20 +443,127 @@ pub const EDITORS: &[Editor] = &[
     editor("files", "File manager", if cfg!(target_os = "macos") { "open" } else { "xdg-open" }, Style::Files),
 ];
 
+/// Where editors are usually installed that a daemon's own `PATH` may leave out.
+fn extra_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = ["/usr/local/bin", "/opt/homebrew/bin", "/snap/bin", "/var/lib/flatpak/exports/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = home() {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join("bin"));
+    }
+    for app in [
+        "/Applications/Cursor.app/Contents/Resources/app/bin",
+        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin",
+        "/Applications/Zed.app/Contents/MacOS",
+        "/Applications/VSCodium.app/Contents/Resources/app/bin",
+    ] {
+        dirs.push(PathBuf::from(app));
+    }
+    dirs
+}
+
+/// A program by name: on `PATH` first, then where editors usually are. A name with a
+/// slash is a path (`~/` allowed).
 pub fn which(program: &str) -> Option<PathBuf> {
+    if let Some(rest) = program.strip_prefix("~/") {
+        let path = home()?.join(rest);
+        return path.is_file().then_some(path);
+    }
     if program.contains('/') {
         let path = PathBuf::from(program);
         return path.is_file().then_some(path);
     }
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(program)).find(|path| path.is_file())
+    let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    on_path.into_iter().chain(extra_dirs()).map(|dir| dir.join(program)).find(|path| path.is_file())
 }
 
-/// The first installed of Cursor, VS Code and Zed, then the file manager.
-pub fn default_editor() -> &'static str {
-    ["cursor", "vscode", "zed"]
-        .into_iter()
-        .find(|id| EDITORS.iter().any(|e| e.id == *id && which(e.command).is_some()))
-        .unwrap_or("files")
+/// Editors that need a terminal of their own, which a daemon cannot give them.
+const TERMINAL_EDITORS: &[&str] = &["vi", "vim", "nvim", "nano", "emacs", "pico", "micro", "hx", "helix", "kak", "ed", "joe", "mcedit"];
+
+/// An editor to launch: where it is, how to give it a file, and why it was chosen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chosen {
+    pub id: String,
+    pub name: String,
+    pub program: PathBuf,
+    /// Arguments that came with it, such as `$EDITOR`'s `--reuse-window`.
+    pub extra: Vec<String>,
+    pub style: Style,
+    pub terminal: bool,
+    /// `settings`, `$VISUAL`, `$EDITOR`, `installed` or `files`.
+    pub source: &'static str,
+}
+
+fn known(editor: &Editor, program: PathBuf, source: &'static str) -> Chosen {
+    Chosen { id: editor.id.into(), name: editor.name.into(), program, extra: vec![], style: editor.style, terminal: false, source }
+}
+
+/// An editor named by the settings file, `$VISUAL` or `$EDITOR`: a known id (`cursor`), a
+/// command line (`code --reuse-window`), or any program, by name or by path.
+pub fn editor_from_value(value: &str, source: &'static str) -> Option<Chosen> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) || value.len() > 300 {
+        return None;
+    }
+    if let Some(editor) = EDITORS.iter().find(|e| e.id == value) {
+        return which(editor.command).map(|program| known(editor, program, source));
+    }
+    let mut words = value.split_whitespace();
+    let program_word = words.next()?;
+    // Waiting for the editor to close would hold the daemon's request open.
+    let extra: Vec<String> = words.filter(|w| !matches!(*w, "-w" | "--wait" | "-W")).map(str::to_string).collect();
+    let program = which(program_word)?;
+    let base = program.file_name()?.to_string_lossy().into_owned();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    if let Some(editor) = EDITORS.iter().find(|e| e.command == stem || e.id == stem) {
+        let mut chosen = known(editor, program, source);
+        chosen.extra = extra;
+        return Some(chosen);
+    }
+    Some(Chosen {
+        id: "custom".into(),
+        name: stem.to_string(),
+        program,
+        extra,
+        style: Style::Plain,
+        terminal: TERMINAL_EDITORS.contains(&stem),
+        source,
+    })
+}
+
+/// The editor to use when a request names none: the settings file's, then `$VISUAL`, then
+/// `$EDITOR` (these two only when a window can open from them), then the first installed of
+/// Cursor, VS Code and Zed, then the file manager.
+pub fn choose_editor(setting: &str, visual: Option<&str>, editor: Option<&str>) -> Option<Chosen> {
+    if let Some(chosen) = editor_from_value(setting, "settings") {
+        return Some(chosen);
+    }
+    for (value, source) in [(visual, "$VISUAL"), (editor, "$EDITOR")] {
+        if let Some(chosen) = value.and_then(|v| editor_from_value(v, source)).filter(|c| !c.terminal) {
+            return Some(chosen);
+        }
+    }
+    for id in ["cursor", "vscode", "zed"] {
+        if let Some(editor) = EDITORS.iter().find(|e| e.id == id)
+            && let Some(program) = which(editor.command)
+        {
+            return Some(known(editor, program, "installed"));
+        }
+    }
+    let files = EDITORS.iter().find(|e| e.id == "files")?;
+    which(files.command).map(|program| known(files, program, "files"))
+}
+
+fn env_editor(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn current_editor(app: &App) -> Option<Chosen> {
+    let setting = app.editor.lock().unwrap().clone();
+    choose_editor(&setting, env_editor("VISUAL").as_deref(), env_editor("EDITOR").as_deref())
 }
 
 /// The arguments that open `file` at a line and column, or show it in its folder.
@@ -450,16 +595,30 @@ pub fn editor_args(style: Style, file: &Path, line: Option<u32>, column: Option<
             args.push(path);
             args
         }
+        Style::Plain => vec![path],
         Style::Files => unreachable!(),
     }
 }
 
-pub async fn editors() -> Reply {
-    let list: Vec<Value> = EDITORS
+pub async fn editors(State(app): State<Arc<App>>) -> Reply {
+    let mut list: Vec<Value> = EDITORS
         .iter()
         .map(|e| json!({ "id": e.id, "name": e.name, "command": e.command, "installed": which(e.command).is_some() }))
         .collect();
-    ok(json!({ "editors": list, "default": default_editor() }))
+    let chosen = current_editor(&app);
+    // An editor that came from the settings or the environment and is not one of the above.
+    if let Some(custom) = chosen.as_ref().filter(|c| c.id == "custom") {
+        list.push(json!({ "id": "custom", "name": custom.name, "command": custom.program.display().to_string(), "installed": true, "terminal": custom.terminal }));
+    }
+    let setting = app.editor.lock().unwrap().clone();
+    ok(json!({
+        "editors": list,
+        "default": chosen.as_ref().map(|c| c.id.as_str()).unwrap_or("files"),
+        "source": chosen.as_ref().map(|c| c.source),
+        "override": setting,
+        "override_found": setting.is_empty() || editor_from_value(&setting, "settings").is_some(),
+        "env": { "VISUAL": env_editor("VISUAL"), "EDITOR": env_editor("EDITOR") },
+    }))
 }
 
 #[derive(Deserialize)]
@@ -472,22 +631,44 @@ pub struct OpenBody {
     reveal: bool,
 }
 
+fn failed_dependency(message: String, command: &str, path: &str) -> Reply {
+    let reply = json!({ "error": message, "command": command, "path": path });
+    Ok(axum::response::IntoResponse::into_response((StatusCode::FAILED_DEPENDENCY, Json(reply))))
+}
+
 /// Open a file in an editor on this machine, the one that holds the project.
 pub async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenBody>) -> Reply {
     let Some(file) = resolve(&app.project, &body.path) else {
         return Err(fail(StatusCode::NOT_FOUND, format!("{} is not a file here", body.path)));
     };
-    let wanted = if body.reveal { "files".to_string() } else { body.editor.clone().unwrap_or_else(|| default_editor().into()) };
-    let Some(editor) = EDITORS.iter().find(|e| e.id == wanted) else {
-        return Err(fail(StatusCode::BAD_REQUEST, format!("unknown editor `{wanted}`")));
-    };
     let full = file.display().to_string();
-    let Some(program) = which(editor.command) else {
-        let reply = json!({ "error": format!("`{}` is not installed on this machine", editor.command), "command": editor.command, "path": full });
-        return Ok(axum::response::IntoResponse::into_response((StatusCode::FAILED_DEPENDENCY, Json(reply))));
+    let wanted = body.editor.as_deref().filter(|id| !id.is_empty());
+    let chosen = if body.reveal {
+        let files = EDITORS.iter().find(|e| e.id == "files").expect("the file manager is listed");
+        which(files.command).map(|program| known(files, program, "files"))
+    } else {
+        match wanted {
+            None | Some("custom") => current_editor(&app),
+            Some(id) => match EDITORS.iter().find(|e| e.id == id) {
+                Some(editor) => which(editor.command).map(|program| known(editor, program, "request")),
+                None => return Err(fail(StatusCode::BAD_REQUEST, format!("unknown editor `{id}`"))),
+            },
+        }
     };
-    let args = editor_args(editor.style, &file, body.line, body.column, body.reveal);
-    let spawned = std::process::Command::new(&program)
+    let Some(chosen) = chosen else {
+        let name = match wanted {
+            Some(id) => EDITORS.iter().find(|e| e.id == id).map(|e| e.command).unwrap_or(id),
+            None => "an editor",
+        };
+        return failed_dependency(format!("`{name}` is not installed on this machine"), name, &full);
+    };
+    let command = chosen.program.display().to_string();
+    if chosen.terminal {
+        return failed_dependency(format!("`{}` runs in a terminal; choose a window editor in Settings", chosen.name), &command, &full);
+    }
+    let mut args = chosen.extra.clone();
+    args.extend(editor_args(chosen.style, &file, body.line, body.column, body.reveal));
+    let spawned = std::process::Command::new(&chosen.program)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -499,12 +680,9 @@ pub async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenBody>) -> Re
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
-            accepted(json!({ "command": editor.command, "args": args, "path": full }))
+            accepted(json!({ "command": command, "editor": chosen.id, "source": chosen.source, "args": args, "path": full }))
         }
-        Err(err) => {
-            let reply = json!({ "error": format!("`{}` did not start: {err}", editor.command), "command": editor.command, "path": full });
-            Ok(axum::response::IntoResponse::into_response((StatusCode::FAILED_DEPENDENCY, Json(reply))))
-        }
+        Err(err) => failed_dependency(format!("`{command}` did not start: {err}"), &command, &full),
     }
 }
 
@@ -514,12 +692,13 @@ pub struct PathsBody {
 }
 
 pub async fn paths(State(app): State<Arc<App>>, Json(body): Json<PathsBody>) -> Reply {
-    let mut out = serde_json::Map::new();
+    let (mut out, mut rel) = (serde_json::Map::new(), serde_json::Map::new());
     for raw in body.paths.into_iter().take(500) {
-        let full = resolve(&app.project, &raw).map(|path| path.display().to_string());
-        out.insert(raw, json!(full));
+        let found = resolve(&app.project, &raw);
+        rel.insert(raw.clone(), json!(found.as_ref().map(|path| relative(&app.project, path))));
+        out.insert(raw, json!(found.map(|path| path.display().to_string())));
     }
-    ok(json!({ "paths": out, "project": app.project.display().to_string() }))
+    ok(json!({ "paths": out, "relative": rel, "project": app.project.display().to_string() }))
 }
 
 pub async fn file(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
@@ -535,6 +714,7 @@ pub async fn file(State(app): State<Arc<App>>, Query(query): Query<HashMap<Strin
     }
     ok(json!({
         "path": raw,
+        "relative": relative(&app.project, &file),
         "full": file.display().to_string(),
         "content": String::from_utf8_lossy(cut),
         "truncated": size > PREVIEW_LIMIT,
@@ -598,6 +778,8 @@ pub async fn decide(State(app): State<Arc<App>>, UrlPath((id, decision)): UrlPat
 pub struct SettingsBody {
     approvals: Option<String>,
     approval_timeout_secs: Option<u64>,
+    /// An editor id, a program name or path, or empty to go back to `$VISUAL`, `$EDITOR` and what is installed.
+    editor: Option<String>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -616,6 +798,14 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         }
         policy.timeout = Duration::from_secs(secs);
         changes.insert("timeout_secs".into(), json!(secs));
+    }
+    if let Some(editor) = &body.editor {
+        let editor = editor.trim();
+        if !editor.is_empty() && editor_from_value(editor, "settings").is_none() {
+            return Err(fail(StatusCode::BAD_REQUEST, format!("`{editor}` is not an editor installed on this machine")));
+        }
+        save_setting(&app.project, "editor", json!(editor)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        *app.editor.lock().unwrap() = editor.to_string();
     }
     if !changes.is_empty() {
         save_setting(&app.project, "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -676,6 +866,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "config_default": project_config.display().to_string(),
         "store": if app.store.is_some() { "sqlite" } else { "files" },
         "roles": crate::Roles::default(),
+        "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "version": env!("CARGO_PKG_VERSION"),
     }))

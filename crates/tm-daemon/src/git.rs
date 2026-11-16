@@ -221,3 +221,55 @@ pub fn worktree_dir(project: &Path, run_id: &str, label: &str) -> PathBuf {
         .collect();
     std::env::temp_dir().join(format!("tm-daemon-{:x}-{}-{}", hasher.finish(), run_id, slug))
 }
+
+/// The directory every worktree of `project` is made in: `<temp>/tm-daemon-<hash>-`
+/// followed by the run and the label.
+fn worktree_prefix(project: &Path) -> String {
+    let dir = worktree_dir(project, "", "");
+    dir.file_name().map(|n| n.to_string_lossy().trim_end_matches('-').to_string() + "-").unwrap_or_default()
+}
+
+/// If `path` is inside one of this project's run worktrees, the worktree's directory and
+/// the path inside it. Agents see their worktree as the whole project, so the paths they
+/// report are absolute paths in it, and mean the same file in the project.
+pub fn in_worktree(project: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let prefix = worktree_prefix(project);
+    let temp = std::env::temp_dir();
+    // The temp directory may itself be reached through a link (`/tmp` on a Mac).
+    for base in [Some(temp.clone()), temp.canonicalize().ok()].into_iter().flatten() {
+        let Ok(rest) = path.strip_prefix(&base) else { continue };
+        let mut parts = rest.components();
+        let Some(first) = parts.next() else { continue };
+        let name = first.as_os_str().to_string_lossy();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let inner: PathBuf = parts.collect();
+        if inner.as_os_str().is_empty() || !inner.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            return None;
+        }
+        return Some((base.join(first.as_os_str()), inner));
+    }
+    None
+}
+
+/// `text` with every absolute worktree path of this project cut back to a path in the
+/// project, for output an agent or a tool produced inside a worktree.
+pub fn unroot_worktrees(project: &Path, text: &str) -> String {
+    let prefix = worktree_prefix(project);
+    let temp = std::env::temp_dir();
+    let mut bases = vec![temp.display().to_string()];
+    if let Ok(real) = temp.canonicalize() {
+        bases.push(real.display().to_string());
+    }
+    let mut out = text.to_string();
+    for base in bases {
+        let needle = format!("{}/{prefix}", base.trim_end_matches('/'));
+        while let Some(at) = out.find(&needle) {
+            let after = at + needle.len();
+            let end = out[after..].find('/').map(|i| after + i + 1).unwrap_or(out.len());
+            out.replace_range(at..end, "");
+        }
+    }
+    out
+}

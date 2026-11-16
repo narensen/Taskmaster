@@ -51,11 +51,10 @@ impl Catalog {
     /// Copy the local HEAD into the Commons. The same content keeps the Commons stats.
     pub fn promote(&self, key: &str) -> anyhow::Result<Option<String>> {
         let Some(entry) = self.local.get(key)? else { return Ok(None) };
-        if let Some(existing) = self.commons.get(key)? {
-            if existing.hash == entry.hash {
+        if let Some(existing) = self.commons.get(key)?
+            && existing.hash == entry.hash {
                 return Ok(Some(existing.hash));
             }
-        }
         let mut shared = entry;
         shared.tier = DictTier::Commons;
         shared.stats = Some(EntryStats { reuses: 0, pass_rate: 1.0, passes: 0, fails: 0 });

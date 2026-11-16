@@ -393,11 +393,10 @@ pub fn parse_codex_models(text: &str) -> anyhow::Result<Vec<ModelChoice>> {
     for entry in entries {
         let Some(id) = entry.get("slug").and_then(Value::as_str) else { continue };
         saw_slug = true;
-        if let Some(visibility) = entry.get("visibility").and_then(Value::as_str) {
-            if visibility != "list" {
+        if let Some(visibility) = entry.get("visibility").and_then(Value::as_str)
+            && visibility != "list" {
                 continue;
             }
-        }
         let name = entry.get("display_name").and_then(Value::as_str).unwrap_or(id);
         push_model(&mut models, id, name, false);
     }
@@ -412,13 +411,11 @@ fn json_document(text: &str) -> anyhow::Result<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(text) {
         return Ok(value);
     }
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if start < end {
-            if let Ok(value) = serde_json::from_str::<Value>(&text[start..=end]) {
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
+        && start < end
+            && let Ok(value) = serde_json::from_str::<Value>(&text[start..=end]) {
                 return Ok(value);
             }
-        }
-    }
     bail!("codex catalog is not JSON")
 }
 

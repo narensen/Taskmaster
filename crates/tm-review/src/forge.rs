@@ -267,11 +267,10 @@ fn clone_url(spec: &str, remote: &Remote) -> String {
     if let Some(request) = parse_request(spec) {
         let _ = request;
     }
-    if spec.starts_with("git@") || spec.contains("://") {
-        if let Some(repo_url) = repository_url(spec) {
+    if (spec.starts_with("git@") || spec.contains("://"))
+        && let Some(repo_url) = repository_url(spec) {
             return repo_url;
         }
-    }
     format!("https://{}/{}/{}.git", remote.host, remote.owner, remote.repo)
 }
 
@@ -306,11 +305,10 @@ pub fn parse_request(input: &str) -> Option<Request> {
 
 fn split_host_path(input: &str) -> Option<(&str, &str)> {
     let url = input.trim().trim_end_matches('/');
-    if let Some(rest) = url.strip_prefix("git@") {
-        if !rest.contains("://") {
+    if let Some(rest) = url.strip_prefix("git@")
+        && !rest.contains("://") {
             return rest.split_once(':').map(|(host, path)| (host.trim_end_matches(':'), path.trim_start_matches('/')));
         }
-    }
     let url = url.strip_prefix("ssh://").or_else(|| url.strip_prefix("git://")).unwrap_or(url);
     let url = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
     let url = match url.split_once('@') {

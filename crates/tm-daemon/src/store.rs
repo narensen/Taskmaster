@@ -11,7 +11,7 @@
 //! runs/<id>/changes.jsonl   what was committed, and by which model
 //! runs/<id>/ledger.jsonl    what every agent call cost
 //! runs/<id>/inflight.json   commands started but not finished
-//! runs/<id>/meta.json       settings a resumed run keeps
+//! runs/<id>/meta.json       settings a resumed run keeps: parallelism, branch, template
 //! runs/<id>/request.json    how the run was asked for, so it can be approved later
 //! runs/<id>/status.json     the outcome and the totals
 //! runs/<id>/merged/<page>   a page merged but not yet recorded in the event log
@@ -132,6 +132,16 @@ impl Store for FileStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub parallel: usize,
+    /// The branch the run builds on. `None` builds in the project's own working tree,
+    /// which is what a repository with no commit yet has to do.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// The commit the branch started from.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The template whose files are written when the contracts are locked.
+    #[serde(default)]
+    pub template: Option<String>,
 }
 
 /// The daemon's records, by name and type.
@@ -375,7 +385,7 @@ pub(crate) mod tests {
         assert!(records.inflight("r1").unwrap().is_none());
         records.save_events("r1", &[Event::PlanApproved, Event::Cancelled]).unwrap();
         records.save_inflight("r1", &[Command::RunVerify]).unwrap();
-        records.save_meta("r1", &Meta { parallel: 3 }).unwrap();
+        records.save_meta("r1", &Meta { parallel: 3, branch: None, base: None, template: None }).unwrap();
         records.mark_merged("r1", "home", "abc").unwrap();
         assert_eq!(records.events("r1").unwrap(), vec![Event::PlanApproved, Event::Cancelled]);
         assert_eq!(records.inflight("r1").unwrap(), Some(vec![Command::RunVerify]));

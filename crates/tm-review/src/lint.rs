@@ -253,11 +253,10 @@ fn locate(worktree: &Path, package: &Path, file_name: &str) -> Option<String> {
         vec![worktree.join(raw), package.join(raw)]
     };
     for candidate in candidates {
-        if let Ok(rel) = candidate.strip_prefix(worktree) {
-            if !rel.as_os_str().is_empty() && !rel.components().any(|c| c.as_os_str() == "..") {
+        if let Ok(rel) = candidate.strip_prefix(worktree)
+            && !rel.as_os_str().is_empty() && !rel.components().any(|c| c.as_os_str() == "..") {
                 return Some(rel.to_string_lossy().replace('\\', "/"));
             }
-        }
     }
     None
 }
@@ -287,7 +286,7 @@ impl Report {
             out.push_str(&format!("- `{}:{}` {}\n", finding.file, finding.line, finding.failure));
         }
         if !self.notes.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
             for note in &self.notes {
                 out.push_str(&format!("- {note}\n"));
             }

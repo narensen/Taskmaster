@@ -219,7 +219,10 @@ mod tests {
     }
 
     fn setup() -> (Arc<McpState>, Router) {
-        let dir = std::env::temp_dir().join(format!("tm-mcp-{}", std::process::id()));
+        // Tests run side by side, so each gets a directory of its own.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tm-mcp-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = LocalStore::open(dir).unwrap();
         store.publish("greeting_contract", EntryKind::Hint, "greeting", "export const G = 1;", "x").unwrap();
@@ -293,7 +296,7 @@ mod tests {
         assert!(text.contains("theme"));
         let (_, cited) = rpc(&app, Some("tok-a"), call("theme")).await;
         assert_eq!(cited["result"]["content"][0]["text"], "export const INK = '#fff';\n");
-        assert_eq!(state.cites()[0].found, true);
+        assert!(state.cites()[0].found);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -117,6 +117,59 @@ pub fn add_worktree(repo: &Path, path: &Path, head: &str) -> anyhow::Result<()> 
     git(repo, &["worktree", "add", "--detach", "--quiet", path, head]).map(|_| ())
 }
 
+pub fn branch_exists(repo: &Path, branch: &str) -> bool {
+    git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// Check `branch` out at `path`, creating it at `base` when it does not exist yet.
+pub fn open_branch(repo: &Path, path: &Path, branch: &str, base: &str) -> anyhow::Result<()> {
+    if base.starts_with('-') || branch.starts_with('-') {
+        bail!("invalid revision");
+    }
+    // A checkout that was deleted from disk still holds its branch until it is pruned.
+    let _ = git(repo, &["worktree", "prune"]);
+    let path = path.to_str().context("worktree path is not valid UTF-8")?;
+    if branch_exists(repo, branch) {
+        git(repo, &["worktree", "add", "--quiet", path, branch]).map(|_| ())
+    } else {
+        git(repo, &["worktree", "add", "--quiet", "-b", branch, path, base]).map(|_| ())
+    }
+}
+
+/// Bring `branch` into whatever the project has checked out. Fast-forward when the
+/// project has not moved, a merge commit when it has. `false` when git refused, which
+/// leaves the project exactly as it was.
+pub fn merge_branch(repo: &Path, branch: &str, generated: &[&str]) -> bool {
+    if git(repo, &["merge", "--ff-only", "--quiet", branch]).is_ok() {
+        return true;
+    }
+    let message = format!("taskmaster: merge {branch}");
+    if git(repo, &["merge", "--no-edit", "--quiet", "-m", &message, branch]).is_ok() {
+        return true;
+    }
+    if settle_generated(repo, generated) {
+        return true;
+    }
+    let _ = git(repo, &["merge", "--abort"]);
+    false
+}
+
+/// Two runs that finish side by side both rewrite the generated documents, and git sees
+/// that as a conflict. When those are the only conflicts, the incoming copy is taken:
+/// it describes the run being merged, which is what the files are for.
+fn settle_generated(repo: &Path, generated: &[&str]) -> bool {
+    let Ok(unmerged) = git(repo, &["diff", "--name-only", "--diff-filter=U", "-z"]) else { return false };
+    let paths: Vec<&str> = unmerged.split('\0').filter(|path| !path.is_empty()).collect();
+    if paths.is_empty() || !paths.iter().all(|path| generated.contains(path)) {
+        return false;
+    }
+    let mut take = vec!["checkout", "--theirs", "--"];
+    take.extend(&paths);
+    let mut add = vec!["add", "--"];
+    add.extend(&paths);
+    git(repo, &take).is_ok() && git(repo, &add).is_ok() && git(repo, &["commit", "-q", "--no-edit"]).is_ok()
+}
+
 pub fn remove_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
     let Some(path) = path.to_str() else { return Ok(()) };
     git(repo, &["worktree", "remove", "--force", path]).map(|_| ())

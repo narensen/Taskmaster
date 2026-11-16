@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -13,7 +13,7 @@ use tm_core::docs::{
 use tm_core::{
     ChangeEntry, ChangeKind, Citation, Command, DictTier, DraftEntry, EntryKind, Event, Finding, Flag,
     FlagResolution, LedgerEntry, PageId, PagePlan, Plan, ReviewScope, Role, Run, RunPhase, Tier, WorkerOutcome,
-    check_plan, page_is_fresh, totals, valid_key,
+    check_plan, forecast, page_is_fresh, totals, valid_key,
 };
 use tm_dictionary::{Catalog, CommonsRemote, Grant, LocalStore, McpState};
 use tm_harness::{
@@ -29,6 +29,7 @@ use crate::reply::{self, Resolution};
 use crate::resume;
 use crate::secret::random_hex;
 use crate::store::{Meta, Records};
+use crate::template::{self, Template};
 use crate::time::rfc3339_now;
 use crate::{Config, Harnesses, Outcome};
 
@@ -77,9 +78,22 @@ enum Step {
     Stop(Outcome),
 }
 
+/// Runs in one process share the project's Errorography, its citation record and its
+/// checked-out branch. Each is read, changed and written back under this lock.
+static PROJECT: Mutex<()> = Mutex::new(());
+
 struct Driver {
     config: Config,
+    /// The repository the run was started in. Records and the Dictionary live here.
     project: PathBuf,
+    /// Where the run writes and commits. A checkout of the run's branch, or `project`
+    /// itself when the run builds in place.
+    tree: PathBuf,
+    branch: Option<String>,
+    /// Set once the run's branch has been offered to the project: the branch, and
+    /// whether it was merged.
+    delivery: Option<(String, bool)>,
+    template: Option<Template>,
     /// The run id, as the records name it.
     id: String,
     records: Records,
@@ -137,7 +151,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         None => Records::files(&project),
     };
     let events = records.events(&id)?;
-    let parallel = load_parallel(&records, &id, !events.is_empty(), config.parallel)?;
+    let meta = load_meta(&records, &project, &config, !events.is_empty())?;
+    let parallel = meta.parallel.max(1);
+    let template = meta.template.as_deref().map(template::load).transpose()?;
     let run = Run::replay(parallel, events.clone());
     let changes = records.changes(&id)?;
     let inflight = records.inflight(&id)?;
@@ -170,7 +186,11 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
 
     let mut driver = Driver {
         config,
+        tree: project.clone(),
         project,
+        branch: meta.branch.clone(),
+        delivery: None,
+        template,
         id,
         records,
         remote,
@@ -192,6 +212,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         trees: Vec::new(),
         parallel,
     };
+    driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
     driver.pull_commons();
     driver.r#loop().await
@@ -249,6 +270,7 @@ impl Driver {
                 } else {
                     bail!("no plan for this run; pass --plan <file> or --prompt <text>");
                 };
+                let plan = self.with_forecast(plan)?;
                 self.push_event(Event::PlanReady(plan))?;
                 self.grant_pages()?;
                 Ok(Step::Continue)
@@ -276,7 +298,7 @@ impl Driver {
         for attempt in 1..=2 {
             let brief = self.planner_brief(prompt, &errors)?;
             let cwd = self.planner_dir()?;
-            let scratch = cwd != self.project;
+            let scratch = cwd != self.tree;
             let token = self.master_token.clone();
             let request = self.read_request(
                 &cwd,
@@ -351,8 +373,12 @@ impl Driver {
         if found.len() == 20 {
             brief.push_str("Further entries may be stored. Search the Dictionary before adding a key.\n");
         }
+        if let Some(template) = &self.template {
+            brief.push_str(&template.brief());
+        }
         brief.push_str(
             "\nReply with one JSON object and do not edit files. \
+             Leave `estimate` at zero: Taskmaster works it out from what past runs cost. \
              `contracts` are shared source files. Each page owns one glob. \
              `dictionary` holds new entries those pages cite. \
              `kind` is schema, routes, component_api, pattern, or hint.\n\
@@ -378,10 +404,10 @@ impl Driver {
     /// A detached worktree when the project has a commit, otherwise the project itself.
     /// The planner is read-only, so the project directory is only used before the first commit.
     fn planner_dir(&mut self) -> anyhow::Result<PathBuf> {
-        if git::has_head(&self.project) {
+        if git::has_head(&self.tree) {
             self.fresh_worktree("plan")
         } else {
-            Ok(self.project.clone())
+            Ok(self.tree.clone())
         }
     }
 
@@ -455,6 +481,7 @@ impl Driver {
             }
             Command::Finish { ok } => {
                 self.settle_commons(ok)?;
+                self.deliver(ok);
                 self.write_status(ok)?;
                 self.persist()?;
                 Ok(Step::Continue)
@@ -509,7 +536,7 @@ impl Driver {
             self.push_event(Event::PageFresh { page })?;
             return Ok(());
         }
-        let created = self.fresh_worktree(&page);
+        let created = self.fresh_worktree(&format!("page-{page}"));
         let worktree = match created {
             Ok(path) => path,
             Err(err) => {
@@ -652,7 +679,7 @@ impl Driver {
         }
         let mut files = Vec::new();
         for change in &changes {
-            let dest = self.project.join(&change.path);
+            let dest = self.tree.join(&change.path);
             if change.status == 'D' {
                 if dest.is_file() {
                     fs::remove_file(&dest)?;
@@ -690,17 +717,34 @@ impl Driver {
 
     fn lock(&mut self) -> anyhow::Result<()> {
         let plan = self.plan()?.clone();
+        let mut files: Vec<String> = Vec::new();
+        // The template first, and only where the project has nothing: a contract with the
+        // same path is written after it and wins.
+        for file in self.template.iter().flat_map(|template| &template.files) {
+            if !git::safe_rel(&file.path) {
+                bail!("template path `{}` leaves the project", file.path);
+            }
+            let dest = self.tree.join(&file.path);
+            if dest.exists() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&dest, &file.content)?;
+            files.push(file.path.clone());
+        }
         for contract in &plan.contracts {
             if !git::safe_rel(&contract.path) {
                 bail!("contract path `{}` leaves the project", contract.path);
             }
-            let dest = self.project.join(&contract.path);
+            let dest = self.tree.join(&contract.path);
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&dest, &contract.content)?;
+            files.push(contract.path.clone());
         }
-        let files: Vec<String> = plan.contracts.iter().map(|c| c.path.clone()).collect();
         let mut keys: Vec<String> = plan.pages.iter().flat_map(|p| p.cites.clone()).collect();
         keys.sort();
         keys.dedup();
@@ -909,7 +953,7 @@ impl Driver {
         eprintln!("taskmaster: verifying the project");
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
-        let sources = load_sources(&self.project)?;
+        let sources = load_sources(&self.tree)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
         for (page, errors) in self.mechanical_checks(&owners).await? {
             let text = failing.entry(page).or_default();
@@ -973,16 +1017,19 @@ impl Driver {
         let mut built: BTreeSet<String> = BTreeSet::new();
         for entry in &self.changes {
             if matches!(entry.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired) {
-                built.extend(entry.files.iter().filter(|file| self.project.join(file).is_file()).cloned());
+                built.extend(entry.files.iter().filter(|file| self.tree.join(file).is_file()).cloned());
             }
         }
         if built.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let (project, files) = (self.project.clone(), built.into_iter().collect::<Vec<_>>());
+        let (project, files) = (self.tree.clone(), built.into_iter().collect::<Vec<_>>());
         let report = tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&project, &files))
             .await
             .context("the project checks panicked")?;
+        for note in &report.notes {
+            eprintln!("taskmaster: check: {note}");
+        }
         let mut failing: BTreeMap<PageId, String> = BTreeMap::new();
         let mut shared = 0;
         for finding in &report.findings {
@@ -1006,10 +1053,13 @@ impl Driver {
     /// Run `.taskmaster/verify` when the project already has an executable there.
     /// `Ok(None)` when there is no script or it passed. The text is the combined output.
     fn run_verify_script(&self) -> anyhow::Result<Option<String>> {
-        let script = self.project.join(".taskmaster/verify");
-        if !script.is_file() {
-            return Ok(None);
-        }
+        // A script the project committed is in the run's checkout. One it keeps untracked
+        // is only in the project.
+        let script = [&self.tree, &self.project]
+            .into_iter()
+            .map(|root| root.join(".taskmaster/verify"))
+            .find(|path| path.is_file());
+        let Some(script) = script else { return Ok(None) };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1019,7 +1069,7 @@ impl Driver {
             }
         }
         let out = std::process::Command::new(&script)
-            .current_dir(&self.project)
+            .current_dir(&self.tree)
             .output()
             .context("failed to run .taskmaster/verify")?;
         if out.status.success() {
@@ -1071,13 +1121,12 @@ impl Driver {
         }
         let model = self.model_byline(tier);
         let book = self.records.book()?;
-        if let Some(errors) = errors {
-            if let Some(fix) = book.fix_for(&model, errors) {
+        if let Some(errors) = errors
+            && let Some(fix) = book.fix_for(&model, errors) {
                 brief.push_str("\nKnown fix for this model:\n");
                 brief.push_str(fix);
                 brief.push('\n');
             }
-        }
         let warnings = book.warnings(&model);
         if !warnings.is_empty() {
             brief.push_str("\nMistakes this model keeps making. Do not repeat them:\n");
@@ -1183,6 +1232,27 @@ impl Driver {
         self.records.charge(&self.id, &entry)
     }
 
+    /// Replace the plan's estimate with one worked out from what this project's earlier
+    /// runs cost, plus what planning this one has already cost. A planner cannot know how
+    /// much each harness adds to every call, so its own number is not used.
+    fn with_forecast(&self, mut plan: Plan) -> anyhow::Result<Plan> {
+        let mut history = Vec::new();
+        for run in self.records.run_ids()? {
+            if run != self.id {
+                history.extend(self.records.ledger(&run)?);
+            }
+        }
+        let keys: BTreeSet<&String> = plan.pages.iter().flat_map(|page| &page.cites).collect();
+        let (mut estimate, basis) = forecast(&history, plan.pages.len(), keys.len() + 1);
+        let planning = totals(&self.records.ledger(&self.id)?);
+        estimate.tokens += planning.fresh;
+        estimate.usd += planning.cost_usd;
+        let source = if basis == 0 { "no earlier runs here, so from defaults".to_string() } else { format!("from {basis} earlier calls") };
+        eprintln!("taskmaster: estimated {} tokens, ${:.2} ({source})", estimate.tokens, estimate.usd);
+        plan.estimate = estimate;
+        Ok(plan)
+    }
+
     fn spend_line(&self) -> anyhow::Result<String> {
         let sum = totals(&self.records.ledger(&self.id)?);
         let mut line = format!("{} agent calls, {} tokens", sum.calls, sum.fresh);
@@ -1237,7 +1307,7 @@ impl Driver {
         paths.retain(|path| git::safe_rel(path));
         paths.sort();
         paths.dedup();
-        match git::commit_paths(&self.project, message, &paths)? {
+        match git::commit_paths(&self.tree, message, &paths)? {
             Some(hash) => {
                 for entry in self.changes.iter_mut().rev().take(count) {
                     entry.commit = Some(hash.clone());
@@ -1249,7 +1319,7 @@ impl Driver {
                 self.changes.truncate(self.changes.len().saturating_sub(count));
                 self.save_changes()?;
                 self.write_docs()?;
-                let _ = git::git(&self.project, &["checkout", "--", ARCHITECTURE_FILE, CHANGES_FILE]);
+                let _ = git::git(&self.tree, &["checkout", "--", ARCHITECTURE_FILE, CHANGES_FILE]);
                 Ok(None)
             }
         }
@@ -1257,13 +1327,13 @@ impl Driver {
 
     fn write_docs(&self) -> anyhow::Result<()> {
         if let Some(plan) = &self.run.plan {
-            let path = self.project.join(ARCHITECTURE_FILE);
+            let path = self.tree.join(ARCHITECTURE_FILE);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(path, render_architecture(plan))?;
         }
-        let path = self.project.join(CHANGES_FILE);
+        let path = self.tree.join(CHANGES_FILE);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1288,12 +1358,27 @@ impl Driver {
     fn write_status(&self, ok: bool) -> anyhow::Result<()> {
         let spent = totals(&self.records.ledger(&self.id)?);
         let estimate = self.run.plan.as_ref().map(|plan| &plan.estimate);
-        let body = serde_json::json!({ "ok": ok, "phase": self.run.phase, "spent": spent, "estimate": estimate });
+        let mut body = serde_json::json!({ "ok": ok, "phase": self.run.phase, "spent": spent, "estimate": estimate });
+        match &self.delivery {
+            Some((branch, merged)) => {
+                body["branch"] = serde_json::json!(branch);
+                body["merged"] = serde_json::json!(merged);
+            }
+            // A finished run that is driven again has nothing new to deliver.
+            None => {
+                let before = self.records.status(&self.id)?.unwrap_or_default();
+                for key in ["branch", "merged"] {
+                    if let Some(value) = before.get(key) {
+                        body[key] = value.clone();
+                    }
+                }
+            }
+        }
         self.records.save_status(&self.id, &body)
     }
 
     fn fresh_worktree(&mut self, label: &str) -> anyhow::Result<PathBuf> {
-        if !git::has_head(&self.project) {
+        if !git::has_head(&self.tree) {
             bail!("the project has no commits yet");
         }
         let path = git::worktree_dir(&self.project, &self.config.run_id, label);
@@ -1304,7 +1389,7 @@ impl Driver {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let head = git::head(&self.project)?;
+        let head = git::head(&self.tree)?;
         git::add_worktree(&self.project, &path, &head)?;
         self.trees.push(path.clone());
         Ok(path)
@@ -1396,6 +1481,7 @@ impl Driver {
     }
 
     fn note_mistake_model(&self, model: &str, failure: &str) -> anyhow::Result<()> {
+        let _project = PROJECT.lock().unwrap();
         let mut book = self.records.book()?;
         book.record(model, failure);
         self.records.save_book(&book)
@@ -1403,6 +1489,7 @@ impl Driver {
 
     fn learn_fix(&self, tier: Tier, failure: &str, text: &str) -> anyhow::Result<()> {
         let model = self.model_byline(tier);
+        let _project = PROJECT.lock().unwrap();
         let mut book = self.records.book()?;
         book.learn_fix(&model, failure, text);
         self.records.save_book(&book)
@@ -1427,6 +1514,7 @@ impl Driver {
         if !self.config.incremental {
             return Ok(());
         }
+        let _project = PROJECT.lock().unwrap();
         let mut citations = self.records.citations()?;
         let cites = self.page(page)?.cites.clone();
         let catalog = self.catalog()?;
@@ -1461,6 +1549,73 @@ impl Driver {
 }
 
 impl Driver {
+    /// Check the run's branch out in a directory of its own, so the project's working tree
+    /// is not touched until the run is over. A run with no branch builds in the project.
+    fn open_tree(&mut self, base: Option<&str>) -> anyhow::Result<()> {
+        let Some(branch) = self.branch.clone() else { return Ok(()) };
+        if !git::branch_exists(&self.project, &branch) && matches!(self.run.phase, RunPhase::Done | RunPhase::Failed) {
+            // Delivered and tidied away on an earlier pass.
+            self.branch = None;
+            return Ok(());
+        }
+        let path = git::worktree_dir(&self.project, &self.id, "tree");
+        if path.exists() {
+            let _ = git::remove_worktree(&self.project, &path);
+            let _ = fs::remove_dir_all(&path);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let base = match base {
+            Some(base) => base.to_string(),
+            None => git::head(&self.project)?,
+        };
+        git::open_branch(&self.project, &path, &branch, &base)?;
+        self.trees.push(path.clone());
+        // The project's installed packages are what its typecheck and linters run from.
+        // They are not in git, so the checkout borrows them.
+        let installed = self.project.join("node_modules");
+        if installed.is_dir() && !path.join("node_modules").exists() {
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink(&installed, path.join("node_modules"));
+        }
+        self.tree = path;
+        Ok(())
+    }
+
+    /// Hand the finished branch to the project. A run that failed, or one git cannot merge
+    /// cleanly, stays on its branch and the project is left as it was.
+    fn deliver(&mut self, ok: bool) {
+        let Some(branch) = self.branch.clone() else { return };
+        if !git::branch_exists(&self.project, &branch) {
+            return;
+        }
+        if !ok || !self.config.merge {
+            let why = if ok { "was not merged" } else { "failed" };
+            eprintln!("taskmaster: run {} {why}; what it built is on branch `{branch}`", self.id);
+            self.delivery = Some((branch, false));
+            return;
+        }
+        let merged = {
+            let _project = PROJECT.lock().unwrap();
+            git::merge_branch(&self.project, &branch, &[ARCHITECTURE_FILE, CHANGES_FILE])
+        };
+        if merged {
+            let tree = self.tree.clone();
+            self.drop_worktree(&tree);
+            self.tree = self.project.clone();
+            let _ = git::git(&self.project, &["branch", "-D", &branch]);
+            self.branch = None;
+            eprintln!("taskmaster: merged `{branch}` into the project");
+        } else {
+            eprintln!(
+                "taskmaster: `{branch}` does not merge cleanly into the project, so it was left alone. \
+                 Merge it yourself: git merge {branch}"
+            );
+        }
+        self.delivery = Some((branch, merged));
+    }
+
     /// Offer a promoted entry to the shared Commons. Promotion already happened here, so
     /// a failed push is only reported.
     fn push_commons(&self, catalog: &Catalog, key: &str) {
@@ -1500,11 +1655,10 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
     let collect = tokio::spawn(async move {
         let mut text = String::new();
         while let Some(event) = rx.recv().await {
-            if let HarnessEvent::Text { text: chunk } = event {
-                if text.len() < 1_000_000 {
+            if let HarnessEvent::Text { text: chunk } = event
+                && text.len() < 1_000_000 {
                     text.push_str(&chunk);
                 }
-            }
         }
         text
     });
@@ -1552,15 +1706,32 @@ fn kind_name(kind: EntryKind) -> &'static str {
     }
 }
 
-fn load_parallel(records: &Records, run: &str, resuming: bool, requested: usize) -> anyhow::Result<usize> {
-    if let Some(meta) = records.meta(run)? {
-        let parallel = meta.parallel.max(1);
-        if resuming && parallel != requested.max(1) {
-            eprintln!("taskmaster: resuming with parallel {parallel} from the run record");
+/// The settings fixed when the run first started. A resumed run keeps them.
+fn load_meta(records: &Records, project: &Path, config: &Config, resuming: bool) -> anyhow::Result<Meta> {
+    let requested = config.parallel.max(1);
+    if let Some(meta) = records.meta(&config.run_id)? {
+        if resuming && meta.parallel.max(1) != requested {
+            eprintln!("taskmaster: resuming with parallel {} from the run record", meta.parallel.max(1));
         }
-        return Ok(parallel);
+        return Ok(meta);
     }
-    let parallel = requested.max(1);
-    records.save_meta(run, &Meta { parallel })?;
-    Ok(parallel)
+    // A repository with no commit has nothing to branch from, so its first run builds in place.
+    let rooted = git::has_head(project);
+    let slug: String =
+        config.run_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let meta = Meta {
+        parallel: requested,
+        branch: rooted.then(|| format!("taskmaster/{slug}")),
+        base: match (&config.base, rooted) {
+            (Some(base), true) => Some(base.clone()),
+            (None, true) => Some(git::head(project)?),
+            (_, false) => None,
+        },
+        template: config.template.clone(),
+    };
+    if let Some(name) = &meta.template {
+        template::load(name)?;
+    }
+    records.save_meta(&config.run_id, &meta)?;
+    Ok(meta)
 }

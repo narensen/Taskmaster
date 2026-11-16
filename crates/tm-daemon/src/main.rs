@@ -9,7 +9,7 @@
 //!           [--worker-model <m>] [--mid-model <m>] [--master-model <m>]
 //!           [--reviewer-model <m>] [--verifier-model <m>]
 //!           [--parallel <n>] [--timeout <secs>] [--dictionary <dir>] [--commons <dir>]
-//!           [--run <id>] [--eval] [--baseline <h>] [--pair]
+//!           [--run <id>] [--template <next | dir>] [--eval] [--baseline <h>] [--pair]
 //! ```
 //!
 //! Harnesses are `claude`, `agy`, `grok`, `codex` and `opencode`. The worker defaults
@@ -53,6 +53,7 @@ struct Args {
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
     run_id: String,
+    template: Option<String>,
     eval: bool,
     baseline: String,
     pair: bool,
@@ -91,7 +92,7 @@ async fn run() -> anyhow::Result<Outcome> {
             serve(args).await?;
             return Ok(Outcome::Finished { ok: true });
         }
-        Invocation::Drive(args) => args,
+        Invocation::Drive(args) => *args,
     };
     check_models(&args.roles, &args.models).await?;
     let mut config = Config::new(&args.project);
@@ -118,6 +119,7 @@ async fn run() -> anyhow::Result<Outcome> {
     config.dictionary = args.dictionary;
     config.commons = args.commons.clone().or_else(home_commons);
     config.run_id = args.run_id.clone();
+    config.template = args.template.clone();
     config.models = args.models;
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;
@@ -214,7 +216,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 enum Invocation {
     Providers { harness: Option<String> },
     Serve(ServeArgs),
-    Drive(Args),
+    Drive(Box<Args>),
 }
 
 fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Invocation> {
@@ -225,7 +227,7 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
     if argv.first().is_some_and(|arg| arg == "serve") {
         return Ok(Invocation::Serve(serve_args(&argv[1..])?));
     }
-    Ok(Invocation::Drive(args_from(argv)?))
+    Ok(Invocation::Drive(Box::new(args_from(argv)?)))
 }
 
 fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
@@ -284,6 +286,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                  [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
                  [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
                  [--timeout <secs>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
+                 [--template <next | dir>] \
                  [--eval] [--baseline <h>] [--pair]\n\
                  harnesses: claude, agy, grok, codex, opencode";
     let mut argv = argv.into_iter();
@@ -302,6 +305,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         dictionary: None,
         commons: None,
         run_id: "current".into(),
+        template: None,
         eval: false,
         baseline: "claude".into(),
         pair: false,
@@ -334,6 +338,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
             "--dictionary" => args.dictionary = Some(need(&mut argv, "--dictionary", usage)?.into()),
             "--commons" => args.commons = Some(need(&mut argv, "--commons", usage)?.into()),
             "--run" => args.run_id = need(&mut argv, "--run", usage)?,
+            "--template" => args.template = Some(need(&mut argv, "--template", usage)?),
             "--eval" => args.eval = true,
             "--baseline" => {
                 args.baseline = need(&mut argv, "--baseline", usage)?;
@@ -359,6 +364,10 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         bail!("--eval needs --plan or --prompt\n{usage}");
     }
     Ok(args)
+}
+
+fn need(argv: &mut impl Iterator<Item = String>, flag: &str, usage: &str) -> anyhow::Result<String> {
+    argv.next().with_context(|| format!("{flag} needs a value\n{usage}"))
 }
 
 #[cfg(test)]
@@ -427,8 +436,4 @@ mod args_tests {
         };
         assert!(err.contains("unknown harness"), "{err}");
     }
-}
-
-fn need(argv: &mut impl Iterator<Item = String>, flag: &str, usage: &str) -> anyhow::Result<String> {
-    argv.next().with_context(|| format!("{flag} needs a value\n{usage}"))
 }

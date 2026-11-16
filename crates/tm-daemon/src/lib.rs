@@ -23,6 +23,7 @@ mod reply;
 mod resume;
 mod secret;
 pub mod store;
+pub mod template;
 mod time;
 
 #[cfg(test)]
@@ -141,6 +142,8 @@ pub struct RunRequest {
     pub models: Models,
     pub parallel: Option<usize>,
     pub timeout_secs: Option<u64>,
+    /// `next`, or a directory. See [`template`].
+    pub template: Option<String>,
 }
 
 /// Optional model names passed through to the harness. The harness id is the default.
@@ -171,6 +174,13 @@ pub struct Config {
     pub reject: bool,
     /// Typecheck and lint what was built, with the project's own tools, before finishing.
     pub checks: bool,
+    /// Merge the run's branch into the project when the run finishes clean. When this is
+    /// off the result stays on `taskmaster/<run id>`.
+    pub merge: bool,
+    /// The commit a new run starts from. `None` is the project's `HEAD`.
+    pub base: Option<String>,
+    /// Files a new project starts with: `next`, or a directory. See [`template`].
+    pub template: Option<String>,
     /// Where run records are kept. `None` is `.taskmaster/` in the project.
     pub store: Option<Arc<dyn Store>>,
     /// The Commons other people share. `None` keeps the Commons on this machine.
@@ -199,6 +209,9 @@ impl Config {
             yes: false,
             reject: false,
             checks: true,
+            merge: true,
+            base: None,
+            template: None,
             store: None,
             remote: None,
             timeout: Duration::from_secs(600),

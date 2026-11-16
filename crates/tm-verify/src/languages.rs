@@ -134,20 +134,18 @@ fn rust_connections(
     let mut rest = source;
     while let Some(at) = rest.find("include!") {
         let after = &rest[at + "include!".len()..];
-        if let Some(path) = after.split('"').nth(1) {
-            if let Some(target) = relative(file, path).filter(|p| sources.contains_key(p)) {
+        if let Some(path) = after.split('"').nth(1)
+            && let Some(target) = relative(file, path).filter(|p| sources.contains_key(p)) {
                 out.insert(target);
             }
-        }
         rest = &rest[at + "include!".len()..];
     }
     for statement in rust_use_statements(source) {
         for path in expand_use(&statement) {
-            if let Some(target) = resolve_rust_use(file, &path, modules, sources) {
-                if target != file {
+            if let Some(target) = resolve_rust_use(file, &path, modules, sources)
+                && target != file {
                     out.insert(target);
                 }
-            }
         }
     }
     out
@@ -318,7 +316,7 @@ fn python_connections(file: &str, source: &str, sources: &BTreeMap<String, Strin
                 out.insert(target);
             }
             for name in names.split(',') {
-                let name = name.trim().split_whitespace().next().unwrap_or("");
+                let name = name.split_whitespace().next().unwrap_or("");
                 if name.is_empty() || name == "*" || name == "(" || name == ")" {
                     continue;
                 }
@@ -476,11 +474,10 @@ fn c_connections(file: &str, source: &str, sources: &BTreeMap<String, String>) -
             } else if let Some(target) = unique_suffix(&[path.to_string()], sources) {
                 out.insert(target);
             }
-        } else if let Some(path) = rest.strip_prefix('<').and_then(|s| s.split('>').next()) {
-            if let Some(target) = unique_suffix(&[path.to_string()], sources) {
+        } else if let Some(path) = rest.strip_prefix('<').and_then(|s| s.split('>').next())
+            && let Some(target) = unique_suffix(&[path.to_string()], sources) {
                 out.insert(target);
             }
-        }
     }
     out
 }
@@ -581,7 +578,7 @@ fn css_candidates(file: &str, path: &str) -> Vec<String> {
     out
 }
 
-fn string_after<'a>(line: &'a str, keyword: &str) -> Option<String> {
+fn string_after(line: &str, keyword: &str) -> Option<String> {
     let rest = line.trim_start().strip_prefix(keyword)?;
     if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
         return None;

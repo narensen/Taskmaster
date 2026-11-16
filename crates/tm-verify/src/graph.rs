@@ -187,12 +187,7 @@ fn strip_comments(source: &str, hash: bool, triple: bool) -> String {
             out.push_str("  ");
         } else if matches!(c, b'"' | b'\'' | b'`') {
             quote = Some(c);
-        } else if hash && c == b'#' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+        } else if (hash && c == b'#') || (c == b'/' && bytes.get(i + 1) == Some(&b'/')) {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
@@ -411,7 +406,7 @@ mod tests {
         assert_eq!(imports(&graph, "src/lib.rs"), vec!["src/bar.rs", "src/foo.rs"]);
         assert_eq!(imports(&graph, "src/foo.rs"), vec!["src/bar.rs", "src/foo/baz.rs", "src/foo/extra.rs"]);
         assert_eq!(imports(&graph, "src/bar.rs"), vec!["src/foo/baz.rs"]);
-        assert!(graph.edges.get("src/hidden.rs").is_none());
+        assert!(!graph.edges.contains_key("src/hidden.rs"));
         assert_eq!(imports(&graph, "pkg/a.py"), vec!["pkg/b.py", "pkg/c.py", "pkg/sub/e.py"]);
         assert_eq!(imports(&graph, "main.go"), vec!["util/util.go"]);
         assert_eq!(imports(&graph, "src/com/acme/A.java"), vec!["src/com/acme/B.java"]);

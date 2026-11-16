@@ -11,7 +11,7 @@ The run is a state machine. The models do the writing. Taskmaster decides the ne
 1. **Plan.** `--prompt` asks the Taskmaster harness for the contracts, the pages, and the Dictionary entries. `--plan` uses a plan file and skips the model.
 2. **Approve.** Without `--yes`, Taskmaster prints the plan and exits. Nothing is built.
 3. **Lock.** The contracts are committed, and each page is granted the Dictionary keys it cites.
-4. **Build.** Each page gets its own git worktree. Only files matching that page's glob are merged back.
+4. **Build.** The run works on its own branch, `taskmaster/<run id>`, in a checkout outside your working tree. Each page gets its own git worktree, and only files matching that page's glob are merged into the run.
 5. **Review.** One reviewer reads each Dictionary connection the changed pages cite, then one security pass reads the dirty pages.
 6. **Verify.** A second harness confirms the findings. Confirmed findings go back to the owning page. Then the project's own tools check what was built, and an optional `.taskmaster/verify` program checks the whole tree.
 
@@ -24,6 +24,19 @@ tm-daemon . --yes
 The first `tm-daemon` command records the plan and exits 2. The second approves that recorded plan and builds it. Pass `--yes` on the first command to approve immediately.
 
 A rejected plan is sent back to the planner once, with the errors. An existing Dictionary entry may be cited. Different content for the same key is refused.
+
+When the run finishes clean, its branch is merged into whatever the project has checked out and then deleted. A run that fails stays on its branch, and so does one git cannot merge cleanly; either way the project is left as it was. A repository with no commit yet has nothing to branch from, so its first run builds in place.
+
+## Starting a project
+
+`--template next` gives a new project its shared files: Next.js 15 with the App Router, React 19 and strict TypeScript. The planner is told the layout, so every page lands in `app/<page id>/` and shared code goes through contract files. A file the project already has is left alone. Any directory works as a template; a `TEMPLATE.md` in it is the note the planner reads.
+
+```bash
+tm-daemon . --template next --prompt "A small notes app with a list and an editor."
+npm install
+```
+
+Taskmaster does not run `npm install`. Once the packages are there, later runs typecheck against them.
 
 ## Who does the work
 
@@ -52,7 +65,7 @@ Before a run finishes, the files it built are typechecked and linted with tools 
 
 ## What a run cost
 
-Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the page, the harness, the model, the tokens, the seconds, and the price when the harness reports one. The last line a run prints is the total next to the plan's estimate. Cache reads are shown apart from the rest: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. `status.json` has the same totals split by role and by model.
+Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the page, the harness, the model, the tokens, the seconds, and the price when the harness reports one. The estimate is not the planner's guess. It is worked out from what build and review calls cost in this project's earlier runs, or from defaults on a first run. The last line a run prints is the total next to that estimate. Cache reads are shown apart from the rest: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. `status.json` has the same totals split by role and by model.
 
 Claude Code reports a price. A harness that does not, such as Antigravity, still has its tokens counted, and the dollar total says how many calls it leaves out.
 
@@ -72,7 +85,7 @@ The project store is `.taskmaster/dictionary`. The Commons defaults to `~/.taskm
 
 ## Eval
 
-`--eval` runs the same plan again on one baseline harness and writes `.taskmaster/evals/<id>.json`. Each side reports its pages, its check failures, its tokens, and its cost. A prompt is planned once, and the baseline reuses that plan. The baseline defaults to the master harness. The comparison runs after the plan is approved.
+`--eval` runs the same plan again on one baseline harness and writes `.taskmaster/evals/<id>.json`. Each side reports its pages, its check failures, its tokens, and its cost. A prompt is planned once, and the baseline reuses that plan. The baseline starts from the same commit and its result stays on `taskmaster/<id>-baseline`. The baseline defaults to the master harness. The comparison runs after the plan is approved.
 
 ```bash
 tm-daemon . --prompt "A small notes app with a list and an editor." --eval --baseline codex --yes
@@ -92,9 +105,10 @@ The first command listens on `127.0.0.1:8737`. `--tailscale` listens on this mac
 ```text
 POST /api/pair                  {code} -> {token}
 GET  /api/runs                  every run, with its phase, pages and spend
-POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?}
+POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?, template?}
 GET  /api/runs/{id}             one run, with its plan
 GET  /api/runs/{id}/events      ?after=<n>
+GET  /api/runs/{id}/stream      the same events as they happen
 GET  /api/runs/{id}/ledger
 GET  /api/runs/{id}/changes
 POST /api/runs/{id}/approve
@@ -110,7 +124,9 @@ POST /api/reviews               {target?, base?, head?, pr?, dirty?}
 GET  /api/reviews/{id}
 ```
 
-One run builds at a time, because a run commits into the project's working tree. `GET /` is a small page for a phone: it pairs, lists the runs, and approves a waiting plan. `--pair` on a run serves the same API on the tailnet for as long as that run lasts.
+`stream` is server-sent events: one `event` per entry in the run's log, then `idle` with the phase once nothing is driving the run. A browser's `EventSource` cannot send a header, so this one route also takes `?token=`.
+
+Each run is on its own branch, so several can build at once. `GET /` is a small page for a phone: it pairs, lists the runs, and approves a waiting plan. `--pair` on a run serves the same API on the tailnet for as long as that run lasts.
 
 ## Left open on purpose
 
@@ -148,7 +164,7 @@ tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--
           [--worker-model <m>] [--mid-model <m>] [--master-model <m>]
           [--reviewer-model <m>] [--verifier-model <m>]
           [--parallel <n>] [--timeout <secs>] [--dictionary <dir>] [--commons <dir>]
-          [--run <id>] [--eval] [--baseline <h>] [--pair]
+          [--run <id>] [--template <next | dir>] [--eval] [--baseline <h>] [--pair]
 
 tm-review <repo | url> [--base <rev>] [--head <rev>] [--pr <n>] [--dirty]
           [--reviewer <h>] [--verifier <h>]

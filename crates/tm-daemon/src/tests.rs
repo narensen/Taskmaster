@@ -311,6 +311,20 @@ fn repo(name: &str) -> Tmp {
     Tmp(dir)
 }
 
+/// A repository that already has a commit, so a run gets a branch of its own.
+fn seeded(name: &str) -> Tmp {
+    let tmp = repo(name);
+    std::fs::write(tmp.0.join("README.md"), "# project\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "start"]);
+    tmp
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
     assert!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
@@ -782,7 +796,8 @@ async fn every_agent_call_is_charged_to_the_run() {
     assert_eq!(status["spent"]["calls"], entries.len());
     assert_eq!(status["spent"]["tokens"], entries.len() * 120);
     assert_eq!(status["spent"]["unpriced_calls"], 0);
-    assert_eq!(status["estimate"]["tokens"], 10);
+    // One page and two reviewers, priced from defaults because nothing ran here before.
+    assert_eq!(status["estimate"]["tokens"], 17_000 + 2 * 500);
 }
 
 #[tokio::test]
@@ -884,6 +899,100 @@ async fn a_type_error_goes_back_to_the_page_that_owns_the_file() {
     assert!(book.models["fake"].iter().any(|mistake| mistake.sample.contains("TS2304")));
 }
 
+#[tokio::test]
+async fn a_run_builds_on_its_own_branch_and_is_merged_when_it_finishes() {
+    let tmp = seeded("branch");
+    let world = World::new(Mode::Write);
+    let planned = plan(&[("a", &[]), ("b", &[])]);
+    let outcome = run(config(&tmp.0, planned.clone(), false, 2), &world).await.unwrap();
+    assert!(matches!(outcome, Outcome::NeedsApproval { .. }));
+    assert!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).contains("taskmaster/current"));
+
+    // The project moves on while the plan waits. The run still lands on top of it.
+    std::fs::write(tmp.0.join("notes.md"), "mine\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "my own work"]);
+
+    let outcome = run(config(&tmp.0, planned, true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
+    assert_eq!(read(&tmp.0.join("notes.md")), "mine\n");
+    assert!(log(&tmp.0).contains("taskmaster: built page a") && log(&tmp.0).contains("my own work"));
+    assert_eq!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).trim(), "");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    let status = Records::files(&tmp.0).status("current").unwrap().unwrap();
+    assert_eq!((status["branch"].as_str(), status["merged"].as_bool()), (Some("taskmaster/current"), Some(true)));
+}
+
+#[tokio::test]
+async fn a_failed_run_leaves_the_project_as_it_was() {
+    let tmp = seeded("branch-fail");
+    let world = World::new(Mode::Nothing);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    assert!(!tmp.0.join("contracts/types.ts").exists());
+    assert_eq!(log(&tmp.0).trim(), "start");
+    assert!(git_out(&tmp.0, &["log", "--format=%s", "taskmaster/current"]).contains("taskmaster: lock contracts"));
+    let status = Records::files(&tmp.0).status("current").unwrap().unwrap();
+    assert_eq!(status["merged"], false);
+}
+
+#[tokio::test]
+async fn a_run_that_conflicts_with_the_project_stays_on_its_branch() {
+    let tmp = seeded("branch-conflict");
+    let world = World::new(Mode::Write);
+    let planned = plan(&[("a", &[])]);
+    assert!(matches!(run(config(&tmp.0, planned.clone(), false, 1), &world).await.unwrap(), Outcome::NeedsApproval { .. }));
+    std::fs::create_dir_all(tmp.0.join("app/a")).unwrap();
+    std::fs::write(tmp.0.join("app/a/page.ts"), "export const mine = true;\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "my page"]);
+
+    let outcome = run(config(&tmp.0, planned, true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const mine = true;\n");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(git_out(&tmp.0, &["show", "taskmaster/current:app/a/page.ts"]).contains("\"a\""));
+    assert_eq!(Records::files(&tmp.0).status("current").unwrap().unwrap()["merged"], false);
+}
+
+#[tokio::test]
+async fn a_template_gives_the_project_its_shared_files_and_the_planner_its_layout() {
+    let tmp = seeded("template");
+    std::fs::write(tmp.0.join("package.json"), "{\"name\":\"mine\"}\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "my package"]);
+    let world = World::new(Mode::Plan);
+    let mut cfg = prompt_config(&tmp.0, "Build page a.", true);
+    cfg.template = Some("next".into());
+    assert_eq!(run(cfg, &world).await.unwrap(), Outcome::Finished { ok: true });
+    let planner = planner_calls(&world).remove(0);
+    assert!(planner.contains("`next` template") && planner.contains("app/<page id>/page.tsx"), "{planner}");
+    assert!(read(&tmp.0.join("tsconfig.json")).contains("\"strict\": true"));
+    assert!(read(&tmp.0.join(".gitignore")).contains("node_modules"));
+    assert!(tmp.0.join("app/layout.tsx").is_file());
+    // A file the project already had is not replaced.
+    assert_eq!(read(&tmp.0.join("package.json")), "{\"name\":\"mine\"}\n");
+    assert!(!tmp.0.join("TEMPLATE.md").exists());
+}
+
+#[tokio::test]
+async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
+    let tmp = seeded("forecast");
+    let world = World::new(Mode::Write);
+    let mut first = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    first.run_id = "one".into();
+    assert_eq!(run(first, &world).await.unwrap(), Outcome::Finished { ok: true });
+    let mut second = config(&tmp.0, plan(&[("b", &[]), ("c", &[])]), true, 1);
+    second.run_id = "two".into();
+    assert_eq!(run(second, &world).await.unwrap(), Outcome::Finished { ok: true });
+    // Every fake call is 120 tokens and one cent: two pages and one security reviewer.
+    let status = Records::files(&tmp.0).status("two").unwrap().unwrap();
+    assert_eq!(status["estimate"]["tokens"], 3 * 120);
+    assert!((status["estimate"]["usd"].as_f64().unwrap() - 0.03).abs() < 1e-9);
+    assert_eq!(status["spent"]["fresh"], 3 * 120);
+}
+
 mod http {
     //! The API over a real socket, with the fake harness behind it.
 
@@ -914,6 +1023,18 @@ mod http {
             let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
             let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
             (status, serde_json::from_str(rest).unwrap_or(Value::Null))
+        }
+
+        /// The body as text, for a reply that is not JSON.
+        async fn text(&self, path: &str) -> (u16, String) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(&self.addr).await.unwrap();
+            let request = format!("GET {path} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\n\r\n", self.addr);
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+            (head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0), rest.to_string())
         }
 
         async fn get(&self, path: &str) -> (u16, Value) {
@@ -982,7 +1103,7 @@ mod http {
         let done = client.settled("web", "done").await;
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
-        assert_eq!(done["estimate"]["tokens"], 10);
+        assert_eq!(done["estimate"]["tokens"], 2 * 17_000 + 2 * 500);
         let calls = done["spent"]["calls"].as_u64().unwrap();
         assert!(calls >= 3 && done["spent"]["tokens"] == calls * 120, "{done}");
         assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);
@@ -997,6 +1118,17 @@ mod http {
         assert_eq!(later["events"].as_array().unwrap().len(), total - 2);
         let (_, changes) = client.get("/api/runs/web/changes").await;
         assert!(changes["changes"].as_array().unwrap().iter().any(|change| change["kind"] == "page_built"));
+
+        // The stream replays the log and stops once nothing is driving the run.
+        let token = client.token.clone().unwrap();
+        assert_eq!(client.text("/api/runs/web/stream").await.0, 401);
+        let (status, feed) = client.text(&format!("/api/runs/web/stream?token={token}")).await;
+        assert_eq!(status, 200);
+        assert_eq!(feed.matches("event: event").count(), total, "{feed}");
+        assert!(feed.contains("id: 1\n") && feed.contains("plan_ready"), "{feed}");
+        assert!(feed.contains("event: idle") && feed.contains("{\"phase\":\"done\"}"), "{feed}");
+        let (_, rest) = client.text(&format!("/api/runs/web/stream?token={token}&after={total}")).await;
+        assert!(!rest.contains("event: event") && rest.contains("event: idle"), "{rest}");
 
         let (_, found) = client.get("/api/dictionary?q=greet").await;
         assert_eq!(found["entries"][0]["key"], "greet");
@@ -1078,6 +1210,48 @@ mod http {
         let (_, listed) = client.get("/api/reviews").await;
         assert!(listed["reviews"].as_array().unwrap().iter().any(|row| row["id"] == id.as_str() && row["confirmed"] == 1));
         assert!(read(&tmp.0.join(".taskmaster/reviews/history.jsonl")).contains("wrong total"));
+    }
+
+    #[tokio::test]
+    async fn two_runs_build_at_once_on_their_own_branches() {
+        let tmp = seeded("api-two");
+        let barrier = Arc::new(Barrier::new(2));
+        let world = World::new(Mode::Parallel(Some(barrier)));
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        // Each worker waits until the other run's worker is building too.
+        for (id, page) in [("one", "a"), ("two", "b")] {
+            let planned = serde_json::to_value(plan(&[(page, &[])])).unwrap();
+            let (status, made) = client.post("/api/runs", json!({ "id": id, "plan": planned, "yes": true })).await;
+            assert_eq!(status, 202, "{made}");
+        }
+        for id in ["one", "two"] {
+            let done = client.settled(id, "done").await;
+            assert_eq!(done["merged"], true, "{done}");
+        }
+        assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
+        assert_eq!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).trim(), "");
+        assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_no_commit_builds_one_run_at_a_time() {
+        let tmp = repo("api-alone");
+        let barrier = Arc::new(Barrier::new(2));
+        let world = World::new(Mode::Parallel(Some(barrier.clone())));
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        assert_eq!(client.post("/api/runs", json!({ "id": "one", "plan": planned, "yes": true })).await.0, 202);
+        let (status, refused) = client.post("/api/runs", json!({ "id": "two", "plan": planned })).await;
+        assert_eq!(status, 409, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("no commit"), "{refused}");
+        barrier.wait().await;
+        client.settled("one", "done").await;
     }
 
     #[tokio::test]

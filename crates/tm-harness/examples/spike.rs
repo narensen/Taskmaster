@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, mut rx) = mpsc::channel(64);
     let printer = tokio::spawn(async move {
+        let mut said = String::new();
         while let Some(event) = rx.recv().await {
             match event {
                 HarnessEvent::ToolCall { name, input, .. } => {
@@ -54,9 +55,12 @@ async fn main() -> anyhow::Result<()> {
                 HarnessEvent::PermissionDecided { tool, allowed } => {
                     println!("gate   {} {tool}", if allowed { "ALLOW" } else { "DENY " });
                 }
-                HarnessEvent::Text { .. } | HarnessEvent::Thought { .. } => {}
+                HarnessEvent::Text { text } => said.push_str(&text),
+                HarnessEvent::Thought { .. } => {}
             }
         }
+        let said: String = said.trim().chars().take(600).collect();
+        println!("said   {said}");
     });
     let summary = harness.run(task, gate, tx).await?;
     printer.await?;

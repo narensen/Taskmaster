@@ -27,11 +27,10 @@ pub fn reconcile(
         }
     }
     for cmd in &mut kept {
-        if let Command::VerifyFindings { findings } = cmd {
-            if !run.pending_findings.is_empty() {
+        if let Command::VerifyFindings { findings } = cmd
+            && !run.pending_findings.is_empty() {
                 *findings = run.pending_findings.clone();
             }
-        }
     }
     kept.sort_by_key(|cmd| rank(run, cmd));
     Ok(kept)

@@ -6,9 +6,10 @@
 //! POST /api/pair                  {code} -> {token}
 //!
 //! GET  /api/runs                  every run, with its phase, pages and spend
-//! POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?, timeout_secs?}
+//! POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?, timeout_secs?, template?}
 //! GET  /api/runs/{id}             one run, with its plan and how it was asked for
 //! GET  /api/runs/{id}/events      ?after=<n> -> {next, events}
+//! GET  /api/runs/{id}/stream      the same events as they happen (server-sent events)
 //! GET  /api/runs/{id}/ledger      what each agent call cost
 //! GET  /api/runs/{id}/changes     what was committed, and by which model
 //! POST /api/runs/{id}/approve     build the plan that is waiting
@@ -26,9 +27,18 @@
 //! ```
 //!
 //! Everything under `/api` except `health` and `pair` needs `Authorization: Bearer <token>`.
-//! One run builds at a time, because a run commits into the project's working tree.
+//! A browser's `EventSource` cannot send that header, so `stream` also takes `?token=`.
+//!
+//! Each run builds on its own branch, so several can run at once. The exception is a
+//! repository with no commit yet: its first run builds in place and runs alone.
+//!
+//! `stream` sends an `event` for each entry in the run's log, numbered from 1, and then an
+//! `idle` when nothing is driving the run, with its phase. The stream ends there: nothing
+//! more can happen until someone approves, resumes or cancels. `?after=<n>` or a
+//! `Last-Event-ID` header skips what the client already has.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -38,11 +48,13 @@ use anyhow::{Context, bail};
 use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use futures_util::stream::{self, Stream};
 use tm_core::{Plan, Run, RunPhase, totals, valid_key};
 use tm_dictionary::{Catalog, CommonsRemote};
 use tm_harness::{HARNESSES, Harness, provider_report, provider_reports};
@@ -97,7 +109,7 @@ pub struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        if let Some(active) = self.app.active.lock().unwrap().as_ref() {
+        for active in self.app.active.lock().unwrap().values() {
             let _ = active.cancel.send(true);
         }
         if let Some(tx) = self.shutdown.take() {
@@ -110,8 +122,9 @@ impl Drop for Server {
 }
 
 struct Active {
-    run: String,
     cancel: watch::Sender<bool>,
+    /// The run commits into the project's own working tree, so it must run alone.
+    in_place: bool,
 }
 
 struct App {
@@ -123,7 +136,7 @@ struct App {
     dictionary: PathBuf,
     commons: PathBuf,
     harness: HarnessFactory,
-    active: Mutex<Option<Active>>,
+    active: Mutex<HashMap<String, Active>>,
 }
 
 impl Server {
@@ -148,7 +161,7 @@ impl Server {
             store: options.store,
             remote: options.remote,
             harness: options.harness,
-            active: Mutex::new(None),
+            active: Mutex::new(HashMap::new()),
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -183,6 +196,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/reviews/{id}", get(show_review))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
+        .route("/api/runs/{id}/stream", get(run_stream))
         .route("/", get(|| async { Html(PAGE) }))
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
@@ -272,8 +286,8 @@ enum Decision {
 }
 
 impl App {
-    fn active_run(&self) -> Option<String> {
-        self.active.lock().unwrap().as_ref().map(|active| active.run.clone())
+    fn is_active(&self, id: &str) -> bool {
+        self.active.lock().unwrap().contains_key(id)
     }
 
     fn replay(&self, id: &str) -> anyhow::Result<Option<Run>> {
@@ -314,8 +328,10 @@ impl App {
         Ok(json!({
             "id": id,
             "phase": run.phase,
-            "active": self.active_run().as_deref() == Some(id),
+            "active": self.is_active(id),
             "error": status.get("error"),
+            "branch": status.get("branch"),
+            "merged": status.get("merged"),
             "pages": pages,
             "estimate": run.plan.as_ref().map(|plan| &plan.estimate),
             "spent": totals(&self.records.ledger(id)?),
@@ -324,11 +340,22 @@ impl App {
         }))
     }
 
-    /// Start driving `id` in the background. Only one run drives at a time.
+    /// Start driving `id` in the background.
     fn start(self: &Arc<Self>, id: &str, request: RunRequest, decision: Decision) -> Result<(), ApiError> {
         let mut active = self.active.lock().unwrap();
-        if let Some(running) = active.as_ref() {
-            return Err(fail(StatusCode::CONFLICT, format!("run `{}` is in progress", running.run)));
+        if active.contains_key(id) {
+            return Err(fail(StatusCode::CONFLICT, format!("run `{id}` is in progress")));
+        }
+        let in_place = match self.records.meta(id)? {
+            Some(meta) => meta.branch.is_none(),
+            None => !crate::git::has_head(&self.project),
+        };
+        if !active.is_empty() && (in_place || active.values().any(|other| other.in_place)) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "a run is building in the project's own working tree, because the repository had no \
+                 commit to branch from; wait for it to finish",
+            ));
         }
         let harnesses = Harnesses::from_roles(&request.roles, &*self.harness)
             .map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
@@ -344,12 +371,13 @@ impl App {
             config.timeout = Duration::from_secs(secs.max(1));
         }
         config.models = request.models;
+        config.template = request.template;
         config.dictionary = Some(self.dictionary.clone());
         config.commons = Some(self.commons.clone());
         config.store = self.store.clone();
         config.remote = self.remote.clone();
         config.cancel = cancelled;
-        *active = Some(Active { run: id.to_string(), cancel });
+        active.insert(id.to_string(), Active { cancel, in_place });
         drop(active);
 
         let app = self.clone();
@@ -360,7 +388,7 @@ impl App {
                 eprintln!("taskmaster: run {id}: {err:#}");
             }
             app.record_outcome(&id, result);
-            *app.active.lock().unwrap() = None;
+            app.active.lock().unwrap().remove(&id);
         });
         Ok(())
     }
@@ -409,6 +437,7 @@ struct NewRun {
     models: Models,
     parallel: Option<usize>,
     timeout_secs: Option<u64>,
+    template: Option<String>,
 }
 
 async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Reply {
@@ -427,6 +456,9 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
         return Err(fail(StatusCode::BAD_REQUEST, "send a prompt or a plan, and not both"));
     }
     check_models(&body.roles, &body.models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    if let Some(name) = &body.template {
+        crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    }
     let request = RunRequest {
         prompt,
         plan: body.plan,
@@ -434,6 +466,7 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
         models: body.models,
         parallel: body.parallel,
         timeout_secs: body.timeout_secs,
+        template: body.template,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.start(&id, request.clone(), decision)?;
@@ -461,6 +494,59 @@ async fn run_events(
     let events = app.records.events(&id)?;
     let after = query.get("after").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(events.len());
     ok(json!({ "next": events.len(), "events": &events[after..] }))
+}
+
+struct Feed {
+    app: Arc<App>,
+    id: String,
+    /// How many of the run's events the client already has.
+    seen: usize,
+    ready: VecDeque<SseEvent>,
+    over: bool,
+}
+
+async fn run_stream(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let token = bearer(&headers).or(query.get("token").map(String::as_str));
+    if token.and_then(|token| app.auth.identify(token)).is_none() {
+        return Err(fail(StatusCode::UNAUTHORIZED, "a token is required"));
+    }
+    app.known(&id)?;
+    let resume = headers.get("last-event-id").and_then(|value| value.to_str().ok()).map(str::to_string);
+    let seen = resume.or_else(|| query.get("after").cloned()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    let feed = Feed { app, id, seen, ready: VecDeque::new(), over: false };
+    let events = stream::unfold(feed, |mut feed| async move {
+        loop {
+            if let Some(event) = feed.ready.pop_front() {
+                return Some((Ok(event), feed));
+            }
+            if feed.over {
+                return None;
+            }
+            // Read "is it running" before the log: anything written while it ran is then
+            // in the log we read, so the last events are not missed.
+            let active = feed.app.is_active(&feed.id);
+            let events = feed.app.records.events(&feed.id).unwrap_or_default();
+            if events.len() > feed.seen {
+                for (index, event) in events.iter().enumerate().skip(feed.seen) {
+                    let body = serde_json::to_string(event).unwrap_or_default();
+                    feed.ready.push_back(SseEvent::default().event("event").id((index + 1).to_string()).data(body));
+                }
+                feed.seen = events.len();
+            } else if !active {
+                let phase = Run::replay(1, events).phase;
+                feed.ready.push_back(SseEvent::default().event("idle").data(json!({ "phase": phase }).to_string()));
+                feed.over = true;
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
 }
 
 async fn run_ledger(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
@@ -522,7 +608,7 @@ async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
     let run = app.known(&id)?;
     {
         let active = app.active.lock().unwrap();
-        if let Some(active) = active.as_ref().filter(|active| active.run == id) {
+        if let Some(active) = active.get(&id) {
             let _ = active.cancel.send(true);
             return accepted(json!({ "id": id }));
         }

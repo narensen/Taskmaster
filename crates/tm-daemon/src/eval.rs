@@ -61,6 +61,10 @@ pub async fn evaluate(
         config.plan = Some(recorded_plan(&records, &id)?);
         config.prompt = None;
     }
+    // The baseline starts from the commit the Taskmaster run started from, and what it
+    // builds stays on its own branch: the project keeps the Taskmaster result.
+    config.base = records.meta(&id)?.and_then(|meta| meta.base);
+    config.merge = false;
     config.run_id = format!("{id}-baseline");
     config.incremental = false;
     let baseline_harnesses = Harnesses {

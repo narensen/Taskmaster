@@ -81,11 +81,10 @@ pub fn resolve_binary(name: &str) -> anyhow::Result<PathBuf> {
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path) {
-        if let Ok(found) = std::fs::canonicalize(dir.join(name)) {
-            if found.is_file() {
+        if let Ok(found) = std::fs::canonicalize(dir.join(name))
+            && found.is_file() {
                 return Ok(found);
             }
-        }
     }
     bail!("`{name}` was not found on PATH")
 }

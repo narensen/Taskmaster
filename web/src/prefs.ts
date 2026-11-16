@@ -6,6 +6,7 @@ import { useSyncExternalStore } from "react";
 import type { RoleName } from "./api";
 
 export type Density = "comfortable" | "compact";
+export type ThemeName = "dark" | "light";
 
 export interface RoleDefault {
   harness: string;
@@ -29,6 +30,7 @@ export interface Prefs {
   searchEndpoint: string;
   motion: boolean;
   density: Density;
+  theme: ThemeName;
   roleDefaults: Partial<Record<RoleName, RoleDefault>>;
   daemons: OtherDaemon[];
   runFlags: Record<string, RunFlags>;
@@ -45,6 +47,7 @@ const DEFAULTS: Prefs = {
   searchEndpoint: "",
   motion: true,
   density: "comfortable",
+  theme: "dark",
   roleDefaults: {},
   daemons: [],
   runFlags: {},

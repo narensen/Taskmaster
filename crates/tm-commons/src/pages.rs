@@ -38,7 +38,8 @@ form{margin:0}.inline{display:inline}.stack{display:flex;flex-direction:column;g
 .good{color:var(--good)}.bad{color:var(--bad)}.ask{color:var(--ask)}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}.stat b{display:block;font-size:1.35rem}
 .providers{display:flex;flex-direction:column;gap:10px;max-width:340px}.warn{color:var(--ask)}.center{max-width:420px;margin:40px auto;text-align:center;align-items:center}
-details summary{cursor:pointer}
+details summary{cursor:pointer}footer{max-width:860px;margin:0 auto;padding:0 18px 32px;display:flex;gap:8px}
+.doc{gap:12px}.doc ul{margin:0;padding-left:20px}
 "#;
 
 pub struct Viewer<'a> {
@@ -60,7 +61,8 @@ pub fn layout(title: &str, viewer: &Viewer, body: &str) -> String {
     format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{} · Taskmaster Commons</title><style>{STYLE}</style></head><body>
-<header><a class="brand" href="/">Taskmaster Commons</a><nav>{nav}</nav></header><main>{body}</main></body></html>"#,
+<header><a class="brand" href="/">Taskmaster Commons</a><nav>{nav}</nav></header><main>{body}</main>
+<footer class="muted small"><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></footer></body></html>"#,
         esc(title)
     )
 }
@@ -326,4 +328,41 @@ pub fn moderate(queue: &Queue) -> String {
         ));
     }
     out
+}
+
+/// What the Commons keeps about you, in plain words. Linked from every page.
+pub fn privacy() -> String {
+    r#"<div class="card doc"><h1>Privacy</h1>
+<p class="muted">The Taskmaster Commons is a small service that lets Taskmaster users sign in and share code entries. This page says what it keeps and why.</p>
+<h2>What is kept</h2>
+<ul>
+<li>When you sign in with GitHub or Google: your account id, your username or name, and your verified email address. Nothing else is asked for. GitHub is asked only for <span class="mono">read:user</span> and <span class="mono">user:email</span>, never for your repositories. Google is asked only for <span class="mono">openid</span>, <span class="mono">email</span> and <span class="mono">profile</span>.</li>
+<li>The tokens you make for your Taskmasters, stored only as hashes, with the label you gave them.</li>
+<li>Entries you choose to share, and reports you send about entries.</li>
+<li>When your Taskmaster reports on an entry: which entry it used and whether the page passed. No code, prompts or files are sent.</li>
+</ul>
+<h2>Cookies</h2>
+<p>Two cookies, both needed to sign you in: one holds your signed-in session, and one holds a sign-in in progress for ten minutes. There are no ads, no analytics and no tracking.</p>
+<h2>Who sees it</h2>
+<p>Moderators see shared entries, reports, and the username or email of who sent them. Approved entries are served to every Taskmaster with the author's username. Your data is not sold or given to anyone else. It is stored in a Postgres database hosted by Neon.</p>
+<h2>Removing it</h2>
+<p>You can revoke any token on your account page. To have your account and what you shared deleted, ask a moderator, and it will be removed.</p>
+<p><a href="/">Back to the Commons</a></p></div>"#
+        .to_string()
+}
+
+/// The rules, in plain words. Linked from every page.
+pub fn terms() -> String {
+    r#"<div class="card doc"><h1>Terms</h1>
+<p class="muted">By signing in to the Taskmaster Commons you agree to these terms.</p>
+<ul>
+<li>Share only code you have the right to share. What you share may be served to every Taskmaster, and anyone may use it.</li>
+<li>Do not share secrets, credentials, personal data, or anything harmful. Entries are reviewed by a person before anyone else gets them.</li>
+<li>Moderators may approve, reject or withdraw any entry, and may ban an account that breaks these rules. A ban revokes its tokens and withdraws what it shared.</li>
+<li>The service is free and provided as is, with no warranty. It may change, go down, or stop at any time. Check any code before you rely on it.</li>
+<li>These terms may change. The current version is always on this page.</li>
+</ul>
+<p>See also the <a href="/privacy">privacy page</a>.</p>
+<p><a href="/">Back to the Commons</a></p></div>"#
+        .to_string()
 }

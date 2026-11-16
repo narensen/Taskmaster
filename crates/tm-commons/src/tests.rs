@@ -315,6 +315,29 @@ async fn a_taskmaster_gets_a_token_it_can_check_without_any_secret() {
     }
 }
 
+#[tokio::test]
+async fn privacy_and_terms_are_public_plain_pages_linked_from_every_page() {
+    let base = service().await;
+    let mut visitor = Browser::new(&base);
+    let privacy = visitor.get("/privacy").await;
+    assert_eq!(privacy.status, 200);
+    assert!(privacy.body.contains("<h1>Privacy</h1>") && privacy.body.contains("verified email") && privacy.body.contains("Cookies"), "{}", privacy.body);
+    let terms = visitor.get("/terms").await;
+    assert_eq!(terms.status, 200);
+    assert!(terms.body.contains("<h1>Terms</h1>") && terms.body.contains("Moderators may"), "{}", terms.body);
+    for path in ["/", "/signin", "/privacy", "/terms"] {
+        let body = visitor.get(path).await.body;
+        assert!(body.contains(r#"href="/privacy""#) && body.contains(r#"href="/terms""#), "{path} links both pages");
+    }
+
+    // Signed in, the same pages still show and keep the menu.
+    let landed = visitor.sign_in("github", "next=%2Fprivacy").await;
+    assert_eq!((landed.status, landed.location.as_str()), (303, "/privacy"));
+    let signed_in = visitor.get("/privacy").await;
+    assert_eq!(signed_in.status, 200);
+    assert!(signed_in.body.contains("@ana") && signed_in.body.contains("Sign out"));
+}
+
 #[test]
 fn plain_http_is_only_for_this_machine_a_private_network_or_a_tailnet() {
     for good in [

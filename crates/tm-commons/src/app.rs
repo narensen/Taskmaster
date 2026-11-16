@@ -17,6 +17,8 @@
 //! POST /moderate/entries/{key}/{hash} {decision: approve | reject, note?}
 //! POST /moderate/reports/{id}         {action: withdraw | ban | dismiss}
 //! GET  /.well-known/jwks.json         the key that signs sign-in tokens
+//! GET  /privacy                       what is kept, and why
+//! GET  /terms                         the rules for using the Commons
 //! GET  /healthz
 //!
 //! GET  /api/commons/entries           ?stack=<next@15,react@19> served entries, and withdrawn ones
@@ -108,6 +110,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/moderate/entries/{key}/{hash}", post(decide))
         .route("/moderate/reports/{id}", post(settle_report))
         .route("/.well-known/jwks.json", get(jwks))
+        .route("/privacy", get(privacy))
+        .route("/terms", get(terms))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/commons/entries", get(api_entries).post(api_submit))
         .route("/api/commons/usage", post(api_usage))
@@ -229,6 +233,16 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let session = session(&app, &headers).await;
     let counts = app.db.counts().await.unwrap_or_default();
     page(&app, session.as_ref(), "The Commons", &pages::home(&counts, session.is_some(), &Provider::enabled(&app.config)))
+}
+
+async fn privacy(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let session = session(&app, &headers).await;
+    page(&app, session.as_ref(), "Privacy", &pages::privacy())
+}
+
+async fn terms(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let session = session(&app, &headers).await;
+    page(&app, session.as_ref(), "Terms", &pages::terms())
 }
 
 async fn signin(State(app): State<Arc<App>>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {

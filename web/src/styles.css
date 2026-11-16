@@ -1580,3 +1580,476 @@ mark.current {
     overflow-wrap: anywhere;
   }
 }
+
+/* ------------------------------------------------------------------------------------
+   Soft shape and motion. Same black, white and link blue; every box is rounded and
+   everything that appears, moves or locks glides. Tokens first, then the shapes, then the
+   keyframes. Motion off (.no-motion) and prefers-reduced-motion switch all of it off at
+   the bottom of this block.
+   ------------------------------------------------------------------------------------ */
+
+:root {
+  /* Radius scale: chips and keys, controls, cards and panels, sheets and the palette. */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-pill: 999px;
+  /* Durations and easings. Mirrored in src/motion.ts for the GSAP and Framer parts. */
+  --t-fast: 140ms;
+  --t-base: 220ms;
+  --t-slow: 380ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-inout: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --lift: 0 6px 22px -10px color-mix(in srgb, var(--ink) 45%, transparent);
+  --lift-hi: 0 14px 34px -12px color-mix(in srgb, var(--ink) 55%, transparent);
+}
+
+/* Controls */
+button,
+.button {
+  border-radius: var(--r-pill);
+  transition:
+    background-color var(--t-fast) var(--ease-out),
+    color var(--t-fast) var(--ease-out),
+    transform var(--t-fast) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out),
+    opacity var(--t-base) var(--ease-out);
+}
+button:hover:not(:disabled):not(.icon):not(.link):not(.ghost),
+.button:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--lift);
+}
+button:active:not(:disabled),
+.button:active {
+  transform: translateY(0) scale(0.97);
+  box-shadow: none;
+}
+button.icon,
+button.link,
+button.ghost,
+button.icon:hover,
+button.link:hover {
+  border-radius: var(--r-sm);
+}
+input,
+select,
+textarea {
+  border-radius: var(--r-sm);
+  transition:
+    border-color var(--t-fast) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
+}
+textarea {
+  border-radius: var(--r-md);
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 18%, transparent);
+}
+:focus-visible {
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+input[type="checkbox"] {
+  border-radius: var(--r-xs);
+}
+.seg {
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+.seg button {
+  border-radius: 0;
+}
+.seg button:hover:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+}
+kbd {
+  border-radius: var(--r-xs);
+}
+
+/* Boxes */
+.card,
+.plan,
+.agent,
+.item,
+.banner,
+.empty,
+.brief,
+.draft,
+.code,
+pre,
+.cite-pop,
+.composer,
+.comment-box,
+.signin-card {
+  border-radius: var(--r-md);
+}
+.card,
+.plan,
+.agent,
+.approval {
+  transition:
+    transform var(--t-base) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out),
+    border-color var(--t-base) var(--ease-out);
+}
+.approval {
+  border: 2px solid var(--ink);
+  border-radius: var(--r-lg);
+}
+.signin-card {
+  border-width: 1px;
+  border-radius: var(--r-lg);
+  box-shadow: var(--lift);
+}
+.badge,
+.chip,
+.thumb,
+.shot-full,
+.preview-frame iframe {
+  border-radius: var(--r-pill);
+}
+.thumb,
+.shot-full,
+.preview-frame iframe {
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.chip {
+  padding-inline: 10px;
+}
+.dot {
+  border-radius: 50%;
+}
+.table-wrap {
+  border-radius: var(--r-sm);
+}
+.gallery-card {
+  overflow: hidden;
+}
+.gallery-card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--lift-hi);
+}
+.gallery-card.ask {
+  outline: 0;
+  border-width: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.frame {
+  border-radius: 0;
+}
+.frame.shot {
+  transition: transform var(--t-slow) var(--ease-out);
+}
+.gallery-card:hover .frame.shot {
+  transform: scale(1.035);
+}
+.frame-link {
+  display: block;
+  overflow: hidden;
+}
+.agent.focused {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.lock-rule {
+  border-radius: var(--r-pill);
+}
+
+/* Navigation */
+.nav a,
+.runrow,
+.palette-hint {
+  border-radius: var(--r-sm);
+}
+.nav {
+  padding: 6px 8px;
+  gap: 2px;
+}
+.nav a {
+  transition: background-color var(--t-fast) var(--ease-out);
+}
+.nav a:hover {
+  background: var(--soft);
+  text-decoration: none;
+}
+.nav a.on {
+  background: var(--soft);
+  text-decoration: none;
+}
+.palette-hint {
+  margin-inline: 8px;
+}
+.runlist ul {
+  padding-inline: 8px;
+}
+.runrow {
+  border-left: 0;
+  box-shadow: inset 3px 0 0 transparent;
+  transition:
+    background-color var(--t-fast) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
+}
+.runrow:hover {
+  background: var(--soft);
+}
+.runrow.on {
+  box-shadow: inset 3px 0 0 var(--ink);
+}
+.tabs button,
+.panel-tab {
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+.tabs button,
+.panel-tab-name {
+  transition: background-color var(--t-fast) var(--ease-out);
+}
+.panel-tab-name {
+  border-radius: var(--r-sm) 0 0 0;
+}
+.tabs button:hover,
+.panel-tab:hover {
+  transform: none;
+  box-shadow: none;
+}
+.panel-tab,
+.tabs button {
+  position: relative;
+}
+.diff-file {
+  border-radius: var(--r-md);
+  border: 1px solid var(--ink);
+  margin: 0 8px 10px;
+  overflow: clip;
+}
+.diff-file-head {
+  border-radius: var(--r-md) var(--r-md) 0 0;
+}
+.popup {
+  border-radius: var(--r-md);
+  overflow: hidden;
+  box-shadow: var(--lift-hi);
+}
+.popup-item {
+  border-radius: 0;
+}
+.popup-item:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+/* Floating things */
+.palette {
+  border-width: 1px;
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  box-shadow: var(--lift-hi);
+}
+.palette-input {
+  border-radius: 0;
+}
+.menu,
+.submenu {
+  border-radius: var(--r-md);
+  padding: 4px;
+  box-shadow: var(--lift-hi);
+}
+.menu-list {
+  padding: 0;
+}
+.menu-item {
+  border-radius: var(--r-sm);
+}
+.menu-item:hover:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+}
+.toast {
+  border-radius: var(--r-md);
+  box-shadow: var(--lift-hi);
+}
+.sheet {
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  border-top-width: 1px;
+  box-shadow: 0 -16px 40px -16px color-mix(in srgb, var(--ink) 45%, transparent);
+}
+.sheet-grip::after {
+  border-radius: var(--r-pill);
+}
+.popup-item.on,
+.palette-list button.on {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 30%, transparent) transparent;
+}
+
+/* Entrances */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(24px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes lock-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ink) 35%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 14px transparent;
+  }
+}
+@keyframes settle {
+  0% {
+    transform: scale(0.985);
+  }
+  60% {
+    transform: scale(1.006);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.main > * {
+  animation: rise var(--t-slow) var(--ease-out) both;
+}
+.palette-back,
+.sheet-back {
+  animation: fade var(--t-base) var(--ease-out) both;
+}
+.palette {
+  animation: pop var(--t-base) var(--ease-spring) both;
+}
+.sheet {
+  animation: slide-up var(--t-slow) var(--ease-out) both;
+}
+.menu,
+.submenu,
+.popup,
+.cite-pop {
+  animation: pop var(--t-fast) var(--ease-out) both;
+  transform-origin: top left;
+}
+.popup {
+  transform-origin: bottom left;
+}
+.toast {
+  animation: toast-in var(--t-base) var(--ease-spring) both;
+}
+.approval,
+.banner {
+  animation: rise var(--t-slow) var(--ease-out) both;
+}
+.plan[data-arrived="true"] {
+  animation: settle var(--t-slow) var(--ease-spring) both, lock-pulse 900ms var(--ease-out) 120ms both;
+}
+.drawer-back {
+  animation: fade var(--t-base) var(--ease-out) both;
+}
+.draft,
+.chip {
+  animation: pop var(--t-base) var(--ease-out) both;
+}
+.diff-file,
+.item,
+.attempt {
+  animation: rise var(--t-slow) var(--ease-out) both;
+}
+
+@media (max-width: 900px) {
+  .side {
+    border-radius: 0 var(--r-lg) var(--r-lg) 0;
+    transition: transform var(--t-base) var(--ease-out);
+    box-shadow: var(--lift-hi);
+  }
+  .side:not(.open) {
+    box-shadow: none;
+  }
+  .topbar button {
+    border-radius: var(--r-pill);
+  }
+}
+
+/* Off switches. Last, so nothing above can outrank them. */
+.no-motion *,
+.no-motion *::before,
+.no-motion *::after {
+  transition: none !important;
+  animation: none !important;
+  scroll-behavior: auto !important;
+}
+.no-motion button:hover,
+.no-motion .button:hover,
+.no-motion .gallery-card:hover,
+.no-motion .gallery-card:hover .frame.shot {
+  transform: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+  button:hover,
+  .button:hover,
+  .gallery-card:hover,
+  .gallery-card:hover .frame.shot {
+    transform: none !important;
+  }
+}
+
+.agent {
+  overflow: clip;
+}

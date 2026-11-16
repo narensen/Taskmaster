@@ -6,6 +6,7 @@ import gsap from "gsap";
 import type { Plan } from "../api";
 import { KnownPath } from "../paths";
 import { motionOn } from "../prefs";
+import { dur, ease } from "../motion";
 import { tokens, usd } from "../format";
 
 export function PlanView({ plan, arrived, compact }: { plan: Plan; arrived?: boolean; compact?: boolean }) {
@@ -13,15 +14,16 @@ export function PlanView({ plan, arrived, compact }: { plan: Plan; arrived?: boo
   useLayoutEffect(() => {
     if (!arrived || !ref.current || !motionOn()) return;
     const tl = gsap.timeline();
-    tl.from(ref.current, { opacity: 0, y: 10, duration: 0.3, ease: "power2.out" })
-      .from(ref.current.querySelectorAll("tbody tr"), { opacity: 0, x: -8, stagger: 0.05, duration: 0.2 }, "-=0.1")
-      .fromTo(ref.current.querySelector(".lock-rule"), { scaleX: 0 }, { scaleX: 1, transformOrigin: "left", duration: 0.4, ease: "power3.inOut" });
+    tl.from(ref.current, { opacity: 0, y: 14, duration: dur.slow, ease: ease.out })
+      .from(ref.current.querySelectorAll("tbody tr"), { opacity: 0, x: -10, stagger: 0.06, duration: dur.base, ease: ease.out }, "-=0.15")
+      .fromTo(ref.current.querySelector(".lock-rule"), { scaleX: 0 }, { scaleX: 1, transformOrigin: "left", duration: 0.5, ease: ease.inOut }, "-=0.2")
+      .from(ref.current.querySelectorAll("p.small, .file-tag"), { opacity: 0, y: 6, stagger: 0.04, duration: dur.base, ease: ease.out }, "-=0.3");
     return () => {
       tl.kill();
     };
   }, [arrived]);
   return (
-    <div className={`plan ${compact ? "compact" : ""}`} ref={ref} data-testid="locked-plan">
+    <div className={`plan ${compact ? "compact" : ""}`} ref={ref} data-testid="locked-plan" data-arrived={arrived ? "true" : undefined}>
       <div className="plan-head">
         <span className="strong">Locked plan</span>
         <span className="muted small">

@@ -9,6 +9,7 @@ import { api, callAt, type RunSummary } from "../api";
 import { Link } from "../router";
 import { ExternalLink } from "../paths";
 import { phaseLabel, usd } from "../format";
+import { dur, ease } from "../motion";
 import { motionOn, setPrefs, usePrefs } from "../prefs";
 import { ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
@@ -135,7 +136,7 @@ export function Gallery() {
     if (animated.current || !grid.current || !list.length) return;
     animated.current = true;
     if (!motionOn()) return;
-    gsap.from(grid.current.querySelectorAll(".gallery-card"), { opacity: 0, y: 12, duration: 0.35, stagger: 0.04, ease: "power2.out" });
+    gsap.from(grid.current.querySelectorAll(".gallery-card"), { opacity: 0, y: 18, scale: 0.97, duration: dur.slow, stagger: 0.05, ease: ease.out, clearProps: "opacity,transform,scale" });
   }, [list.length]);
 
   return (

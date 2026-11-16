@@ -112,7 +112,7 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
                   { label: flags.archived ? "Unarchive" : "Archive", run: () => toggleFlag(run.id, "archived") },
                 ]);
               return (
-                <motion.li key={run.id} layout="position" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                <motion.li key={run.id} layout="position" initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -8 }} transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}>
                   {head && <div className="group-head">{head}</div>}
                   <div
                     className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}

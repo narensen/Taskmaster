@@ -107,9 +107,9 @@ export function AgentSurface({
   return (
     <motion.section
       layout="position"
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
+      initial={{ opacity: 0, y: 14, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
       className={`agent state-${s.state} ${focused ? "focused" : ""}`}
       id={`agent-${s.id}`}
       data-agent={s.id}

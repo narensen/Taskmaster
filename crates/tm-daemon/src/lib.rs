@@ -22,6 +22,7 @@ mod engine;
 mod eval;
 mod git;
 pub mod live;
+pub mod preview;
 mod reply;
 mod resume;
 mod runtime;

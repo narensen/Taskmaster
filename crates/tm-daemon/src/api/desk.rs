@@ -10,6 +10,9 @@
 //! POST /api/runs/{id}/terminal    {command}: run it in the project as the daemon's user
 //! GET  /api/runs/{id}/diff        ?scope=run|page&page=<id>
 //! POST /api/runs/{id}/pr          push the run's branch and open a draft pull request
+//! GET  /api/runs/{id}/preview     the run's live preview: whether the project has a dev server, and its url
+//! POST /api/runs/{id}/preview     start the run's dev server (once; it listens on this machine only)
+//! POST /api/runs/{id}/preview/stop
 //! GET  /api/approvals             ?run=<id> risky tool calls waiting for a person
 //! POST /api/approvals/{id}/{approve|deny}   answer one
 //! GET  /api/settings              where this daemon keeps things, and the approval policy
@@ -810,6 +813,53 @@ pub async fn skills(State(app): State<Arc<App>>) -> Reply {
     }
     found.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     ok(json!({ "skills": found }))
+}
+
+// The live preview.
+
+fn preview_view(app: &App, id: &str) -> Value {
+    let status = app.previews.status(id);
+    json!({
+        "available": app.previews.available(),
+        "state": status.as_ref().map(|s| s.state).unwrap_or("none"),
+        "url": status.as_ref().filter(|s| matches!(s.state, "starting" | "running")).map(|s| s.url.clone()),
+        "port": status.as_ref().map(|s| s.port),
+        "command": status.as_ref().map(|s| s.command.clone()),
+        "reason": status.as_ref().and_then(|s| s.reason.clone()),
+        "output": status.as_ref().filter(|s| s.state == "failed").map(|_| app.previews.output(id)),
+        "started": status.as_ref().map(|s| s.started.clone()),
+    })
+}
+
+pub async fn preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    app.known(&id)?;
+    ok(preview_view(&app, &id))
+}
+
+pub async fn start_preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    let run = app.known(&id)?;
+    if !app.previews.available() {
+        return Err(fail(StatusCode::CONFLICT, "this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file"));
+    }
+    let meta = app.records.meta(&id)?;
+    if meta.is_none() || matches!(run.phase, RunPhase::Planning | RunPhase::AwaitingApproval) {
+        return Err(fail(StatusCode::CONFLICT, "there is nothing to preview until the run has started building"));
+    }
+    if app.is_active(&id) && run.phase != RunPhase::Done {
+        return Err(fail(StatusCode::CONFLICT, "the run is still building; preview it when it stops"));
+    }
+    // A run still on its branch is previewed from that branch; a merged one from the project.
+    let branch = meta.and_then(|m| m.branch).filter(|branch| crate::git::branch_exists(&app.project, branch));
+    match app.previews.start(&id, branch.as_deref()).await {
+        Ok(_) => accepted(preview_view(&app, &id)),
+        Err(err) => Err(fail(StatusCode::CONFLICT, format!("{err:#}"))),
+    }
+}
+
+pub async fn stop_preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    app.known(&id)?;
+    app.previews.stop(&id);
+    ok(preview_view(&app, &id))
 }
 
 // Approvals.

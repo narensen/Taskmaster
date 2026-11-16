@@ -2076,6 +2076,145 @@ mod http {
         assert_eq!(client.get("/api/runs/pr1/diff?scope=page").await.0, 409);
     }
 
+    fn have_python() -> bool {
+        std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
+    }
+
+    /// A stub dev server: Python's file server on `$PORT`, in the directory it was started in.
+    const STUB: &str = "python3 -m http.server {port} --bind 127.0.0.1";
+
+    async fn fetch(port: u16, path: &str) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        stream.write_all(format!("GET {path} HTTP/1.0\r\nhost: x\r\n\r\n").as_bytes()).await.ok()?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.ok()?;
+        reply.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+    }
+
+    async fn until<F: std::future::Future<Output = bool>>(what: &str, mut check: impl FnMut() -> F) {
+        for _ in 0..400 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn the_dev_command_is_the_settings_or_the_projects_own_script() {
+        use crate::preview::dev_command;
+        let tmp = repo("preview-cmd");
+        assert_eq!(dev_command(&tmp.0, "", 3000), None);
+        assert_eq!(dev_command(&tmp.0, "serve --port {port}", 4000).as_deref(), Some("serve --port 4000"));
+        std::fs::write(tmp.0.join("package.json"), r#"{"scripts":{"dev":"next dev"},"dependencies":{"next":"15"}}"#).unwrap();
+        assert_eq!(dev_command(&tmp.0, "", 3001).as_deref(), Some("npm run dev -- -p 3001 -H 127.0.0.1"));
+        std::fs::write(tmp.0.join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(tmp.0.join("package.json"), r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"6"}}"#).unwrap();
+        assert_eq!(dev_command(&tmp.0, "", 3002).as_deref(), Some("pnpm run dev -- --port 3002 --host 127.0.0.1 --strictPort"));
+        std::fs::write(tmp.0.join("package.json"), r#"{"scripts":{"build":"x"}}"#).unwrap();
+        assert_eq!(dev_command(&tmp.0, "", 3003), None);
+        assert_eq!(dev_command(&tmp.0, "   ", 3003), None);
+    }
+
+    #[tokio::test]
+    async fn a_run_gets_a_dev_server_that_is_tracked_and_stopped() {
+        if !have_python() {
+            eprintln!("python3 is not installed; skipping the preview test");
+            return;
+        }
+        let tmp = seeded("preview");
+        let world = World::new(Mode::Write);
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let code = auth.code().to_string();
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        let w = world.clone();
+        options.harness = Arc::new(move |_| Ok(Arc::new(Fake(w.clone())) as Arc<dyn Harness>));
+        options.preview_command = STUB.into();
+        let server = Server::serve(options).await.unwrap();
+        let mut client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
+        client.token = Some(client.post("/api/pair", json!({ "code": code })).await.1["token"].as_str().unwrap().to_string());
+
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "pv", "plan": planned })).await;
+        client.settled("pv", "awaiting_approval").await;
+        let (_, before) = client.get("/api/runs/pv/preview").await;
+        assert_eq!((before["available"].as_bool(), before["state"].as_str(), before["url"].is_null()), (Some(true), Some("none"), true), "{before}");
+        // Nothing to show until it has been built.
+        assert_eq!(client.post("/api/runs/pv/preview", json!({})).await.0, 409);
+        assert_eq!(client.get("/api/runs/nope/preview").await.0, 404);
+        client.post("/api/runs/pv/approve", json!({})).await;
+        client.settled("pv", "done").await;
+
+        // Started once, tracked, and it serves the project the run was merged into.
+        let (status, started) = client.post("/api/runs/pv/preview", json!({})).await;
+        assert_eq!(status, 202, "{started}");
+        let port = started["port"].as_u64().unwrap() as u16;
+        assert!(started["url"].as_str().unwrap().starts_with(&format!("http://127.0.0.1:{port}")));
+        until("the preview to run", || async { client.get("/api/runs/pv/preview").await.1["state"] == "running" }).await;
+        let again = client.post("/api/runs/pv/preview", json!({})).await.1;
+        assert_eq!(again["port"].as_u64().unwrap() as u16, port, "a second start finds the first");
+        let listing = fetch(port, "/").await.unwrap();
+        assert!(listing.contains("app/"), "{listing}");
+
+        // Stopping ends it, and the port goes quiet.
+        let (_, stopped) = client.post("/api/runs/pv/preview/stop", json!({})).await;
+        assert_eq!(stopped["state"], "stopped");
+        until("the port to close", || async { fetch(port, "/").await.is_none() }).await;
+        // A stopped preview can be started again, on a new port if need be.
+        let (_, restarted) = client.post("/api/runs/pv/preview", json!({})).await;
+        let port = restarted["port"].as_u64().unwrap() as u16;
+        until("the second preview", || async { client.get("/api/runs/pv/preview").await.1["state"] == "running" }).await;
+
+        // The daemon going away takes its previews with it.
+        drop(server);
+        until("the port to close after the daemon stops", || async { fetch(port, "/").await.is_none() }).await;
+    }
+
+    #[tokio::test]
+    async fn a_run_still_on_its_branch_is_previewed_from_a_checkout_that_goes_with_it() {
+        use crate::preview::Previews;
+        if !have_python() {
+            return;
+        }
+        let tmp = seeded("preview-branch");
+        git(&tmp.0, &["checkout", "-q", "-b", "taskmaster/r9"]);
+        std::fs::write(tmp.0.join("only-on-the-branch.txt"), "branch content\n").unwrap();
+        git(&tmp.0, &["add", "."]);
+        git(&tmp.0, &["commit", "-q", "-m", "branch work"]);
+        git(&tmp.0, &["checkout", "-q", "main"]);
+        let project = tmp.0.canonicalize().unwrap();
+        assert!(!project.join("only-on-the-branch.txt").exists());
+
+        let previews = Previews::new(project.clone(), STUB.into());
+        let started = previews.start("r9", Some("taskmaster/r9")).await.unwrap();
+        let tree = std::path::PathBuf::from(&started.dir);
+        assert!(tree.join("only-on-the-branch.txt").is_file() && tree != project);
+        until("the preview", || async { fetch(started.port, "/only-on-the-branch.txt").await.is_some_and(|b| b.contains("branch content")) }).await;
+        previews.stop("r9");
+        until("the checkout to be removed", || async { !tree.exists() }).await;
+        assert_eq!(previews.status("r9").unwrap().state, "stopped");
+        let worktrees = git_out(&project, &["worktree", "list"]);
+        assert_eq!(worktrees.lines().count(), 1, "{worktrees}");
+    }
+
+    #[tokio::test]
+    async fn a_dev_server_that_dies_is_reported_with_what_it_said() {
+        use crate::preview::Previews;
+        let tmp = repo("preview-fail");
+        let project = tmp.0.canonicalize().unwrap();
+        let previews = Previews::new(project.clone(), "echo cannot bind {port} >&2; exit 3".into());
+        previews.start("r1", None).await.unwrap();
+        until("the failure", || async { previews.status("r1").unwrap().state == "failed" }).await;
+        let reason = previews.status("r1").unwrap().reason.unwrap();
+        assert!(reason.contains("code 3") && reason.contains("cannot bind"), "{reason}");
+        // No dev server at all is an error before anything starts.
+        let none = Previews::new(project, String::new());
+        assert!(!none.available());
+        assert!(none.start("r2", None).await.unwrap_err().to_string().contains("no dev server"));
+    }
+
 }
 
 mod commons_service {

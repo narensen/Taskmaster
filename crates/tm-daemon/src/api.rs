@@ -149,6 +149,7 @@ impl Drop for Server {
             let _ = active.cancel.send(true);
         }
         self.app.live.approvals.refuse_all();
+        self.app.previews.stop_all();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
@@ -178,7 +179,7 @@ struct App {
     live: Arc<Live>,
     /// The editor override; the settings file's value until `POST /api/settings` changes it.
     editor: Mutex<String>,
-    preview_command: String,
+    previews: crate::preview::Previews,
 }
 
 impl Server {
@@ -200,6 +201,7 @@ impl Server {
         };
         let live = Arc::new(Live::new(live_store));
         live.approvals.set_policy(options.approvals);
+        let project_for_previews = project.clone();
         let app = Arc::new(App {
             dictionary: options.dictionary.unwrap_or_else(|| project.join(".taskmaster/dictionary")),
             commons: options.commons.unwrap_or_else(|| project.join(".taskmaster/commons")),
@@ -213,7 +215,7 @@ impl Server {
             active: Mutex::new(HashMap::new()),
             live,
             editor: Mutex::new(options.editor),
-            preview_command: options.preview_command,
+            previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -257,6 +259,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/terminal", post(desk::terminal))
         .route("/api/runs/{id}/diff", get(desk::diff))
         .route("/api/runs/{id}/pr", post(desk::open_pr))
+        .route("/api/runs/{id}/preview", get(desk::preview).post(desk::start_preview))
+        .route("/api/runs/{id}/preview/stop", post(desk::stop_preview))
         .route("/api/approvals", get(desk::approvals))
         .route("/api/approvals/{id}/{decision}", post(desk::decide))
         .route("/api/settings", get(desk::settings).post(desk::update_settings))
@@ -533,6 +537,8 @@ impl App {
         config.cancel = cancelled;
         config.live = Some(self.live.clone());
         self.live.approvals.reopen(id);
+        // The run is about to change what it built, so a preview of the old build goes.
+        self.previews.stop(id);
         active.insert(id.to_string(), Active { cancel, in_place });
         drop(active);
 
@@ -816,6 +822,7 @@ async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
         if let Some(active) = active.get(&id) {
             let _ = active.cancel.send(true);
             app.live.approvals.refuse_run(&id);
+            app.previews.stop(&id);
             return accepted(json!({ "id": id }));
         }
     }

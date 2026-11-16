@@ -1857,7 +1857,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures-util",
- "hmac",
  "rusqlite",
  "serde",
  "serde_json",

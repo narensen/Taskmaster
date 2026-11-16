@@ -551,9 +551,11 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "sha2",
  "tm-core",
  "tm-dictionary",
  "tm-harness",
+ "tm-review",
  "tm-verify",
  "tokio",
 ]

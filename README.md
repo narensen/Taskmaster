@@ -13,7 +13,7 @@ The run is a state machine. The models do the writing. Taskmaster decides the ne
 3. **Lock.** The contracts are committed, and each page is granted the Dictionary keys it cites.
 4. **Build.** Each page gets its own git worktree. Only files matching that page's glob are merged back.
 5. **Review.** One reviewer reads each Dictionary connection the changed pages cite, then one security pass reads the dirty pages.
-6. **Verify.** A second harness confirms the findings. Confirmed findings go back to the owning page. An optional `.taskmaster/verify` program checks the whole tree.
+6. **Verify.** A second harness confirms the findings. Confirmed findings go back to the owning page. Then the project's own tools check what was built, and an optional `.taskmaster/verify` program checks the whole tree.
 
 ```bash
 cargo build --release -p tm-daemon -p tm-review
@@ -46,6 +46,16 @@ A page that fails its checks is sent back with the errors. It gets two repairs o
 
 The reviewer and the verifier are different harnesses, so one model does not grade its own page. Findings the verifier rejects are dropped. A write outside the page's glob fails the attempt, including a write to a locked contract. Up to four pages build at once. `--parallel` changes that for a new run. A resumed run keeps the parallelism it started with.
 
+## Checks that cost nothing
+
+Before a run finishes, the files it built are typechecked and linted with tools the project already has: `tsc` from `node_modules`, eslint when it is configured, clippy for Rust, ruff for Python. Only errors count. A type error, a compile error, or a lint rule the project set to `error` goes back to the page that owns the file, and into that model's Errorography. Style warnings do not. An error in a file no page owns is printed and does not fail the run. Taskmaster installs nothing here.
+
+## What a run cost
+
+Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the page, the harness, the model, the tokens, the seconds, and the price when the harness reports one. The last line a run prints is the total next to the plan's estimate. `status.json` has the same totals split by role and by model.
+
+Claude Code reports a price. A harness that does not, such as Antigravity, still has its tokens counted, and the dollar total says how many calls it leaves out.
+
 ## Dictionary and Commons
 
 The Dictionary is an immutable, content-addressed store. Pages cite keys. They do not invent a second copy of a contract in the brief.
@@ -62,19 +72,55 @@ The project store is `.taskmaster/dictionary`. The Commons defaults to `~/.taskm
 
 ## Eval
 
-`--eval` runs the same plan again on one baseline harness and writes `.taskmaster/evals/<id>.json`. A prompt is planned once, and the baseline reuses that plan. The baseline defaults to the master harness. The comparison runs after the plan is approved.
+`--eval` runs the same plan again on one baseline harness and writes `.taskmaster/evals/<id>.json`. Each side reports its pages, its check failures, its tokens, and its cost. A prompt is planned once, and the baseline reuses that plan. The baseline defaults to the master harness. The comparison runs after the plan is approved.
 
 ```bash
 tm-daemon . --prompt "A small notes app with a list and an editor." --eval --baseline codex --yes
 ```
 
-## Phone
+## The API
 
-`--pair` serves a status page on this machine's Tailscale address, port 8737. The terminal prints a code. The phone submits that code and then polls each run's phase and each page's state. The page is served only on a Tailscale address.
+`serve` keeps the daemon up with no run of its own. A frontend starts, approves, rejects, resumes and cancels runs through it, reads the event log and the ledger, searches the Dictionary, and starts reviews.
 
 ```bash
-tm-daemon . --pair
+tm-daemon serve .
+tm-daemon serve . --tailscale
 ```
+
+The first command listens on `127.0.0.1:8737`. `--tailscale` listens on this machine's Tailscale address, which is how a phone reaches it. The terminal prints a pairing code. A device posts the code once and gets a token; every other call sends that token. Paired devices stay paired across restarts, and only a hash of each token is stored.
+
+```text
+POST /api/pair                  {code} -> {token}
+GET  /api/runs                  every run, with its phase, pages and spend
+POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?}
+GET  /api/runs/{id}             one run, with its plan
+GET  /api/runs/{id}/events      ?after=<n>
+GET  /api/runs/{id}/ledger
+GET  /api/runs/{id}/changes
+POST /api/runs/{id}/approve
+POST /api/runs/{id}/reject      {prompt?} plans again when a prompt is given
+POST /api/runs/{id}/resume
+POST /api/runs/{id}/cancel
+GET  /api/providers
+GET  /api/dictionary            ?q=<text>
+GET  /api/dictionary/{key}
+GET  /api/errorography
+GET  /api/reviews
+POST /api/reviews               {target?, base?, head?, pr?, dirty?}
+GET  /api/reviews/{id}
+```
+
+One run builds at a time, because a run commits into the project's working tree. `GET /` is a small page for a phone: it pairs, lists the runs, and approves a waiting plan. `--pair` on a run serves the same API on the tailnet for as long as that run lasts.
+
+## Left open on purpose
+
+Three parts are behind traits, so each can be replaced without touching the engine.
+
+| Trait | Today | Later |
+| --- | --- | --- |
+| `Store` | Files under `.taskmaster/` | A database. Five operations on named records. |
+| `Auth` | A pairing code and one token per device | Accounts. `enroll` takes what a sign-in returns, `identify` says whose token it is. |
+| `CommonsRemote` | Nothing. The Commons is a directory on this machine. | A Commons shared between people. The daemon already pulls before it plans and pushes each entry it promotes. |
 
 ## Review any repository
 
@@ -85,7 +131,7 @@ tm-review . --dirty
 tm-review https://github.com/org/repo --pr 12
 ```
 
-Give it a repository or a request on GitHub, GitLab, Bitbucket, Gitea, Forgejo, Codeberg, Azure DevOps, or SourceHut. `--pr` reviews that request on the local `origin`. `--base` and `--head` select a range. The import graph is built from the repo. Clippy, eslint, and ruff run when the diff speaks those languages, and `--install-lints` installs a missing linter. A second harness verifies the findings. Confirmed and rejected findings are appended to `.taskmaster/reviews/history.jsonl`.
+Give it a repository or a request on GitHub, GitLab, Bitbucket, Gitea, Forgejo, Codeberg, Azure DevOps, or SourceHut. `--pr` reviews that request on the local `origin`. `--base` and `--head` select a range. The import graph is built from the repo. Clippy, `tsc`, eslint, and ruff run when the diff speaks those languages and the tool is there. `--install-lints` installs clippy when it is missing, and nothing else. A second harness verifies the findings. Confirmed and rejected findings are appended to `.taskmaster/reviews/history.jsonl`.
 
 Rules for the whole project live in `.taskmaster/REVIEW.md`. A `REVIEW.md` further down the tree covers that directory and everything under it. The reviewer defaults to `claude` and the verifier to `agy`.
 
@@ -93,6 +139,8 @@ Rules for the whole project live in `.taskmaster/REVIEW.md`. A `REVIEW.md` furth
 
 ```text
 tm-daemon providers [--harness <h>]
+
+tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
 
 tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
           [--worker <h>] [--mid <h>] [--master <h>]
@@ -116,7 +164,7 @@ Commits the daemon makes need `user.name` and `user.email` on that repository. T
 | Crate | Role |
 | --- | --- |
 | `tm-core` | The plan, the Dictionary rules, and the run state machine. No I/O. |
-| `tm-daemon` | The executor. The binary is `tm-daemon`. |
+| `tm-daemon` | The executor, the ledger, and the API. The binary is `tm-daemon`. |
 | `tm-dictionary` | The local store, the Commons, and the MCP server. |
 | `tm-harness` | Headless adapters for Claude Code, Antigravity, Grok, Codex, and OpenCode. |
 | `tm-verify` | Ownership globs and the import graph. |

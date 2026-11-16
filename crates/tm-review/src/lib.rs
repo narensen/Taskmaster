@@ -13,6 +13,7 @@ pub mod git;
 pub mod history;
 pub mod lint;
 pub mod rules;
+pub mod run;
 
 /// Directory inside the review checkout that holds the context files.
 pub const CONTEXT_DIR: &str = ".taskmaster-review";

@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! tm-daemon providers [--harness <h>]
+//! tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
 //! tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
 //!           [--worker <h>] [--mid <h>] [--master <h>]
 //!           [--reviewer <h>] [--verifier <h>]
@@ -22,17 +23,24 @@
 //! printed; nothing is built until a later run passes `--yes`. A run resumes from
 //! `.taskmaster/runs/<id>/`. `--eval` runs the plan again with one model and writes
 //! `.taskmaster/evals/<id>.json`. A prompt is planned once and reused for the baseline.
-//! `--pair` serves the phone UI on this machine's Tailscale address.
+//! `--pair` serves the API and the phone page on this machine's Tailscale address for as
+//! long as the run lasts. `serve` keeps the API up with no run of its own: a frontend
+//! starts, approves and cancels runs through it. It listens on `127.0.0.1:8737` unless
+//! `--bind` or `--tailscale` says otherwise.
 
-use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use tm_daemon::{Config, Harnesses, Models, Outcome, PhoneEndpoint, evaluate, is_tailscale, tailscale_ipv4};
-use tm_harness::{harness, provider_report, provider_reports, require_model, HARNESSES};
+use std::sync::Arc;
+
+use tm_daemon::{
+    Config, Harnesses, Models, Outcome, PairingAuth, Records, Roles, Server, ServerOptions, check_models, evaluate,
+    tailscale_ipv4,
+};
+use tm_harness::{harness, provider_report, provider_reports, HARNESSES};
 
 struct Args {
     project: PathBuf,
@@ -48,19 +56,23 @@ struct Args {
     eval: bool,
     baseline: String,
     pair: bool,
-    worker: String,
-    mid: String,
-    master: String,
-    reviewer: String,
-    verifier: String,
+    roles: Roles,
     models: Models,
+}
+
+struct ServeArgs {
+    project: PathBuf,
+    bind: Option<SocketAddr>,
+    tailscale: bool,
+    dictionary: Option<PathBuf>,
+    commons: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
     match run() {
         Ok(Outcome::Finished { ok: true }) => ExitCode::SUCCESS,
         Ok(Outcome::Finished { ok: false }) => ExitCode::from(1),
-        Ok(Outcome::NeedsApproval { .. }) => ExitCode::from(2),
+        Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => ExitCode::from(2),
         Err(err) => {
             eprintln!("taskmaster: {err:#}");
             ExitCode::from(1)
@@ -75,9 +87,13 @@ async fn run() -> anyhow::Result<Outcome> {
             print_providers(harness.as_deref()).await?;
             return Ok(Outcome::Finished { ok: true });
         }
+        Invocation::Serve(args) => {
+            serve(args).await?;
+            return Ok(Outcome::Finished { ok: true });
+        }
         Invocation::Drive(args) => args,
     };
-    validate_models(&args).await?;
+    check_models(&args.roles, &args.models).await?;
     let mut config = Config::new(&args.project);
     config.plan = match &args.plan {
         Some(path) => Some(
@@ -103,10 +119,23 @@ async fn run() -> anyhow::Result<Outcome> {
     config.commons = args.commons.clone().or_else(home_commons);
     config.run_id = args.run_id.clone();
     config.models = args.models;
-    let phone = if args.pair { Some(serve_phone(&args.project).await?) } else { None };
-    if let Some(phone) = &phone {
-        println!("taskmaster: phone {}  code {}", phone.url, phone.code);
-    }
+    let phone = if args.pair {
+        let ip = tailscale_ipv4()?;
+        let options = ServeArgs {
+            project: args.project.clone(),
+            bind: None,
+            tailscale: false,
+            dictionary: config.dictionary.clone(),
+            commons: config.commons.clone(),
+        };
+        let primary = SocketAddr::from((IpAddr::V4(ip), 8737));
+        Some(match start_server(&options, primary).await {
+            Ok(server) => server,
+            Err(_) => start_server(&options, SocketAddr::from((IpAddr::V4(ip), 0))).await?,
+        })
+    } else {
+        None
+    };
     let has_request = args.plan.is_some() || config.prompt.is_some();
     if !has_request && !args.eval {
         if phone.is_some() {
@@ -114,13 +143,7 @@ async fn run() -> anyhow::Result<Outcome> {
         }
         bail!("pass --plan or --prompt, or --pair to serve the phone");
     }
-    let harnesses = Harnesses {
-        worker: harness(&args.worker)?,
-        mid: harness(&args.mid)?,
-        master: harness(&args.master)?,
-        reviewer: harness(&args.reviewer)?,
-        verifier: harness(&args.verifier)?,
-    };
+    let harnesses = Harnesses::from_roles(&args.roles, &harness)?;
     let outcome = if args.eval {
         let baseline = harness(&args.baseline)?;
         let (outcome, report) = evaluate(config, harnesses, baseline, &args.baseline).await?;
@@ -142,27 +165,50 @@ async fn run() -> anyhow::Result<Outcome> {
 
 fn eval_line(side: &tm_daemon::EvalSide) -> String {
     let state = if side.ok { "finished" } else { "failed" };
-    format!("{state}, {} passed, {} failed, {} check failures", side.passed, side.failed, side.check_failures)
+    let mut line = format!(
+        "{state}, {} passed, {} failed, {} check failures, {} tokens in {} calls",
+        side.passed, side.failed, side.check_failures, side.tokens, side.agent_calls
+    );
+    if side.unpriced_calls < side.agent_calls {
+        line.push_str(&format!(", ${:.2}", side.cost_usd));
+    }
+    line
 }
 
 fn home_commons() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".taskmaster/commons"))
 }
 
-async fn serve_phone(project: &std::path::Path) -> anyhow::Result<PhoneEndpoint> {
-    let ip = tailscale_ipv4()?;
-    if !is_tailscale(ip) {
-        bail!("{ip} is not a Tailscale address");
+/// Start the API and print where it is and the code that pairs a device with it.
+async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Server> {
+    let project = args.project.canonicalize().with_context(|| format!("cannot open {}", args.project.display()))?;
+    let auth = Arc::new(PairingAuth::new(Records::files(&project))?);
+    let code = auth.code().to_string();
+    let mut options = ServerOptions::new(project, bind, auth);
+    options.dictionary = args.dictionary.clone();
+    options.commons = args.commons.clone().or_else(home_commons);
+    let server = Server::serve(options).await?;
+    println!("taskmaster: api {}  code {code}", server.url);
+    Ok(server)
+}
+
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let bind = match (args.bind, args.tailscale) {
+        (Some(addr), _) => addr,
+        (None, true) => SocketAddr::from((IpAddr::V4(tailscale_ipv4()?), 8737)),
+        (None, false) => SocketAddr::from(([127, 0, 0, 1], 8737)),
+    };
+    if !bind.ip().is_loopback() && !matches!(bind.ip(), IpAddr::V4(ip) if tm_daemon::is_tailscale(ip)) {
+        eprintln!("taskmaster: {bind} is neither this machine nor its tailnet; anyone who can reach it can try the code");
     }
-    let primary = SocketAddr::from((IpAddr::V4(ip), 8737));
-    match PhoneEndpoint::serve(project, primary).await {
-        Ok(endpoint) => Ok(endpoint),
-        Err(_) => PhoneEndpoint::serve(project, SocketAddr::from((IpAddr::V4(ip), 0))).await,
-    }
+    let _server = start_server(&args, bind).await?;
+    tokio::signal::ctrl_c().await.context("cannot wait for ctrl-c")?;
+    Ok(())
 }
 
 enum Invocation {
     Providers { harness: Option<String> },
+    Serve(ServeArgs),
     Drive(Args),
 }
 
@@ -171,7 +217,31 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
     if argv.first().is_some_and(|arg| arg == "providers") {
         return Ok(Invocation::Providers { harness: providers_harness(&argv[1..])? });
     }
+    if argv.first().is_some_and(|arg| arg == "serve") {
+        return Ok(Invocation::Serve(serve_args(&argv[1..])?));
+    }
     Ok(Invocation::Drive(args_from(argv)?))
+}
+
+fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
+    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]";
+    let mut argv = argv.iter().cloned();
+    let project = argv.next().filter(|arg| !arg.starts_with('-')).context(usage)?;
+    let mut args =
+        ServeArgs { project: PathBuf::from(project), bind: None, tailscale: false, dictionary: None, commons: None };
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--tailscale" => args.tailscale = true,
+            "--bind" => {
+                let value = need(&mut argv, "--bind", usage)?;
+                args.bind = Some(value.parse().with_context(|| format!("`{value}` is not an address like 127.0.0.1:8737"))?);
+            }
+            "--dictionary" => args.dictionary = Some(need(&mut argv, "--dictionary", usage)?.into()),
+            "--commons" => args.commons = Some(need(&mut argv, "--commons", usage)?.into()),
+            other => bail!("unknown argument `{other}`\n{usage}"),
+        }
+    }
+    Ok(args)
 }
 
 fn providers_harness(argv: &[String]) -> anyhow::Result<Option<String>> {
@@ -201,36 +271,9 @@ async fn print_providers(harness: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn validate_models(args: &Args) -> anyhow::Result<()> {
-    let roles = [
-        ("--worker-model", args.worker.as_str(), args.models.worker.as_deref()),
-        ("--mid-model", args.mid.as_str(), args.models.mid.as_deref()),
-        ("--master-model", args.master.as_str(), args.models.master.as_deref()),
-        ("--reviewer-model", args.reviewer.as_str(), args.models.reviewer.as_deref()),
-        ("--verifier-model", args.verifier.as_str(), args.models.verifier.as_deref()),
-    ];
-    let mut groups: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
-    for (flag, id, model) in roles {
-        let Some(model) = model else { continue };
-        if !HARNESSES.contains(&id) {
-            bail!("unknown harness `{id}`: use one of {}", HARNESSES.join(", "));
-        }
-        groups.entry(id).or_default().push((flag, model));
-    }
-    for (id, chosen) in groups {
-        let report = provider_report(id).await;
-        if let Some(note) = report.error.as_deref().filter(|_| !report.models.is_empty()) {
-            eprintln!("taskmaster: {id}: {note}");
-        }
-        for (flag, model) in chosen {
-            require_model(&report, flag, model)?;
-        }
-    }
-    Ok(())
-}
-
 fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
     let usage = "usage: tm-daemon providers [--harness <h>]\n       \
+                 tm-daemon serve <project> [--bind <addr>] [--tailscale]\n       \
                  tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] \
                  [--yes] [--worker <h>] [--mid <h>] [--master <h>] [--reviewer <h>] \
                  [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
@@ -257,13 +300,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         eval: false,
         baseline: "claude".into(),
         pair: false,
-        // The reviewer and the verifier are different harnesses, so one model does not
-        // check its own work. The worker is the cheap one.
-        worker: "agy".into(),
-        mid: "grok".into(),
-        master: "claude".into(),
-        reviewer: "claude".into(),
-        verifier: "agy".into(),
+        roles: Roles::default(),
         models: Models::default(),
     };
     let mut baseline_set = false;
@@ -273,11 +310,11 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
             "--plan" => args.plan = Some(need(&mut argv, "--plan", usage)?.into()),
             "--prompt" => args.prompt = Some(need(&mut argv, "--prompt", usage)?),
             "--prompt-file" => args.prompt_file = Some(need(&mut argv, "--prompt-file", usage)?.into()),
-            "--worker" => args.worker = need(&mut argv, "--worker", usage)?,
-            "--mid" => args.mid = need(&mut argv, "--mid", usage)?,
-            "--master" => args.master = need(&mut argv, "--master", usage)?,
-            "--reviewer" => args.reviewer = need(&mut argv, "--reviewer", usage)?,
-            "--verifier" => args.verifier = need(&mut argv, "--verifier", usage)?,
+            "--worker" => args.roles.worker = need(&mut argv, "--worker", usage)?,
+            "--mid" => args.roles.mid = need(&mut argv, "--mid", usage)?,
+            "--master" => args.roles.master = need(&mut argv, "--master", usage)?,
+            "--reviewer" => args.roles.reviewer = need(&mut argv, "--reviewer", usage)?,
+            "--verifier" => args.roles.verifier = need(&mut argv, "--verifier", usage)?,
             "--worker-model" => args.models.worker = Some(need(&mut argv, "--worker-model", usage)?),
             "--mid-model" => args.models.mid = Some(need(&mut argv, "--mid-model", usage)?),
             "--master-model" => args.models.master = Some(need(&mut argv, "--master-model", usage)?),
@@ -302,7 +339,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         }
     }
     if !baseline_set {
-        args.baseline = args.master.clone();
+        args.baseline = args.roles.master.clone();
     }
     if args.plan.is_some() && (args.prompt.is_some() || args.prompt_file.is_some()) {
         bail!("pass only one of --plan and --prompt\n{usage}");
@@ -349,16 +386,30 @@ mod args_tests {
     #[test]
     fn the_taskmaster_harness_and_its_model_are_chosen() {
         let args = parse("proj --master grok --master-model grok-4.7 --plan p.json").unwrap();
-        assert_eq!(args.master, "grok");
+        assert_eq!(args.roles.master, "grok");
         assert_eq!(args.models.master.as_deref(), Some("grok-4.7"));
         assert_eq!(args.baseline, "grok");
+    }
+
+    #[test]
+    fn serve_takes_a_project_and_an_address() {
+        let argv = "serve proj --bind 127.0.0.1:9000 --commons /tmp/c".split_whitespace().map(str::to_string);
+        match invocation_from(argv).unwrap() {
+            Invocation::Serve(args) => {
+                assert_eq!(args.project, PathBuf::from("proj"));
+                assert_eq!(args.bind, Some("127.0.0.1:9000".parse().unwrap()));
+                assert!(!args.tailscale);
+            }
+            _ => panic!("serve was read as a project"),
+        }
+        assert!(invocation_from(["serve".to_string()]).is_err());
     }
 
     #[test]
     fn providers_lists_models_without_a_project() {
         match invocation_from(["providers".to_string()]).unwrap() {
             Invocation::Providers { harness: None } => {}
-            Invocation::Drive(_) => panic!("providers was read as a project"),
+            Invocation::Drive(_) | Invocation::Serve(_) => panic!("providers was read as a project"),
             Invocation::Providers { harness: Some(name) } => panic!("unexpected filter {name}"),
         }
         match invocation_from(["providers".into(), "--harness".into(), "grok".into()]).unwrap() {

@@ -3,24 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use tm_core::docs::{
     ARCHITECTURE_FILE, CHANGES_FILE, render_architecture, render_changes, review_brief, security_brief, verify_brief,
 };
 use tm_core::{
     ChangeEntry, ChangeKind, Citation, Command, DictTier, DraftEntry, EntryKind, Event, Finding, Flag,
-    FlagResolution, PageId, PagePlan, Plan, ReviewScope, Run, RunPhase, Tier, WorkerOutcome, check_plan,
-    page_is_fresh, valid_key,
+    FlagResolution, LedgerEntry, PageId, PagePlan, Plan, ReviewScope, Role, Run, RunPhase, Tier, WorkerOutcome,
+    check_plan, page_is_fresh, totals, valid_key,
 };
-use tm_dictionary::{Catalog, Grant, LocalStore, McpState};
+use tm_dictionary::{Catalog, CommonsRemote, Grant, LocalStore, McpState};
 use tm_harness::{
-    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, WorkerTask, WorktreeGate,
+    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, Usage, WorkerTask, WorktreeGate,
 };
 use tm_verify::{ImportGraph, Owners, load_sources, outside_owned};
 use tokio::net::TcpListener;
@@ -28,15 +25,34 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::git;
-use crate::records;
 use crate::reply::{self, Resolution};
 use crate::resume;
+use crate::secret::random_hex;
+use crate::store::{Meta, Records};
 use crate::time::rfc3339_now;
-use crate::{Config, Harnesses, Outcome, run_directory};
+use crate::{Config, Harnesses, Outcome};
 
-struct Product {
+/// What one agent said and what it cost.
+struct Answer {
     text: String,
     ok: bool,
+    usage: Usage,
+    cost_usd: Option<f64>,
+    seconds: f64,
+}
+
+/// Who a call is charged to in the ledger.
+#[derive(Clone)]
+struct Bill {
+    role: Role,
+    page: Option<PageId>,
+    harness: String,
+    model: Option<String>,
+}
+
+struct Product {
+    answer: Answer,
+    bill: Bill,
     worktree: PathBuf,
 }
 
@@ -50,20 +66,24 @@ struct AgentRequest {
     read_only: bool,
 }
 
+impl AgentRequest {
+    fn bill(&self, role: Role, page: Option<&str>) -> Bill {
+        Bill { role, page: page.map(str::to_string), harness: self.harness.id().to_string(), model: self.model.clone() }
+    }
+}
+
 enum Step {
     Continue,
     Stop(Outcome),
 }
 
-#[derive(Serialize, Deserialize)]
-struct Meta {
-    parallel: usize,
-}
-
 struct Driver {
     config: Config,
     project: PathBuf,
-    dir: PathBuf,
+    /// The run id, as the records name it.
+    id: String,
+    records: Records,
+    remote: Option<Arc<dyn CommonsRemote>>,
     run: Run,
     events: Vec<Event>,
     changes: Vec<ChangeEntry>,
@@ -111,13 +131,16 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     git::require_identity(&project)?;
     git::ensure_exclude(&project)?;
 
-    let dir = run_directory(&project, &config.run_id);
-    fs::create_dir_all(&dir)?;
-    let events: Vec<Event> = load_lines(&dir.join("events.jsonl"))?;
-    let parallel = load_parallel(&dir, !events.is_empty(), config.parallel)?;
+    let id = config.run_id.clone();
+    let records = match &config.store {
+        Some(store) => Records::new(store.clone()),
+        None => Records::files(&project),
+    };
+    let events = records.events(&id)?;
+    let parallel = load_parallel(&records, &id, !events.is_empty(), config.parallel)?;
     let run = Run::replay(parallel, events.clone());
-    let changes: Vec<ChangeEntry> = load_lines(&dir.join("changes.jsonl"))?;
-    let inflight = load_inflight(&dir.join("inflight.json"))?;
+    let changes = records.changes(&id)?;
+    let inflight = records.inflight(&id)?;
     let pending = match inflight {
         Some(cmds) => resume::reconcile(&run, &events, &changes, cmds)?,
         None if !events.is_empty() => resume::reconcile(&run, &events, &changes, vec![])?,
@@ -136,10 +159,11 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     });
     let _server = AbortOnDrop(server);
 
-    let reviewer_token = fresh_token("reviewer");
-    let verifier_token = fresh_token("verifier");
-    let master_token = fresh_token("master");
+    let reviewer_token = fresh_token()?;
+    let verifier_token = fresh_token()?;
+    let master_token = fresh_token()?;
     let run_id = config.run_id.clone();
+    let remote = config.remote.clone();
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into() });
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into() });
     mcp.grant(&master_token, Grant { run: run_id, page: "master".into() });
@@ -147,7 +171,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     let mut driver = Driver {
         config,
         project,
-        dir,
+        id,
+        records,
+        remote,
         run,
         events,
         changes,
@@ -166,7 +192,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         trees: Vec::new(),
         parallel,
     };
-    driver.grant_pages();
+    driver.grant_pages()?;
+    driver.pull_commons();
     driver.r#loop().await
 }
 
@@ -223,7 +250,7 @@ impl Driver {
                     bail!("no plan for this run; pass --plan <file> or --prompt <text>");
                 };
                 self.push_event(Event::PlanReady(plan))?;
-                self.grant_pages();
+                self.grant_pages()?;
                 Ok(Step::Continue)
             }
             RunPhase::AwaitingApproval => {
@@ -233,8 +260,9 @@ impl Driver {
             RunPhase::Done | RunPhase::Failed => {
                 let ok = self.run.phase == RunPhase::Done;
                 self.write_status(ok)?;
-                self.clear_inflight()?;
+                self.records.save_inflight(&self.id, &[])?;
                 println!("taskmaster: run {} {}", self.config.run_id, if ok { "finished" } else { "failed" });
+                println!("taskmaster: {}", self.spend_line()?);
                 Ok(Step::Stop(Outcome::Finished { ok }))
             }
             _ => bail!("run is {:?} with nothing left to do", self.run.phase),
@@ -257,11 +285,14 @@ impl Driver {
                 self.config.models.master.clone(),
                 &token,
             )?;
+            let bill = request.bill(Role::Planner, None);
             let asked = ask(request).await;
             if scratch {
                 self.drop_worktree(&cwd);
             }
-            let (text, ok) = asked?;
+            let answer = asked?;
+            self.charge(&bill, &answer)?;
+            let (text, ok) = (answer.text, answer.ok);
             if !ok {
                 errors = vec!["the planner did not finish".into()];
             } else {
@@ -271,7 +302,7 @@ impl Driver {
                         match check_plan(&plan, &drafts, &existing) {
                             Ok(()) => {
                                 let published = self.publish_drafts(&drafts, &existing)?;
-                                atomic_write(&self.dir.join("plan.json"), &serde_json::to_vec_pretty(&plan)?)?;
+                                self.records.save_plan(&self.id, &plan)?;
                                 eprintln!(
                                     "taskmaster: planned {} pages and {} new dictionary entries",
                                     plan.pages.len(),
@@ -418,7 +449,7 @@ impl Driver {
                 Ok(Step::Continue)
             }
             Command::RunVerify => {
-                let (ok, failing) = self.verify_project()?;
+                let (ok, failing) = self.verify_project().await?;
                 self.push_event(Event::VerifyFinished { ok, failing })?;
                 Ok(Step::Continue)
             }
@@ -432,6 +463,14 @@ impl Driver {
     }
 
     fn approve(&mut self) -> anyhow::Result<Step> {
+        if self.config.reject {
+            self.config.reject = false;
+            eprintln!("taskmaster: plan rejected");
+            self.push_event(Event::PlanRejected)?;
+            let replan = self.config.plan.is_some()
+                || self.config.prompt.as_ref().is_some_and(|prompt| !prompt.trim().is_empty());
+            return Ok(if replan { Step::Continue } else { Step::Stop(Outcome::Rejected) });
+        }
         if !self.config.yes {
             self.pending.push_front(Command::RequestApproval);
             self.persist()?;
@@ -452,14 +491,14 @@ impl Driver {
             bail!("expected a worker spawn");
         };
         if self.is_stale(&page) {
-            let _ = fs::remove_file(self.marker(&page));
+            self.records.clear_merged(&self.id, &page);
             eprintln!("taskmaster: {page} was built against an amended entry; discarding it");
             let outcome = WorkerOutcome::Passed;
             self.push_event(Event::WorkerFinished { page, outcome })?;
             return Ok(());
         }
-        if self.marker(&page).is_file() {
-            let _ = fs::remove_file(self.marker(&page));
+        if self.records.merged(&self.id, &page) {
+            self.records.clear_merged(&self.id, &page);
             eprintln!("taskmaster: {page} was already merged; recording it");
             self.record_citations(&page)?;
             self.push_event(Event::WorkerFinished { page, outcome: WorkerOutcome::Passed })?;
@@ -493,8 +532,9 @@ impl Driver {
         };
         eprintln!("taskmaster: building {page} ({})", tier_name(tier));
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
+        let bill = request.bill(Role::builder(tier), Some(&page));
         self.jobs.spawn(async move {
-            let result = ask(request).await.map(|(text, ok)| Product { text, ok, worktree });
+            let result = ask(request).await.map(|answer| Product { answer, bill, worktree });
             (page, result)
         });
         self.persist()?;
@@ -519,9 +559,10 @@ impl Driver {
                 return Err(err);
             }
         };
+        self.charge(&product.bill, &product.answer)?;
         if self.is_stale(&page) {
             self.drop_worktree(&product.worktree);
-            let _ = fs::remove_file(self.marker(&page));
+            self.records.clear_merged(&self.id, &page);
             eprintln!("taskmaster: {page} was built against an amended entry; discarding it");
             self.push_event(Event::WorkerFinished { page, outcome: WorkerOutcome::Passed })?;
             return Ok(());
@@ -530,7 +571,7 @@ impl Driver {
             Some(Command::SpawnWorker { tier, errors, .. }) => (*tier, errors.clone()),
             _ => (Tier::Worker, None),
         };
-        let text = product.text.clone();
+        let text = product.answer.text.clone();
         let outcome = match self.judge(&page, tier, &errors, product) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -557,7 +598,7 @@ impl Driver {
             WorkerOutcome::Flagged(_) => {}
         }
         self.push_event(Event::WorkerFinished { page: page.clone(), outcome })?;
-        let _ = fs::remove_file(self.marker(&page));
+        self.records.clear_merged(&self.id, &page);
         Ok(())
     }
 
@@ -574,7 +615,7 @@ impl Driver {
         errors: &Option<String>,
         product: &Product,
     ) -> anyhow::Result<WorkerOutcome> {
-        if let Some((key, issue)) = reply::parse_flag(&product.text) {
+        if let Some((key, issue)) = reply::parse_flag(&product.answer.text) {
             return Ok(WorkerOutcome::Flagged(Flag { page: page.to_string(), key, issue }));
         }
         let changes = git::worktree_changes(&product.worktree)?;
@@ -602,7 +643,7 @@ impl Driver {
             )));
         }
         if changes.is_empty() {
-            let why = if product.ok {
+            let why = if product.answer.ok {
                 "worker produced no changes under its owned files"
             } else {
                 "harness failed and produced no changes"
@@ -643,8 +684,7 @@ impl Driver {
         let Some(hash) = self.commit_entries(vec![entry], files, &message)? else {
             return Ok(failed("worker produced no changes under its owned files"));
         };
-        fs::create_dir_all(self.dir.join("merged"))?;
-        fs::write(self.marker(page), hash)?;
+        self.records.mark_merged(&self.id, page, &hash)?;
         Ok(WorkerOutcome::Passed)
     }
 
@@ -705,9 +745,12 @@ impl Driver {
             self.config.models.master.clone(),
             &self.master_token.clone(),
         )?;
-        let (text, _) = ask(request).await?;
+        let bill = request.bill(Role::Arbiter, Some(&flag.page));
+        let asked = ask(request).await;
         self.drop_worktree(&worktree);
-        let resolution = match reply::parse_resolution(&text)? {
+        let answer = asked?;
+        self.charge(&bill, &answer)?;
+        let resolution = match reply::parse_resolution(&answer.text)? {
             Resolution::Conform => {
                 eprintln!("taskmaster: {} stands; {} must conform", flag.key, flag.page);
                 FlagResolution::Conform
@@ -754,10 +797,10 @@ impl Driver {
                 &self.reviewer_token.clone(),
             )?;
             let permit = sem.clone();
+            let bill = request.bill(Role::Reviewer, None);
             set.spawn(async move {
                 let _permit = permit.acquire_owned().await.context("review stopped")?;
-                let (text, _) = ask(request).await?;
-                reply::parse_review(&text, Some(key))
+                Ok::<_, anyhow::Error>((bill, Some(key), ask(request).await?))
             });
         }
         if !security.is_empty() {
@@ -770,17 +813,28 @@ impl Driver {
                 &self.reviewer_token.clone(),
             )?;
             let permit = sem.clone();
+            let bill = request.bill(Role::Security, None);
             set.spawn(async move {
                 let _permit = permit.acquire_owned().await.context("review stopped")?;
-                let (text, _) = ask(request).await?;
-                reply::parse_review(&text, None)
+                Ok::<_, anyhow::Error>((bill, None, ask(request).await?))
             });
         }
         let mut findings = Vec::new();
+        let mut failure = None;
         while let Some(joined) = set.join_next().await {
-            findings.extend(joined.context("review task panicked")??);
+            let parsed = joined.context("review task panicked").and_then(|done| done).and_then(|(bill, key, answer)| {
+                self.charge(&bill, &answer)?;
+                reply::parse_review(&answer.text, key)
+            });
+            match parsed {
+                Ok(found) => findings.extend(found),
+                Err(err) => failure = Some(err),
+            }
         }
         self.drop_worktree(&worktree);
+        if let Some(err) = failure {
+            return Err(err);
+        }
         Ok(findings)
     }
 
@@ -799,20 +853,29 @@ impl Driver {
                 &self.verifier_token.clone(),
             )?;
             let permit = sem.clone();
+            let bill = request.bill(Role::Verifier, Some(&finding.page));
             set.spawn(async move {
                 let _permit = permit.acquire_owned().await.context("verifier stopped")?;
-                let (text, _) = ask(request).await?;
-                Ok::<_, anyhow::Error>((finding, reply::parse_verdict(&text)))
+                Ok::<_, anyhow::Error>((finding, bill, ask(request).await?))
             });
         }
         let mut confirmed = Vec::new();
+        let mut failure = None;
         while let Some(joined) = set.join_next().await {
-            let (finding, real) = joined.context("verifier task panicked")??;
-            if real {
-                confirmed.push(finding);
+            match joined.context("verifier task panicked").and_then(|done| done) {
+                Ok((finding, bill, answer)) => {
+                    self.charge(&bill, &answer)?;
+                    if reply::parse_verdict(&answer.text) {
+                        confirmed.push(finding);
+                    }
+                }
+                Err(err) => failure = Some(err),
             }
         }
         self.drop_worktree(&worktree);
+        if let Some(err) = failure {
+            return Err(err);
+        }
         Ok(confirmed)
     }
 
@@ -842,12 +905,19 @@ impl Driver {
         Ok(())
     }
 
-    fn verify_project(&mut self) -> anyhow::Result<(bool, BTreeMap<PageId, String>)> {
+    async fn verify_project(&mut self) -> anyhow::Result<(bool, BTreeMap<PageId, String>)> {
         eprintln!("taskmaster: verifying the project");
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
         let sources = load_sources(&self.project)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
+        for (page, errors) in self.mechanical_checks(&owners).await? {
+            let text = failing.entry(page).or_default();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&errors);
+        }
         if let Some(note) = self.run_verify_script()? {
             let mut attributed = false;
             for line in note.lines() {
@@ -891,6 +961,46 @@ impl Driver {
             self.commit_entries(entries, vec![], "taskmaster: record verification failure")?;
         }
         Ok((failing.is_empty(), failing))
+    }
+
+    /// Typecheck and lint the files this run built, with the project's own tools. No tokens
+    /// are spent. An error in a page's file goes back to that page. An error in a file no
+    /// page owns is printed and does not fail the run, because no worker could repair it.
+    async fn mechanical_checks(&self, owners: &Owners) -> anyhow::Result<BTreeMap<PageId, String>> {
+        if !self.config.checks {
+            return Ok(BTreeMap::new());
+        }
+        let mut built: BTreeSet<String> = BTreeSet::new();
+        for entry in &self.changes {
+            if matches!(entry.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired) {
+                built.extend(entry.files.iter().filter(|file| self.project.join(file).is_file()).cloned());
+            }
+        }
+        if built.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let (project, files) = (self.project.clone(), built.into_iter().collect::<Vec<_>>());
+        let report = tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&project, &files))
+            .await
+            .context("the project checks panicked")?;
+        let mut failing: BTreeMap<PageId, String> = BTreeMap::new();
+        let mut shared = 0;
+        for finding in &report.findings {
+            match owners.owner(&finding.file) {
+                Some(page) => {
+                    let line = format!("{}:{} {}\n", finding.file, finding.line, finding.failure);
+                    failing.entry(page.clone()).or_default().push_str(&line);
+                }
+                None => {
+                    shared += 1;
+                    eprintln!("taskmaster: {}:{} {}", finding.file, finding.line, finding.failure);
+                }
+            }
+        }
+        if shared > 0 {
+            eprintln!("taskmaster: {shared} error(s) are in files no page owns and were not sent to a worker");
+        }
+        Ok(failing)
     }
 
     /// Run `.taskmaster/verify` when the project already has an executable there.
@@ -960,7 +1070,7 @@ impl Driver {
             brief.push('\n');
         }
         let model = self.model_byline(tier);
-        let book = records::load_book(&self.project)?;
+        let book = self.records.book()?;
         if let Some(errors) = errors {
             if let Some(fix) = book.fix_for(&model, errors) {
                 brief.push_str("\nKnown fix for this model:\n");
@@ -1040,16 +1150,63 @@ impl Driver {
         DictionaryAccess { name: "dictionary".into(), url: self.url.clone(), bearer_token: token.to_string() }
     }
 
-    fn grant_pages(&mut self) {
+    fn grant_pages(&mut self) -> anyhow::Result<()> {
         let pages: Vec<String> =
             self.run.plan.as_ref().map(|plan| plan.pages.iter().map(|p| p.id.clone()).collect()).unwrap_or_default();
         for page in pages {
             if self.tokens.contains_key(&page) {
                 continue;
             }
-            let token = fresh_token(&page);
+            let token = fresh_token()?;
             self.mcp.grant(&token, Grant { run: self.config.run_id.clone(), page: page.clone() });
             self.tokens.insert(page, token);
+        }
+        Ok(())
+    }
+
+    /// Record one agent call in the run's ledger.
+    fn charge(&self, bill: &Bill, answer: &Answer) -> anyhow::Result<()> {
+        let entry = LedgerEntry {
+            at: rfc3339_now(),
+            role: bill.role,
+            page: bill.page.clone(),
+            harness: bill.harness.clone(),
+            model: bill.model.clone(),
+            input: answer.usage.input,
+            output: answer.usage.output,
+            cache_read: answer.usage.cache_read,
+            cache_write: answer.usage.cache_write,
+            cost_usd: answer.cost_usd,
+            seconds: answer.seconds,
+            ok: answer.ok,
+        };
+        self.records.charge(&self.id, &entry)
+    }
+
+    fn spend_line(&self) -> anyhow::Result<String> {
+        let sum = totals(&self.records.ledger(&self.id)?);
+        let mut line = format!("{} agent calls, {} tokens", sum.calls, sum.tokens);
+        if sum.unpriced_calls < sum.calls {
+            line.push_str(&format!(", ${:.2}", sum.cost_usd));
+            if sum.unpriced_calls > 0 {
+                let calls = if sum.unpriced_calls == 1 { "call" } else { "calls" };
+                line.push_str(&format!(" ({} {calls} reported no price)", sum.unpriced_calls));
+            }
+        }
+        if let Some(plan) = &self.run.plan {
+            line.push_str(&format!("; the plan estimated {} tokens", plan.estimate.tokens));
+        }
+        Ok(line)
+    }
+
+    /// Bring in what other people published. A remote that cannot be reached is not a
+    /// reason to stop: the local Commons still works.
+    fn pull_commons(&self) {
+        let Some(remote) = &self.remote else { return };
+        match LocalStore::open(&self.commons).and_then(|commons| remote.pull(&commons)) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("taskmaster: {n} Commons entries arrived"),
+            Err(err) => eprintln!("taskmaster: the Commons was not synced: {err:#}"),
         }
     }
 
@@ -1114,41 +1271,22 @@ impl Driver {
     fn persist(&self) -> anyhow::Result<()> {
         let mut commands = self.running.clone();
         commands.extend(self.pending.iter().cloned());
-        let path = self.dir.join("inflight.json");
-        if commands.is_empty() {
-            let _ = fs::remove_file(path);
-            return Ok(());
-        }
-        atomic_write(&path, &serde_json::to_vec_pretty(&commands)?)?;
-        Ok(())
-    }
-
-    fn clear_inflight(&self) -> anyhow::Result<()> {
-        let _ = fs::remove_file(self.dir.join("inflight.json"));
-        Ok(())
+        self.records.save_inflight(&self.id, &commands)
     }
 
     fn save_events(&self) -> anyhow::Result<()> {
-        let mut body = String::new();
-        for event in &self.events {
-            body.push_str(&serde_json::to_string(event)?);
-            body.push('\n');
-        }
-        atomic_write(&self.dir.join("events.jsonl"), body.as_bytes())
+        self.records.save_events(&self.id, &self.events)
     }
 
     fn save_changes(&self) -> anyhow::Result<()> {
-        let mut body = String::new();
-        for entry in &self.changes {
-            body.push_str(&serde_json::to_string(entry)?);
-            body.push('\n');
-        }
-        atomic_write(&self.dir.join("changes.jsonl"), body.as_bytes())
+        self.records.save_changes(&self.id, &self.changes)
     }
 
     fn write_status(&self, ok: bool) -> anyhow::Result<()> {
-        let body = serde_json::json!({ "ok": ok, "phase": self.run.phase });
-        atomic_write(&self.dir.join("status.json"), &serde_json::to_vec_pretty(&body)?)
+        let spent = totals(&self.records.ledger(&self.id)?);
+        let estimate = self.run.plan.as_ref().map(|plan| &plan.estimate);
+        let body = serde_json::json!({ "ok": ok, "phase": self.run.phase, "spent": spent, "estimate": estimate });
+        self.records.save_status(&self.id, &body)
     }
 
     fn fresh_worktree(&mut self, label: &str) -> anyhow::Result<PathBuf> {
@@ -1173,10 +1311,6 @@ impl Driver {
         let _ = git::remove_worktree(&self.project, path);
         let _ = fs::remove_dir_all(path);
         self.trees.retain(|have| have != path);
-    }
-
-    fn marker(&self, page: &str) -> PathBuf {
-        self.dir.join("merged").join(page)
     }
 
     fn is_stale(&self, page: &str) -> bool {
@@ -1259,23 +1393,23 @@ impl Driver {
     }
 
     fn note_mistake_model(&self, model: &str, failure: &str) -> anyhow::Result<()> {
-        let mut book = records::load_book(&self.project)?;
+        let mut book = self.records.book()?;
         book.record(model, failure);
-        records::save_book(&self.project, &book)
+        self.records.save_book(&book)
     }
 
     fn learn_fix(&self, tier: Tier, failure: &str, text: &str) -> anyhow::Result<()> {
         let model = self.model_byline(tier);
-        let mut book = records::load_book(&self.project)?;
+        let mut book = self.records.book()?;
         book.learn_fix(&model, failure, text);
-        records::save_book(&self.project, &book)
+        self.records.save_book(&book)
     }
 
     fn citations_fresh(&self, page: &str) -> anyhow::Result<bool> {
         if !self.config.incremental {
             return Ok(false);
         }
-        let citations = records::load_citations(&self.project)?;
+        let citations = self.records.citations()?;
         let cites = self.page(page)?.cites.clone();
         let catalog = self.catalog()?;
         let mut current = BTreeMap::new();
@@ -1290,7 +1424,7 @@ impl Driver {
         if !self.config.incremental {
             return Ok(());
         }
-        let mut citations = records::load_citations(&self.project)?;
+        let mut citations = self.records.citations()?;
         let cites = self.page(page)?.cites.clone();
         let catalog = self.catalog()?;
         let mut recorded = Vec::new();
@@ -1299,7 +1433,7 @@ impl Driver {
             recorded.push(Citation { key: key.clone(), hash });
         }
         citations.pages.insert(page.to_string(), recorded);
-        records::save_citations(&self.project, &citations)
+        self.records.save_citations(&citations)
     }
 
     /// Promote local entries that a passed page cited, and update Commons pass rates.
@@ -1315,6 +1449,7 @@ impl Driver {
                 } else if passed {
                     catalog.promote(key)?;
                     catalog.note_result(key, true)?;
+                    self.push_commons(&catalog, key);
                 }
             }
         }
@@ -1322,11 +1457,26 @@ impl Driver {
     }
 }
 
+impl Driver {
+    /// Offer a promoted entry to the shared Commons. Promotion already happened here, so
+    /// a failed push is only reported.
+    fn push_commons(&self, catalog: &Catalog, key: &str) {
+        let Some(remote) = &self.remote else { return };
+        let pushed = catalog.commons.get(key).and_then(|entry| match entry {
+            Some(entry) => remote.push(&entry),
+            None => Ok(()),
+        });
+        if let Err(err) = pushed {
+            eprintln!("taskmaster: `{key}` was not sent to the Commons: {err:#}");
+        }
+    }
+}
+
 fn failed(errors: impl Into<String>) -> WorkerOutcome {
     WorkerOutcome::CheckFailed { errors: errors.into() }
 }
 
-async fn ask(request: AgentRequest) -> anyhow::Result<(String, bool)> {
+async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
     if request.read_only {
@@ -1355,10 +1505,17 @@ async fn ask(request: AgentRequest) -> anyhow::Result<(String, bool)> {
         }
         text
     });
+    let started = Instant::now();
     let run = request.harness.run(task, Arc::new(gate), tx).await;
     let text = collect.await.unwrap_or_default();
     let summary = run?;
-    Ok((text, summary.ok))
+    Ok(Answer {
+        text,
+        ok: summary.ok,
+        usage: summary.usage,
+        cost_usd: summary.cost_usd,
+        seconds: started.elapsed().as_secs_f64(),
+    })
 }
 
 fn dict_prefixes() -> Vec<String> {
@@ -1368,10 +1525,10 @@ fn dict_prefixes() -> Vec<String> {
         .collect()
 }
 
-fn fresh_token(label: &str) -> String {
-    static N: AtomicU64 = AtomicU64::new(1);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    format!("{label}-{n}")
+/// A Dictionary token. Any process on this machine can reach the server, so the token
+/// must not be guessable.
+fn fresh_token() -> anyhow::Result<String> {
+    random_hex(24)
 }
 
 fn tier_name(tier: Tier) -> &'static str {
@@ -1392,10 +1549,8 @@ fn kind_name(kind: EntryKind) -> &'static str {
     }
 }
 
-fn load_parallel(dir: &Path, resuming: bool, requested: usize) -> anyhow::Result<usize> {
-    let path = dir.join("meta.json");
-    if let Ok(text) = fs::read_to_string(&path) {
-        let meta: Meta = serde_json::from_str(&text).with_context(|| format!("cannot read {}", path.display()))?;
+fn load_parallel(records: &Records, run: &str, resuming: bool, requested: usize) -> anyhow::Result<usize> {
+    if let Some(meta) = records.meta(run)? {
         let parallel = meta.parallel.max(1);
         if resuming && parallel != requested.max(1) {
             eprintln!("taskmaster: resuming with parallel {parallel} from the run record");
@@ -1403,36 +1558,6 @@ fn load_parallel(dir: &Path, resuming: bool, requested: usize) -> anyhow::Result
         return Ok(parallel);
     }
     let parallel = requested.max(1);
-    atomic_write(&path, &serde_json::to_vec_pretty(&Meta { parallel })?)?;
+    records.save_meta(run, &Meta { parallel })?;
     Ok(parallel)
-}
-
-fn load_inflight(path: &Path) -> anyhow::Result<Option<Vec<Command>>> {
-    let Ok(text) = fs::read_to_string(path) else { return Ok(None) };
-    if text.trim().is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    Ok(Some(serde_json::from_str(&text).with_context(|| format!("cannot read {}", path.display()))?))
-}
-
-fn load_lines<T: DeserializeOwned>(path: &Path) -> anyhow::Result<Vec<T>> {
-    let Ok(text) = fs::read_to_string(path) else { return Ok(Vec::new()) };
-    let mut out = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        out.push(serde_json::from_str(line).with_context(|| format!("{}:{}", path.display(), index + 1))?);
-    }
-    Ok(out)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
 }

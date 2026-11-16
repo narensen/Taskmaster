@@ -2,7 +2,8 @@
 //!
 //! Clippy is the connection check for Rust: it compiles the crates the change
 //! touches, so a break in a file that depends on the change shows up even when
-//! that file itself did not change. Warnings stay limited to the diff.
+//! that file itself did not change. Warnings stay limited to the diff. `tsc --noEmit`
+//! does the same job for TypeScript when the checkout has TypeScript installed.
 //!
 //! `--install-lints` installs toolchain linters only (clippy, through rustup).
 //! A project linter such as eslint or ruff is run when the repository already
@@ -102,10 +103,20 @@ fn nearest_manifest(root: &Path, rel: &Path) -> Option<PathBuf> {
 /// Read `cargo clippy --message-format=json`. `package` is the directory of the manifest
 /// that was checked, used when a path is relative to the package rather than the repo.
 pub fn clippy_diagnostics(jsonl: &str, worktree: &Path, package: &Path, changed: &BTreeSet<String>) -> Vec<Finding> {
+    clippy_diags(jsonl, worktree, package, changed, false)
+}
+
+fn clippy_diags(
+    jsonl: &str,
+    worktree: &Path,
+    package: &Path,
+    changed: &BTreeSet<String>,
+    errors_only: bool,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     for line in jsonl.lines() {
         let Some(diag) = parse_clippy_line(line, worktree, package) else { continue };
-        if !keep_diag(&diag, changed) {
+        if !keep_diag(&diag, changed) || (errors_only && diag.level != "error") {
             continue;
         }
         out.push(to_finding(&diag, changed));
@@ -151,6 +162,10 @@ fn to_finding(diag: &Diag, changed: &BTreeSet<String>) -> Finding {
 
 /// ESLint's JSON formatter, limited to the files it was asked to check.
 pub fn eslint_diagnostics(json: &str, worktree: &Path) -> Vec<Finding> {
+    eslint_diags(json, worktree, false)
+}
+
+fn eslint_diags(json: &str, worktree: &Path, errors_only: bool) -> Vec<Finding> {
     let Ok(value) = serde_json::from_str::<Value>(json) else { return Vec::new() };
     let Some(files) = value.as_array() else { return Vec::new() };
     let mut out = Vec::new();
@@ -159,6 +174,9 @@ pub fn eslint_diagnostics(json: &str, worktree: &Path) -> Vec<Finding> {
         let Some(rel) = locate(worktree, worktree, path) else { continue };
         let Some(messages) = file["messages"].as_array() else { continue };
         for message in messages {
+            if errors_only && message["severity"].as_u64() != Some(2) {
+                continue;
+            }
             let Some(line) = message["line"].as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0) else {
                 continue;
             };
@@ -177,10 +195,26 @@ pub fn eslint_diagnostics(json: &str, worktree: &Path) -> Vec<Finding> {
 
 /// `ruff check --output-format json`.
 pub fn ruff_diagnostics(json: &str, worktree: &Path) -> Vec<Finding> {
+    ruff_diags(json, worktree, false)
+}
+
+/// Ruff codes that mean the file is broken, not just untidy: syntax errors, undefined
+/// names, and misplaced statements.
+fn ruff_breaks(code: Option<&str>) -> bool {
+    match code {
+        None => true,
+        Some(code) => ["E9", "F82", "F63", "F7"].iter().any(|prefix| code.starts_with(prefix)),
+    }
+}
+
+fn ruff_diags(json: &str, worktree: &Path, errors_only: bool) -> Vec<Finding> {
     let Ok(value) = serde_json::from_str::<Value>(json) else { return Vec::new() };
     let Some(items) = value.as_array() else { return Vec::new() };
     let mut out = Vec::new();
     for item in items {
+        if errors_only && !ruff_breaks(item["code"].as_str()) {
+            continue;
+        }
         let Some(path) = item["filename"].as_str() else { continue };
         let Some(rel) = locate(worktree, worktree, path) else { continue };
         let Some(line) = item["location"]["row"].as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0)
@@ -190,6 +224,23 @@ pub fn ruff_diagnostics(json: &str, worktree: &Path) -> Vec<Finding> {
         let code = item["code"].as_str().unwrap_or("ruff");
         let text = one_line(item["message"].as_str().unwrap_or("lint finding"));
         out.push(Finding { kind: Kind::Lint, file: rel, line, failure: format!("ruff: {code}: {text}") });
+    }
+    out
+}
+
+/// `tsc --noEmit --pretty false`. Each error line is `path(line,col): error TS2322: text`.
+/// Every error is kept: a type error in an unchanged file is a connection the change broke.
+pub fn tsc_diagnostics(text: &str, worktree: &Path) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((place, rest)) = line.split_once("): error ") else { continue };
+        let Some((path, position)) = place.rsplit_once('(') else { continue };
+        let Some(row) = position.split(',').next().and_then(|n| n.trim().parse::<u32>().ok()).filter(|n| *n > 0)
+        else {
+            continue;
+        };
+        let Some(rel) = locate(worktree, worktree, path.trim()) else { continue };
+        out.push(Finding { kind: Kind::Lint, file: rel, line: row, failure: format!("tsc: {}", one_line(rest)) });
     }
     out
 }
@@ -248,32 +299,51 @@ impl Report {
 /// Run the linters this diff calls for. `install` adds clippy when rustup can, and
 /// nothing else.
 pub fn run(worktree: &Path, changed: &[String], install: bool) -> Report {
+    run_with(worktree, changed, install, false)
+}
+
+/// Errors only: type errors, compile errors, lint rules the project set to `error`, and
+/// Python that cannot run. This is what a build sends back to a worker, so style warnings
+/// stay out. Nothing is installed.
+pub fn run_errors(worktree: &Path, changed: &[String]) -> Report {
+    run_with(worktree, changed, false, true)
+}
+
+fn run_with(worktree: &Path, changed: &[String], install: bool, errors_only: bool) -> Report {
     let mut findings = Vec::new();
     let mut notes = Vec::new();
     let changed_set: BTreeSet<String> = changed.iter().cloned().collect();
 
     let rust = changed.iter().any(|p| is_rust_path(p));
-    match clippy_step(rust, command_ok("cargo", &["clippy", "--version"]), command_ok("rustup", &["--version"]), install)
-    {
+    // The toolchain is only asked when the diff has Rust in it.
+    let has_clippy = rust && command_ok("cargo", &["clippy", "--version"]);
+    let has_rustup = rust && !has_clippy && install && command_ok("rustup", &["--version"]);
+    match clippy_step(rust, has_clippy, has_rustup, install) {
         Step::Skip { note } => {
             if !note.is_empty() {
                 notes.push(note);
             }
         }
         Step::InstallThenRun => match install_clippy() {
-            Ok(()) => findings.extend(run_clippy(worktree, changed, &changed_set, &mut notes)),
+            Ok(()) => findings.extend(run_clippy(worktree, changed, &changed_set, errors_only, &mut notes)),
             Err(e) => notes.push(format!("could not install clippy: {e}")),
         },
-        Step::Run => findings.extend(run_clippy(worktree, changed, &changed_set, &mut notes)),
+        Step::Run => findings.extend(run_clippy(worktree, changed, &changed_set, errors_only, &mut notes)),
     }
 
-    notes.extend(project_lints(worktree, changed, &mut findings));
+    notes.extend(project_lints(worktree, changed, errors_only, &mut findings));
     findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
     findings.dedup();
     Report { findings, notes }
 }
 
-fn run_clippy(worktree: &Path, changed: &[String], changed_set: &BTreeSet<String>, notes: &mut Vec<String>) -> Vec<Finding> {
+fn run_clippy(
+    worktree: &Path,
+    changed: &[String],
+    changed_set: &BTreeSet<String>,
+    errors_only: bool,
+    notes: &mut Vec<String>,
+) -> Vec<Finding> {
     let manifests = manifests_for(worktree, changed);
     if manifests.is_empty() {
         notes.push(
@@ -287,7 +357,7 @@ fn run_clippy(worktree: &Path, changed: &[String], changed_set: &BTreeSet<String
         match cargo_clippy(worktree, manifest) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let diags = clippy_diagnostics(&stdout, worktree, package, changed_set);
+                let diags = clippy_diags(&stdout, worktree, package, changed_set, errors_only);
                 if diags.is_empty() && !output.status.success() {
                     let err_text = String::from_utf8_lossy(&output.stderr);
                     let offline = if err_text.contains("offline") {
@@ -345,18 +415,33 @@ fn install_clippy() -> anyhow::Result<()> {
 }
 
 /// Project linters. They run only when the repo already configured them.
-fn project_lints(worktree: &Path, changed: &[String], findings: &mut Vec<Finding>) -> Vec<String> {
+fn project_lints(worktree: &Path, changed: &[String], errors_only: bool, findings: &mut Vec<Finding>) -> Vec<String> {
     let mut notes = Vec::new();
     let js: Vec<&str> = changed
         .iter()
         .filter(|p| matches_ext(p, &["js", "jsx", "ts", "tsx", "mjs", "cjs"]))
         .map(String::as_str)
         .collect();
+    let typed = changed.iter().any(|p| matches_ext(p, &["ts", "tsx", "mts", "cts"]));
+    if typed && worktree.join("tsconfig.json").is_file() {
+        match run_tsc(worktree) {
+            Some(text) => {
+                let found = tsc_diagnostics(&text, worktree);
+                notes.push(format!("tsc checked the project ({} type error(s))", found.len()));
+                findings.extend(found);
+            }
+            None => notes.push(
+                "TypeScript files changed, but `node_modules/.bin/tsc` is not in this checkout, so \
+                 types were not checked. Taskmaster does not install dependencies."
+                    .into(),
+            ),
+        }
+    }
     if !js.is_empty() {
         if eslint_configured(worktree) {
             match run_eslint(worktree, &js) {
                 Some(json) => {
-                    let found = eslint_diagnostics(&json, worktree);
+                    let found = eslint_diags(&json, worktree, errors_only);
                     notes.push(format!("eslint checked {} file(s) ({} finding(s))", js.len(), found.len()));
                     findings.extend(found);
                 }
@@ -379,7 +464,7 @@ fn project_lints(worktree: &Path, changed: &[String], findings: &mut Vec<Finding
         if ruff_configured(worktree) {
             match run_ruff(worktree, &py) {
                 Some(json) => {
-                    let found = ruff_diagnostics(&json, worktree);
+                    let found = ruff_diags(&json, worktree, errors_only);
                     notes.push(format!("ruff checked {} file(s) ({} finding(s))", py.len(), found.len()));
                     findings.extend(found);
                 }
@@ -392,7 +477,7 @@ fn project_lints(worktree: &Path, changed: &[String], findings: &mut Vec<Finding
         } else if command_ok("ruff", &["--version"]) {
             match run_ruff(worktree, &py) {
                 Some(json) => {
-                    let found = ruff_diagnostics(&json, worktree);
+                    let found = ruff_diags(&json, worktree, errors_only);
                     notes.push(format!("ruff checked {} file(s) ({} finding(s))", py.len(), found.len()));
                     findings.extend(found);
                 }
@@ -445,6 +530,19 @@ fn run_eslint(worktree: &Path, files: &[&str]) -> Option<String> {
     };
     cmd.args(["-f", "json", "--no-error-on-unmatched-pattern"]);
     cmd.args(files);
+    let output = output_with_timeout(&mut cmd, LINT_TIMEOUT).ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `None` when the checkout has no TypeScript of its own. A global `tsc` is not used,
+/// because its version decides what counts as an error.
+fn run_tsc(worktree: &Path) -> Option<String> {
+    let local = worktree.join("node_modules/.bin/tsc");
+    if !local.is_file() {
+        return None;
+    }
+    let mut cmd = Command::new(local);
+    cmd.current_dir(worktree).args(["--noEmit", "--pretty", "false"]);
     let output = output_with_timeout(&mut cmd, LINT_TIMEOUT).ok()?;
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -566,6 +664,47 @@ mod tests {
         assert!(found[1].failure.contains("outside the diff"));
         assert!(found.iter().all(|f| f.kind == Kind::Lint && f.is_actionable()));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_build_keeps_errors_and_drops_style_warnings() {
+        let root = scratch("errors");
+        std::fs::write(root.join("a.js"), "x").unwrap();
+        std::fs::write(root.join("a.py"), "x").unwrap();
+        let eslint = format!(
+            r#"[{{"filePath":"{}","messages":[
+                {{"ruleId":"no-undef","severity":2,"message":"'x' is not defined.","line":3}},
+                {{"ruleId":"semi","severity":1,"message":"Missing semicolon.","line":4}}]}}]"#,
+            root.join("a.js").display()
+        );
+        let kept = eslint_diags(&eslint, &root, true);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].failure.contains("no-undef"));
+        assert_eq!(eslint_diags(&eslint, &root, false).len(), 2);
+        let ruff = format!(
+            r#"[{{"filename":"{0}","code":"F821","message":"Undefined name `y`","location":{{"row":2}}}},
+                {{"filename":"{0}","code":"F401","message":"`os` imported but unused","location":{{"row":1}}}}]"#,
+            root.join("a.py").display()
+        );
+        let kept = ruff_diags(&ruff, &root, true);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].failure.contains("F821"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tsc_errors_keep_their_file_and_line() {
+        let root = scratch("tsc");
+        std::fs::create_dir_all(root.join("app/a")).unwrap();
+        std::fs::write(root.join("app/a/page.tsx"), "x").unwrap();
+        let text = "app/a/page.tsx(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\n\
+                    Found 1 error.\n\
+                    ../outside.ts(1,1): error TS1005: ';' expected.\n";
+        let found = tsc_diagnostics(text, &root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].file.as_str(), found[0].line), ("app/a/page.tsx", 12));
+        assert!(found[0].failure.starts_with("tsc: TS2322"), "{}", found[0].failure);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

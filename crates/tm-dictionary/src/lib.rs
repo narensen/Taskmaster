@@ -3,8 +3,10 @@
 
 pub mod catalog;
 pub mod mcp;
+pub mod remote;
 pub mod store;
 
 pub use catalog::Catalog;
 pub use mcp::{CiteRecord, Grant, McpState, router};
+pub use remote::CommonsRemote;
 pub use store::LocalStore;

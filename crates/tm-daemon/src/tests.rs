@@ -15,7 +15,8 @@ use tm_dictionary::LocalStore;
 use tm_harness::{Harness, HarnessEvent, PermissionGate, RunSummary, Usage, WorkerTask};
 use tokio::sync::{Barrier, Notify, mpsc, watch};
 
-use crate::{Config, Harnesses, Outcome, drive, evaluate, records, run_directory};
+use crate::store::Records;
+use crate::{Config, Harnesses, Outcome, drive, evaluate, run_directory};
 
 enum Mode {
     Write,
@@ -100,7 +101,8 @@ impl Harness for Fake {
             }
         }
         let _ = events.send(HarnessEvent::Text { text: script.text }).await;
-        Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0 })
+        let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0 })
     }
 }
 
@@ -145,6 +147,15 @@ impl World {
         if brief.contains("Decide whether it is real") {
             let real = matches!(self.mode, Mode::ConfirmFinding);
             return Ok(Script::text(if real { "{\"real\": true}" } else { "{\"real\": false}" }));
+        }
+        // A review of a repository, started through the API, not a run's own review.
+        if brief.contains("You are reviewing a code change") {
+            let found = matches!(self.mode, Mode::ConfirmFinding) && !brief.contains("security problems only");
+            return Ok(Script::text(if found {
+                "[{\"file\":\"src/lib.ts\",\"line\":1,\"kind\":\"bug\",\"failure\":\"returns the wrong total when the cart is empty\"}]"
+            } else {
+                "[]"
+            }));
         }
         if brief.contains("reviewing one connection") || brief.contains("security problems") {
             return Ok(self.review(&brief));
@@ -545,7 +556,7 @@ async fn mistakes_stay_with_the_model_that_made_them() {
             fix: None,
         }],
     );
-    records::save_book(&tmp.0, &book).unwrap();
+    Records::files(&tmp.0).save_book(&book).unwrap();
     let world = World::new(Mode::Learn);
     let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
@@ -554,7 +565,7 @@ async fn mistakes_stay_with_the_model_that_made_them() {
     assert!(page_b.contains("worker produced no changes under its owned files"));
     assert!(page_b.contains("Read the route param before rendering the header."));
     assert!(!calls.iter().any(|call| call.contains("claude-only mistake")));
-    let saved = records::load_book(&tmp.0).unwrap();
+    let saved = Records::files(&tmp.0).book().unwrap();
     assert!(saved.models["fake"].iter().any(|mistake| mistake.promoted()));
     assert_eq!(saved.models["claude"][0].count, PROMOTE_AT);
 }
@@ -616,6 +627,9 @@ async fn eval_runs_the_plan_against_one_model() {
     assert!(!baseline.ok);
     assert!(baseline.check_failures >= 3);
     assert!(baseline.failed >= 1);
+    // Each side is charged for its own calls, so the two can be compared on cost.
+    assert_eq!(report.taskmaster.tokens, report.taskmaster.agent_calls * 120);
+    assert!(baseline.agent_calls >= 3 && baseline.tokens == baseline.agent_calls * 120);
     assert!(tmp.0.join(".taskmaster/evals/score.json").is_file());
 }
 
@@ -748,4 +762,336 @@ async fn eval_of_a_prompt_plans_once() {
     let baseline = report.baseline.expect("baseline ran");
     assert!(!baseline.ok);
     assert!(baseline.check_failures >= 3);
+}
+
+#[tokio::test]
+async fn every_agent_call_is_charged_to_the_run() {
+    let tmp = repo("ledger");
+    let world = World::new(Mode::ConfirmFinding);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["auth"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let records = Records::files(&tmp.0);
+    let entries = records.ledger("current").unwrap();
+    assert_eq!(entries.len(), world.calls.lock().unwrap().len());
+    let roles: Vec<&str> = entries.iter().map(|entry| entry.role.name()).collect();
+    for role in ["worker", "reviewer", "security", "verifier"] {
+        assert!(roles.contains(&role), "{role} missing from {roles:?}");
+    }
+    assert!(entries.iter().any(|entry| entry.role.name() == "worker" && entry.page.as_deref() == Some("a")));
+    let status = records.status("current").unwrap().unwrap();
+    assert_eq!(status["spent"]["calls"], entries.len());
+    assert_eq!(status["spent"]["tokens"], entries.len() * 120);
+    assert_eq!(status["spent"]["unpriced_calls"], 0);
+    assert_eq!(status["estimate"]["tokens"], 10);
+}
+
+#[tokio::test]
+async fn a_run_keeps_its_records_wherever_the_store_puts_them() {
+    let tmp = repo("memory");
+    let world = World::new(Mode::Write);
+    let store = Arc::new(crate::store::tests::Memory::default());
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.store = Some(store.clone());
+    assert_eq!(run(cfg, &world).await.unwrap(), Outcome::Finished { ok: true });
+    assert!(tmp.0.join("app/a/page.ts").is_file());
+    assert!(!tmp.0.join(".taskmaster/runs").exists());
+    assert!(!tmp.0.join(".taskmaster/citations.json").exists());
+    let keys: Vec<String> = store.0.lock().unwrap().keys().cloned().collect();
+    for key in ["runs/current/events.jsonl", "runs/current/ledger.jsonl", "runs/current/status.json", "citations.json"] {
+        assert!(keys.iter().any(|have| have == key), "{key} missing from {keys:?}");
+    }
+}
+
+#[derive(Default)]
+struct Shared {
+    pulls: AtomicUsize,
+    pushed: Mutex<Vec<String>>,
+}
+
+impl tm_dictionary::CommonsRemote for Shared {
+    fn pull(&self, commons: &LocalStore) -> anyhow::Result<usize> {
+        self.pulls.fetch_add(1, Ordering::SeqCst);
+        commons.publish("theme", EntryKind::Pattern, "color tokens", "export const INK = '#fff';\n", "next")?;
+        Ok(1)
+    }
+
+    fn push(&self, entry: &tm_core::DictionaryEntry) -> anyhow::Result<()> {
+        self.pushed.lock().unwrap().push(entry.key.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_shared_commons_is_pulled_before_planning_and_sent_what_is_promoted() {
+    let tmp = repo("remote");
+    let store = LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();
+    store.publish("greet", EntryKind::Hint, "greeting", "export const G = 1;\n", "next").unwrap();
+    let remote = Arc::new(Shared::default());
+    let world = World::new(Mode::Write);
+    let mut cfg = config(&tmp.0, plan(&[("a", &["greet"])]), true, 1);
+    cfg.remote = Some(remote.clone());
+    assert_eq!(run(cfg, &world).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(remote.pulls.load(Ordering::SeqCst), 1);
+    assert_eq!(*remote.pushed.lock().unwrap(), vec!["greet".to_string()]);
+    // What arrived is offered to the worker like any other Commons entry.
+    let commons = LocalStore::open(tmp.0.join(".taskmaster/commons")).unwrap();
+    assert!(commons.get("theme").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_rejected_plan_goes_back_to_planning_and_can_be_planned_again() {
+    let tmp = repo("reject");
+    let world = World::new(Mode::Plan);
+    let outcome = run(prompt_config(&tmp.0, "Build page a.", false), &world).await.unwrap();
+    assert!(matches!(outcome, Outcome::NeedsApproval { .. }));
+
+    let mut cfg = Config::new(&tmp.0);
+    cfg.reject = true;
+    assert_eq!(run(cfg, &world).await.unwrap(), Outcome::Rejected);
+    let events = Records::files(&tmp.0).events("current").unwrap();
+    assert_eq!(Run::replay(1, events).phase, RunPhase::Planning);
+    assert_eq!(world.plans.load(Ordering::SeqCst), 1);
+
+    // A new request plans again and waits for approval as before.
+    let outcome = run(prompt_config(&tmp.0, "Build page a, differently.", false), &world).await.unwrap();
+    assert!(matches!(outcome, Outcome::NeedsApproval { .. }));
+    assert_eq!(world.plans.load(Ordering::SeqCst), 2);
+    assert!(!tmp.0.join("app/a/page.ts").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_type_error_goes_back_to_the_page_that_owns_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = repo("typecheck");
+    std::fs::write(tmp.0.join("tsconfig.json"), "{}\n").unwrap();
+    let bin = tmp.0.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // Stands in for the project's own TypeScript: one error on the first run, none after.
+    let script = "#!/bin/sh\nif [ ! -f node_modules/ran ]; then touch node_modules/ran; \
+                  echo \"app/a/page.ts(1,1): error TS2304: Cannot find name 'nope'.\"; exit 2; fi\n";
+    std::fs::write(bin.join("tsc"), script).unwrap();
+    std::fs::set_permissions(bin.join("tsc"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let world = World::new(Mode::ConfirmFinding);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let repair = calls.iter().find(|call| call.contains("Checks failed last time")).expect("page a was repaired");
+    assert!(repair.contains("app/a/page.ts:1 tsc: TS2304"), "{repair}");
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("a = 2"));
+    let book = Records::files(&tmp.0).book().unwrap();
+    assert!(book.models["fake"].iter().any(|mistake| mistake.sample.contains("TS2304")));
+}
+
+mod http {
+    //! The API over a real socket, with the fake harness behind it.
+
+    use super::*;
+    use crate::api::{Server, ServerOptions};
+    use crate::auth::PairingAuth;
+    use serde_json::{Value, json};
+
+    struct Client {
+        addr: String,
+        token: Option<String>,
+    }
+
+    impl Client {
+        async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(&self.addr).await.unwrap();
+            let body = body.map(|value| value.to_string()).unwrap_or_default();
+            let auth = self.token.as_ref().map(|token| format!("authorization: Bearer {token}\r\n")).unwrap_or_default();
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+                self.addr,
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+            let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+            (status, serde_json::from_str(rest).unwrap_or(Value::Null))
+        }
+
+        async fn get(&self, path: &str) -> (u16, Value) {
+            self.call("GET", path, None).await
+        }
+
+        async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+            self.call("POST", path, Some(body)).await
+        }
+
+        /// Poll a run until it is idle in `phase`.
+        async fn settled(&self, id: &str, phase: &str) -> Value {
+            for _ in 0..400 {
+                let (_, run) = self.get(&format!("/api/runs/{id}")).await;
+                if run["phase"] == phase && run["active"] == false {
+                    return run;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("run {id} never reached {phase}: {}", self.get(&format!("/api/runs/{id}")).await.1);
+        }
+    }
+
+    async fn server(tmp: &Tmp, world: &Arc<World>) -> (Server, Client, String) {
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let code = auth.code().to_string();
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        let world = world.clone();
+        options.harness = Arc::new(move |_| Ok(Arc::new(Fake(world.clone())) as Arc<dyn Harness>));
+        let server = Server::serve(options).await.unwrap();
+        let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        (server, Client { addr, token: None }, code)
+    }
+
+    #[tokio::test]
+    async fn a_device_pairs_starts_a_run_approves_it_and_reads_what_it_cost() {
+        let tmp = repo("api");
+        LocalStore::open(tmp.0.join(".taskmaster/dictionary"))
+            .unwrap()
+            .publish("greet", EntryKind::Hint, "greeting", "export const G = 1;\n", "next")
+            .unwrap();
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+
+        assert_eq!(client.get("/api/health").await.0, 200);
+        assert_eq!(client.get("/api/runs").await.0, 401);
+        assert_eq!(client.post("/api/pair", json!({ "code": "WRONG" })).await.0, 401);
+        let (status, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        assert_eq!(status, 200, "{paired}");
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        assert_eq!(client.get("/api/runs").await.1, json!({ "runs": [] }));
+
+        // Nothing is built until the plan is approved.
+        let planned = serde_json::to_value(plan(&[("a", &["greet"]), ("b", &["greet"])])).unwrap();
+        let (status, made) = client.post("/api/runs", json!({ "id": "web", "plan": planned, "parallel": 2 })).await;
+        assert_eq!(status, 202, "{made}");
+        let waiting = client.settled("web", "awaiting_approval").await;
+        assert_eq!(waiting["plan"]["pages"].as_array().unwrap().len(), 2);
+        assert_eq!(waiting["roles"]["worker"], "agy");
+        assert!(!tmp.0.join("app/a/page.ts").exists());
+        assert_eq!(client.post("/api/runs", json!({ "id": "web", "plan": planned })).await.0, 409);
+        assert_eq!(client.post("/api/runs", json!({ "id": "../x", "plan": planned })).await.0, 400);
+        assert_eq!(client.post("/api/runs", json!({ "id": "empty" })).await.0, 400);
+
+        assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 202);
+        let done = client.settled("web", "done").await;
+        assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
+        assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
+        assert_eq!(done["estimate"]["tokens"], 10);
+        let calls = done["spent"]["calls"].as_u64().unwrap();
+        assert!(calls >= 3 && done["spent"]["tokens"] == calls * 120, "{done}");
+        assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);
+        assert_eq!(client.post("/api/runs/web/cancel", json!({})).await.0, 409);
+
+        let (_, ledger) = client.get("/api/runs/web/ledger").await;
+        assert_eq!(ledger["entries"].as_array().unwrap().len() as u64, calls);
+        assert!(ledger["totals"]["by_role"]["worker"]["calls"].as_u64().unwrap() >= 2);
+        let (_, all) = client.get("/api/runs/web/events").await;
+        let (_, later) = client.get("/api/runs/web/events?after=2").await;
+        let total = all["next"].as_u64().unwrap() as usize;
+        assert_eq!(later["events"].as_array().unwrap().len(), total - 2);
+        let (_, changes) = client.get("/api/runs/web/changes").await;
+        assert!(changes["changes"].as_array().unwrap().iter().any(|change| change["kind"] == "page_built"));
+
+        let (_, found) = client.get("/api/dictionary?q=greet").await;
+        assert_eq!(found["entries"][0]["key"], "greet");
+        assert_eq!(client.get("/api/dictionary/greet").await.1["content"], "export const G = 1;\n");
+        assert_eq!(client.get("/api/dictionary/nope").await.0, 404);
+        assert_eq!(client.get("/api/runs/nope").await.0, 404);
+        assert_eq!(client.get("/api/errorography").await.0, 200);
+        assert_eq!(client.get("/api/providers?harness=nope").await.0, 400);
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_rejected_then_the_run_is_cancelled() {
+        let tmp = repo("api-reject");
+        let world = World::new(Mode::Plan);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let (status, made) = client.post("/api/runs", json!({ "prompt": "Build page a." })).await;
+        assert_eq!(status, 202, "{made}");
+        let id = made["id"].as_str().unwrap().to_string();
+        let waiting = client.settled(&id, "awaiting_approval").await;
+        assert_eq!(waiting["prompt"], "Build page a.");
+        assert_eq!(waiting["spent"]["by_role"]["planner"]["calls"], 1);
+
+        // A new prompt plans again; the run waits for approval a second time.
+        let again = json!({ "prompt": "Build page a with a greeting." });
+        assert_eq!(client.post(&format!("/api/runs/{id}/reject"), again).await.0, 202);
+        for _ in 0..400 {
+            if world.plans.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let waiting = client.settled(&id, "awaiting_approval").await;
+        assert_eq!(waiting["prompt"], "Build page a with a greeting.");
+
+        assert_eq!(client.post(&format!("/api/runs/{id}/reject"), json!({})).await.0, 202);
+        client.settled(&id, "planning").await;
+        assert_eq!(client.post(&format!("/api/runs/{id}/approve"), json!({})).await.0, 409);
+        assert_eq!(client.post(&format!("/api/runs/{id}/cancel"), json!({})).await.0, 202);
+        client.settled(&id, "failed").await;
+        assert!(!tmp.0.join("app/a/page.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn a_review_of_the_project_is_started_and_read_back() {
+        let tmp = repo("api-review");
+        std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+        std::fs::write(tmp.0.join("src/lib.ts"), "export const total = 0;\n").unwrap();
+        git(&tmp.0, &["add", "-A"]);
+        git(&tmp.0, &["commit", "-q", "-m", "first"]);
+        std::fs::write(tmp.0.join("src/lib.ts"), "export const total = 1;\n").unwrap();
+        git(&tmp.0, &["commit", "-q", "-am", "second"]);
+
+        let world = World::new(Mode::ConfirmFinding);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let (status, made) = client.post("/api/reviews", json!({})).await;
+        assert_eq!(status, 202, "{made}");
+        let id = made["id"].as_str().unwrap().to_string();
+        let mut job = Value::Null;
+        for _ in 0..400 {
+            job = client.get(&format!("/api/reviews/{id}")).await.1;
+            if job["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(job["status"], "done", "{job}");
+        let findings = job["report"]["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{job}");
+        assert_eq!(findings[0]["file"], "src/lib.ts");
+        assert_eq!(findings[0]["outcome"], "confirmed");
+        assert!(job["text"].as_str().unwrap().contains("[bug] src/lib.ts:1"));
+        assert!(job["report"]["usage"]["input"].as_u64().unwrap() >= 300);
+        let (_, listed) = client.get("/api/reviews").await;
+        assert!(listed["reviews"].as_array().unwrap().iter().any(|row| row["id"] == id.as_str() && row["confirmed"] == 1));
+        assert!(read(&tmp.0.join(".taskmaster/reviews/history.jsonl")).contains("wrong total"));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_cannot_start_reports_why() {
+        let tmp = repo("api-error");
+        let world = World::new(Mode::PlanBad);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let (_, made) = client.post("/api/runs", json!({ "id": "bad", "prompt": "Build page a." })).await;
+        assert_eq!(made["id"], "bad");
+        let run = client.settled("bad", "planning").await;
+        assert!(run["error"].as_str().unwrap().contains("no pages"), "{run}");
+        let (_, listed) = client.get("/api/runs").await;
+        assert_eq!(listed["runs"][0]["id"], "bad");
+    }
 }

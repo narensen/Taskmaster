@@ -8,14 +8,21 @@
 //!
 //! `--prompt` asks the master harness for the plan and its Dictionary entries. `--plan`
 //! skips that and locks the file as given.
+//!
+//! Three things are behind traits so they can be replaced without touching the engine:
+//! [`Store`] (files today, a database later), [`Auth`] (a pairing code today, accounts
+//! later), and [`tm_dictionary::CommonsRemote`] (nothing today, a shared Commons later).
+//! [`api`] is the HTTP surface a frontend talks to.
 
+pub mod api;
+pub mod auth;
 mod engine;
 mod eval;
 mod git;
-mod phone;
-mod records;
 mod reply;
 mod resume;
+mod secret;
+pub mod store;
 mod time;
 
 #[cfg(test)]
@@ -25,13 +32,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
+use serde::{Deserialize, Serialize};
 use tm_core::Plan;
-use tm_harness::Harness;
+use tm_dictionary::CommonsRemote;
+use tm_harness::{HARNESSES, Harness, provider_report, require_model};
 use tokio::sync::watch;
 
+pub use api::{Server, ServerOptions, is_tailscale, tailscale_ipv4};
+pub use auth::{Auth, PairingAuth, Principal};
 pub use engine::drive;
 pub use eval::{EvalReport, EvalSide, evaluate};
-pub use phone::{PhoneEndpoint, is_tailscale, tailscale_ipv4};
+pub use store::{FileStore, Records, Store};
 
 /// Where a run's event log, change log and status file are kept, inside the project.
 pub fn run_directory(project: &std::path::Path, run_id: &str) -> PathBuf {
@@ -47,8 +59,93 @@ pub struct Harnesses {
     pub verifier: Arc<dyn Harness>,
 }
 
+impl Harnesses {
+    /// Build the five adapters from their names, with `make` deciding what a name means.
+    pub fn from_roles(
+        roles: &Roles,
+        make: &dyn Fn(&str) -> anyhow::Result<Arc<dyn Harness>>,
+    ) -> anyhow::Result<Self> {
+        Ok(Harnesses {
+            worker: make(&roles.worker)?,
+            mid: make(&roles.mid)?,
+            master: make(&roles.master)?,
+            reviewer: make(&roles.reviewer)?,
+            verifier: make(&roles.verifier)?,
+        })
+    }
+}
+
+/// The harness name for each role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Roles {
+    pub worker: String,
+    pub mid: String,
+    pub master: String,
+    pub reviewer: String,
+    pub verifier: String,
+}
+
+impl Default for Roles {
+    /// The worker is the cheap one. The reviewer and the verifier are different harnesses,
+    /// so one model does not check its own work.
+    fn default() -> Self {
+        Roles {
+            worker: "agy".into(),
+            mid: "grok".into(),
+            master: "claude".into(),
+            reviewer: "claude".into(),
+            verifier: "agy".into(),
+        }
+    }
+}
+
+/// A chosen model must be one its provider lists right now. A role with no model chosen
+/// keeps the provider's default, and the provider is not asked.
+pub async fn check_models(roles: &Roles, models: &Models) -> anyhow::Result<()> {
+    let chosen = [
+        ("--worker-model", roles.worker.as_str(), models.worker.as_deref()),
+        ("--mid-model", roles.mid.as_str(), models.mid.as_deref()),
+        ("--master-model", roles.master.as_str(), models.master.as_deref()),
+        ("--reviewer-model", roles.reviewer.as_str(), models.reviewer.as_deref()),
+        ("--verifier-model", roles.verifier.as_str(), models.verifier.as_deref()),
+    ];
+    let mut groups: std::collections::BTreeMap<&str, Vec<(&str, &str)>> = Default::default();
+    for (flag, id, model) in chosen {
+        let Some(model) = model else { continue };
+        if !HARNESSES.contains(&id) {
+            bail!("unknown harness `{id}`: use one of {}", HARNESSES.join(", "));
+        }
+        groups.entry(id).or_default().push((flag, model));
+    }
+    for (id, chosen) in groups {
+        let report = provider_report(id).await;
+        if let Some(note) = report.error.as_deref().filter(|_| !report.models.is_empty()) {
+            eprintln!("taskmaster: {id}: {note}");
+        }
+        for (flag, model) in chosen {
+            require_model(&report, flag, model)?;
+        }
+    }
+    Ok(())
+}
+
+/// How a run was asked for. It is stored with the run, so a plan approved later, from
+/// another process or another device, is built by the harnesses that were chosen then.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunRequest {
+    pub prompt: Option<String>,
+    pub plan: Option<Plan>,
+    pub roles: Roles,
+    pub models: Models,
+    pub parallel: Option<usize>,
+    pub timeout_secs: Option<u64>,
+}
+
 /// Optional model names passed through to the harness. The harness id is the default.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Models {
     pub worker: Option<String>,
     pub mid: Option<String>,
@@ -69,6 +166,15 @@ pub struct Config {
     pub parallel: usize,
     /// Approve the plan and build. Without this, the plan is printed and the process stops.
     pub yes: bool,
+    /// Throw away the plan that is waiting for approval. With a new `prompt` or `plan`
+    /// the run plans again; without one it stops with [`Outcome::Rejected`].
+    pub reject: bool,
+    /// Typecheck and lint what was built, with the project's own tools, before finishing.
+    pub checks: bool,
+    /// Where run records are kept. `None` is `.taskmaster/` in the project.
+    pub store: Option<Arc<dyn Store>>,
+    /// The Commons other people share. `None` keeps the Commons on this machine.
+    pub remote: Option<Arc<dyn CommonsRemote>>,
     pub timeout: Duration,
     /// Dictionary directory. Defaults to `.taskmaster/dictionary` in the project.
     pub dictionary: Option<PathBuf>,
@@ -91,6 +197,10 @@ impl Config {
             prompt: None,
             parallel: 4,
             yes: false,
+            reject: false,
+            checks: true,
+            store: None,
+            remote: None,
             timeout: Duration::from_secs(600),
             dictionary: None,
             commons: None,
@@ -119,5 +229,7 @@ impl Clone for Harnesses {
 pub enum Outcome {
     /// The plan is recorded. Run again with `yes` to build it.
     NeedsApproval { summary: String },
+    /// The waiting plan was rejected and nothing replaced it. The run is back at planning.
+    Rejected,
     Finished { ok: bool },
 }

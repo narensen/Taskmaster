@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taskmaster</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #000; color: #fff; font: 18px/1.4 ui-sans-serif, system-ui, sans-serif; }
+  main { max-width: 32rem; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
+  h1 { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.03em; margin: 0 0 0.25rem; }
+  p { color: #c8c8c8; }
+  form, section { display: grid; gap: 0.75rem; }
+  input { font: inherit; padding: 0.8rem 0.9rem; border-radius: 0.7rem; border: 1px solid #333; background: #111; color: #fff; letter-spacing: 0.2em; text-transform: uppercase; }
+  button { font: inherit; padding: 0.85rem 1rem; border: 0; border-radius: 0.7rem; background: #fff; color: #000; font-weight: 650; }
+  .run { border-top: 1px solid #222; padding: 0.9rem 0; }
+  .phase { font-size: 1.15rem; }
+  .bad { color: #ffb4b4; }
+  .ok { color: #b6f5c8; }
+  .muted { color: #9a9a9a; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Taskmaster</h1>
+  <p id="lead">Pair this phone with the machine running the daemon.</p>
+  <form id="pair">
+    <input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" placeholder="Pairing code" required>
+    <button type="submit">Pair</button>
+  </form>
+  <section id="status" hidden></section>
+</main>
+<script>
+const form = document.getElementById("pair");
+const status = document.getElementById("status");
+const lead = document.getElementById("lead");
+const key = "taskmaster-phone-token";
+function line(parent, text, className) {
+  const p = document.createElement("p");
+  p.textContent = text;
+  if (className) p.className = className;
+  parent.appendChild(p);
+}
+async function load() {
+  const token = localStorage.getItem(key);
+  if (!token) return;
+  const response = await fetch("/api/runs", { headers: { authorization: "Bearer " + token } });
+  if (response.status === 401) { localStorage.removeItem(key); return; }
+  const body = await response.json();
+  form.hidden = true;
+  status.hidden = false;
+  status.replaceChildren();
+  lead.textContent = "This phone is paired.";
+  if (!body.runs.length) line(status, "No runs yet.", "muted");
+  for (const run of body.runs) {
+    const block = document.createElement("div");
+    block.className = "run";
+    const phase = run.phase.replace("_", " ") + (run.active ? " (running)" : "");
+    line(block, run.id + "  " + phase, "phase " + (run.phase === "failed" ? "bad" : run.phase === "done" ? "ok" : ""));
+    for (const page of run.pages) line(block, page.id + "  " + page.state, "muted");
+    if (run.spent.calls) line(block, run.spent.tokens.toLocaleString() + " tokens in " + run.spent.calls + " calls", "muted");
+    if (run.error) line(block, run.error, "bad");
+    if (run.phase === "awaiting_approval" && !run.active) {
+      const approve = document.createElement("button");
+      approve.textContent = "Approve and build";
+      approve.addEventListener("click", async () => {
+        approve.disabled = true;
+        await fetch("/api/runs/" + encodeURIComponent(run.id) + "/approve", { method: "POST", headers: { authorization: "Bearer " + token } });
+        load();
+      });
+      block.appendChild(approve);
+    }
+    status.appendChild(block);
+  }
+}
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const code = document.getElementById("code").value.trim();
+  const response = await fetch("/api/pair", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
+  if (!response.ok) { lead.textContent = "That code was refused."; return; }
+  const body = await response.json();
+  localStorage.setItem(key, body.token);
+  load();
+});
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>

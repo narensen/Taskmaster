@@ -1932,6 +1932,150 @@ mod http {
         assert_eq!(client.post("/api/settings", json!({ "editor": "" })).await.1["editor"], "");
     }
 
+    /// Whatever goes wrong under /api, the reply is JSON with a message in `error`.
+    async fn raw(client: &Client, method: &str, path: &str, content_type: Option<&str>, body: &str) -> (u16, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(&client.addr).await.unwrap();
+        let ct = content_type.map(|c| format!("content-type: {c}\r\n")).unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n{ct}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            client.token.clone().unwrap_or_default(),
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+        let status = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+        (status, head.to_lowercase(), rest.to_string())
+    }
+
+    #[test]
+    fn keys_credentials_and_git_internals_are_never_previewed_and_addresses_lose_their_passwords() {
+        use crate::api::{redact, sensitive};
+        for secret in [
+            "/home/a/.ssh/id_rsa",
+            "/home/a/.aws/credentials",
+            "/p/.git/config",
+            "/p/.env",
+            "/p/app/.env.local",
+            "/p/server.pem",
+            "/p/deploy/prod.key",
+            "/home/a/.config/gh/hosts.yml",
+            "/home/a/.netrc",
+            "/w/secrets.env",
+            "/w/.TASKMASTER/../.ENV",
+        ] {
+            assert!(sensitive(Path::new(secret)), "{secret}");
+        }
+        for fine in ["/p/.env.example", "/p/src/main.rs", "/p/README.md", "/p/.github/workflows/ci.yml", "/p/environment.ts", "/p/keys.md"] {
+            assert!(!sensitive(Path::new(fine)), "{fine}");
+        }
+        assert_eq!(
+            redact("fatal: unable to access 'https://naren:ghp_abc123@github.com/o/r.git/': 403 and http://h.example/x"),
+            "fatal: unable to access 'https://***@github.com/o/r.git/': 403 and http://h.example/x"
+        );
+        assert_eq!(redact("nothing to hide"), "nothing to hide");
+    }
+
+    #[tokio::test]
+    async fn the_ui_endpoints_refuse_bad_input_with_json_errors_and_never_leave_the_project() {
+        let tmp = repo("api-harden");
+        let project = tmp.0.canonicalize().unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(project.join(".env"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(project.join(".env.example"), "TOKEN=\n").unwrap();
+        std::fs::write(project.join("big.txt"), vec![b'a'; 2 * 1024 * 1024]).unwrap();
+        std::fs::write(project.join("bin.dat"), [0u8, 1, 2]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/hostname", project.join("link")).unwrap();
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        // A body that is not JSON, the wrong type, a missing field, a bad number, a wrong method: all JSON.
+        for (method, path, ct, body, status) in [
+            ("POST", "/api/open", Some("application/json"), "{not json", 400),
+            ("POST", "/api/open", Some("application/json"), "{}", 422),
+            ("POST", "/api/open", Some("text/plain"), "{}", 415),
+            ("POST", "/api/open", None, "{}", 415),
+            ("POST", "/api/paths", Some("application/json"), r#"{"paths":"x"}"#, 422),
+            ("POST", "/api/settings", Some("application/json"), r#"{"approvals":7}"#, 422),
+            ("GET", "/api/gh/pr/abc", None, "", 400),
+            ("GET", "/api/gh/pr/-1", None, "", 400),
+            ("DELETE", "/api/settings", None, "", 405),
+            ("GET", "/api/nope", None, "", 404),
+            ("POST", "/api/runs/x/notes", Some("application/json"), r#"{"to":"master"}"#, 422),
+        ] {
+            let (got, head, text) = raw(&client, method, path, ct, body).await;
+            assert_eq!(got, status, "{method} {path}: {text}");
+            assert!(head.contains("content-type: application/json"), "{method} {path}: {head}");
+            let reply: Value = serde_json::from_str(&text).unwrap_or_else(|_| panic!("{method} {path}: {text}"));
+            assert!(reply["error"].as_str().is_some_and(|e| !e.is_empty()), "{method} {path}: {reply}");
+        }
+        // Known failures keep one shape too.
+        for (status, reply) in [
+            client.get("/api/runs/nope").await,
+            client.get("/api/file?path=nope.rs").await,
+            client.get("/api/file").await,
+            client.post("/api/open", json!({ "path": "nope.rs" })).await,
+            client.post("/api/runs/nope/pr", json!({})).await,
+            client.get("/api/runs/nope/diff").await,
+            client.post("/api/settings", json!({ "approvals": "sometimes" })).await,
+        ] {
+            assert!(status >= 400 && reply["error"].as_str().is_some(), "{status}: {reply}");
+        }
+
+        // Nothing outside the project (or the home directory) is read, opened or reported as real.
+        let up = "../".repeat(12) + "etc/passwd";
+        for path in [
+            "/etc/passwd".to_string(),
+            "src/../../../../../../etc/passwd".to_string(),
+            up.clone(),
+            "~/../../etc/passwd".to_string(),
+            "link".to_string(),
+            "src".to_string(),
+            "src/\0main.rs".to_string(),
+            "x".repeat(5000),
+        ] {
+            let query = path.replace('\0', "%00").replace('/', "%2F");
+            let (status, reply) = client.get(&format!("/api/file?path={query}")).await;
+            assert_eq!(status, 404, "{path}: {reply}");
+            let (status, reply) = client.post("/api/open", json!({ "path": path })).await;
+            assert_eq!(status, 404, "{path}: {reply}");
+            let (_, found) = client.post("/api/paths", json!({ "paths": [path.clone()] })).await;
+            assert!(found["paths"][&path].is_null(), "{path}: {found}");
+        }
+        // A path with `..` that comes back inside is fine.
+        assert_eq!(client.get("/api/file?path=src%2F..%2Fsrc%2Fmain.rs").await.0, 200);
+        // Secrets inside the project are real but not shown; a template is.
+        let (status, reply) = client.get("/api/file?path=.env").await;
+        assert_eq!(status, 403, "{reply}");
+        assert!(!reply.to_string().contains("hunter2"));
+        assert_eq!(client.get("/api/file?path=.env.example").await.0, 200);
+        // Only the start of a big file is read; a binary file has no text preview.
+        let (status, big) = client.get("/api/file?path=big.txt").await;
+        assert_eq!((status, big["truncated"].as_bool(), big["content"].as_str().unwrap().len()), (200, Some(true), 512 * 1024));
+        assert_eq!(client.get("/api/file?path=bin.dat").await.0, 415);
+
+        // Settings: bad values change nothing.
+        assert_eq!(client.post("/api/settings", json!({ "approval_timeout_secs": 999999 })).await.0, 400);
+        assert_eq!(client.post("/api/settings", json!({ "editor": "x\nrm -rf" })).await.0, 400);
+        assert!(!project.join(".taskmaster/config.json").exists(), "a refused change writes nothing");
+        // The PR draft needs a finished run; the pull request lookup needs a number.
+        assert_eq!(client.get("/api/gh/pr/99999999999999999999").await.0, 400);
+        assert_eq!(client.get("/api/approvals?run=..").await.0, 400);
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "pr1", "plan": planned })).await;
+        client.settled("pr1", "awaiting_approval").await;
+        let (status, reply) = client.post("/api/runs/pr1/pr", json!({})).await;
+        assert_eq!(status, 409, "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("done"));
+        assert_eq!(client.get("/api/runs/pr1/diff?scope=page").await.0, 409);
+    }
+
 }
 
 mod commons_service {

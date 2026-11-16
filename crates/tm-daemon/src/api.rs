@@ -81,7 +81,7 @@ use tokio::sync::{oneshot, watch};
 mod desk;
 
 #[cfg(test)]
-pub(crate) use desk::{Style, choose_editor};
+pub(crate) use desk::{Style, choose_editor, redact, sensitive};
 
 use crate::auth::Auth;
 use crate::live::Live;
@@ -275,6 +275,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/pair", post(pair))
         .merge(private)
         .fallback(frontend)
+        .layer(middleware::from_fn(json_errors))
         .layer(middleware::from_fn(cors))
         .with_state(app)
 }
@@ -302,6 +303,35 @@ async fn cors(request: Request, next: Next) -> Response {
     headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type"));
     headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
     response
+}
+
+/// Every error under `/api` is `{"error": "<what went wrong>"}`, including the ones the
+/// framework makes before a handler runs (a body that is not JSON, a number that is not
+/// one, a method the route does not take).
+async fn json_errors(request: Request, next: Next) -> Response {
+    let api = request.uri().path().starts_with("/api/");
+    let response = next.run(request).await;
+    if !api || !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+    let json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if json {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    let message = if text.is_empty() { parts.status.canonical_reason().unwrap_or("error").to_lowercase() } else { text };
+    let mut headers = parts.headers;
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::CONTENT_TYPE);
+    let mut reply = (parts.status, Json(json!({ "error": message }))).into_response();
+    reply.headers_mut().extend(headers);
+    reply
 }
 
 struct ApiError(StatusCode, String);

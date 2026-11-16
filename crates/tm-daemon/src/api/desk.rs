@@ -49,6 +49,54 @@ const TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 const KEEP: usize = 64 * 1024;
 const PREVIEW_LIMIT: u64 = 512 * 1024;
 
+/// The longest path or command-line value the API accepts.
+const MAX_PATH: usize = 4096;
+
+/// Files a preview never shows, wherever they are: keys, credentials, environment files
+/// and git's own directory (whose config can hold a token in a remote's address).
+pub fn sensitive(path: &Path) -> bool {
+    const DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git", ".password-store", ".azure"];
+    const NAMES: &[&str] = &[
+        ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".pgpass", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials",
+        "credentials.json", "secrets.env", "taskmaster-credentials.tgz",
+    ];
+    let parts: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+    if parts.iter().any(|part| DIRS.contains(&part.as_str())) {
+        return true;
+    }
+    // GitHub CLI's own login.
+    if parts.windows(2).any(|pair| pair[0] == ".config" && pair[1] == "gh") {
+        return true;
+    }
+    let Some(name) = parts.last() else { return false };
+    if NAMES.contains(&name.as_str()) || [".pem", ".key", ".p12", ".pfx", ".keystore", ".kdbx"].iter().any(|ext| name.ends_with(ext)) {
+        return true;
+    }
+    let template = [".example", ".sample", ".template", ".dist"].iter().any(|ext| name.ends_with(ext));
+    (name == ".env" || name.starts_with(".env.") || name.ends_with(".env")) && !template
+}
+
+/// Hide a password or token in an address (`https://user:secret@host/..`) in text that is
+/// about to be shown, as git and gh print the remote they could not reach.
+pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let end = tail.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(i) => {
+                out.push_str("***@");
+                rest = &tail[i + 1..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -59,7 +107,7 @@ fn home() -> Option<PathBuf> {
 /// project yet is found there.
 pub fn resolve(project: &Path, raw: &str) -> Option<PathBuf> {
     let raw = raw.trim();
-    if raw.is_empty() || raw.contains('\0') {
+    if raw.is_empty() || raw.len() > MAX_PATH || raw.contains('\0') {
         return None;
     }
     let path = if let Some(rest) = raw.strip_prefix("~/") {
@@ -176,6 +224,11 @@ pub struct TerminalBody {
     command: String,
 }
 
+/// A value from a request, cut short before it goes into a message.
+fn clip_text(text: &str) -> String {
+    text.chars().take(200).collect()
+}
+
 fn tail(text: &str) -> String {
     if text.len() <= KEEP {
         return text.to_string();
@@ -230,7 +283,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|err| format!("cannot run git: {err}"))?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        return Err(redact(String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -299,7 +352,7 @@ fn gh(project: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|_| "gh is not installed".to_string())?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if !out.status.success() {
-        return Err(text.trim().to_string());
+        return Err(redact(text.trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -331,6 +384,7 @@ pub async fn gh_pr(State(app): State<Arc<App>>, UrlPath(number): UrlPath<u64>) -
     .unwrap_or_else(|_| Err("gh stopped".into()));
     match found {
         Ok(text) => ok(serde_json::from_str(&text).unwrap_or(Value::Null)),
+        Err(err) if err.contains("not installed") => Err(fail(StatusCode::FAILED_DEPENDENCY, err)),
         Err(err) => Err(fail(StatusCode::NOT_FOUND, err)),
     }
 }
@@ -639,7 +693,7 @@ fn failed_dependency(message: String, command: &str, path: &str) -> Reply {
 /// Open a file in an editor on this machine, the one that holds the project.
 pub async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenBody>) -> Reply {
     let Some(file) = resolve(&app.project, &body.path) else {
-        return Err(fail(StatusCode::NOT_FOUND, format!("{} is not a file here", body.path)));
+        return Err(fail(StatusCode::NOT_FOUND, format!("{} is not a file here", clip_text(&body.path))));
     };
     let full = file.display().to_string();
     let wanted = body.editor.as_deref().filter(|id| !id.is_empty());
@@ -704,11 +758,21 @@ pub async fn paths(State(app): State<Arc<App>>, Json(body): Json<PathsBody>) -> 
 pub async fn file(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
     let raw = query.get("path").cloned().unwrap_or_default();
     let Some(file) = resolve(&app.project, &raw) else {
-        return Err(fail(StatusCode::NOT_FOUND, format!("{raw} is not a file here")));
+        return Err(fail(StatusCode::NOT_FOUND, format!("{} is not a file here", clip_text(&raw))));
     };
+    if sensitive(&file) {
+        return Err(fail(StatusCode::FORBIDDEN, "keys, credentials, environment files and .git are never previewed"));
+    }
     let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-    let bytes = std::fs::read(&file).map_err(|err| fail(StatusCode::NOT_FOUND, err.to_string()))?;
-    let cut = &bytes[..bytes.len().min(PREVIEW_LIMIT as usize)];
+    // Only the part that is shown is read, however large the file is.
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read;
+        std::fs::File::open(&file)
+            .and_then(|f| f.take(PREVIEW_LIMIT).read_to_end(&mut bytes))
+            .map_err(|err| fail(StatusCode::NOT_FOUND, err.to_string()))?;
+    }
+    let cut = &bytes[..];
     if cut.contains(&0) {
         return Err(fail(StatusCode::UNSUPPORTED_MEDIA_TYPE, "a binary file has no text preview"));
     }

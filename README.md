@@ -61,7 +61,7 @@ The reviewer and the verifier are different harnesses, so one model does not gra
 
 ## Checks that cost nothing
 
-Before a run finishes, the files it built are typechecked and linted with tools the project already has: `tsc` from `node_modules`, eslint when it is configured, clippy for Rust, ruff for Python. Only errors count. A type error, a compile error, or a lint rule the project set to `error` goes back to the page that owns the file, and into that model's Errorography. Style warnings do not. An error in a file no page owns is printed and does not fail the run. Taskmaster installs nothing here.
+Before a run finishes, the files it built are typechecked and linted with tools the project already has: `tsc` from `node_modules`, eslint when it is configured, clippy for Rust, ruff for Python. Only errors count. A type error, a compile error, or a lint rule the project set to `error` goes back to the page that owns the file, and into that model's Errorography. Style warnings do not. An error in a shared file the run wrote, a contract or a template file, goes to the master, which may edit those files and nothing else. It gets two such repairs in a run; if the file still fails, the run fails. An error in a file the run did not write was there before, so it is printed and left alone. Taskmaster installs nothing here.
 
 ## What a run cost
 
@@ -79,13 +79,13 @@ The project store is `.taskmaster/dictionary`. The Commons defaults to `~/.taskm
 
 **Errorography.** Each model has its own book in `.taskmaster/errorography.json`. The same mistake, three times for that model, is handed back on its next attempt, with a fix when one was learned.
 
-**Citations.** `.taskmaster/citations.json` stores the Dictionary hash each page was built against. A later run skips a page whose cited hashes still match.
+**Citations.** `.taskmaster/citations.json` stores the Dictionary hash each page was built against. A later run skips a page whose cited hashes still match. A page is recorded only once its run is merged, so a run left on its branch does not make the next one skip anything.
 
 **The event log.** `.taskmaster/runs/<id>/events.jsonl` is the run. Replaying it rebuilds the state. The default id is `current`.
 
 ## Eval
 
-`--eval` runs the same plan again on one baseline harness and writes `.taskmaster/evals/<id>.json`. Each side reports its pages, its check failures, its tokens, and its cost. A prompt is planned once, and the baseline reuses that plan. The baseline starts from the same commit and its result stays on `taskmaster/<id>-baseline`. The baseline defaults to the master harness. The comparison runs after the plan is approved.
+`--eval` runs the same plan again on one baseline harness and writes `.taskmaster/evals/<id>.json`. Each side reports its pages, its check failures, its tokens, and its cost. A prompt is planned once, and the baseline reuses that plan. The baseline starts from the same commit. It is measured and then discarded: the project keeps the Taskmaster result. The baseline defaults to the master harness. The comparison runs after the plan is approved.
 
 ```bash
 tm-daemon . --prompt "A small notes app with a list and an editor." --eval --baseline codex --yes
@@ -186,13 +186,21 @@ Commits the daemon makes need `user.name` and `user.email` on that repository. T
 | `tm-verify` | Ownership globs and the import graph. |
 | `tm-review` | Review of any git repository. The binary is `tm-review`. |
 
-## Build
+## Install
+
+```bash
+scripts/install.sh
+```
+
+This builds both binaries and copies them to `~/.local/bin`, or to the directory you pass. It needs `cargo` and `git`. Antigravity, Grok Build and OpenCode are confined with bubblewrap, so those three also need `bwrap`. A tag starting with `v` builds a Linux release on GitHub.
+
+To build without installing:
 
 ```bash
 cargo build --release -p tm-daemon -p tm-review
 ```
 
-The binaries are `target/release/tm-daemon` and `target/release/tm-review`.
+The binaries are `target/release/tm-daemon` and `target/release/tm-review`. A harness is found on `PATH`, and also in `~/.local/bin` and `~/.opencode/bin`, where their installers put them.
 
 ## License
 

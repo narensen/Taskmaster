@@ -59,6 +59,7 @@ pub fn render_changes(entries: &[ChangeEntry], limit: usize) -> String {
     for e in entries.iter().rev().take(limit) {
         let kind = match e.kind {
             ChangeKind::ContractsLocked => "contracts locked",
+            ChangeKind::SharedRepaired => "shared files repaired",
             ChangeKind::PageBuilt => "page built",
             ChangeKind::PageRepaired => "page repaired",
             ChangeKind::EntryAmended => "entry amended",

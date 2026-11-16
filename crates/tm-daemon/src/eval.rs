@@ -46,6 +46,7 @@ pub async fn evaluate(
         Some(store) => Records::new(store.clone()),
         None => Records::files(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone())),
     };
+    let project = config.project.canonicalize().unwrap_or_else(|_| config.project.clone());
     let id = config.run_id.clone();
     let taskmaster_name = harnesses.worker.id().to_string();
     config.incremental = true;
@@ -76,6 +77,10 @@ pub async fn evaluate(
     };
     let baseline_outcome = drive(config, baseline_harnesses).await?;
     let baseline_side = side(&records, &format!("{id}-baseline"), baseline_name, &baseline_outcome)?;
+    // The baseline was only ever measured. Its branch would otherwise pile up, one per eval.
+    if let Some(branch) = records.meta(&format!("{id}-baseline"))?.and_then(|meta| meta.branch) {
+        let _ = crate::git::git(&project, &["branch", "-D", &branch]);
+    }
     let report = EvalReport { taskmaster, baseline: Some(baseline_side) };
     records.save_eval(&id, &report)?;
     Ok((outcome, report))

@@ -53,7 +53,8 @@ impl AcpHarness {
         })
     }
 
-    /// Opencode (`opencode acp`). Written from its documented interface; not yet run here.
+    /// Opencode (`opencode acp`). It does not ask before file edits, so the sandbox is what
+    /// confines it, as with Antigravity. Its model is a session option, not `set_model`.
     pub fn opencode() -> anyhow::Result<Self> {
         Ok(AcpHarness {
             id: "opencode",
@@ -66,7 +67,8 @@ impl AcpHarness {
 
     fn command(&self, task: &WorkerTask) -> anyhow::Result<Command> {
         let Some(sandbox) = &self.sandbox else {
-            let mut cmd = Command::new(&self.binary);
+            let binary = resolve_binary(&self.binary)?;
+            let mut cmd = Command::new(binary);
             cmd.args(&self.args).current_dir(&task.cwd);
             return Ok(cmd);
         };
@@ -119,6 +121,15 @@ impl Harness for AcpHarness {
     }
 }
 
+/// The id of the session option that chooses the model, when the agent has one.
+fn model_option(session: &Value) -> Option<&str> {
+    session["configOptions"]
+        .as_array()?
+        .iter()
+        .find(|option| option["category"] == "model" || option["id"] == "model")
+        .and_then(|option| option["id"].as_str())
+}
+
 struct Session {
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
@@ -161,10 +172,16 @@ impl Session {
             session["sessionId"].as_str().context("session/new returned no sessionId")?.to_string();
 
         if let Some(model) = &task.model {
-            let params = json!({ "sessionId": session_id, "modelId": model });
-            self.call("session/set_model", params)
-                .await
-                .with_context(|| format!("could not select model `{model}`"))?;
+            // Opencode offers the model as a session option. Antigravity and Grok Build
+            // take `session/set_model`.
+            let (method, params) = match model_option(&session) {
+                Some(option) => (
+                    "session/set_config_option",
+                    json!({ "sessionId": session_id, "configId": option, "value": model }),
+                ),
+                None => ("session/set_model", json!({ "sessionId": session_id, "modelId": model })),
+            };
+            self.call(method, params).await.with_context(|| format!("could not select model `{model}`"))?;
         }
 
         let prompt = json!({

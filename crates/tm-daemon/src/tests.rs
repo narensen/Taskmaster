@@ -148,6 +148,19 @@ impl World {
             let real = matches!(self.mode, Mode::ConfirmFinding);
             return Ok(Script::text(if real { "{\"real\": true}" } else { "{\"real\": false}" }));
         }
+        if brief.contains("Shared files this run wrote fail the project's checks") {
+            if matches!(self.mode, Mode::Nothing) {
+                return Ok(Script::text("I could not find the problem."));
+            }
+            // The second file is not on the list the master was given.
+            return Ok(Script {
+                text: "fixed".into(),
+                files: vec![
+                    ("contracts/types.ts".into(), Some("export type Id = string; // repaired\n".into())),
+                    ("app/a/page.ts".into(), Some("hacked\n".into())),
+                ],
+            });
+        }
         // A review of a repository, started through the API, not a run's own review.
         if brief.contains("You are reviewing a code change") {
             let found = matches!(self.mode, Mode::ConfirmFinding) && !brief.contains("security problems only");
@@ -645,6 +658,9 @@ async fn eval_runs_the_plan_against_one_model() {
     assert_eq!(report.taskmaster.tokens, report.taskmaster.agent_calls * 120);
     assert!(baseline.agent_calls >= 3 && baseline.tokens == baseline.agent_calls * 120);
     assert!(tmp.0.join(".taskmaster/evals/score.json").is_file());
+    // The baseline was measured, not kept.
+    assert_eq!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).trim(), "");
+    assert!(!read(&tmp.0.join("app/a/page.ts")).is_empty());
 }
 
 fn planner_calls(world: &World) -> Vec<String> {
@@ -922,6 +938,7 @@ async fn a_run_builds_on_its_own_branch_and_is_merged_when_it_finishes() {
     assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
     let status = Records::files(&tmp.0).status("current").unwrap().unwrap();
     assert_eq!((status["branch"].as_str(), status["merged"].as_bool()), (Some("taskmaster/current"), Some(true)));
+    assert!(Records::files(&tmp.0).citations().unwrap().pages.contains_key("a"));
 }
 
 #[tokio::test]
@@ -954,6 +971,8 @@ async fn a_run_that_conflicts_with_the_project_stays_on_its_branch() {
     assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
     assert!(git_out(&tmp.0, &["show", "taskmaster/current:app/a/page.ts"]).contains("\"a\""));
     assert_eq!(Records::files(&tmp.0).status("current").unwrap().unwrap()["merged"], false);
+    // The project does not have the run's page, so a later run must not skip it as unchanged.
+    assert!(!Records::files(&tmp.0).citations().unwrap().pages.contains_key("a"));
 }
 
 #[tokio::test]
@@ -991,6 +1010,75 @@ async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
     assert_eq!(status["estimate"]["tokens"], 3 * 120);
     assert!((status["estimate"]["usd"].as_f64().unwrap() - 0.03).abs() < 1e-9);
     assert_eq!(status["spent"]["fresh"], 3 * 120);
+}
+
+/// A project whose `tsc` is a script: it reports `error` until `fixed_when` holds.
+#[cfg(unix)]
+fn typed(name: &str, error: &str, fixed_when: &str) -> Tmp {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = repo(name);
+    std::fs::create_dir_all(tmp.0.join("lib")).unwrap();
+    std::fs::write(tmp.0.join("tsconfig.json"), "{}\n").unwrap();
+    std::fs::write(tmp.0.join("lib/old.ts"), "export const old = 1;\n").unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "start"]);
+    // Installed packages are not in git. The run's checkout has to borrow them.
+    let bin = tmp.0.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!("#!/bin/sh\nif {fixed_when}; then exit 0; fi\necho \"{error}\"\nexit 2\n");
+    std::fs::write(bin.join("tsc"), script).unwrap();
+    std::fs::set_permissions(bin.join("tsc"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_error_in_a_contract_is_repaired_by_the_master_and_nothing_else_is_touched() {
+    let tmp = typed(
+        "shared",
+        "contracts/types.ts(1,1): error TS1005: ';' expected.",
+        "grep -q repaired contracts/types.ts",
+    );
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let repair = calls.iter().find(|call| call.contains("Shared files this run wrote")).expect("the master was asked");
+    assert!(repair.contains("contracts/types.ts:1 tsc: TS1005") && repair.contains("- `contracts/types.ts`"), "{repair}");
+    assert!(read(&tmp.0.join("contracts/types.ts")).contains("repaired"));
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));
+    assert!(log(&tmp.0).contains("taskmaster: repair shared files"));
+    let entries = Records::files(&tmp.0).ledger("current").unwrap();
+    assert!(entries.iter().any(|entry| entry.role.name() == "master" && entry.page.is_none()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_contract_nobody_can_repair_fails_the_run() {
+    let tmp = typed("shared-stuck", "contracts/types.ts(1,1): error TS1005: ';' expected.", "false");
+    // Pages build, but the master's repair changes nothing.
+    let world = World::new(Mode::Write);
+    let stuck = World::new(Mode::Nothing);
+    let mut harnesses = world.harnesses();
+    harnesses.master = Arc::new(Fake(stuck.clone()));
+    let cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses)).await.unwrap().unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    assert_eq!(stuck.calls.lock().unwrap().len(), 1, "one repair attempt, then the run stops");
+    assert!(!tmp.0.join("app/a/page.ts").exists());
+    assert!(read(&run_directory(&tmp.0, "current").join("changes.jsonl")).contains("TS1005"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_error_that_was_there_before_the_run_is_left_alone() {
+    let tmp = typed("shared-older", "lib/old.ts(1,1): error TS2304: Cannot find name 'gone'.", "false");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(!world.calls.lock().unwrap().iter().any(|call| call.contains("Shared files this run wrote")));
+    assert!(tmp.0.join("app/a/page.ts").is_file());
 }
 
 mod http {

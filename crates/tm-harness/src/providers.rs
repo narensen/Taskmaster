@@ -283,7 +283,9 @@ struct Captured {
 }
 
 async fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<Captured> {
-    let mut cmd = tokio::process::Command::new(program);
+    // The same lookup the adapters use, so a harness that runs can also be listed.
+    let found = resolve_binary(program).map(|path| path.into_os_string()).unwrap_or_else(|_| program.into());
+    let mut cmd = tokio::process::Command::new(found);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

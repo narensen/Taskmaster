@@ -133,6 +133,8 @@ impl Finding {
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     ContractsLocked,
+    /// The master repaired a shared file the run wrote, after the project's checks failed on it.
+    SharedRepaired,
     PageBuilt,
     PageRepaired,
     EntryAmended,

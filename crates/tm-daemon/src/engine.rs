@@ -73,6 +73,18 @@ impl AgentRequest {
     }
 }
 
+/// Shared-file repairs the master gets in one run.
+const MAX_SHARED_REPAIRS: usize = 2;
+
+/// What the project's own tools said about the files a run wrote.
+#[derive(Default)]
+struct Checked {
+    /// Errors in a page's files, by page.
+    pages: BTreeMap<PageId, String>,
+    /// Errors in shared files the run wrote: the file, and the line to show.
+    shared: Vec<(String, String)>,
+}
+
 enum Step {
     Continue,
     Stop(Outcome),
@@ -93,6 +105,10 @@ struct Driver {
     /// Set once the run's branch has been offered to the project: the branch, and
     /// whether it was merged.
     delivery: Option<(String, bool)>,
+    /// Citations of pages built on the run's branch. They are written to the project's
+    /// record only once the branch is merged: until then the project does not have the
+    /// pages, and a later run must not skip them.
+    staged: BTreeMap<PageId, Vec<Citation>>,
     template: Option<Template>,
     /// The run id, as the records name it.
     id: String,
@@ -190,6 +206,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         project,
         branch: meta.branch.clone(),
         delivery: None,
+        staged: BTreeMap::new(),
         template,
         id,
         records,
@@ -955,12 +972,35 @@ impl Driver {
         let owners = Owners::from_plan(&plan)?;
         let sources = load_sources(&self.tree)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
-        for (page, errors) in self.mechanical_checks(&owners).await? {
+        let mut checked = self.mechanical_checks(&owners).await?;
+        if !checked.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
+            self.repair_shared(&checked.shared).await?;
+            checked = self.mechanical_checks(&owners).await?;
+        }
+        for (page, errors) in checked.pages {
             let text = failing.entry(page).or_default();
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
             }
             text.push_str(&errors);
+        }
+        if failing.is_empty() && !checked.shared.is_empty() {
+            // No page owns these files and the master could not repair them, so there is
+            // nobody left to send the errors to.
+            let lines: Vec<String> = checked.shared.iter().map(|(_, line)| line.clone()).collect();
+            eprintln!("taskmaster: shared files still fail the project's checks:\n{}", lines.join("\n"));
+            let entry = ChangeEntry {
+                at: rfc3339_now(),
+                kind: ChangeKind::VerifyFailed,
+                page: None,
+                commit: None,
+                model: None,
+                files: checked.shared.iter().map(|(file, _)| file.clone()).collect(),
+                keys: vec![],
+                summary: lines.join("\n"),
+            };
+            self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
+            return Ok((false, BTreeMap::new()));
         }
         if let Some(note) = self.run_verify_script()? {
             let mut attributed = false;
@@ -1007,12 +1047,102 @@ impl Driver {
         Ok((failing.is_empty(), failing))
     }
 
+    /// Shared files this run wrote: the contracts and the template.
+    fn locked_files(&self) -> BTreeSet<String> {
+        self.changes
+            .iter()
+            .filter(|entry| matches!(entry.kind, ChangeKind::ContractsLocked | ChangeKind::SharedRepaired))
+            .flat_map(|entry| entry.files.iter().cloned())
+            .collect()
+    }
+
+    fn shared_repairs(&self) -> usize {
+        self.changes.iter().filter(|entry| entry.kind == ChangeKind::SharedRepaired).count()
+    }
+
+    /// Ask the master to fix shared files the run wrote. Workers may not touch them, and
+    /// the master may touch nothing else: any other edit it makes is discarded.
+    async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<()> {
+        let allowed: BTreeSet<String> = errors.iter().map(|(file, _)| file.clone()).collect();
+        eprintln!("taskmaster: asking the master to repair {} shared file(s)", allowed.len());
+        let mut brief = String::from(
+            "Shared files this run wrote fail the project's checks. Fix the errors below.\n\
+             You may edit only these files; any other edit is discarded:\n",
+        );
+        for file in &allowed {
+            brief.push_str(&format!("- `{file}`\n"));
+        }
+        brief.push_str("\nPages already import these files, so keep every exported name and type that still makes sense.\n\nErrors:\n");
+        for (_, line) in errors {
+            brief.push_str(&format!("{line}\n"));
+        }
+        let worktree = self.fresh_worktree("shared")?;
+        let request = AgentRequest {
+            harness: self.harnesses.master.clone(),
+            brief,
+            cwd: worktree.clone(),
+            model: self.config.models.master.clone(),
+            dictionary: Some(self.access(&self.master_token.clone())),
+            timeout: self.config.timeout,
+            read_only: false,
+        };
+        let bill = request.bill(Role::Master, None);
+        let asked = ask(request).await;
+        let merged = match asked {
+            Ok(answer) => {
+                self.charge(&bill, &answer)?;
+                self.merge_shared(&worktree, &allowed)
+            }
+            Err(err) => Err(err),
+        };
+        self.drop_worktree(&worktree);
+        let files = merged?;
+        // The attempt is recorded even when nothing changed, so it is not made again.
+        let summary = if files.is_empty() {
+            "the master changed no shared file".to_string()
+        } else {
+            format!("repaired {}", files.join(", "))
+        };
+        let entry = ChangeEntry {
+            at: rfc3339_now(),
+            kind: ChangeKind::SharedRepaired,
+            page: None,
+            commit: None,
+            model: Some(self.byline(self.harnesses.master.id(), &self.config.models.master)),
+            files: files.clone(),
+            keys: vec![],
+            summary,
+        };
+        if self.commit_entries(vec![entry.clone()], files, "taskmaster: repair shared files")?.is_none() {
+            self.changes.push(entry);
+            self.save_changes()?;
+        }
+        Ok(())
+    }
+
+    fn merge_shared(&self, worktree: &Path, allowed: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
+        let mut files = Vec::new();
+        for change in git::worktree_changes(worktree)? {
+            if !allowed.contains(&change.path) || change.status == 'D' || !git::safe_rel(&change.path) {
+                continue;
+            }
+            let src = worktree.join(&change.path);
+            if fs::symlink_metadata(&src)?.file_type().is_symlink() {
+                continue;
+            }
+            fs::copy(&src, self.tree.join(&change.path)).with_context(|| format!("cannot copy {}", change.path))?;
+            files.push(change.path);
+        }
+        Ok(files)
+    }
+
     /// Typecheck and lint the files this run built, with the project's own tools. No tokens
-    /// are spent. An error in a page's file goes back to that page. An error in a file no
-    /// page owns is printed and does not fail the run, because no worker could repair it.
-    async fn mechanical_checks(&self, owners: &Owners) -> anyhow::Result<BTreeMap<PageId, String>> {
+    /// are spent. An error in a page's file goes back to that page. An error in a shared
+    /// file this run wrote goes to the master. An error anywhere else was there before the
+    /// run, so it is printed and nothing more.
+    async fn mechanical_checks(&self, owners: &Owners) -> anyhow::Result<Checked> {
         if !self.config.checks {
-            return Ok(BTreeMap::new());
+            return Ok(Checked::default());
         }
         let mut built: BTreeSet<String> = BTreeSet::new();
         for entry in &self.changes {
@@ -1021,8 +1151,11 @@ impl Driver {
             }
         }
         if built.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(Checked::default());
         }
+        let locked = self.locked_files();
+        // Shared files are checked too: a page can be right and its contract wrong.
+        built.extend(locked.iter().filter(|file| self.tree.join(file).is_file()).cloned());
         let (project, files) = (self.tree.clone(), built.into_iter().collect::<Vec<_>>());
         let report = tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&project, &files))
             .await
@@ -1030,24 +1163,27 @@ impl Driver {
         for note in &report.notes {
             eprintln!("taskmaster: check: {note}");
         }
-        let mut failing: BTreeMap<PageId, String> = BTreeMap::new();
-        let mut shared = 0;
+        let mut checked = Checked::default();
+        let mut older = 0;
         for finding in &report.findings {
+            let line = format!("{}:{} {}", finding.file, finding.line, finding.failure);
             match owners.owner(&finding.file) {
                 Some(page) => {
-                    let line = format!("{}:{} {}\n", finding.file, finding.line, finding.failure);
-                    failing.entry(page.clone()).or_default().push_str(&line);
+                    let text = checked.pages.entry(page.clone()).or_default();
+                    text.push_str(&line);
+                    text.push('\n');
                 }
+                None if locked.contains(&finding.file) => checked.shared.push((finding.file.clone(), line)),
                 None => {
-                    shared += 1;
-                    eprintln!("taskmaster: {}:{} {}", finding.file, finding.line, finding.failure);
+                    older += 1;
+                    eprintln!("taskmaster: {line}");
                 }
             }
         }
-        if shared > 0 {
-            eprintln!("taskmaster: {shared} error(s) are in files no page owns and were not sent to a worker");
+        if older > 0 {
+            eprintln!("taskmaster: {older} error(s) are in files this run did not write, so they were left alone");
         }
-        Ok(failing)
+        Ok(checked)
     }
 
     /// Run `.taskmaster/verify` when the project already has an executable there.
@@ -1510,12 +1646,11 @@ impl Driver {
         Ok(page_is_fresh(&cites, citations.pages.get(page).map(Vec::as_slice), &current))
     }
 
-    fn record_citations(&self, page: &str) -> anyhow::Result<()> {
+    fn record_citations(&mut self, page: &str) -> anyhow::Result<()> {
         if !self.config.incremental {
             return Ok(());
         }
         let _project = PROJECT.lock().unwrap();
-        let mut citations = self.records.citations()?;
         let cites = self.page(page)?.cites.clone();
         let catalog = self.catalog()?;
         let mut recorded = Vec::new();
@@ -1523,6 +1658,11 @@ impl Driver {
             let hash = catalog.resolve(key)?.map(|entry| entry.hash).unwrap_or_default();
             recorded.push(Citation { key: key.clone(), hash });
         }
+        if self.branch.is_some() {
+            self.staged.insert(page.to_string(), recorded);
+            return Ok(());
+        }
+        let mut citations = self.records.citations()?;
         citations.pages.insert(page.to_string(), recorded);
         self.records.save_citations(&citations)
     }
@@ -1583,6 +1723,17 @@ impl Driver {
         Ok(())
     }
 
+    /// The pages are in the project now, so a later run may skip the unchanged ones.
+    fn flush_citations(&mut self) -> anyhow::Result<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        let _project = PROJECT.lock().unwrap();
+        let mut citations = self.records.citations()?;
+        citations.pages.append(&mut self.staged);
+        self.records.save_citations(&citations)
+    }
+
     /// Hand the finished branch to the project. A run that failed, or one git cannot merge
     /// cleanly, stays on its branch and the project is left as it was.
     fn deliver(&mut self, ok: bool) {
@@ -1607,6 +1758,9 @@ impl Driver {
             let _ = git::git(&self.project, &["branch", "-D", &branch]);
             self.branch = None;
             eprintln!("taskmaster: merged `{branch}` into the project");
+            if let Err(err) = self.flush_citations() {
+                eprintln!("taskmaster: citations were not recorded, so these pages rebuild next time: {err:#}");
+            }
         } else {
             eprintln!(
                 "taskmaster: `{branch}` does not merge cleanly into the project, so it was left alone. \

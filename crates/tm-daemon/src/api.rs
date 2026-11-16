@@ -32,6 +32,9 @@
 //! POST /api/commons/entries       an entry another daemon promoted
 //! ```
 //!
+//! The control surface's own routes (the agent transcript, notes, the terminal, diffs,
+//! opening files in an editor, completions, gh) are listed in `api/desk.rs`.
+//!
 //! `health` also says how to sign in: with a pairing code, an account, or either. When a
 //! built frontend is given (`web`), every path that is not under `/api` serves it.
 //!
@@ -45,6 +48,11 @@
 //! `idle` when nothing is driving the run, with its phase. The stream ends there: nothing
 //! more can happen until someone approves, resumes or cancels. `?after=<n>` or a
 //! `Last-Event-ID` header skips what the client already has.
+//!
+//! `stream` also sends an `agent` for each entry of the agent transcript (an agent's text,
+//! thoughts and tool calls with the gate's answer, tagged with the agent), without an id so
+//! the log's numbering is unchanged. `?agents_after=<n>` skips entries the client has.
+//! `approve` takes `{note?}`: a note to every worker that builds after it.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -70,7 +78,10 @@ use tm_harness::{HARNESSES, Harness, provider_report, provider_reports};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
+mod desk;
+
 use crate::auth::Auth;
+use crate::live::Live;
 use crate::secret::random_hex;
 use crate::store::{Records, Store};
 use crate::time::rfc3339_now;
@@ -151,6 +162,7 @@ struct App {
     harness: HarnessFactory,
     web: Option<PathBuf>,
     active: Mutex<HashMap<String, Active>>,
+    live: Arc<Live>,
 }
 
 impl Server {
@@ -166,6 +178,11 @@ impl Server {
         let listener =
             TcpListener::bind(options.bind).await.with_context(|| format!("cannot bind {}", options.bind))?;
         let addr = listener.local_addr().context("the API listener has no address")?;
+        let live_store: Arc<dyn Store> = match &options.store {
+            Some(store) => store.clone(),
+            None => Arc::new(crate::store::FileStore::in_project(&project)),
+        };
+        let live = Arc::new(Live::new(live_store));
         let app = Arc::new(App {
             dictionary: options.dictionary.unwrap_or_else(|| project.join(".taskmaster/dictionary")),
             commons: options.commons.unwrap_or_else(|| project.join(".taskmaster/commons")),
@@ -177,6 +194,7 @@ impl Server {
             harness: options.harness,
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
+            live,
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -214,6 +232,21 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/reviews", get(list_reviews).post(create_review))
         .route("/api/reviews/{id}", get(show_review))
         .route("/api/commons/entries", get(commons_entries).post(commons_add))
+        .route("/api/runs/{id}/agents", get(desk::agents))
+        .route("/api/runs/{id}/notes", get(desk::notes).post(desk::add_note))
+        .route("/api/runs/{id}/notes/{note}", post(desk::edit_note))
+        .route("/api/runs/{id}/terminal", post(desk::terminal))
+        .route("/api/runs/{id}/diff", get(desk::diff))
+        .route("/api/runs/{id}/pr", post(desk::open_pr))
+        .route("/api/settings", get(desk::settings))
+        .route("/api/editors", get(desk::editors))
+        .route("/api/open", post(desk::open))
+        .route("/api/paths", post(desk::paths))
+        .route("/api/file", get(desk::file))
+        .route("/api/files", get(desk::files))
+        .route("/api/skills", get(desk::skills))
+        .route("/api/gh", get(desk::gh_status))
+        .route("/api/gh/pr/{number}", get(desk::gh_pr))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
         .route("/api/runs/{id}/stream", get(run_stream))
@@ -354,7 +387,14 @@ impl App {
         if events.is_empty() && self.records.request(id)?.is_none() {
             return Ok(None);
         }
-        Ok(Some(Run::replay(1, events)))
+        Ok(Some(Run::replay(self.parallel(id), events)))
+    }
+
+    /// Replay with the parallelism the run was built with, as the engine does: with 1, a
+    /// page that finished out of order (fresh pages report in any order) is dropped and
+    /// the run looks stuck in building.
+    fn parallel(&self, id: &str) -> usize {
+        self.records.meta(id).ok().flatten().map(|meta| meta.parallel.max(1)).unwrap_or(1)
     }
 
     fn known(&self, id: &str) -> Result<Run, ApiError> {
@@ -439,6 +479,7 @@ impl App {
         config.store = self.store.clone();
         config.remote = self.remote.clone();
         config.cancel = cancelled;
+        config.live = Some(self.live.clone());
         active.insert(id.to_string(), Active { cancel, in_place });
         drop(active);
 
@@ -563,6 +604,8 @@ struct Feed {
     id: String,
     /// How many of the run's events the client already has.
     seen: usize,
+    /// How many agent transcript entries it has.
+    agents_seen: usize,
     ready: VecDeque<SseEvent>,
     over: bool,
 }
@@ -580,7 +623,8 @@ async fn run_stream(
     app.known(&id)?;
     let resume = headers.get("last-event-id").and_then(|value| value.to_str().ok()).map(str::to_string);
     let seen = resume.or_else(|| query.get("after").cloned()).and_then(|n| n.parse().ok()).unwrap_or(0);
-    let feed = Feed { app, id, seen, ready: VecDeque::new(), over: false };
+    let agents_seen = query.get("agents_after").and_then(|n| n.parse().ok()).unwrap_or(0);
+    let feed = Feed { app, id, seen, agents_seen, ready: VecDeque::new(), over: false };
     let events = stream::unfold(feed, |mut feed| async move {
         loop {
             if let Some(event) = feed.ready.pop_front() {
@@ -593,6 +637,14 @@ async fn run_stream(
             // in the log we read, so the last events are not missed.
             let active = feed.app.is_active(&feed.id);
             let events = feed.app.records.events(&feed.id).unwrap_or_default();
+            let (agents_total, said) = feed.app.live.read(&feed.id, feed.agents_seen);
+            for entry in &said {
+                feed.ready.push_back(SseEvent::default().event("agent").data(entry.to_string()));
+            }
+            feed.agents_seen = agents_total.max(feed.agents_seen);
+            if !said.is_empty() {
+                continue;
+            }
             if events.len() > feed.seen {
                 for (index, event) in events.iter().enumerate().skip(feed.seen) {
                     let body = serde_json::to_string(event).unwrap_or_default();
@@ -600,7 +652,7 @@ async fn run_stream(
                 }
                 feed.seen = events.len();
             } else if !active {
-                let phase = Run::replay(1, events).phase;
+                let phase = Run::replay(feed.app.parallel(&feed.id), events).phase;
                 feed.ready.push_back(SseEvent::default().event("idle").data(json!({ "phase": phase }).to_string()));
                 feed.over = true;
             } else {
@@ -653,8 +705,22 @@ fn waiting(run: &Run) -> Result<(), ApiError> {
     Err(fail(StatusCode::CONFLICT, "this run has no plan waiting for approval"))
 }
 
-async fn approve_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ApproveBody {
+    /// A note for every worker that builds after this.
+    note: Option<String>,
+}
+
+async fn approve_run(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    body: Option<Json<ApproveBody>>,
+) -> Reply {
     waiting(&app.known(&id)?)?;
+    if let Some(note) = body.and_then(|Json(body)| body.note).filter(|text| !text.trim().is_empty()) {
+        app.live.add_note(&id, "workers", note.trim())?;
+    }
     app.start(&id, app.request_for(&id)?, Decision::Approve)?;
     accepted(json!({ "id": id }))
 }

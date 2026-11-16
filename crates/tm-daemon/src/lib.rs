@@ -20,6 +20,7 @@ pub mod commons;
 mod engine;
 mod eval;
 mod git;
+pub mod live;
 mod reply;
 mod resume;
 mod runtime;
@@ -206,6 +207,9 @@ pub struct Config {
     pub models: Models,
     /// Set to `true` to stop the run at the next command boundary.
     pub cancel: watch::Receiver<bool>,
+    /// Where agents' text, thoughts and tool calls are written as they happen. `None`
+    /// writes them next to the run's records.
+    pub live: Option<Arc<live::Live>>,
 }
 
 impl Config {
@@ -232,6 +236,7 @@ impl Config {
             run_id: "current".into(),
             models: Models::default(),
             cancel,
+            live: None,
         }
     }
 }

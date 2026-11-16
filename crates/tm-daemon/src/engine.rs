@@ -25,6 +25,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::git;
+use crate::live::{Live, tool_target};
 use crate::reply::{self, Resolution};
 use crate::resume;
 use crate::secret::random_hex;
@@ -66,6 +67,14 @@ struct AgentRequest {
     dictionary: Option<DictionaryAccess>,
     timeout: Duration,
     read_only: bool,
+    /// Where the agent's events go as they arrive, tagged with who it is.
+    feed: Option<Feed>,
+}
+
+struct Feed {
+    live: Arc<Live>,
+    run: String,
+    agent: serde_json::Value,
 }
 
 impl AgentRequest {
@@ -163,6 +172,7 @@ struct Driver {
     master_token: String,
     trees: Vec<PathBuf>,
     parallel: usize,
+    live: Arc<Live>,
 }
 
 impl Drop for Driver {
@@ -228,6 +238,13 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     let master_token = fresh_token()?;
     let run_id = config.run_id.clone();
     let remote = config.remote.clone();
+    let live = config.live.clone().unwrap_or_else(|| {
+        let store: Arc<dyn crate::store::Store> = match &config.store {
+            Some(store) => store.clone(),
+            None => Arc::new(crate::store::FileStore::in_project(&project)),
+        };
+        Arc::new(Live::new(store))
+    });
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into() });
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into() });
     mcp.grant(&master_token, Grant { run: run_id, page: "master".into() });
@@ -260,6 +277,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         master_token,
         trees: Vec::new(),
         parallel,
+        live,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -344,18 +362,20 @@ impl Driver {
     /// Dictionary entries are published before the plan is recorded.
     async fn draft_plan(&mut self, prompt: &str) -> anyhow::Result<Plan> {
         let mut errors = Vec::new();
+        let master_notes = self.live.take_notes(&self.id, &["master"]);
         for attempt in 1..=2 {
-            let brief = self.planner_brief(prompt, &errors)?;
+            let brief = self.with_notes(self.planner_brief(prompt, &errors)?, &master_notes);
             let cwd = self.planner_dir()?;
             let scratch = cwd != self.tree;
             let token = self.master_token.clone();
-            let request = self.read_request(
+            let mut request = self.read_request(
                 &cwd,
                 brief,
                 self.harnesses.master.clone(),
                 self.config.models.master.clone(),
                 &token,
             )?;
+            self.tag(&mut request, "master", "planner", None);
             let bill = request.bill(Role::Planner, None);
             let asked = ask(request).await;
             if scratch {
@@ -598,7 +618,7 @@ impl Driver {
             let text = errors.as_deref();
             self.worker_request(&page, tier, text, worktree.clone())
         };
-        let request = match built {
+        let mut request = match built {
             Ok(request) => request,
             Err(err) => {
                 self.pending.push_front(Command::SpawnWorker { page, tier, errors });
@@ -607,6 +627,7 @@ impl Driver {
             }
         };
         eprintln!("taskmaster: building {page} ({})", tier_name(tier));
+        self.tag(&mut request, &format!("page:{page}"), tier_name(tier), Some(&page));
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
         let bill = request.bill(Role::builder(tier), Some(&page));
         self.jobs.spawn(async move {
@@ -863,13 +884,14 @@ impl Driver {
             issue = flag.issue,
         );
         let worktree = self.fresh_worktree("arbitrate")?;
-        let request = self.read_request(
+        let mut request = self.read_request(
             &worktree,
             brief,
             self.harnesses.master.clone(),
             self.config.models.master.clone(),
             &self.master_token.clone(),
         )?;
+        self.tag(&mut request, "master", "arbiter", Some(&flag.page));
         let bill = request.bill(Role::Arbiter, Some(&flag.page));
         let asked = ask(request).await;
         self.drop_worktree(&worktree);
@@ -911,16 +933,18 @@ impl Driver {
         let worktree = self.fresh_worktree("review")?;
         let sem = Arc::new(Semaphore::new(self.parallel.max(1)));
         let mut set = JoinSet::new();
+        let reviewer_notes = self.live.take_notes(&self.id, &["reviewer"]);
         for scope in scopes {
             let key = scope.key.clone();
-            let brief = review_brief(&scope);
-            let request = self.read_request(
+            let brief = self.with_notes(review_brief(&scope), &reviewer_notes);
+            let mut request = self.read_request(
                 &worktree,
                 brief,
                 self.harnesses.reviewer.clone(),
                 self.config.models.reviewer.clone(),
                 &self.reviewer_token.clone(),
             )?;
+            self.tag(&mut request, "reviewer", "reviewer", None);
             let permit = sem.clone();
             let bill = request.bill(Role::Reviewer, None);
             set.spawn(async move {
@@ -929,14 +953,15 @@ impl Driver {
             });
         }
         if !security.is_empty() {
-            let brief = security_brief(&security);
-            let request = self.read_request(
+            let brief = self.with_notes(security_brief(&security), &reviewer_notes);
+            let mut request = self.read_request(
                 &worktree,
                 brief,
                 self.harnesses.reviewer.clone(),
                 self.config.models.reviewer.clone(),
                 &self.reviewer_token.clone(),
             )?;
+            self.tag(&mut request, "reviewer", "security", None);
             let permit = sem.clone();
             let bill = request.bill(Role::Security, None);
             set.spawn(async move {
@@ -968,15 +993,17 @@ impl Driver {
         let worktree = self.fresh_worktree("verify")?;
         let sem = Arc::new(Semaphore::new(self.parallel.max(1)));
         let mut set = JoinSet::new();
+        let verifier_notes = self.live.take_notes(&self.id, &["verifier"]);
         for finding in findings {
-            let brief = verify_brief(&finding);
-            let request = self.read_request(
+            let brief = self.with_notes(verify_brief(&finding), &verifier_notes);
+            let mut request = self.read_request(
                 &worktree,
                 brief,
                 self.harnesses.verifier.clone(),
                 self.config.models.verifier.clone(),
                 &self.verifier_token.clone(),
             )?;
+            self.tag(&mut request, "verifier", "verifier", Some(&finding.page));
             let permit = sem.clone();
             let bill = request.bill(Role::Verifier, Some(&finding.page));
             set.spawn(async move {
@@ -1143,7 +1170,20 @@ impl Driver {
     async fn runtime_checks(&mut self, owners: &Owners, routes: &[(PageId, String)]) -> anyhow::Result<Ran> {
         let mut ran = Ran::default();
         let steps = runtime::steps(&self.tree);
-        if let Some(failure) = runtime::run_steps(&self.tree, &steps, RUNTIME_TIMEOUT).await {
+        for step in &steps {
+            self.terminal(
+                "command",
+                serde_json::json!({ "command": format!("{} {}", step.program, step.args.join(" ")), "cwd": self.tree.display().to_string() }),
+            );
+        }
+        let failed = runtime::run_steps(&self.tree, &steps, RUNTIME_TIMEOUT).await;
+        if !steps.is_empty() {
+            match &failed {
+                Some(failure) => self.terminal("output", serde_json::json!({ "ok": false, "step": failure.step, "text": failure.output })),
+                None => self.terminal("output", serde_json::json!({ "ok": true, "text": format!("{} step(s) passed", steps.len()) })),
+            }
+        }
+        if let Some(failure) = failed {
             let (pages, rest) = runtime::attribute(&failure.output, owners, routes);
             for (page, text) in pages {
                 ran.pages.insert(page, format!("`{}` failed:\n{text}", failure.step));
@@ -1165,7 +1205,25 @@ impl Driver {
             }
             return Ok(ran);
         }
-        match runtime::browse(&self.tree, routes).await {
+        self.terminal(
+            "command",
+            serde_json::json!({ "command": format!("browser check: {} route(s)", routes.len()), "cwd": self.tree.display().to_string() }),
+        );
+        let browsed = runtime::browse(&self.tree, routes).await;
+        match &browsed {
+            Ok(Some(browsed)) => {
+                let mut text: Vec<String> = browsed.notes.clone();
+                for (page, problem) in &browsed.pages {
+                    text.push(format!("{page}: {problem}"));
+                }
+                let routes: Vec<_> = routes.iter().map(|(page, route)| serde_json::json!({ "page": page, "route": route })).collect();
+                self.terminal("preview", serde_json::json!({ "routes": routes, "shots": browsed.screenshots.len() }));
+                self.terminal("output", serde_json::json!({ "ok": browsed.pages.is_empty(), "text": text.join("\n") }));
+            }
+            Ok(None) => self.terminal("output", serde_json::json!({ "ok": true, "text": "no browser check for this project" })),
+            Err(err) => self.terminal("output", serde_json::json!({ "ok": false, "text": format!("the browser check did not run: {err:#}") })),
+        }
+        match browsed {
             Ok(Some(browsed)) => {
                 for (page, png) in &browsed.screenshots {
                     if let Err(err) = self.records.save_screenshot(&self.id, page, png) {
@@ -1217,8 +1275,10 @@ impl Driver {
         for (_, line) in errors.iter().filter(|(_, line)| !line.is_empty()) {
             brief.push_str(&format!("{line}\n"));
         }
+        let notes = self.live.take_notes(&self.id, &["master"]);
+        let brief = self.with_notes(brief, &notes);
         let worktree = self.fresh_worktree("shared")?;
-        let request = AgentRequest {
+        let mut request = AgentRequest {
             harness: self.harnesses.master.clone(),
             brief,
             cwd: worktree.clone(),
@@ -1226,7 +1286,9 @@ impl Driver {
             dictionary: Some(self.access(&self.master_token.clone())),
             timeout: self.config.timeout,
             read_only: false,
+            feed: None,
         };
+        self.tag(&mut request, "master", "master", None);
         let bill = request.bill(Role::Master, None);
         let asked = ask(request).await;
         let merged = match asked {
@@ -1298,9 +1360,15 @@ impl Driver {
         // Shared files are checked too: a page can be right and its contract wrong.
         built.extend(locked.iter().filter(|file| self.tree.join(file).is_file()).cloned());
         let (project, files) = (self.tree.clone(), built.into_iter().collect::<Vec<_>>());
+        self.terminal("command", serde_json::json!({ "command": format!("lint {} file(s)", files.len()), "cwd": project.display().to_string() }));
         let report = tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&project, &files))
             .await
             .context("the project checks panicked")?;
+        let lines: Vec<String> = report.findings.iter().map(|f| format!("{}:{} {}", f.file, f.line, f.failure)).collect();
+        self.terminal(
+            "output",
+            serde_json::json!({ "ok": lines.is_empty(), "text": if lines.is_empty() { "no errors".to_string() } else { lines.join("\n") } }),
+        );
         for note in &report.notes {
             eprintln!("taskmaster: check: {note}");
         }
@@ -1345,19 +1413,26 @@ impl Driver {
                 return Ok(None);
             }
         }
+        self.terminal("command", serde_json::json!({ "command": script.display().to_string(), "cwd": self.tree.display().to_string() }));
         let out = std::process::Command::new(&script)
             .current_dir(&self.tree)
             .output()
             .context("failed to run .taskmaster/verify")?;
+        let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        self.terminal("output", serde_json::json!({ "ok": out.status.success(), "text": clip(text.trim(), 8000) }));
         if out.status.success() {
             return Ok(None);
         }
-        let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         Ok(Some(text))
     }
 
     fn worker_request(&mut self, page: &str, tier: Tier, errors: Option<&str>, cwd: PathBuf) -> anyhow::Result<AgentRequest> {
-        let brief = self.worker_brief(page, tier, errors)?;
+        // A note queued to this page is fix text: it rides on the next repair, and only
+        // then. A note to every worker goes into each brief.
+        let target = format!("page:{page}");
+        let wanted: Vec<&str> = if errors.is_some() { vec![target.as_str(), "workers"] } else { vec!["workers"] };
+        let notes = self.live.take_notes(&self.id, &wanted);
+        let brief = self.with_notes(self.worker_brief(page, tier, errors)?, &notes);
         let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
         Ok(AgentRequest {
             harness: self.harness_for(tier),
@@ -1367,6 +1442,7 @@ impl Driver {
             dictionary: Some(self.access(&token)),
             timeout: self.config.timeout,
             read_only: false,
+            feed: None,
         })
     }
 
@@ -1510,7 +1586,43 @@ impl Driver {
             dictionary: Some(self.access(token)),
             timeout: self.config.timeout,
             read_only: true,
+            feed: None,
         })
+    }
+
+    /// Send this call's events to the run's agent transcript, under `agent`.
+    fn tag(&self, request: &mut AgentRequest, agent: &str, role: &str, page: Option<&str>) {
+        let owned_glob = page.and_then(|id| self.page(id).ok()).map(|page| page.owned_glob.clone());
+        let tag = serde_json::json!({
+            "id": agent,
+            "role": role,
+            "page": page,
+            "harness": request.harness.id(),
+            "model": request.model,
+            "owned_glob": owned_glob,
+            "worktree": request.cwd.display().to_string(),
+            "branch": self.branch,
+            "call": self.live.next_call(),
+        });
+        request.feed = Some(Feed { live: self.live.clone(), run: self.id.clone(), agent: tag });
+    }
+
+    /// A brief with the notes a person queued for this agent.
+    fn with_notes(&self, mut brief: String, notes: &[String]) -> String {
+        if notes.is_empty() {
+            return brief;
+        }
+        brief.push_str("\nNotes from the person running Taskmaster:\n");
+        for note in notes {
+            brief.push_str(&format!("- {}\n", note.trim()));
+        }
+        brief
+    }
+
+    /// A line in the run's terminal transcript: a command the daemon ran, and what it said.
+    fn terminal(&self, kind: &str, fields: serde_json::Value) {
+        let agent = serde_json::json!({ "id": "runtime", "role": "runtime" });
+        self.live.push(&self.id, &agent, kind, fields);
     }
 
     fn access(&self, token: &str) -> DictionaryAccess {
@@ -1942,6 +2054,11 @@ impl Driver {
             let tree = self.tree.clone();
             self.drop_worktree(&tree);
             self.tree = self.project.clone();
+            if let Ok(tip) = git::git(&self.project, &["rev-parse", "--verify", &format!("{branch}^{{commit}}")])
+                && let Err(err) = self.live.set_tip(&self.id, &tip)
+            {
+                eprintln!("taskmaster: the branch tip was not kept, so this run's diff needs the branch: {err:#}");
+            }
             let _ = git::git(&self.project, &["branch", "-D", &branch]);
             self.branch = None;
             eprintln!("taskmaster: merged `{branch}` into the project");
@@ -1992,10 +2109,33 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
         timeout: request.timeout,
         read_only: request.read_only,
     };
+    let feed = request.feed;
+    if let Some(feed) = &feed {
+        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&task.brief, 4000) }));
+    }
     let (tx, mut rx) = mpsc::channel(256);
+    let tee = feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
     let collect = tokio::spawn(async move {
+        // The answer is only the text. Thoughts and tool calls go to the transcript.
         let mut text = String::new();
         while let Some(event) = rx.recv().await {
+            if let Some((live, run, agent)) = &tee {
+                match &event {
+                    HarnessEvent::Text { text: chunk } => live.push(run, agent, "text", serde_json::json!({ "text": chunk })),
+                    HarnessEvent::Thought { text: chunk } => {
+                        live.push(run, agent, "thought", serde_json::json!({ "text": chunk }))
+                    }
+                    HarnessEvent::ToolCall { id, name, input } => live.push(
+                        run,
+                        agent,
+                        "tool_call",
+                        serde_json::json!({ "id": id, "name": name, "target": tool_target(input), "input": input }),
+                    ),
+                    HarnessEvent::PermissionDecided { tool, allowed } => {
+                        live.push(run, agent, "permission", serde_json::json!({ "tool": tool, "allowed": allowed }))
+                    }
+                }
+            }
             if let HarnessEvent::Text { text: chunk } = event
                 && text.len() < 1_000_000 {
                     text.push_str(&chunk);
@@ -2006,6 +2146,26 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
     let started = Instant::now();
     let run = request.harness.run(task, Arc::new(gate), tx).await;
     let text = collect.await.unwrap_or_default();
+    if let Some(feed) = &feed {
+        let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64() });
+        match &run {
+            Ok(summary) => {
+                end["ok"] = serde_json::json!(summary.ok);
+                end["denied"] = serde_json::json!(summary.denied);
+                end["cost_usd"] = serde_json::json!(summary.cost_usd);
+                let usage = &summary.usage;
+                // Only a provider that reports usage gets a meter.
+                if usage.input + usage.output + usage.cache_read + usage.cache_write > 0 {
+                    end["usage"] = serde_json::json!(usage);
+                }
+            }
+            Err(err) => {
+                end["ok"] = serde_json::json!(false);
+                end["error"] = serde_json::json!(format!("{err:#}"));
+            }
+        }
+        feed.live.push(&feed.run, &feed.agent, "end", end);
+    }
     let summary = run?;
     Ok(Answer {
         text,

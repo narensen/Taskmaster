@@ -88,6 +88,13 @@ impl Harness for Fake {
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let script = self.0.respond(&task).await?;
+        // Thoughts and tool calls go to the transcript, never into the answer.
+        let _ = events.send(HarnessEvent::Thought { text: "thinking".into() }).await;
+        for (path, _) in &script.files {
+            let input = serde_json::json!({ "file_path": path });
+            let _ = events.send(HarnessEvent::ToolCall { id: "t1".into(), name: "Write".into(), input }).await;
+            let _ = events.send(HarnessEvent::PermissionDecided { tool: "Write".into(), allowed: true }).await;
+        }
         for (path, content) in script.files {
             let full = task.cwd.join(&path);
             if let Some(parent) = full.parent() {
@@ -1317,6 +1324,121 @@ mod http {
         assert_eq!(client.get("/api/errorography").await.0, 200);
         assert_eq!(client.get("/api/templates").await.1, json!({ "templates": ["next"] }));
         assert_eq!(client.get("/api/providers?harness=nope").await.0, 400);
+    }
+
+    #[tokio::test]
+    async fn agents_stream_their_text_thoughts_and_tool_calls_and_notes_reach_the_next_repair() {
+        let tmp = repo("api-agents");
+        let world = World::new(Mode::Learn);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        assert_eq!(client.post("/api/runs", json!({ "id": "talk", "plan": planned })).await.0, 202);
+        client.settled("talk", "awaiting_approval").await;
+        // A gutter comment is fix text for that page's next repair; it adds no phase.
+        let (status, note) = client.post("/api/runs/talk/notes", json!({ "to": "page:a", "text": "keep the header" })).await;
+        assert_eq!(status, 200, "{note}");
+        assert_eq!(client.post("/api/runs/talk/notes", json!({ "to": "page:../x", "text": "x" })).await.0, 400);
+        let gone = client.post("/api/runs/talk/notes", json!({ "to": "master", "text": "drop me" })).await.1;
+        assert_eq!(client.post(&format!("/api/runs/talk/notes/{}", gone["id"].as_str().unwrap()), json!({})).await.0, 200);
+        assert_eq!(client.get("/api/runs/talk/notes").await.1["notes"].as_array().unwrap().len(), 1);
+
+        assert_eq!(client.post("/api/runs/talk/approve", json!({ "note": "use tabs" })).await.0, 202);
+        client.settled("talk", "done").await;
+        let briefs = world.calls.lock().unwrap().clone();
+        let builds: Vec<&String> = briefs.iter().filter(|brief| brief.contains("Build page `a`")).collect();
+        assert!(builds.len() >= 2, "{builds:?}");
+        assert!(!builds[0].contains("keep the header") && builds[0].contains("use tabs"), "{}", builds[0]);
+        assert!(builds[1].contains("keep the header") && builds[1].contains("use tabs"), "{}", builds[1]);
+        assert_eq!(builds.iter().filter(|brief| brief.contains("keep the header")).count(), 1);
+        let (_, notes) = client.get("/api/runs/talk/notes").await;
+        assert!(notes["notes"].as_array().unwrap().iter().all(|note| note["delivered"] == true), "{notes}");
+
+        let (_, said) = client.get("/api/runs/talk/agents").await;
+        let entries = said["entries"].as_array().unwrap();
+        assert_eq!(said["next"].as_u64().unwrap() as usize, entries.len());
+        let of = |kind: &str| entries.iter().filter(|e| e["kind"] == kind && e["agent"]["id"] == "page:a").count();
+        assert!(of("start") >= 2 && of("end") >= 2 && of("text") >= 2 && of("thought") >= 2, "{said}");
+        let call = entries.iter().find(|e| e["kind"] == "tool_call").unwrap();
+        assert_eq!((call["name"].as_str(), call["target"].as_str()), (Some("Write"), Some("app/a/page.ts")));
+        assert!(entries.iter().any(|e| e["kind"] == "permission" && e["allowed"] == true));
+        let end = entries.iter().find(|e| e["kind"] == "end").unwrap();
+        assert_eq!(end["usage"]["input"], 100);
+        let start = entries.iter().find(|e| e["kind"] == "start" && e["agent"]["id"] == "page:a").unwrap();
+        assert_eq!(start["agent"]["owned_glob"], "app/a/**");
+        assert_eq!(start["agent"]["role"], "worker");
+        assert!(start["agent"]["worktree"].as_str().unwrap().contains("page-a"), "{start}");
+        // The answer kept only the text: thoughts never reached a brief or the plan.
+        let (_, later) = client.get(&format!("/api/runs/talk/agents?after={}", entries.len() - 1)).await;
+        assert_eq!(later["entries"].as_array().unwrap().len(), 1);
+
+        let token = client.token.clone().unwrap();
+        let (_, feed) = client.text(&format!("/api/runs/talk/stream?token={token}")).await;
+        assert_eq!(feed.matches("event: agent").count(), entries.len(), "{feed}");
+        let (_, rest) = client.text(&format!("/api/runs/talk/stream?token={token}&agents_after={}", entries.len())).await;
+        assert!(!rest.contains("event: agent"), "{rest}");
+    }
+
+    #[tokio::test]
+    async fn paths_resolve_from_the_project_and_open_in_an_editor() {
+        let tmp = repo("api-paths");
+        std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+        std::fs::write(tmp.0.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let (_, found) = client.post("/api/paths", json!({ "paths": ["src/main.rs", "src/nope.rs", "/etc/passwd"] })).await;
+        let full = tmp.0.canonicalize().unwrap().join("src/main.rs").display().to_string();
+        assert_eq!(found["paths"]["src/main.rs"], full.as_str());
+        assert!(found["paths"]["src/nope.rs"].is_null() && found["paths"]["/etc/passwd"].is_null(), "{found}");
+        let (status, preview) = client.get("/api/file?path=src/main.rs").await;
+        assert_eq!(status, 200);
+        assert_eq!(preview["content"], "fn main() {}\n");
+        assert_eq!(client.get("/api/file?path=src/nope.rs").await.0, 404);
+        assert_eq!(client.post("/api/open", json!({ "path": "src/nope.rs", "line": 3 })).await.0, 404);
+        assert_eq!(client.post("/api/open", json!({ "path": "src/main.rs", "editor": "nope" })).await.0, 400);
+        let (_, editors) = client.get("/api/editors").await;
+        assert_eq!(editors["editors"].as_array().unwrap().len(), 21);
+        // An editor that is not installed is named, with the full path, for the toast.
+        let missing = editors["editors"].as_array().unwrap().iter().find(|e| e["installed"] == false && e["id"] != "files");
+        if let Some(missing) = missing {
+            let (status, reply) =
+                client.post("/api/open", json!({ "path": "src/main.rs", "line": 1, "editor": missing["id"] })).await;
+            assert_eq!(status, 424, "{reply}");
+            assert_eq!(reply["command"], missing["command"]);
+            assert_eq!(reply["path"], full.as_str());
+        }
+        let (_, files) = client.get("/api/files").await;
+        assert!(files["files"].as_array().unwrap().iter().any(|f| f == "src/main.rs"), "{files}");
+        assert_eq!(client.get("/api/skills").await.1, json!({ "skills": [] }));
+        let (_, settings) = client.get("/api/settings").await;
+        assert_eq!(settings["project"], tmp.0.canonicalize().unwrap().display().to_string().as_str());
+    }
+
+    #[tokio::test]
+    async fn the_terminal_runs_what_a_person_types_and_keeps_it_in_the_transcript() {
+        let tmp = repo("api-terminal");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "t", "plan": planned })).await;
+        client.settled("t", "awaiting_approval").await;
+        let (status, ran) = client.post("/api/runs/t/terminal", json!({ "command": "echo hello" })).await;
+        assert_eq!(status, 200, "{ran}");
+        assert_eq!((ran["ok"].as_bool(), ran["output"].as_str()), (Some(true), Some("hello")));
+        let (_, said) = client.get("/api/runs/t/agents").await;
+        let typed: Vec<&Value> = said["entries"].as_array().unwrap().iter().filter(|e| e["agent"]["id"] == "person").collect();
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed[0]["command"], "echo hello");
+        assert_eq!(client.post("/api/runs/t/pr", json!({})).await.0, 409);
+        let (status, diff) = client.get("/api/runs/t/diff?scope=attempt").await;
+        assert!(matches!(status, 400 | 404 | 409), "{diff}");
     }
 
     #[tokio::test]

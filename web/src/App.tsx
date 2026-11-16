@@ -5,17 +5,22 @@ import {
   ArchiveRestore,
   BookOpen,
   Bug,
+  ChevronDown,
   Circle,
+  CircleAlert,
   CircleCheck,
   Cpu,
+  GitBranch,
   GitPullRequest,
   LayoutGrid,
+  Loader2,
   Menu,
   Pin,
   PinOff,
   Plus,
   Search,
   Settings,
+  SquarePen,
   type LucideIcon,
 } from "lucide-react";
 import { api, setToken, token, tokenFromRedirect, type DaemonSettings, type RunSummary } from "./api";
@@ -162,12 +167,21 @@ function useClocks(ids: string[]) {
   return clocks;
 }
 
+function RunMark({ group }: { group: Group }) {
+  if (group === "Working") return <Loader2 size={13} className="spin-ico" />;
+  if (group === "Needs approval") return <CircleAlert size={13} />;
+  if (group === "Pinned") return <Pin size={13} />;
+  if (group === "Archived") return <Archive size={13} />;
+  return <Circle size={13} />;
+}
+
 function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onPick: () => void }) {
   const p = usePrefs();
   const list = ordered(runs, p.showArchived);
   const clocks = useClocks(list.map((x) => x.run.id));
   const working = list.some((x) => x.group === "Working");
   const [now, setNow] = useState(() => Date.now());
+  const [folded, setFolded] = useState<Partial<Record<Group, boolean>>>({});
   useEffect(() => {
     if (!working) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -184,6 +198,8 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
             {list.map(({ run, group }, i) => {
               const head = group !== last ? group : null;
               last = group;
+              const shut = !!folded[group];
+              if (shut && !head) return null;
               const on = path === `/runs/${encodeURIComponent(run.id)}` || path === `/runs/${run.id}`;
               const flags = p.runFlags[run.id] ?? {};
               const clock = clocks[run.id];
@@ -197,8 +213,10 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
                 group === "Working" && clock
                   ? shortSpan(now - clock.start)
                   : group !== "Working" && clock
-                    ? shortSpan(Date.now() - clock.end)
+                    ? shortSpan(now - clock.end)
                     : null;
+              const stamp =
+                group === "Working" ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase());
               return (
                 <motion.li
                   key={run.id}
@@ -209,45 +227,65 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
                   transition={{ duration: 0.16, ease: bezier.out, layout: { duration: dur.base, ease: bezier.out } }}
                 >
                   {head && (
-                    <div className="group-head">
+                    <button
+                      type="button"
+                      className="group-head"
+                      aria-expanded={!shut}
+                      onClick={() => setFolded((f) => ({ ...f, [group]: !f[group] }))}
+                    >
                       <span>{head}</span>
-                      <span className="group-count">{counts.get(head)}</span>
+                      <span className="group-count">
+                        {counts.get(head)}
+                        <ChevronDown size={12} className={shut ? "chev closed" : "chev"} />
+                      </span>
+                    </button>
+                  )}
+                  {!shut && (
+                    <div
+                      className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}
+                      onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
+                      onDrop={(e) => {
+                        if (e.dataTransfer.files.length) {
+                          e.preventDefault();
+                          void dropOnRun(run.id, e.dataTransfer.files);
+                        }
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        menu(e.clientX, e.clientY);
+                      }}
+                    >
+                      <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick}>
+                        <span className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs approval" ? "ask" : ""}`} aria-hidden>
+                          <RunMark group={group} />
+                        </span>
+                        <span className="run-copy">
+                          <span className="clip run-title">{run.id}</span>
+                          {run.branch && (
+                            <span className="run-branch clip">
+                              <GitBranch size={11} />
+                              {run.branch}
+                            </span>
+                          )}
+                        </span>
+                        <span className={`runrow-phase ${group === "Working" ? "elapsed" : ""}`}>
+                          {i < 9 && <kbd>{i + 1}</kbd>}
+                          <span>{stamp}</span>
+                        </span>
+                      </Link>
+                      <span className="runrow-actions">
+                        <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
+                          {flags.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+                        </button>
+                        <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
+                          {flags.settled ? <CircleCheck size={13} /> : <Circle size={13} />}
+                        </button>
+                        <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
+                          {flags.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+                        </button>
+                      </span>
                     </div>
                   )}
-                  <div
-                    className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}
-                    onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
-                    onDrop={(e) => {
-                      if (e.dataTransfer.files.length) {
-                        e.preventDefault();
-                        void dropOnRun(run.id, e.dataTransfer.files);
-                      }
-                    }}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      menu(e.clientX, e.clientY);
-                    }}
-                  >
-                    <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick}>
-                      {group === "Working" ? <span className="spin" aria-hidden /> : <span className={`dot ${group === "Needs approval" ? "ask" : "quiet"}`} aria-hidden />}
-                      <span className="clip">{run.id}</span>
-                      <span className="runrow-phase">
-                        {i < 9 && <kbd>{i + 1}</kbd>}
-                        {group === "Working" ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase())}
-                      </span>
-                    </Link>
-                    <span className="runrow-actions">
-                      <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
-                        {flags.pinned ? <PinOff size={13} /> : <Pin size={13} />}
-                      </button>
-                      <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
-                        {flags.settled ? <CircleCheck size={13} /> : <Circle size={13} />}
-                      </button>
-                      <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
-                        {flags.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
-                      </button>
-                    </span>
-                  </div>
                 </motion.li>
               );
             })}
@@ -335,11 +373,16 @@ export function App() {
               <img src="/icon.png" alt="" width={16} height={16} />
               <span>Taskmaster</span>
             </Link>
-            <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
-              <Search size={14} />
-              <span>Search</span>
-              <kbd>⌘K</kbd>
-            </button>
+            <div className="side-search">
+              <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
+                <Search size={14} />
+                <span>Search</span>
+                <kbd>⌘K</kbd>
+              </button>
+              <Link to="/runs/new" className="side-new" aria-label="New run" title="New run" onClick={() => setDrawer(false)}>
+                <SquarePen size={14} />
+              </Link>
+            </div>
             <nav className="nav">
               {NAV.map((item) => {
                 const on = item.active ? item.active(path) : path === item.to || path.startsWith(item.to + "/");

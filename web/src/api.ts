@@ -151,6 +151,18 @@ export interface ChangeEntry {
   summary: string;
 }
 
+export interface Attempt {
+  at: string;
+  tier: Tier;
+  model: string;
+  outcome: "merged" | "discarded" | "flagged";
+  fixing: string | null;
+  failure: string | null;
+  files: string[];
+  said: string;
+  diff: string | null;
+}
+
 export interface ModelChoice {
   id: string;
   name: string;
@@ -346,6 +358,18 @@ export const api = {
     call<{ next: number; events: RunEvent[] }>("GET", `/api/runs/${enc(id)}/events?after=${after}`),
   ledger: (id: string) => call<{ totals: Totals; entries: LedgerEntry[] }>("GET", `/api/runs/${enc(id)}/ledger`),
   changes: (id: string) => call<{ changes: ChangeEntry[] }>("GET", `/api/runs/${enc(id)}/changes`).then((r) => r.changes),
+  attempts: (id: string, page: string) =>
+    call<{ attempts: Attempt[] }>("GET", `/api/runs/${enc(id)}/attempts/${enc(page)}`).then((r) => r.attempts),
+  screens: (id: string) => call<{ pages: string[] }>("GET", `/api/runs/${enc(id)}/screens`).then((r) => r.pages),
+  /** A screenshot as an object URL. An <img> cannot send the token, so it is fetched. */
+  screen: async (id: string, page: string) => {
+    const bearer = token();
+    const response = await fetch(`${server()}/api/runs/${enc(id)}/screens/${enc(page)}`, {
+      headers: bearer ? { authorization: `Bearer ${bearer}` } : {},
+    });
+    if (!response.ok) throw new ApiError(response.status, "no screenshot");
+    return URL.createObjectURL(await response.blob());
+  },
   approve: (id: string) => call("POST", `/api/runs/${enc(id)}/approve`, {}),
   reject: (id: string, prompt?: string) => call("POST", `/api/runs/${enc(id)}/reject`, { prompt }),
   resume: (id: string) => call("POST", `/api/runs/${enc(id)}/resume`, {}),

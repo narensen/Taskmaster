@@ -144,6 +144,29 @@ pub struct Meta {
     pub template: Option<String>,
 }
 
+/// One go at building or repairing a page, kept so the next attempt knows what was tried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub at: String,
+    pub tier: tm_core::Tier,
+    /// The harness and model, such as `agy gemini-flash`.
+    pub model: String,
+    /// `merged`, `discarded` or `flagged`.
+    pub outcome: String,
+    /// What it was asked to fix, if this was a repair.
+    #[serde(default)]
+    pub fixing: Option<String>,
+    /// Why it was discarded.
+    #[serde(default)]
+    pub failure: Option<String>,
+    pub files: Vec<String>,
+    /// The agent's own last words, shortened.
+    pub said: String,
+    /// The change itself, when it was discarded and so is not in the tree.
+    #[serde(default)]
+    pub diff: Option<String>,
+}
+
 /// The daemon's records, by name and type.
 #[derive(Clone)]
 pub struct Records {
@@ -248,6 +271,35 @@ impl Records {
 
     pub fn clear_merged(&self, run: &str, page: &str) {
         let _ = self.store.remove(&format!("runs/{run}/merged/{page}"));
+    }
+
+    /// Every attempt at a page so far, oldest first.
+    pub fn attempts(&self, run: &str, page: &str) -> anyhow::Result<Vec<Attempt>> {
+        let Some(bytes) = self.store.read(&format!("runs/{run}/attempts/{page}.jsonl"))? else { return Ok(Vec::new()) };
+        Ok(String::from_utf8_lossy(&bytes).lines().filter_map(|line| serde_json::from_str(line).ok()).collect())
+    }
+
+    pub fn note_attempt(&self, run: &str, page: &str, attempt: &Attempt) -> anyhow::Result<()> {
+        self.store.append(&format!("runs/{run}/attempts/{page}.jsonl"), &serde_json::to_string(attempt)?)
+    }
+
+    /// What a page looked like in the browser, as PNG.
+    pub fn screenshot(&self, run: &str, page: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.store.read(&format!("runs/{run}/screens/{page}.png"))
+    }
+
+    pub fn save_screenshot(&self, run: &str, page: &str, png: &[u8]) -> anyhow::Result<()> {
+        self.store.write(&format!("runs/{run}/screens/{page}.png"), png)
+    }
+
+    /// The pages that have a screenshot.
+    pub fn screenshots(&self, run: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .store
+            .list(&format!("runs/{run}/screens"))?
+            .into_iter()
+            .filter_map(|name| name.strip_suffix(".png").map(str::to_string))
+            .collect())
     }
 
     // The project.

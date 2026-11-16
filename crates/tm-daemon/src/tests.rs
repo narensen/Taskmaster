@@ -937,6 +937,70 @@ async fn a_type_error_goes_back_to_the_page_that_owns_the_file() {
 }
 
 #[tokio::test]
+async fn the_next_attempt_is_told_what_the_last_one_did_and_sees_its_discarded_change() {
+    let tmp = repo("handoff");
+    let world = World::new(Mode::Outside);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let repair = calls.iter().find(|call| call.contains("Checks failed last time")).expect("page a was repaired");
+    assert!(repair.contains("What was tried on this page before"), "{repair}");
+    assert!(repair.contains("fake (worker) — discarded."), "{repair}");
+    assert!(repair.contains("Why it was not kept: these files are outside"), "{repair}");
+    // The change was thrown away, so the next attempt gets it as a diff.
+    assert!(repair.contains("```diff") && repair.contains("+hacked"), "{repair}");
+    let attempts = Records::files(&tmp.0).attempts("current", "a").unwrap();
+    assert_eq!(attempts.iter().map(|a| a.outcome.as_str()).collect::<Vec<_>>(), vec!["discarded", "merged"]);
+    assert!(attempts[1].fixing.as_deref().unwrap().contains("outside"));
+    assert!(attempts[1].diff.is_none(), "a merged change is in the tree, not in the record");
+}
+
+/// A project whose `npm run build` fails until `fixed_when` holds, printing `error`.
+fn buildable(name: &str, error: &str, fixed_when: &str) -> Option<Tmp> {
+    let npm = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("npm").is_file()));
+    if !npm {
+        eprintln!("npm is not installed; skipping");
+        return None;
+    }
+    let tmp = repo(name);
+    std::fs::write(tmp.0.join("package.json"), r#"{"name":"t","private":true,"scripts":{"build":"sh build.sh"}}"#).unwrap();
+    std::fs::write(tmp.0.join("build.sh"), format!("if {fixed_when}; then exit 0; fi\nprintf '%s\\n' \"{error}\"\nexit 1\n")).unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "start"]);
+    std::fs::create_dir_all(tmp.0.join("node_modules")).unwrap();
+    Some(tmp)
+}
+
+#[tokio::test]
+async fn a_failing_build_goes_back_to_the_page_its_output_names() {
+    let Some(tmp) = buildable("build-page", "./app/a/page.ts:1:1 Type error: the build broke here", "grep -q 'a = 2' app/a/page.ts") else {
+        return;
+    };
+    let world = World::new(Mode::ConfirmFinding);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let repair = calls
+        .iter()
+        .find(|call| call.contains("`build` failed:"))
+        .expect("the build failure went back to a page");
+    assert!(repair.contains("Build page `a`") && repair.contains("the build broke here"), "{repair}");
+    assert!(!calls.iter().any(|call| call.contains("Build page `b`") && call.contains("`build` failed")));
+}
+
+#[tokio::test]
+async fn a_build_failure_in_no_file_of_this_run_costs_nothing() {
+    let Some(tmp) = buildable("build-elsewhere", "lib/legacy.ts:3:1 something old is broken", "false") else { return };
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    assert!(!calls.iter().any(|call| call.contains("failed:")), "nobody was asked to fix it");
+}
+
+#[tokio::test]
 async fn a_run_builds_on_its_own_branch_and_is_merged_when_it_finishes() {
     let tmp = seeded("branch");
     let world = World::new(Mode::Write);
@@ -1226,6 +1290,11 @@ mod http {
         let (_, later) = client.get("/api/runs/web/events?after=2").await;
         let total = all["next"].as_u64().unwrap() as usize;
         assert_eq!(later["events"].as_array().unwrap().len(), total - 2);
+        let (_, attempts) = client.get("/api/runs/web/attempts/a").await;
+        assert_eq!(attempts["attempts"][0]["outcome"], "merged", "{attempts}");
+        assert_eq!(client.get("/api/runs/web/screens").await.1, json!({ "pages": [] }));
+        assert_eq!(client.get("/api/runs/web/screens/a").await.0, 404);
+        assert_eq!(client.get("/api/runs/web/attempts/..").await.0, 404);
         let (_, changes) = client.get("/api/runs/web/changes").await;
         assert!(changes["changes"].as_array().unwrap().iter().any(|change| change["kind"] == "page_built"));
 

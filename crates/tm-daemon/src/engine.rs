@@ -28,7 +28,8 @@ use crate::git;
 use crate::reply::{self, Resolution};
 use crate::resume;
 use crate::secret::random_hex;
-use crate::store::{Meta, Records};
+use crate::runtime;
+use crate::store::{Attempt, Meta, Records};
 use crate::template::{self, Template};
 use crate::time::rfc3339_now;
 use crate::{Config, Harnesses, Outcome};
@@ -75,6 +76,37 @@ impl AgentRequest {
 
 /// Shared-file repairs the master gets in one run.
 const MAX_SHARED_REPAIRS: usize = 2;
+
+/// What the build, the tests and the browser found.
+#[derive(Default)]
+struct Ran {
+    pages: BTreeMap<PageId, String>,
+    /// For the master: shared files the output names, and the output (with no file).
+    shared: Vec<(String, String)>,
+}
+
+/// How long the project's build or tests may take.
+const RUNTIME_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+fn first_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.trim().lines().collect();
+    let mut out = lines.iter().take(n).copied().collect::<Vec<_>>().join("\n    ");
+    if lines.len() > n {
+        out.push_str("\n    …");
+    }
+    out
+}
 
 /// What the project's own tools said about the files a run wrote.
 #[derive(Default)]
@@ -648,8 +680,40 @@ impl Driver {
 
     fn judge(&mut self, page: &str, tier: Tier, errors: &Option<String>, product: Product) -> anyhow::Result<WorkerOutcome> {
         let outcome = self.judge_inner(page, tier, errors, &product);
+        if let Ok(outcome) = &outcome {
+            self.note_attempt(page, tier, errors.as_deref(), &product, outcome);
+        }
         self.drop_worktree(&product.worktree);
         outcome
+    }
+
+    /// Keep what this attempt did, so the next one on this page knows. A change that was
+    /// thrown away is kept as a diff, since it is not in the tree.
+    fn note_attempt(&self, page: &str, tier: Tier, fixing: Option<&str>, product: &Product, outcome: &WorkerOutcome) {
+        let files: Vec<String> =
+            git::worktree_changes(&product.worktree).map(|changes| changes.into_iter().map(|c| c.path).collect()).unwrap_or_default();
+        let (label, failure, diff) = match outcome {
+            WorkerOutcome::Passed => ("merged", None, None),
+            WorkerOutcome::CheckFailed { errors } => {
+                let diff = git::worktree_diff(&product.worktree).ok().filter(|d| !d.trim().is_empty()).map(|d| clip(&d, 6000));
+                ("discarded", Some(clip(errors, 1500)), diff)
+            }
+            WorkerOutcome::Flagged(flag) => ("flagged", Some(format!("objected to `{}`: {}", flag.key, flag.issue)), None),
+        };
+        let attempt = Attempt {
+            at: rfc3339_now(),
+            tier,
+            model: self.model_byline(tier),
+            outcome: label.into(),
+            fixing: fixing.map(|text| clip(text, 1500)),
+            failure,
+            files,
+            said: clip(product.answer.text.trim(), 1500),
+            diff,
+        };
+        if let Err(err) = self.records.note_attempt(&self.id, page, &attempt) {
+            eprintln!("taskmaster: the attempt at {page} was not recorded: {err:#}");
+        }
     }
 
     fn judge_inner(
@@ -1002,6 +1066,31 @@ impl Driver {
             self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
             return Ok((false, BTreeMap::new()));
         }
+        if failing.is_empty() && self.config.runtime_checks {
+            let routes: Vec<(PageId, String)> = plan.pages.iter().map(|p| (p.id.clone(), p.route.clone())).collect();
+            let mut ran = self.runtime_checks(&owners, &routes).await?;
+            if ran.pages.is_empty() && !ran.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
+                self.repair_shared(&ran.shared).await?;
+                ran = self.runtime_checks(&owners, &routes).await?;
+            }
+            failing.extend(ran.pages);
+            if failing.is_empty() && !ran.shared.is_empty() {
+                let lines: Vec<String> = ran.shared.iter().map(|(_, line)| line.clone()).collect();
+                eprintln!("taskmaster: the project's build or tests still fail in shared files:\n{}", lines.join("\n"));
+                let entry = ChangeEntry {
+                    at: rfc3339_now(),
+                    kind: ChangeKind::VerifyFailed,
+                    page: None,
+                    commit: None,
+                    model: None,
+                    files: ran.shared.iter().map(|(file, _)| file.clone()).filter(|f| !f.is_empty()).collect(),
+                    keys: vec![],
+                    summary: clip(&lines.join("\n"), 4000),
+                };
+                self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
+                return Ok((false, BTreeMap::new()));
+            }
+        }
         if let Some(note) = self.run_verify_script()? {
             let mut attributed = false;
             for line in note.lines() {
@@ -1047,6 +1136,58 @@ impl Driver {
         Ok((failing.is_empty(), failing))
     }
 
+    /// Build and test the project with its own scripts, then open each page in a browser.
+    /// Failures in a page's files or at its route go to that page. Ones that name a shared
+    /// file this run wrote go to the master. Anything else is in files the run did not
+    /// write, or in the setup, and is reported without spending tokens on it.
+    async fn runtime_checks(&mut self, owners: &Owners, routes: &[(PageId, String)]) -> anyhow::Result<Ran> {
+        let mut ran = Ran::default();
+        let steps = runtime::steps(&self.tree);
+        if let Some(failure) = runtime::run_steps(&self.tree, &steps, RUNTIME_TIMEOUT).await {
+            let (pages, rest) = runtime::attribute(&failure.output, owners, routes);
+            for (page, text) in pages {
+                ran.pages.insert(page, format!("`{}` failed:\n{text}", failure.step));
+            }
+            if !rest.is_empty() {
+                let locked = self.locked_files();
+                let named: BTreeSet<String> =
+                    rest.lines().flat_map(runtime::paths_in).filter(|path| locked.contains(path)).collect();
+                if !named.is_empty() {
+                    let text = format!("`{}` failed:\n{rest}", failure.step);
+                    ran.shared = named.into_iter().map(|file| (file, String::new())).collect();
+                    ran.shared.push((String::new(), text));
+                } else if ran.pages.is_empty() {
+                    eprintln!(
+                        "taskmaster: `{}` failed, and the output names no file this run wrote, so nothing was sent for repair:\n{rest}",
+                        failure.step
+                    );
+                }
+            }
+            return Ok(ran);
+        }
+        match runtime::browse(&self.tree, routes).await {
+            Ok(Some(browsed)) => {
+                for (page, png) in &browsed.screenshots {
+                    if let Err(err) = self.records.save_screenshot(&self.id, page, png) {
+                        eprintln!("taskmaster: the screenshot of {page} was not kept: {err:#}");
+                    }
+                }
+                for note in &browsed.notes {
+                    eprintln!("taskmaster: browser check: {note}");
+                }
+                eprintln!(
+                    "taskmaster: opened {} page(s) in a browser; {} had errors",
+                    browsed.screenshots.len(),
+                    browsed.pages.len()
+                );
+                ran.pages = browsed.pages;
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("taskmaster: the browser check did not run: {err:#}"),
+        }
+        Ok(ran)
+    }
+
     /// Shared files this run wrote: the contracts and the template.
     fn locked_files(&self) -> BTreeSet<String> {
         self.changes
@@ -1063,7 +1204,7 @@ impl Driver {
     /// Ask the master to fix shared files the run wrote. Workers may not touch them, and
     /// the master may touch nothing else: any other edit it makes is discarded.
     async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<()> {
-        let allowed: BTreeSet<String> = errors.iter().map(|(file, _)| file.clone()).collect();
+        let allowed: BTreeSet<String> = errors.iter().map(|(file, _)| file.clone()).filter(|file| !file.is_empty()).collect();
         eprintln!("taskmaster: asking the master to repair {} shared file(s)", allowed.len());
         let mut brief = String::from(
             "Shared files this run wrote fail the project's checks. Fix the errors below.\n\
@@ -1073,7 +1214,7 @@ impl Driver {
             brief.push_str(&format!("- `{file}`\n"));
         }
         brief.push_str("\nPages already import these files, so keep every exported name and type that still makes sense.\n\nErrors:\n");
-        for (_, line) in errors {
+        for (_, line) in errors.iter().filter(|(_, line)| !line.is_empty()) {
             brief.push_str(&format!("{line}\n"));
         }
         let worktree = self.fresh_worktree("shared")?;
@@ -1254,6 +1395,7 @@ impl Driver {
             brief.push_str("\nChecks failed last time. Fix these and leave every other page alone:\n");
             brief.push_str(errors);
             brief.push('\n');
+            brief.push_str(&self.handoff(page_id, tier)?);
         }
         let model = self.model_byline(tier);
         let book = self.records.book()?;
@@ -1310,6 +1452,46 @@ impl Driver {
             }
         }
         Ok(brief)
+    }
+
+    /// What earlier attempts at this page did, for the one taking over.
+    fn handoff(&self, page: &str, tier: Tier) -> anyhow::Result<String> {
+        let attempts = self.records.attempts(&self.id, page)?;
+        if attempts.is_empty() {
+            return Ok(String::new());
+        }
+        let mut out = String::from("\nWhat was tried on this page before, latest last:\n");
+        let shown = &attempts[attempts.len().saturating_sub(2)..];
+        for attempt in shown {
+            out.push_str(&format!("\n- {} ({}) — {}.", attempt.model, tier_name(attempt.tier), attempt.outcome));
+            if !attempt.files.is_empty() {
+                out.push_str(&format!(" Changed {}.", attempt.files.join(", ")));
+            }
+            out.push('\n');
+            if let Some(fixing) = &attempt.fixing {
+                out.push_str(&format!("  It was fixing: {}\n", first_lines(fixing, 6)));
+            }
+            if let Some(failure) = &attempt.failure {
+                out.push_str(&format!("  Why it was not kept: {}\n", first_lines(failure, 8)));
+            }
+            if !attempt.said.is_empty() {
+                out.push_str(&format!("  What it said when it finished: {}\n", first_lines(&attempt.said, 12)));
+            }
+            if let Some(diff) = &attempt.diff {
+                out.push_str("  Its change, which is not in your files:\n```diff\n");
+                out.push_str(diff);
+                out.push_str("\n```\n");
+            }
+        }
+        if let Some(last) = shown.last() {
+            if last.outcome == "merged" {
+                out.push_str("\nThe last attempt's work is already in your files. Build on it; do not start over.\n");
+            }
+            if last.tier != tier {
+                out.push_str("\nYou are taking this page over from a cheaper model. Its notes above say where it got stuck.\n");
+            }
+        }
+        Ok(out)
     }
 
     fn read_request(

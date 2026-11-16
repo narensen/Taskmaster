@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, follow, type ChangeEntry, type PagePlan, type RunDetail, type RunEvent, type Spend } from "../api";
+import { api, follow, type Attempt, type ChangeEntry, type PagePlan, type RunDetail, type RunEvent, type Spend } from "../api";
 import { CHANGE, phaseLabel, ago, describe, pageTone, phaseTone, seconds, tokens, usd } from "../format";
 import { Link } from "../router";
 import { Badge, Code, Dot, Empty, Problem, Spinner, Stat, Tabs, useAction, useLoad } from "../ui";
@@ -225,11 +225,19 @@ function Pages({ run }: { run: RunDetail }) {
   const plans = new Map((run.plan?.pages ?? []).map((page) => [page.id, page]));
   if (!run.plan) return <Empty title="No plan yet">{run.active ? "The master is planning." : "The run has no plan."}</Empty>;
   const states = new Map(run.pages.map((page) => [page.id, page]));
+  const shots = useLoad(() => api.screens(run.id), [run.id, run.spent.calls]);
   return (
     <div className="stack">
       <div className="list">
         {run.plan.pages.map((plan) => (
-          <PageRow key={plan.id} plan={plan} state={states.get(plan.id)} />
+          <PageRow
+            key={plan.id}
+            runId={run.id}
+            plan={plan}
+            state={states.get(plan.id)}
+            shot={(shots.data ?? []).includes(plan.id)}
+            version={run.spent.calls}
+          />
         ))}
         {run.pages
           .filter((page) => !plans.has(page.id))
@@ -257,9 +265,22 @@ function Pages({ run }: { run: RunDetail }) {
   );
 }
 
-function PageRow({ plan, state }: { plan: PagePlan; state?: RunDetail["pages"][number] }) {
+function PageRow({
+  runId,
+  plan,
+  state,
+  shot,
+  version,
+}: {
+  runId: string;
+  plan: PagePlan;
+  state?: RunDetail["pages"][number];
+  shot: boolean;
+  version: number;
+}) {
+  const [open, setOpen] = useState(false);
   return (
-    <details className="item page-row">
+    <details className="item page-row" onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
       <summary>
         <div className="row between gap">
           <div className="row gap">
@@ -292,8 +313,70 @@ function PageRow({ plan, state }: { plan: PagePlan; state?: RunDetail["pages"][n
             ))}
           </p>
         )}
+        {open && shot && <Screenshot runId={runId} page={plan.id} version={version} />}
+        {open && <Attempts runId={runId} page={plan.id} version={version} />}
       </div>
     </details>
+  );
+}
+
+function Screenshot({ runId, page, version }: { runId: string; page: string; version: number }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let made: string | null = null;
+    api.screen(runId, page).then(
+      (value) => {
+        made = value;
+        setUrl(value);
+      },
+      () => setUrl(null),
+    );
+    return () => {
+      if (made) URL.revokeObjectURL(made);
+    };
+  }, [runId, page, version]);
+  if (!url) return null;
+  return (
+    <figure className="shot">
+      <img src={url} alt={`${page} in the browser`} loading="lazy" />
+      <figcaption className="muted small">As the browser check saw it</figcaption>
+    </figure>
+  );
+}
+
+const OUTCOME: Record<Attempt["outcome"], string> = { merged: "kept", discarded: "thrown away", flagged: "objected" };
+
+function Attempts({ runId, page, version }: { runId: string; page: string; version: number }) {
+  const attempts = useLoad(() => api.attempts(runId, page), [runId, page, version]);
+  const list = attempts.data ?? [];
+  if (list.length === 0) return null;
+  return (
+    <div className="stack">
+      <span className="section-title">Attempts</span>
+      <ol className="attempts">
+        {list.map((attempt, i) => (
+          <li key={i}>
+            <div className="row between gap wrap">
+              <span>
+                <span className="mono">{attempt.model}</span> <span className="muted">({attempt.tier})</span>
+              </span>
+              <Badge tone={attempt.outcome === "merged" ? "good" : attempt.outcome === "flagged" ? "ask" : "bad"}>
+                {OUTCOME[attempt.outcome] ?? attempt.outcome}
+              </Badge>
+            </div>
+            {attempt.fixing && <p className="muted small">Fixing: {attempt.fixing.split("\n")[0]}</p>}
+            {attempt.failure && <p className="error-line">{attempt.failure.split("\n")[0]}</p>}
+            {attempt.said && <p className="small">“{attempt.said.length > 280 ? `${attempt.said.slice(0, 280)}…` : attempt.said}”</p>}
+            {attempt.diff && (
+              <details>
+                <summary className="muted small">The change that was thrown away</summary>
+                <Code>{attempt.diff}</Code>
+              </details>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 

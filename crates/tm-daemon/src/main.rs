@@ -11,6 +11,7 @@
 //!           [--reviewer-model <m>] [--verifier-model <m>]
 //!           [--parallel <n>] [--timeout <secs>] [--dictionary <dir>] [--commons <dir>]
 //!           [--run <id>] [--template <next | dir>] [--eval] [--baseline <h>] [--pair]
+//!           [--no-runtime-checks]
 //! ```
 //!
 //! Harnesses are `claude`, `agy`, `grok`, `codex` and `opencode`. The worker defaults
@@ -47,6 +48,8 @@ struct Args {
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
     yes: bool,
+    /// Skip the project's build, its tests and the browser.
+    no_runtime_checks: bool,
     parallel: usize,
     timeout: u64,
     dictionary: Option<PathBuf>,
@@ -114,6 +117,7 @@ async fn run() -> anyhow::Result<Outcome> {
         bail!("the prompt is empty");
     }
     config.yes = args.yes;
+    config.runtime_checks = !args.no_runtime_checks;
     config.parallel = args.parallel;
     config.timeout = Duration::from_secs(args.timeout);
     config.dictionary = args.dictionary;
@@ -305,7 +309,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                  [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
                  [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
                  [--timeout <secs>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
-                 [--template <next | dir>] \
+                 [--template <next | dir>] [--no-runtime-checks] \
                  [--eval] [--baseline <h>] [--pair]\n\
                  harnesses: claude, agy, grok, codex, opencode";
     let mut argv = argv.into_iter();
@@ -328,6 +332,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         eval: false,
         baseline: "claude".into(),
         pair: false,
+        no_runtime_checks: false,
         roles: Roles::default(),
         models: Models::default(),
     };
@@ -335,6 +340,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--yes" => args.yes = true,
+            "--no-runtime-checks" => args.no_runtime_checks = true,
             "--plan" => args.plan = Some(need(&mut argv, "--plan", usage)?.into()),
             "--prompt" => args.prompt = Some(need(&mut argv, "--prompt", usage)?),
             "--prompt-file" => args.prompt_file = Some(need(&mut argv, "--prompt-file", usage)?.into()),

@@ -63,6 +63,20 @@ The reviewer and the verifier are different harnesses, so one model does not gra
 
 Before a run finishes, the files it built are typechecked and linted with tools the project already has: `tsc` from `node_modules`, eslint when it is configured, clippy for Rust, ruff for Python. Only errors count. A type error, a compile error, or a lint rule the project set to `error` goes back to the page that owns the file, and into that model's Errorography. Style warnings do not. An error in a shared file the run wrote, a contract or a template file, goes to the master, which may edit those files and nothing else. It gets two such repairs in a run; if the file still fails, the run fails. An error in a file the run did not write was there before, so it is printed and left alone. Taskmaster installs nothing here.
 
+When the types are clean, the project is run. Its own `build` and `test` scripts run through the package manager its lockfile names (npm, pnpm, yarn or bun). A Rust project gets `cargo test`, and a Python project with a test directory gets `pytest`. Each failure goes back to the page whose file or route the output names. A failure that names a shared file the run wrote goes to the master. One that names neither is printed and costs nothing.
+
+A Next.js app that built is then started and opened in headless Chrome, one page per route, over the DevTools protocol. A dynamic segment such as `[id]` gets a sample value, and its 404 is not counted against it. The page gets back:
+- an error status;
+- an uncaught exception;
+- a `console.error`;
+- a resource that failed to load.
+
+A screenshot of each page is kept, and the app shows it next to the page. Chrome is found on `PATH`, or at `$TASKMASTER_CHROME`. `--no-runtime-checks` skips all of this.
+
+## Handing over
+
+Each attempt at a page is kept in `.taskmaster/runs/<id>/attempts/<page>.jsonl`: the model, what it was asked to fix, the files it changed, what it said when it finished, and why it was not kept. When a page goes back for repair, or up to a stronger model, the next attempt is given the last two. A change that was thrown away is included as a diff, since it is not in the tree. A kept one is already in the files, and the brief says to build on it.
+
 ## What a run cost
 
 Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the page, the harness, the model, the tokens, the seconds, and the price when the harness reports one. The estimate is not the planner's guess. It is worked out from what build and review calls cost in this project's earlier runs, or from defaults on a first run. The last line a run prints is the total next to that estimate. Cache reads are shown apart from the rest: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. `status.json` has the same totals split by role and by model.
@@ -201,6 +215,9 @@ tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--
           [--reviewer-model <m>] [--verifier-model <m>]
           [--parallel <n>] [--timeout <secs>] [--dictionary <dir>] [--commons <dir>]
           [--run <id>] [--template <next | dir>] [--eval] [--baseline <h>] [--pair]
+          [--no-runtime-checks]
+
+tm-commons serve | check | keygen      the Commons service; see deploy/commons
 
 tm-review <repo | url> [--base <rev>] [--head <rev>] [--pr <n>] [--dirty]
           [--reviewer <h>] [--verifier <h>]

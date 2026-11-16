@@ -22,6 +22,7 @@ mod eval;
 mod git;
 mod reply;
 mod resume;
+mod runtime;
 mod secret;
 pub mod settings;
 pub mod sqlite;
@@ -180,6 +181,9 @@ pub struct Config {
     pub reject: bool,
     /// Typecheck and lint what was built, with the project's own tools, before finishing.
     pub checks: bool,
+    /// Run the project's own build and tests once the type checks pass, and open each page
+    /// of a Next.js app in headless Chrome. No tokens are spent on either.
+    pub runtime_checks: bool,
     /// Merge the run's branch into the project when the run finishes clean. When this is
     /// off the result stays on `taskmaster/<run id>`.
     pub merge: bool,
@@ -215,6 +219,7 @@ impl Config {
             yes: false,
             reject: false,
             checks: true,
+            runtime_checks: true,
             merge: true,
             base: None,
             template: None,

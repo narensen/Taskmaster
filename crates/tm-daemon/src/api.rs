@@ -12,6 +12,9 @@
 //! GET  /api/runs/{id}/stream      the same events as they happen (server-sent events)
 //! GET  /api/runs/{id}/ledger      what each agent call cost
 //! GET  /api/runs/{id}/changes     what was committed, and by which model
+//! GET  /api/runs/{id}/attempts/{page}  every attempt at a page: who, what, and why it was not kept
+//! GET  /api/runs/{id}/screens     pages with a screenshot from the browser check
+//! GET  /api/runs/{id}/screens/{page}   the screenshot, as PNG
 //! POST /api/runs/{id}/approve     build the plan that is waiting
 //! POST /api/runs/{id}/reject      {prompt?} drop the plan, and plan again when a prompt is given
 //! POST /api/runs/{id}/resume      carry on a run that stopped part way
@@ -196,6 +199,9 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/events", get(run_events))
         .route("/api/runs/{id}/ledger", get(run_ledger))
         .route("/api/runs/{id}/changes", get(run_changes))
+        .route("/api/runs/{id}/attempts/{page}", get(run_attempts))
+        .route("/api/runs/{id}/screens", get(run_screens))
+        .route("/api/runs/{id}/screens/{page}", get(run_screen))
         .route("/api/runs/{id}/approve", post(approve_run))
         .route("/api/runs/{id}/reject", post(reject_run))
         .route("/api/runs/{id}/resume", post(resume_run))
@@ -614,6 +620,30 @@ async fn run_ledger(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
 async fn run_changes(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
     app.known(&id)?;
     ok(json!({ "changes": app.records.changes(&id)? }))
+}
+
+async fn run_attempts(State(app): State<Arc<App>>, UrlPath((id, page)): UrlPath<(String, String)>) -> Reply {
+    app.known(&id)?;
+    if !valid_key(&page) {
+        return Err(fail(StatusCode::NOT_FOUND, "no such page"));
+    }
+    ok(json!({ "attempts": app.records.attempts(&id, &page)? }))
+}
+
+async fn run_screens(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    app.known(&id)?;
+    ok(json!({ "pages": app.records.screenshots(&id)? }))
+}
+
+async fn run_screen(State(app): State<Arc<App>>, UrlPath((id, page)): UrlPath<(String, String)>) -> Reply {
+    app.known(&id)?;
+    if !valid_key(&page) {
+        return Err(fail(StatusCode::NOT_FOUND, "no such page"));
+    }
+    match app.records.screenshot(&id, &page)? {
+        Some(png) => Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-cache")], png).into_response()),
+        None => Err(fail(StatusCode::NOT_FOUND, "no screenshot of this page")),
+    }
 }
 
 fn waiting(run: &Run) -> Result<(), ApiError> {

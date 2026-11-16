@@ -103,6 +103,13 @@ pub fn worktree_changes(repo: &Path) -> anyhow::Result<Vec<Change>> {
     Ok(changes)
 }
 
+/// Everything changed in a scratch worktree as one diff, new files included. Stages the
+/// changes, so call it only on a worktree that is about to be thrown away.
+pub fn worktree_diff(repo: &Path) -> anyhow::Result<String> {
+    git(repo, &["add", "-A"])?;
+    git(repo, &["diff", "--cached", "--no-color", "--no-ext-diff", "HEAD"])
+}
+
 fn parse_name_status(out: &str) -> Vec<Change> {
     let mut parts = out.split('\0').filter(|p| !p.is_empty());
     let mut changes = Vec::new();

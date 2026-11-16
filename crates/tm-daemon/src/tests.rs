@@ -1461,3 +1461,118 @@ mod http {
         assert_eq!(client.get("/api/health").await.0, 200);
     }
 }
+
+mod commons_service {
+    //! The daemon against the real Commons service, with its database in memory.
+
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::auth::{AccountAuth, Auth};
+    use crate::commons::HttpCommons;
+    use tm_commons::db::{Db, Identity, Memory, Status};
+    use tm_dictionary::CommonsRemote;
+
+    const SEED: [u8; 32] = [11; 32];
+
+    async fn service() -> (String, Arc<Memory>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let vars: HashMap<&str, String> = [
+            ("TM_COMMONS_URL", base.clone()),
+            ("DATABASE_URL", "memory".to_string()),
+            ("TM_COMMONS_SIGNING_KEY", tm_token::Signer::seed_from(&SEED).unwrap()),
+            ("TM_COMMONS_SESSION_SECRET", "0123456789abcdef0123456789abcdef".to_string()),
+            ("GITHUB_CLIENT_ID", "id".to_string()),
+            ("GITHUB_CLIENT_SECRET", "secret".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let config = tm_commons::Config::from_vars(|name| vars.get(name).cloned()).unwrap();
+        let db = Arc::new(Memory::default());
+        let app = Arc::new(tm_commons::App::new(config, db.clone()).unwrap());
+        tokio::spawn(async move { axum::serve(listener, tm_commons::router(app)).await.unwrap() });
+        (base, db)
+    }
+
+    #[tokio::test]
+    async fn entries_go_to_the_commons_come_back_reviewed_earn_a_pass_rate_and_can_be_withdrawn() {
+        let (base, db) = service().await;
+        let ana = db
+            .upsert_user(&Identity { provider: "github".into(), subject: "1".into(), login: Some("ana".into()), email: None, name: None })
+            .await
+            .unwrap();
+        let token = format!("tmc_{}", "ab".repeat(24));
+        db.add_token(ana.id, &crate::secret::fingerprint(&token), "laptop").await.unwrap();
+
+        let tmp = repo("commons-service");
+        let mine = LocalStore::open(tmp.0.join("mine")).unwrap();
+        mine.publish("card", EntryKind::Pattern, "a card", "export const Card = 1;\n", "next@15").unwrap();
+        let card = mine.get("card").unwrap().unwrap();
+
+        // Sharing is off unless asked for.
+        let quiet = HttpCommons::new(&base, &token).sharing(false);
+        let (shared, sent) = (HttpCommons::new(&base, &token).sharing(true), card.clone());
+        tokio::task::spawn_blocking(move || {
+            quiet.push(&sent).unwrap();
+            shared.push(&sent).unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.submissions(Status::Pending).await.unwrap().len(), 1);
+
+        // Nobody gets it until a moderator approves it.
+        let theirs = LocalStore::open(tmp.0.join("theirs")).unwrap();
+        let pull = |store: LocalStore| {
+            let remote = HttpCommons::new(&base, "");
+            async move { tokio::task::spawn_blocking(move || remote.pull(&store).unwrap()).await.unwrap() }
+        };
+        assert_eq!(pull(theirs.clone()).await, 0);
+        db.review("card", &card.hash, Status::Approved, ana.id, None).await.unwrap();
+        assert_eq!(pull(theirs.clone()).await, 1);
+        let arrived = theirs.get("card").unwrap().unwrap();
+        assert_eq!(arrived.tier, DictTier::Commons);
+
+        // A run that used it reports back, and its pass rate is earned there.
+        let reporter = HttpCommons::new(&base, &token);
+        let used = arrived.clone();
+        tokio::task::spawn_blocking(move || reporter.report(&used, true).unwrap()).await.unwrap();
+        assert_eq!(db.submission("card", &card.hash).await.unwrap().unwrap().passes, 1);
+
+        // Withdrawn: the next pull deletes it here.
+        db.review("card", &card.hash, Status::Rejected, ana.id, Some("unsafe")).await.unwrap();
+        assert_eq!(pull(theirs.clone()).await, 0);
+        assert!(theirs.get("card").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_daemon_lets_in_a_listed_account_with_a_token_from_the_service() {
+        let (base, _db) = service().await;
+        let signer = tm_token::Signer::from_seed(&tm_token::Signer::seed_from(&SEED).unwrap()).unwrap();
+        let token = |login: &str| {
+            signer.sign(&tm_token::Claims {
+                iss: base.clone(),
+                sub: format!("github:{login}-id"),
+                aud: tm_token::DAEMON_AUDIENCE.into(),
+                iat: tm_token::now(),
+                exp: tm_token::now() + 600,
+                login: Some(login.into()),
+                email: None,
+                name: None,
+            })
+        };
+        let auth = AccountAuth::new(&base, vec!["github:naren".into()]);
+        // The keys are fetched in the background.
+        let mut seen = None;
+        for _ in 0..100 {
+            seen = auth.identify(&token("naren"));
+            if seen.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen.unwrap().id, "github:naren-id");
+        assert!(auth.identify(&token("someone")).is_none());
+        assert_eq!(auth.describe()["sign_in"], base.as_str());
+    }
+}

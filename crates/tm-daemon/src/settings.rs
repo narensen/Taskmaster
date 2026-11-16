@@ -44,19 +44,31 @@ impl Default for StoreSettings {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
-    /// The sign-in service whose tokens are accepted, alongside paired devices.
+    /// The Commons service, whose sign-in tokens are accepted alongside paired devices.
     pub issuer: String,
-    /// The secret that service signs with.
-    pub secret: String,
+    /// The accounts that may sign in here: `github:<login>`, `google:<email>`, or an
+    /// email. Anyone can have an account with the service, so nobody is let in by default.
+    pub allow: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CommonsSettings {
-    /// A Taskmaster daemon that holds the shared Commons, such as `https://commons.example`.
+    /// The shared Commons: the Commons service, or a daemon acting as a hub.
     pub remote: String,
-    /// A token that daemon issued.
+    /// A token made on the service's account page. Pulling works without one.
     pub token: String,
+    /// Offer entries this machine promotes. Off unless set: an entry is project code.
+    pub share: bool,
+    /// Say how Commons entries did in this machine's runs, which is how their pass rates
+    /// are earned. Only the entry and pass or fail are sent.
+    pub report: bool,
+}
+
+impl Default for CommonsSettings {
+    fn default() -> Self {
+        CommonsSettings { remote: String::new(), token: String::new(), share: false, report: true }
+    }
 }
 
 /// A value still as the example file has it.
@@ -97,28 +109,40 @@ impl Settings {
     pub fn auth(&self, records: Records) -> anyhow::Result<(Arc<dyn Auth>, String)> {
         let pairing = Arc::new(PairingAuth::new(records)?);
         let code = pairing.code().to_string();
-        if is_placeholder(&self.auth.issuer) || is_placeholder(&self.auth.secret) {
-            if !self.auth.issuer.trim().is_empty() || !self.auth.secret.trim().is_empty() {
+        if is_placeholder(&self.auth.issuer) {
+            if !self.auth.issuer.trim().is_empty() {
                 eprintln!("taskmaster: account sign-in is still a placeholder in the settings file; pairing only");
             }
             return Ok((pairing, code));
         }
-        if self.auth.secret.len() < 32 {
-            bail!("the sign-in secret in the settings file is shorter than 32 characters");
+        let issuer = self.auth.issuer.trim();
+        if !issuer.starts_with("https://") && !issuer.starts_with("http://localhost") && !issuer.starts_with("http://127.0.0.1") {
+            bail!("the sign-in service in the settings file must be https://");
         }
-        let accounts = Arc::new(AccountAuth::new(self.auth.issuer.trim(), &self.auth.secret));
+        let allow: Vec<String> = self.auth.allow.iter().filter(|entry| !is_placeholder(entry)).cloned().collect();
+        if allow.is_empty() {
+            eprintln!("taskmaster: `auth.allow` in the settings file is empty, so no account can sign in here");
+        }
+        let accounts = Arc::new(AccountAuth::new(issuer, allow));
         Ok((Arc::new(AnyAuth(vec![pairing, accounts])), code))
     }
 
     /// `None` keeps the Commons on this machine.
     pub fn remote(&self) -> Option<Arc<dyn CommonsRemote>> {
-        if is_placeholder(&self.commons.remote) || is_placeholder(&self.commons.token) {
+        if is_placeholder(&self.commons.remote) {
             if !self.commons.remote.trim().is_empty() {
                 eprintln!("taskmaster: the shared Commons is still a placeholder in the settings file; using the local one");
             }
             return None;
         }
-        Some(Arc::new(HttpCommons::new(self.commons.remote.trim(), self.commons.token.trim())))
+        let token = if is_placeholder(&self.commons.token) { "" } else { self.commons.token.trim() };
+        if token.is_empty() && self.commons.share {
+            eprintln!("taskmaster: `commons.share` is on but there is no token, so nothing will be shared");
+        }
+        let remote = HttpCommons::new(self.commons.remote.trim(), token)
+            .sharing(self.commons.share && !token.is_empty())
+            .reporting(self.commons.report);
+        Some(Arc::new(remote))
     }
 }
 
@@ -130,7 +154,8 @@ mod tests {
     fn the_example_file_is_all_placeholders_and_changes_nothing() {
         let example = include_str!("../../../config.example.json");
         let settings: Settings = serde_json::from_str(example).unwrap();
-        assert!(is_placeholder(&settings.auth.issuer) && is_placeholder(&settings.auth.secret));
+        assert!(is_placeholder(&settings.auth.issuer) && settings.auth.allow.iter().all(|a| is_placeholder(a)));
+        assert!(!settings.commons.share && settings.commons.report);
         assert!(is_placeholder(&settings.commons.remote) && is_placeholder(&settings.commons.token));
         assert!(settings.remote().is_none());
         let dir = std::env::temp_dir().join(format!("tm-settings-{}", std::process::id()));
@@ -150,8 +175,8 @@ mod tests {
         std::fs::write(
             dir.join(".taskmaster/config.json"),
             r#"{"store":{"kind":"sqlite"},
-                "auth":{"issuer":"https://auth.test","secret":"0123456789abcdef0123456789abcdef"},
-                "commons":{"remote":"http://127.0.0.1:9","token":"abc"}}"#,
+                "auth":{"issuer":"http://127.0.0.1:9","allow":["github:naren"]},
+                "commons":{"remote":"http://127.0.0.1:9","token":"abc","share":true}}"#,
         )
         .unwrap();
         let settings = Settings::load(&dir).unwrap();
@@ -162,8 +187,9 @@ mod tests {
         let (auth, _) = settings.auth(records).unwrap();
         assert_eq!(auth.describe()["methods"], serde_json::json!(["pairing", "account"]));
         assert!(settings.remote().is_some());
-        let short = Settings { auth: AuthSettings { issuer: "https://auth.test".into(), secret: "short".into() }, ..Settings::default() };
-        assert!(short.auth(Records::files(&dir)).is_err());
+        assert!(settings.commons.share && settings.commons.report);
+        let plain = Settings { auth: AuthSettings { issuer: "http://auth.test".into(), allow: vec![] }, ..Settings::default() };
+        assert!(plain.auth(Records::files(&dir)).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

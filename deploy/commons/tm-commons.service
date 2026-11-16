@@ -1,0 +1,29 @@
+# /etc/systemd/system/tm-commons.service
+[Unit]
+Description=Taskmaster Commons
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tm-commons
+Group=tm-commons
+EnvironmentFile=/etc/tm-commons/commons.env
+ExecStart=/usr/local/bin/tm-commons serve
+Restart=on-failure
+RestartSec=5
+
+# It needs the network and nothing else on the machine.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# /etc/caddy/Caddyfile. Replace the name with yours; Caddy gets the certificate itself.
+commons.example.invalid {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8740
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# No `form-action`: signing in to a Taskmaster ends in a redirect to that Taskmaster.
+		Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+		-Server
+	}
+}

@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
-      - run: cargo build --release --locked -p tm-daemon -p tm-review
+      - run: cargo build --release --locked -p tm-daemon -p tm-review -p tm-commons
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -22,7 +22,8 @@ jobs:
         run: |
           name="taskmaster-${GITHUB_REF_NAME}-x86_64-linux"
           mkdir "$name"
-          cp target/release/tm-daemon target/release/tm-review README.md config.example.json "$name/"
+          cp target/release/tm-daemon target/release/tm-review target/release/tm-commons README.md config.example.json "$name/"
+          cp -R deploy "$name/deploy"
           # Serve it with `tm-daemon serve <project> --web web`, or copy it to ~/.local/share/taskmaster/web.
           cp -R web/dist "$name/web"
           tar -czf "$name.tar.gz" "$name"

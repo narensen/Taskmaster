@@ -1677,6 +1677,11 @@ impl Driver {
                 let Some(entry) = catalog.resolve(key)? else { continue };
                 if entry.tier == DictTier::Commons {
                     catalog.note_result(key, passed)?;
+                    if let Some(remote) = &self.remote
+                        && let Err(err) = remote.report(&entry, passed)
+                    {
+                        eprintln!("taskmaster: {err:#}");
+                    }
                 } else if passed {
                     catalog.promote(key)?;
                     catalog.note_result(key, true)?;

@@ -8,6 +8,7 @@ use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
 use tm_core::{DictTier, DictionaryEntry, EntryKind};
 
+#[derive(Debug, Clone)]
 pub struct LocalStore {
     root: PathBuf,
 }
@@ -120,6 +121,28 @@ impl LocalStore {
         fs::write(dir.join(format!("{}.json", entry.hash)), serde_json::to_vec_pretty(entry)?)?;
         fs::write(dir.join("HEAD"), &entry.hash)?;
         Ok(())
+    }
+
+    /// Delete one version, as when the Commons withdraws it. With it gone from HEAD, the
+    /// key is gone: an older version is not brought back, since nobody chose it.
+    /// Returns whether anything was deleted.
+    pub fn withdraw(&self, key: &str, hash: &str) -> anyhow::Result<bool> {
+        check_key(key)?;
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.is_empty() {
+            bail!("invalid hash");
+        }
+        let dir = self.root.join(key);
+        let file = dir.join(format!("{hash}.json"));
+        if !file.is_file() {
+            return Ok(false);
+        }
+        let head = fs::read_to_string(dir.join("HEAD")).unwrap_or_default();
+        if head.trim() == hash {
+            fs::remove_dir_all(&dir)?;
+        } else {
+            fs::remove_file(file)?;
+        }
+        Ok(true)
     }
 
     pub fn root(&self) -> &Path {

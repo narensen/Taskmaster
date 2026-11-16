@@ -150,23 +150,29 @@ Without `--web`, the daemon serves `$TASKMASTER_WEB` or `~/.local/share/taskmast
 
 To work on the app, run `npm run dev` in `web/` next to `tm-daemon serve`. Vite sends `/api` to `127.0.0.1:8737`, or to `$TASKMASTER_DAEMON`. A build served from somewhere else can name the daemon on its sign-in screen; the API allows any origin, because it authenticates with tokens, not cookies.
 
-## Storage, accounts and a shared Commons
+## Storage, accounts and the Commons
 
-Each of these is behind a trait, and each is set in `.taskmaster/config.json` in the project, or in `~/.taskmaster/config.json`. Without the file nothing changes. `config.example.json` lists every field with a placeholder. A placeholder counts as not set: the daemon says so and keeps the default. You can therefore copy the file as it is and fill in one part at a time.
+These are set in `.taskmaster/config.json` in the project, or in `~/.taskmaster/config.json`. Without the file nothing changes. `config.example.json` lists every field with a placeholder. A placeholder counts as not set, so you can copy the file and fill in one part at a time.
 
-```bash
-cp config.example.json .taskmaster/config.json
-```
+| Part | Default | Set up |
+| --- | --- | --- |
+| Records | Files under `.taskmaster/` | `"store": {"kind": "sqlite"}` keeps them in one SQLite file. |
+| The Commons | A directory on this machine | `"commons": {"remote", "token", "share", "report"}` connects to the Taskmaster Commons, which everyone shares. |
+| Sign-in | A pairing code, and one token per device | `"auth": {"issuer", "allow"}` also lets you in with your Commons account. Only the accounts in `allow` get in. |
 
-| Part | Trait | Default | Set up |
-| --- | --- | --- | --- |
-| Records | `Store` | Files under `.taskmaster/` | `"store": {"kind": "sqlite"}` keeps them in one SQLite file, `.taskmaster/taskmaster.db` unless `path` says otherwise. |
-| Sign-in | `Auth` | A pairing code, and one token per device | `"auth": {"issuer", "secret"}` also accepts accounts. A sign-in service issues an HS256 JWT with `iss` set to the issuer, a `sub`, and an `exp`, signed with the shared secret (32 characters or more). The daemon checks the signature, the issuer and the expiry, and stores nothing. Pairing keeps working. |
-| Shared Commons | `CommonsRemote` | The Commons is a directory on this machine | `"commons": {"remote", "token"}` names another daemon as the hub. Before it plans, this daemon pulls the hub's entries. It sends the hub each entry it promotes. The token is one the hub issued when this machine paired with it. |
+### The Taskmaster Commons
 
-Any daemon can be a hub. `GET /api/commons/entries` lists its Commons. `POST /api/commons/entries` adds an entry only if its content matches its hash. The pass and fail counts start over on the hub, so a sender cannot claim a track record.
+`tm-commons` is one service for everyone. It signs people in with GitHub or Google, and serves the entries people chose to share. Your Taskmaster pulls those entries before it plans, and deletes any entry the Commons has withdrawn.
 
-The sign-in service itself does not exist yet. The app sends the browser to `<issuer>/authorize?redirect_uri=<app>/signed-in` and expects to come back to `/signed-in#token=<jwt>`. That contract is in `web/src/api.ts`, ready to change when the service is built.
+Sharing works like this:
+- With `share` on, your Taskmaster sends each entry your runs promote.
+- Before anyone else gets an entry, the service refuses anything that looks like a credential, and a moderator approves it in the weekly review.
+- `report`, on by default, says whether pages that used a Commons entry passed. That is how an entry earns its pass rate in other people's runs.
+- Moderators withdraw entries that are reported or that keep failing, and can ban someone.
+
+The service signs sign-in tokens with an Ed25519 key and publishes the public half. A Taskmaster checks tokens with that public key alone, and holds nothing that could make one.
+
+`deploy/commons/` has what the server needs: how to set it up, the environment file with placeholders, a systemd unit and a Caddy config. A daemon can also act as a hub for a group, through `GET` and `POST /api/commons/entries`.
 
 ## Review any repository
 
@@ -215,6 +221,8 @@ Commits the daemon makes need `user.name` and `user.email` on that repository. T
 | `tm-harness` | Headless adapters for Claude Code, Antigravity, Grok, Codex, and OpenCode. |
 | `tm-verify` | Ownership globs and the import graph. |
 | `tm-review` | Review of any git repository. The binary is `tm-review`. |
+| `tm-commons` | The Commons and sign-in service everyone shares. The binary is `tm-commons`. |
+| `tm-token` | Sign-in tokens: Ed25519 JWTs and the published key. |
 
 `web/` is the app, which is not a crate.
 

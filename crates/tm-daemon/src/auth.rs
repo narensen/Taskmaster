@@ -7,12 +7,11 @@
 //! devices already paired.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::time::Duration;
 
-use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use tm_token::{DAEMON_AUDIENCE, Verifier};
 
 use crate::secret::{fingerprint, random_bytes, random_hex};
 use crate::store::Records;
@@ -45,49 +44,84 @@ pub trait Auth: Send + Sync {
     }
 }
 
-/// Accounts. A sign-in service issues a token signed with a secret this daemon shares
-/// (a JWT, HS256). Nothing is stored here: the signature and the expiry are the check.
+/// Accounts. The Commons service signs people in with GitHub or Google and hands this
+/// daemon a token signed with its Ed25519 key. The daemon checks the token against the
+/// key the service publishes at `/.well-known/jwks.json`, so it holds nothing that could
+/// make a token. Anyone can have an account, so a token is accepted only for an account
+/// on this daemon's `allow` list.
 pub struct AccountAuth {
-    secret: Vec<u8>,
-    /// The `iss` a token must carry, and where a frontend sends people to sign in.
+    /// The service: what a token's `iss` must be, and where to send people to sign in.
     issuer: String,
+    allow: Vec<String>,
+    keys: Arc<RwLock<Option<Verifier>>>,
+    /// Asks the background fetch to look again, when a token names a key not seen yet.
+    refetch: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl AccountAuth {
-    pub fn new(issuer: &str, secret: &str) -> Self {
-        AccountAuth { secret: secret.as_bytes().to_vec(), issuer: issuer.to_string() }
+    /// Fetches the service's keys now and every hour after, on a thread of its own.
+    pub fn new(issuer: &str, allow: Vec<String>) -> Self {
+        let issuer = issuer.trim_end_matches('/').to_string();
+        let keys = Arc::new(RwLock::new(None));
+        let (tx, rx) = mpsc::channel::<()>();
+        let (url, slot, iss) = (format!("{issuer}/.well-known/jwks.json"), keys.clone(), issuer.clone());
+        std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
+            loop {
+                let fetched = agent
+                    .get(&url)
+                    .call()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|reply| Ok(reply.into_json::<Value>()?))
+                    .and_then(|jwks| Verifier::from_jwks(&jwks, &iss, DAEMON_AUDIENCE));
+                match fetched {
+                    Ok(verifier) => *slot.write().unwrap() = Some(verifier),
+                    Err(err) => eprintln!("taskmaster: cannot read the sign-in keys at {url}: {err:#}"),
+                }
+                // Wait an hour, or until asked; then no sooner than a minute from now.
+                match rx.recv_timeout(Duration::from_secs(3600)) {
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    _ => std::thread::sleep(Duration::from_secs(60)),
+                }
+                while rx.try_recv().is_ok() {}
+            }
+        });
+        AccountAuth { issuer, allow, keys, refetch: Mutex::new(Some(tx)) }
     }
 
-    fn claims(&self, token: &str) -> Option<Value> {
-        let mut parts = token.split('.');
-        let (head, body, sign) = (parts.next()?, parts.next()?, parts.next()?);
-        if parts.next().is_some() {
-            return None;
+    /// With keys already in hand. Nothing is fetched.
+    pub fn with_keys(issuer: &str, allow: Vec<String>, verifier: Verifier) -> Self {
+        AccountAuth {
+            issuer: issuer.trim_end_matches('/').to_string(),
+            allow,
+            keys: Arc::new(RwLock::new(Some(verifier))),
+            refetch: Mutex::new(None),
         }
-        let header: Value = serde_json::from_slice(&unbase64(head)?).ok()?;
-        // Only the one algorithm: a token that names another, or none, is refused.
-        if header["alg"] != "HS256" {
-            return None;
-        }
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).ok()?;
-        mac.update(format!("{head}.{body}").as_bytes());
-        mac.verify_slice(&unbase64(sign)?).ok()?;
-        let claims: Value = serde_json::from_slice(&unbase64(body)?).ok()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-        if claims["exp"].as_u64()? <= now || claims["iss"].as_str()? != self.issuer {
-            return None;
-        }
-        Some(claims)
     }
 }
 
 impl Auth for AccountAuth {
     fn identify(&self, token: &str) -> Option<Principal> {
-        let claims = self.claims(token)?;
-        Some(Principal { id: claims["sub"].as_str().filter(|sub| !sub.is_empty())?.to_string() })
+        let claims = {
+            let keys = self.keys.read().unwrap();
+            let verifier = keys.as_ref();
+            let claims = verifier.and_then(|v| v.verify(token));
+            let unknown_key = Verifier::key_id_of(token).is_some_and(|kid| !verifier.is_some_and(|v| v.has_key(&kid)));
+            if claims.is_none()
+                && unknown_key
+                && let Some(tx) = self.refetch.lock().unwrap().as_ref()
+            {
+                let _ = tx.send(());
+            }
+            claims?
+        };
+        if !claims.allowed_by(&self.allow) {
+            return None;
+        }
+        Some(Principal { id: claims.sub })
     }
 
-    /// The credential is the token the sign-in service issued. A good one is the bearer
+    /// The credential is the token the service handed over. A good one is the bearer
     /// token itself, so there is nothing to exchange.
     fn enroll(&self, credential: &str) -> anyhow::Result<Option<String>> {
         Ok(self.identify(credential.trim()).map(|_| credential.trim().to_string()))
@@ -139,25 +173,6 @@ impl Auth for AnyAuth {
     }
 }
 
-const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/// Base64 as tokens carry it: the URL alphabet, no padding.
-fn unbase64(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let (mut bits, mut have) = (0u32, 0u8);
-    for byte in text.trim_end_matches('=').bytes() {
-        let value = BASE64URL.iter().position(|c| *c == byte)? as u32;
-        bits = (bits << 6) | value;
-        have += 6;
-        if have >= 8 {
-            have -= 8;
-            out.push((bits >> have) as u8);
-            bits &= (1 << have) - 1;
-        }
-    }
-    Some(out)
-}
-
 /// A printed code, one token per device. Only token hashes are stored.
 pub struct PairingAuth {
     code: String,
@@ -206,25 +221,6 @@ impl Auth for PairingAuth {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn sign(secret: &str, claims: &Value) -> String {
-    fn base64(bytes: &[u8]) -> String {
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let n = chunk.iter().fold(0u32, |acc, b| (acc << 8) | *b as u32) << (8 * (3 - chunk.len()));
-            for i in 0..=chunk.len() {
-                out.push(BASE64URL[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            }
-        }
-        out
-    }
-    let head = base64(br#"{"alg":"HS256","typ":"JWT"}"#);
-    let body = base64(claims.to_string().as_bytes());
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(format!("{head}.{body}").as_bytes());
-    format!("{head}.{body}.{}", base64(&mac.finalize().into_bytes()))
-}
-
 /// Compare without stopping at the first difference.
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -262,22 +258,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn an_account_token_is_checked_by_signature_issuer_and_expiry() {
-        let auth = AccountAuth::new("https://auth.test", "a-long-shared-secret");
-        let later = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
-        let good = sign("a-long-shared-secret", &json!({ "sub": "naren", "iss": "https://auth.test", "exp": later }));
-        assert_eq!(auth.identify(&good), Some(Principal { id: "naren".into() }));
-        assert_eq!(auth.enroll(&good).unwrap().as_deref(), Some(good.as_str()));
+    fn service() -> tm_token::Signer {
+        tm_token::Signer::from_seed(&tm_token::Signer::seed_from(&[5u8; 32]).unwrap()).unwrap()
+    }
 
-        let forged = sign("another-secret", &json!({ "sub": "naren", "iss": "https://auth.test", "exp": later }));
-        let expired = sign("a-long-shared-secret", &json!({ "sub": "naren", "iss": "https://auth.test", "exp": 10 }));
-        let elsewhere = sign("a-long-shared-secret", &json!({ "sub": "naren", "iss": "https://other.test", "exp": later }));
-        // The same claims with the algorithm switched off and the signature removed.
-        let unsigned = format!("eyJhbGciOiJub25lIn0.{}.", good.split('.').nth(1).unwrap());
-        for bad in [forged, expired, elsewhere, unsigned, "not.a.token".into(), String::new()] {
+    fn token(signer: &tm_token::Signer, issuer: &str, login: &str, exp: u64) -> String {
+        signer.sign(&tm_token::Claims {
+            iss: issuer.into(),
+            sub: "github:42".into(),
+            aud: DAEMON_AUDIENCE.into(),
+            iat: tm_token::now(),
+            exp,
+            login: Some(login.into()),
+            email: None,
+            name: None,
+        })
+    }
+
+    fn accounts(allow: &[&str]) -> AccountAuth {
+        let verifier = Verifier::from_jwks(&service().jwks(), "https://commons.test", DAEMON_AUDIENCE).unwrap();
+        AccountAuth::with_keys("https://commons.test/", allow.iter().map(|a| a.to_string()).collect(), verifier)
+    }
+
+    #[test]
+    fn an_account_token_is_checked_by_key_issuer_expiry_and_the_allow_list() {
+        let signer = service();
+        let later = tm_token::now() + 600;
+        let auth = accounts(&["github:naren"]);
+        let good = token(&signer, "https://commons.test", "naren", later);
+        assert_eq!(auth.identify(&good), Some(Principal { id: "github:42".into() }));
+        assert_eq!(auth.enroll(&good).unwrap().as_deref(), Some(good.as_str()));
+        assert_eq!(auth.describe()["sign_in"], "https://commons.test");
+
+        let stranger = tm_token::Signer::from_seed(&tm_token::Signer::seed_from(&[6u8; 32]).unwrap()).unwrap();
+        let bad = [
+            // Anyone can sign in to the service; only listed accounts get in here.
+            token(&signer, "https://commons.test", "someone-else", later),
+            token(&stranger, "https://commons.test", "naren", later),
+            token(&signer, "https://commons.test", "naren", 10),
+            token(&signer, "https://other.test", "naren", later),
+            "not.a.token".into(),
+            String::new(),
+        ];
+        for bad in bad {
             assert_eq!(auth.identify(&bad), None, "{bad}");
         }
+        assert_eq!(accounts(&[]).identify(&good), None, "an empty list lets nobody in");
     }
 
     #[test]
@@ -285,14 +311,13 @@ mod tests {
         let (records, dir) = records("any");
         let pairing = Arc::new(PairingAuth::new(records).unwrap());
         let code = pairing.code().to_string();
-        let any = AnyAuth(vec![pairing, Arc::new(AccountAuth::new("https://auth.test", "a-long-shared-secret"))]);
-        let later = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
-        let account = sign("a-long-shared-secret", &json!({ "sub": "naren", "iss": "https://auth.test", "exp": later }));
+        let any = AnyAuth(vec![pairing, Arc::new(accounts(&["github:naren"]))]);
+        let account = token(&service(), "https://commons.test", "naren", tm_token::now() + 600);
         let device = any.enroll(&code).unwrap().unwrap();
         assert!(any.identify(&device).is_some() && any.identify(&account).is_some());
         assert!(any.identify("nope").is_none());
         assert_eq!(any.describe()["methods"], json!(["pairing", "account"]));
-        assert_eq!(any.describe()["sign_in"], "https://auth.test");
+        assert_eq!(any.describe()["sign_in"], "https://commons.test");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -2,7 +2,9 @@
 // surfaces, the live plan, approvals, the notes waiting for the next brief, and a right
 // panel with the plan, the diff, the browser, web search, the terminal and file previews.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import gsap from "gsap";
 import { api, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
@@ -10,7 +12,8 @@ import { phaseLabel, usd } from "../format";
 import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
-import { prefs, setPrefs } from "../prefs";
+import { motionOn, prefs, setPrefs } from "../prefs";
+import { bezier, dur, ease } from "../motion";
 import { Problem, Spinner, useLoad } from "../ui";
 import { takeAttachments } from "../App";
 import { AgentSurface } from "../run/AgentSurface";
@@ -66,7 +69,13 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
     }
   };
   return (
-    <div className="approval" data-testid="approval">
+    <motion.div
+      className="approval"
+      data-testid="approval"
+      initial={motionOn() ? { opacity: 0, y: 8 } : false}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.18, ease: bezier.out }}
+    >
       <div className="strong">The master asks to build this plan</div>
       <div className="small muted">
         {plan ? `${plan.pages.length} page(s): ${plan.pages.map((p) => `${p.id} → ${p.owned_glob}`).join(", ")}` : "a plan"} · Build stays blocked until you approve.
@@ -85,7 +94,7 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
           {reply.trim() ? "Reject with reply" : "Reject"}
         </button>
       </div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -102,6 +111,8 @@ export function RunView({ id }: { id: string }) {
   const [cite, setCite] = useState<{ x: number; y: number; text: string; agent: string } | null>(null);
   const [citeNote, setCiteNote] = useState("");
   const [pr, setPr] = useState<string | null>(null);
+  const panelBody = useRef<HTMLDivElement>(null);
+  const citeRef = useRef<HTMLDivElement>(null);
 
   // The right panel: fixed tabs plus file previews; the active one is kept per run.
   const [tabs, setTabs] = useState<string[]>([...FIXED]);
@@ -220,6 +231,16 @@ export function RunView({ id }: { id: string }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [tab, closed, closeTab, setTab]);
 
+  useLayoutEffect(() => {
+    if (!panelBody.current || !motionOn()) return;
+    gsap.fromTo(panelBody.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
+  }, [tab]);
+
+  useLayoutEffect(() => {
+    if (!cite || !citeRef.current || !motionOn()) return;
+    gsap.fromTo(citeRef.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
+  }, [cite]);
+
   // Cite: select text in an agent's reply.
   useEffect(() => {
     const onUp = () => {
@@ -275,7 +296,7 @@ export function RunView({ id }: { id: string }) {
           </button>
         )}
       </div>
-      <div className="panel-body">
+      <div className="panel-body" ref={panelBody}>
         {tab === "plan" && (detail.plan ? <PlanView plan={detail.plan} /> : <div className="pad muted">No plan yet. The master is still planning.</div>)}
         {tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
         {tab === "browser" && <BrowserTab run={id} detail={detail} entries={entries} />}
@@ -290,6 +311,7 @@ export function RunView({ id }: { id: string }) {
   return (
     <div className={`run ${narrow ? "narrow" : ""}`}>
       <div className="run-main">
+        <div className="run-scroll">
         <header className="run-head">
           <div className="grow">
             <div className="eyebrow">{settings.data?.project ?? "run"}</div>
@@ -418,8 +440,9 @@ export function RunView({ id }: { id: string }) {
           )}
         </section>
 
+        </div>
         <div className="composer-bar">
-          <div className="row gap small">
+          <div className="row gap wrap small">
             <label className="muted" htmlFor="note-to">
               Note to
             </label>
@@ -452,7 +475,7 @@ export function RunView({ id }: { id: string }) {
       )}
 
       {cite && (
-        <div className="cite-pop" style={{ left: Math.max(8, cite.x - 120), top: Math.max(8, cite.y - 76) }} onMouseUp={(e) => e.stopPropagation()}>
+        <div ref={citeRef} className="cite-pop" style={{ left: Math.max(8, cite.x - 120), top: Math.max(8, cite.y - 76) }} onMouseUp={(e) => e.stopPropagation()}>
           <input placeholder="Optional comment" value={citeNote} onChange={(e) => setCiteNote(e.target.value)} />
           <div className="row gap">
             <button

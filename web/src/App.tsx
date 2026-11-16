@@ -1,6 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "framer-motion";
-import { api, setToken, token, tokenFromRedirect, type RunSummary } from "./api";
+import {
+  Archive,
+  ArchiveRestore,
+  BookOpen,
+  Bug,
+  Circle,
+  CircleCheck,
+  Cpu,
+  GitPullRequest,
+  LayoutGrid,
+  Menu,
+  Pin,
+  PinOff,
+  Plus,
+  Search,
+  Settings,
+  type LucideIcon,
+} from "lucide-react";
+import { api, setToken, token, tokenFromRedirect, type DaemonSettings, type RunSummary } from "./api";
 import { Link, match, navigate, usePath } from "./router";
 import { Dictionary } from "./pages/Dictionary";
 import { Errorography } from "./pages/Errorography";
@@ -9,24 +27,25 @@ import { ReviewView, Reviews } from "./pages/Reviews";
 import { RunView } from "./pages/RunView";
 import { Gallery } from "./pages/Gallery";
 import { Providers } from "./pages/Providers";
-import { Settings } from "./pages/Settings";
+import { Settings as SettingsPage } from "./pages/Settings";
 import { SignIn } from "./pages/SignIn";
 import { ContextMenu, Toasts, openMenu, undoLatest, type Chip } from "./overlay";
 import { Palette, type PaletteState } from "./palette";
 import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
-import { phaseLabel } from "./format";
+import { phaseLabel, shortSpan } from "./format";
 import { readFile } from "./composer";
+import { bezier, dur } from "./motion";
 import { useLoad } from "./ui";
 
-const NAV = [
-  { to: "/", label: "Gallery", active: (p: string) => p === "/" || p === "/runs" },
-  { to: "/runs/new", label: "New run" },
-  { to: "/dictionary", label: "Dictionary" },
-  { to: "/errorography", label: "Errorography" },
-  { to: "/reviews", label: "Reviews" },
-  { to: "/providers", label: "Providers" },
-  { to: "/settings", label: "Settings" },
+const NAV: { to: string; label: string; icon: LucideIcon; active?: (p: string) => boolean }[] = [
+  { to: "/", label: "Gallery", icon: LayoutGrid, active: (p) => p === "/" || p === "/runs" },
+  { to: "/runs/new", label: "New run", icon: Plus },
+  { to: "/dictionary", label: "Dictionary", icon: BookOpen },
+  { to: "/errorography", label: "Errorography", icon: Bug },
+  { to: "/reviews", label: "Reviews", icon: GitPullRequest },
+  { to: "/providers", label: "Providers", icon: Cpu },
+  { to: "/settings", label: "Settings", icon: Settings },
 ];
 
 /** Files dropped on a run card wait here for that run's composer. */
@@ -75,7 +94,7 @@ function Page({ path }: { path: string }) {
   if (path === "/reviews") return <Reviews />;
   if ((params = match(path, "/reviews/:id"))) return <ReviewView id={params.id!} />;
   if (path === "/providers") return <Providers />;
-  if (path === "/settings") return <Settings />;
+  if (path === "/settings") return <SettingsPage />;
   return (
     <div className="page">
       <h1>Nothing here</h1>
@@ -91,9 +110,71 @@ export function typing(target: EventTarget | null): boolean {
   return target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
 }
 
+function projectName(project: string | undefined): string {
+  if (!project) return "Project";
+  const parts = project.split(/[/\\]/).filter(Boolean);
+  return parts[parts.length - 1] || project;
+}
+
+function hereLabel(path: string): string {
+  if (path === "/" || path === "/runs") return "Gallery";
+  if (path === "/runs/new") return "New run";
+  if (path.startsWith("/runs/")) return decodeURIComponent(path.slice("/runs/".length));
+  if (path === "/dictionary") return "Dictionary";
+  if (path === "/errorography") return "Errorography";
+  if (path === "/reviews") return "Reviews";
+  if (path.startsWith("/reviews/")) return "Review";
+  if (path === "/providers") return "Providers";
+  if (path === "/settings") return "Settings";
+  return "Taskmaster";
+}
+
+function Crumbs({ project, here }: { project: string; here: string }) {
+  return (
+    <div className="crumbs">
+      <span className="clip">{project}</span>
+      <span className="crumb-sep">/</span>
+      <span className="clip crumb-here">{here}</span>
+    </div>
+  );
+}
+
+/** First and last ledger timestamps, so Working can show elapsed time and Settled a relative time. */
+function useClocks(ids: string[]) {
+  const [clocks, setClocks] = useState<Record<string, { start: number; end: number }>>({});
+  const key = ids.join("|");
+  useEffect(() => {
+    let cancel = false;
+    for (const id of key ? key.split("|") : []) {
+      api
+        .ledger(id)
+        .then((ledger) => {
+          const stamps = ledger.entries.map((e) => Date.parse(e.at)).filter((n) => !Number.isNaN(n));
+          if (cancel || !stamps.length) return;
+          setClocks((c) => (c[id] ? c : { ...c, [id]: { start: Math.min(...stamps), end: Math.max(...stamps) } }));
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancel = true;
+    };
+  }, [key]);
+  return clocks;
+}
+
 function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onPick: () => void }) {
   const p = usePrefs();
   const list = ordered(runs, p.showArchived);
+  const clocks = useClocks(list.map((x) => x.run.id));
+  const working = list.some((x) => x.group === "Working");
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!working) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [working]);
+  const counts = new Map<Group, number>();
+  for (const item of list) counts.set(item.group, (counts.get(item.group) ?? 0) + 1);
   let last: Group | null = null;
   return (
     <div className="runlist">
@@ -105,15 +186,34 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
               last = group;
               const on = path === `/runs/${encodeURIComponent(run.id)}` || path === `/runs/${run.id}`;
               const flags = p.runFlags[run.id] ?? {};
+              const clock = clocks[run.id];
               const menu = (x: number, y: number) =>
                 openMenu(x, y, [
                   { label: flags.pinned ? "Unpin" : "Pin", run: () => toggleFlag(run.id, "pinned") },
                   { label: flags.settled ? "Unsettle" : "Settle", run: () => toggleFlag(run.id, "settled") },
                   { label: flags.archived ? "Unarchive" : "Archive", run: () => toggleFlag(run.id, "archived") },
                 ]);
+              const when =
+                group === "Working" && clock
+                  ? shortSpan(now - clock.start)
+                  : group !== "Working" && clock
+                    ? shortSpan(Date.now() - clock.end)
+                    : null;
               return (
-                <motion.li key={run.id} layout="position" initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -8 }} transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}>
-                  {head && <div className="group-head">{head}</div>}
+                <motion.li
+                  key={run.id}
+                  layout="position"
+                  initial={{ opacity: 0, y: 4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  transition={{ duration: 0.16, ease: bezier.out, layout: { duration: dur.base, ease: bezier.out } }}
+                >
+                  {head && (
+                    <div className="group-head">
+                      <span>{head}</span>
+                      <span className="group-count">{counts.get(head)}</span>
+                    </div>
+                  )}
                   <div
                     className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}
                     onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
@@ -129,20 +229,22 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
                     }}
                   >
                     <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick}>
+                      {group === "Working" ? <span className="spin" aria-hidden /> : <span className={`dot ${group === "Needs approval" ? "ask" : "quiet"}`} aria-hidden />}
                       <span className="clip">{run.id}</span>
                       <span className="runrow-phase">
-                        {i < 9 && <kbd>{i + 1}</kbd>} {phaseLabel(run).toLowerCase()}
+                        {i < 9 && <kbd>{i + 1}</kbd>}
+                        {group === "Working" ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase())}
                       </span>
                     </Link>
                     <span className="runrow-actions">
-                      <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
-                        {flags.pinned ? "unpin" : "pin"}
+                      <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
+                        {flags.pinned ? <PinOff size={13} /> : <Pin size={13} />}
                       </button>
-                      <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
-                        {flags.settled ? "unsettle" : "settle"}
+                      <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
+                        {flags.settled ? <CircleCheck size={13} /> : <Circle size={13} />}
                       </button>
-                      <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
-                        {flags.archived ? "unarchive" : "archive"}
+                      <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
+                        {flags.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
                       </button>
                     </span>
                   </div>
@@ -168,6 +270,7 @@ export function App() {
   const [palette, setPalette] = useState<PaletteState | null>(null);
   const [drawer, setDrawer] = useState(false);
   const runs = useLoad(() => (signedIn ? api.runs() : Promise.resolve([] as RunSummary[])), [signedIn], 3000);
+  const settings = useLoad(() => (signedIn ? api.settings() : Promise.resolve(null as DaemonSettings | null)), [signedIn]);
 
   useEffect(() => {
     if (signedIn && path === "/signed-in") navigate("/", true);
@@ -209,47 +312,65 @@ export function App() {
   }, [runs.data]);
 
   const runsState = useMemo(() => ({ runs: runs.data ?? [], reload: () => void runs.reload() }), [runs.data, runs.reload]);
+  const project = projectName(settings.data?.project);
+  const here = hereLabel(path);
 
   if (!signedIn) return <SignIn />;
 
   return (
     <MotionConfig reducedMotion={motionOn ? "never" : "always"}>
       <RunsContext.Provider value={runsState}>
-        <div className={`shell density-${p.density} ${motionOn ? "" : "no-motion"}`}>
+        <div className={`shell theme-${p.theme} density-${p.density} ${motionOn ? "" : "no-motion"}`}>
           <header className="topbar">
             <button className="ghost small" onClick={() => setDrawer(!drawer)} aria-label="Menu">
-              menu
+              <Menu size={16} />
             </button>
-            <Link to="/" className="brand">
-              TASKMASTER
-            </Link>
-            <button className="ghost small" onClick={() => setPalette({ open: true, mode: "all" })}>
-              ⌘K
+            <Crumbs project={project} here={here} />
+            <button className="ghost small" aria-label="Search" onClick={() => setPalette({ open: true, mode: "all" })}>
+              <Search size={16} />
             </button>
           </header>
           <aside className={`side ${drawer ? "open" : ""}`} aria-label="Main">
-            <Link to="/" className="brand side-brand">
-              TASKMASTER
+            <Link to="/" className="brand side-brand" onClick={() => setDrawer(false)}>
+              <img src="/icon.png" alt="" width={16} height={16} />
+              <span>Taskmaster</span>
             </Link>
+            <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
+              <Search size={14} />
+              <span>Search</span>
+              <kbd>⌘K</kbd>
+            </button>
             <nav className="nav">
               {NAV.map((item) => {
                 const on = item.active ? item.active(path) : path === item.to || path.startsWith(item.to + "/");
+                const Icon = item.icon;
                 return (
                   <Link key={item.to} to={item.to} className={on ? "on" : ""} aria-current={on ? "page" : undefined} onClick={() => setDrawer(false)}>
-                    {item.label}
+                    <Icon size={15} strokeWidth={1.75} />
+                    <span>{item.label}</span>
                   </Link>
                 );
               })}
             </nav>
-            <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
-              <span>Search runs and commands</span>
-              <kbd>⌘K</kbd>
-            </button>
             <RunList runs={runs.data ?? []} path={path} onPick={() => setDrawer(false)} />
           </aside>
           {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
           <main className="main">
-            <Page path={path} />
+            <div className="crumbbar">
+              <Crumbs project={project} here={here} />
+            </div>
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div
+                key={path}
+                className="route"
+                initial={motionOn ? { opacity: 0, y: 4 } : false}
+                animate={{ opacity: 1, y: 0 }}
+                exit={motionOn ? { opacity: 0 } : undefined}
+                transition={{ duration: 0.16, ease: bezier.out }}
+              >
+                <Page path={path} />
+              </motion.div>
+            </AnimatePresence>
           </main>
           {palette && <Palette state={palette} onClose={() => setPalette(null)} />}
           <ContextMenu />

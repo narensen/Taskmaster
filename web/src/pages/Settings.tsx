@@ -218,8 +218,14 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Theme" note="Black and white. Blue is kept for links: path words, pull requests and addresses.">
-        <span />
+      <Section title="Theme" note="Dark is the default. Blue marks focus, links and the active state.">
+        <div className="seg" role="radiogroup" aria-label="Theme">
+          {(["dark", "light"] as const).map((t) => (
+            <button key={t} role="radio" aria-checked={p.theme === t} className={p.theme === t ? "on" : ""} onClick={() => setPrefs({ theme: t })}>
+              {t}
+            </button>
+          ))}
+        </div>
       </Section>
 
       <Section title="Keybindings">

@@ -9,7 +9,7 @@ import { api, callAt, type RunSummary } from "../api";
 import { Link } from "../router";
 import { ExternalLink } from "../paths";
 import { phaseLabel, usd } from "../format";
-import { dur, ease } from "../motion";
+import { bezier, dur, ease } from "../motion";
 import { motionOn, setPrefs, usePrefs } from "../prefs";
 import { ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
@@ -59,6 +59,7 @@ function RunCard({ run, group }: { run: RunSummary; group: string }) {
   return (
     <motion.article
       layout
+      transition={{ layout: { duration: dur.base, ease: bezier.out } }}
       className={`card gallery-card ${group === "Needs approval" ? "ask" : ""}`}
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
       onDrop={(e) => {
@@ -99,7 +100,7 @@ function RunCard({ run, group }: { run: RunSummary; group: string }) {
 function DaemonCard({ url, token, pinned }: { url: string; token: string | null; pinned: boolean }) {
   const state = useLoad(() => callAt<{ runs: RunSummary[] }>(url, token, "/api/runs"), [url, token], 15000);
   return (
-    <motion.article layout className="card gallery-card">
+    <motion.article layout transition={{ layout: { duration: dur.base, ease: bezier.out } }} className="card gallery-card">
       <div className="frame typed">
         <div className="typed-line">{url}</div>
         <div className="typed-phase">
@@ -136,7 +137,7 @@ export function Gallery() {
     if (animated.current || !grid.current || !list.length) return;
     animated.current = true;
     if (!motionOn()) return;
-    gsap.from(grid.current.querySelectorAll(".gallery-card"), { opacity: 0, y: 18, scale: 0.97, duration: dur.slow, stagger: 0.05, ease: ease.out, clearProps: "opacity,transform,scale" });
+    gsap.from(grid.current.querySelectorAll(".gallery-card"), { opacity: 0, y: 8, duration: dur.base, stagger: 0.03, ease: ease.out, clearProps: "opacity,transform" });
   }, [list.length]);
 
   return (

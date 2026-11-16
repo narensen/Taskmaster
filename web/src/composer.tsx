@@ -3,7 +3,7 @@
 // or Dictionary key; # and digits a pull request gh can see; / at the start a command or a
 // skill. A big paste or a dropped file becomes an attachment.
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, type Skill } from "./api";
 import { commands, type Command } from "./commands";
 import { emit, toast, useOn, type Chip } from "./overlay";
@@ -94,6 +94,8 @@ export interface ComposerProps {
   bus?: boolean;
   onChipClick?: (chip: Chip) => void;
   className?: string;
+  /** Controls under the field: a model pill, a send button. */
+  footer?: ReactNode;
 }
 
 function chipNode(chip: Chip): HTMLSpanElement {
@@ -492,6 +494,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         onPaste={onPaste}
         onBlur={() => window.setTimeout(() => setPopup(null), 150)}
       />
+      {props.footer}
     </div>
   );
 });

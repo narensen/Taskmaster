@@ -1,14 +1,16 @@
 // Command-K: runs, pages and commands. A leading > shows only commands. / outside a text
 // field opens it on commands and skills.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import gsap from "gsap";
 import { commands, useRunContext } from "./commands";
 import { skills } from "./composer";
 import { emit } from "./overlay";
 import { navigate } from "./router";
 import { ordered, useRuns } from "./runs";
 import { phaseLabel } from "./format";
-import { usePrefs } from "./prefs";
+import { motionOn, usePrefs } from "./prefs";
+import { dur, ease } from "./motion";
 import type { Skill } from "./api";
 
 export interface PaletteState {
@@ -29,6 +31,7 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
   const [active, setActive] = useState(0);
   const [skillList, setSkills] = useState<Skill[]>([]);
   const input = useRef<HTMLInputElement>(null);
+  const box = useRef<HTMLDivElement>(null);
   const { runs } = useRuns();
   const ctx = useRunContext();
   const { showArchived } = usePrefs();
@@ -36,6 +39,11 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
   useEffect(() => {
     input.current?.focus();
     void skills().then(setSkills);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!box.current || !motionOn()) return;
+    gsap.fromTo(box.current, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: dur.base, ease: ease.out, clearProps: "opacity,transform" });
   }, []);
 
   const items = useMemo<Item[]>(() => {
@@ -82,7 +90,7 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
 
   return (
     <div className="palette-back" onMouseDown={onClose}>
-      <div className="palette" role="dialog" aria-label="Command palette" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={box} className="palette" role="dialog" aria-label="Command palette" onMouseDown={(e) => e.stopPropagation()}>
         <input
           ref={input}
           className="palette-input"

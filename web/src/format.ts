@@ -19,6 +19,17 @@ export function seconds(value: number): string {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
+/** Compact relative time: 12s, 5m, 3h, 6d. */
+export function shortSpan(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
 export function ago(at: string): string {
   const then = Date.parse(at);
   if (Number.isNaN(then)) return at;

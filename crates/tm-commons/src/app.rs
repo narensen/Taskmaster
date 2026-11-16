@@ -454,18 +454,18 @@ async fn report_page(
     problem(&app, Some(&session), StatusCode::NOT_FOUND, "No such entry", "It may have been withdrawn already.")
 }
 
-async fn moderator(app: &App, headers: &HeaderMap) -> Result<Session, Response> {
+async fn moderator(app: &App, headers: &HeaderMap) -> Result<Session, Box<Response>> {
     match session(app, headers).await {
         Some(session) if app.is_moderator(&session.user) => Ok(session),
-        Some(session) => Err(problem(app, Some(&session), StatusCode::FORBIDDEN, "Moderators only", "Your account is not on the moderator list.")),
-        None => Err(see_other("/signin?next=%2Fmoderate")),
+        Some(session) => Err(Box::new(problem(app, Some(&session), StatusCode::FORBIDDEN, "Moderators only", "Your account is not on the moderator list."))),
+        None => Err(Box::new(see_other("/signin?next=%2Fmoderate"))),
     }
 }
 
 async fn moderate(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let session = match moderator(&app, &headers).await {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let pending = app.db.submissions(Status::Pending).await.unwrap_or_default();
     let mut reports = Vec::new();
@@ -495,7 +495,7 @@ async fn decide(
     let session = match moderator(&app, &headers).await {
         Ok(session) if form.get("csrf").is_some_and(|c| *c == app.sealer.csrf(&session.raw)) => session,
         Ok(session) => return problem(&app, Some(&session), StatusCode::FORBIDDEN, "Start again", "Reload the page and try again."),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let status = match form.get("decision").map(String::as_str) {
         Some("approve") => Status::Approved,
@@ -516,7 +516,7 @@ async fn settle_report(
     let session = match moderator(&app, &headers).await {
         Ok(session) if form.get("csrf").is_some_and(|c| *c == app.sealer.csrf(&session.raw)) => session,
         Ok(session) => return problem(&app, Some(&session), StatusCode::FORBIDDEN, "Start again", "Reload the page and try again."),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let reports = app.db.open_reports().await.unwrap_or_default();
     let Some(report) = reports.iter().find(|r| r.id == id) else { return see_other("/moderate") };

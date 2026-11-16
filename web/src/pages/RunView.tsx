@@ -1,526 +1,484 @@
-import { useEffect, useRef, useState } from "react";
-import { api, follow, type Attempt, type ChangeEntry, type PagePlan, type RunDetail, type RunEvent, type Spend } from "../api";
-import { CHANGE, phaseLabel, ago, describe, pageTone, phaseTone, seconds, tokens, usd } from "../format";
-import { Link } from "../router";
-import { Badge, Code, Dot, Empty, Problem, Spinner, Stat, Tabs, useAction, useLoad } from "../ui";
+// A run: the master, each page worker, the reviewer and the verifier as their own
+// surfaces, the live plan, approvals, the notes waiting for the next brief, and a right
+// panel with the plan, the diff, the browser, web search, the terminal and file previews.
 
-type Tab = "pages" | "activity" | "cost" | "changes";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, type RunDetail } from "../api";
+import { setRunContext } from "../commands";
+import { Composer, messageText, type ComposerHandle } from "../composer";
+import { phaseLabel, usd } from "../format";
+import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
+import { ExternalLink, Rich, label, resolvedPath } from "../paths";
+import { navigate } from "../router";
+import { prefs, setPrefs } from "../prefs";
+import { Problem, Spinner, useLoad } from "../ui";
+import { takeAttachments } from "../App";
+import { AgentSurface } from "../run/AgentSurface";
+import { DiffTab, type Scope } from "../run/Diff";
+import { PlanView } from "../run/PlanView";
+import { BrowserTab, PreviewTab, SearchTab, TerminalTab } from "../run/Tabs";
+import { surfaces, useRun } from "../run/model";
+
+const FIXED = ["plan", "diff", "browser", "search", "terminal"] as const;
+const TAB_LABEL: Record<string, string> = { plan: "Plan", diff: "Diff", browser: "Browser", search: "Web search", terminal: "Terminal" };
+
+function useNarrow(): boolean {
+  const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 900px)").matches);
+  useEffect(() => {
+    const q = window.matchMedia("(max-width: 900px)");
+    const on = () => setNarrow(q.matches);
+    q.addEventListener("change", on);
+    return () => q.removeEventListener("change", on);
+  }, []);
+  return narrow;
+}
+
+function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: RunDetail; composer: React.RefObject<ComposerHandle | null>; onDone: () => void }) {
+  const [reply, setReply] = useState("");
+  const [busy, setBusy] = useState(false);
+  const plan = detail.plan;
+  const approve = async () => {
+    setBusy(true);
+    try {
+      // A draft in the composer rides along as the note on this approval.
+      const draft = composer.current && !composer.current.isEmpty() ? messageText(composer.current.read()) : undefined;
+      await api.approve(id, draft);
+      composer.current?.clear();
+      onDone();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const reject = async () => {
+    setBusy(true);
+    try {
+      // A text reply rejects this plan; the master plans again with it as the note.
+      const prompt = reply.trim() ? `${detail.prompt ?? ""}\n\nThe person rejected the last plan: ${reply.trim()}`.trim() : undefined;
+      await api.reject(id, prompt);
+      setReply("");
+      onDone();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="approval" data-testid="approval">
+      <div className="strong">The master asks to build this plan</div>
+      <div className="small muted">
+        {plan ? `${plan.pages.length} page(s): ${plan.pages.map((p) => `${p.id} → ${p.owned_glob}`).join(", ")}` : "a plan"} · Build stays blocked until you approve.
+      </div>
+      <textarea
+        rows={2}
+        value={reply}
+        placeholder="Reply in words to reject it and plan again with your note"
+        onChange={(e) => setReply(e.target.value)}
+      />
+      <div className="row gap wrap">
+        <button className="primary" disabled={busy} onClick={() => void approve()}>
+          Approve
+        </button>
+        <button disabled={busy} onClick={() => void reject()}>
+          {reply.trim() ? "Reject with reply" : "Reject"}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function RunView({ id }: { id: string }) {
-  const run = useLoad(() => api.run(id), [id], 3000);
-  const [tab, setTab] = useState<Tab>(() => {
-    const asked = new URLSearchParams(window.location.search).get("tab");
-    return asked === "activity" || asked === "cost" || asked === "changes" ? asked : "pages";
-  });
-  const { events, live } = useEvents(id, run.data?.active ?? false, run.reload);
-  const action = useAction();
+  const data = useRun(id);
+  const { detail, entries, ledger, notes } = data;
+  const narrow = useNarrow();
+  const composer = useRef<ComposerHandle>(null);
+  const settings = useLoad(api.settings, []);
+  const gh = useLoad(api.gh, []);
+  const [focus, setFocus] = useState<string | null>(null);
+  const [to, setTo] = useState("master");
+  const [sheet, setSheet] = useState(false);
+  const [cite, setCite] = useState<{ x: number; y: number; text: string; agent: string } | null>(null);
+  const [citeNote, setCiteNote] = useState("");
+  const [pr, setPr] = useState<string | null>(null);
 
-  if (run.loading && !run.data) return <div className="page"><Spinner label="Loading the run" /></div>;
-  if (!run.data) return <div className="page"><Problem error={run.error} onRetry={run.reload} /></div>;
-  const r = run.data;
-
-  const act = (name: string, call: () => Promise<unknown>) =>
-    void action.run(name, async () => {
-      await call();
-      await run.reload();
-    });
-
-  return (
-    <div className="page">
-      <nav className="crumbs">
-        <Link to="/">Runs</Link> / <span className="mono">{r.id}</span>
-      </nav>
-      <header className="run-head">
-        <div className="row between wrap gap">
-          <h1 className="mono">{r.id}</h1>
-          <Badge tone={r.cancelled ? "quiet" : phaseTone(r.phase)}>
-            {r.active && <span className="pulse" aria-hidden />}
-            {phaseLabel(r)}
-          </Badge>
-        </div>
-        {r.prompt && <p className="prompt">{r.prompt}</p>}
-        <div className="row wrap gap muted small">
-          {r.branch && (
-            <span>
-              branch <span className="mono">{r.branch}</span>
-              {r.merged === true && " · merged into the project"}
-              {r.merged === false && r.phase === "done" && " · not merged, it is on its branch"}
-            </span>
-          )}
-          {r.review_rounds > 0 && <span>{r.review_rounds} review round{r.review_rounds === 1 ? "" : "s"}</span>}
-          {r.amendments > 0 && <span>{r.amendments} Dictionary amendment{r.amendments === 1 ? "" : "s"}</span>}
-          {live && <span className="live">live</span>}
-        </div>
-        {r.error && <p className="error-line">{r.error}</p>}
-      </header>
-
-      <Actions run={r} busy={action.busy} act={act} />
-      <Problem error={action.error} />
-
-      {r.spent.calls > 0 && <div className="stats">
-        <Stat label="Spent" value={usd(r.spent.cost_usd)} note={r.spent.unpriced_calls ? `${r.spent.unpriced_calls} calls had no price` : undefined} />
-        <Stat label="Fresh tokens" value={tokens(r.spent.fresh)} note={r.estimate ? `plan said ${tokens(r.estimate.tokens)}` : undefined} />
-        <Stat label="Read from cache" value={tokens(r.spent.cache_read)} />
-        <Stat label="Agent calls" value={r.spent.calls} note={seconds(r.spent.seconds)} />
-      </div>}
-
-      <Tabs<Tab>
-        value={tab}
-        onChange={setTab}
-        tabs={[
-          { id: "pages", label: "Pages", count: r.pages.length },
-          { id: "activity", label: "Activity", count: events.length },
-          { id: "cost", label: "Cost" },
-          { id: "changes", label: "Changes" },
-        ]}
-      />
-      {tab === "pages" && <Pages run={r} />}
-      {tab === "activity" && <Activity events={events} />}
-      {tab === "cost" && <Cost id={id} calls={r.spent.calls} />}
-      {tab === "changes" && <Changes id={id} calls={r.spent.calls} />}
-    </div>
+  // The right panel: fixed tabs plus file previews; the active one is kept per run.
+  const [tabs, setTabs] = useState<string[]>([...FIXED]);
+  const [closed, setClosed] = useState<string[]>([]);
+  const [tab, setTabState] = useState<string>(() => prefs().panelTab[id] ?? "plan");
+  const [previews, setPreviews] = useState<Record<string, { path: string; line?: number }>>({});
+  const [diffRequest, setDiffRequest] = useState<{ scope: Scope; page?: string; attempt?: number; n: number } | null>(null);
+  const setTab = useCallback(
+    (t: string) => {
+      setTabState(t);
+      setTabs((all) => (all.includes(t) ? all : [...all, t]));
+      setPrefs((p) => ({ panelTab: { ...p.panelTab, [id]: t } }));
+    },
+    [id],
   );
-}
 
-/** The run's log so far, then the rest as it happens. */
-function useEvents(id: string, active: boolean, changed: () => void) {
-  const [events, setEvents] = useState<RunEvent[]>([]);
-  const [live, setLive] = useState(false);
-  const seen = useRef(0);
-  const [loaded, setLoaded] = useState(false);
-  const refresh = useRef(changed);
-  refresh.current = changed;
+  const list = useMemo(() => surfaces(detail, entries, ledger?.entries ?? []), [detail, entries, ledger]);
+  const master = list.find((s) => s.id === "master");
+  const workers = list.filter((s) => s.page);
+  const rest = list.filter((s) => s.id !== "master" && !s.page);
+  const maxTokens = Math.max(1, ...list.map((s) => s.tokens));
+  const pages = detail?.plan?.pages.map((p) => p.id) ?? detail?.pages.map((p) => p.id) ?? [];
+  const phase = detail?.phase;
+
+  const focusAgent = useCallback((agent: string) => {
+    setFocus(agent);
+    const el = document.getElementById(`agent-${agent}`);
+    el?.scrollIntoView({ block: "start", behavior: "smooth" });
+    el?.focus({ preventScroll: true });
+    setTo(agent.startsWith("page:") ? agent : agent === "master" || agent === "reviewer" || agent === "verifier" ? agent : "master");
+  }, []);
+
+  const openTab = useCallback(
+    (t: string) => {
+      setTab(t);
+      if (narrow) setSheet(true);
+    },
+    [narrow, setTab],
+  );
+
+  const approveNow = useCallback(async () => {
+    await api.approve(id).catch((err) => toast(err.message));
+    await data.reload();
+    data.refollow();
+  }, [id, data]);
 
   useEffect(() => {
-    seen.current = 0;
-    setEvents([]);
-    setLoaded(false);
-    let gone = false;
-    api.events(id).then(
-      (log) => {
-        if (gone) return;
-        seen.current = log.next;
-        setEvents(log.events);
-        setLoaded(true);
-      },
-      () => setLoaded(true),
-    );
-    return () => {
-      gone = true;
-    };
+    setRunContext({
+      id,
+      pages,
+      focusAgent,
+      openTab,
+      approve: phase === "awaiting_approval" ? () => void approveNow() : undefined,
+      reject: phase === "awaiting_approval" ? () => void api.reject(id).then(() => data.reload()) : undefined,
+    });
+    return () => setRunContext(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, pages.join(","), phase, focusAgent, openTab, approveNow]);
+
+  // Files dropped on this run's card elsewhere.
+  useEffect(() => {
+    const waiting = takeAttachments(id);
+    if (waiting.length) window.setTimeout(() => composer.current?.attach(waiting), 50);
   }, [id]);
 
+  useOn<{ path: string; line?: number }>("preview", ({ path, line }) => {
+    const key = `file:${path}`;
+    setPreviews((p) => ({ ...p, [key]: { path, line } }));
+    setTab(key);
+    if (narrow) setSheet(true);
+  });
+  useOn<{ scope: Scope; page?: string; attempt?: number }>("diff", (req) => {
+    setDiffRequest({ ...req, n: Date.now() });
+    openTab("diff");
+  });
+  useOn<Chip>("chip-jump", (chip) => {
+    if (chip.kind === "file") {
+      const full = resolvedPath(chip.value) ?? chip.value;
+      emit("preview", { path: full, line: chip.line });
+    } else if (chip.kind === "page") focusAgent(`page:${chip.value}`);
+    else if (chip.kind === "agent") focusAgent(chip.value.startsWith("worker:") ? `page:${chip.value.slice(7)}` : chip.value);
+    else if (chip.kind === "key") navigate(`/dictionary?q=${encodeURIComponent(chip.value)}`);
+  });
+  useOn<Chip>("chip", (chip) => {
+    if (chip.to) setTo(chip.to.startsWith("page:") || ["master", "reviewer", "verifier", "workers"].includes(chip.to) ? chip.to : "master");
+  });
+
+  // Command-W closes the focused tab; Command-Shift-T opens the last one closed.
+  const closeTab = useCallback(
+    (t: string) => {
+      setTabs((all) => {
+        const next = all.filter((x) => x !== t);
+        if (t === tab) setTabState(next[next.length - 1] ?? "plan");
+        return next;
+      });
+      setClosed((c) => [...c, t]);
+    },
+    [tab],
+  );
   useEffect(() => {
-    if (!loaded || !active) return;
-    let timer: number | undefined;
-    const soon = () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => refresh.current(), 400);
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && !e.shiftKey && e.key.toLowerCase() === "w") {
+        e.preventDefault();
+        closeTab(tab);
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        const last = closed[closed.length - 1];
+        if (last) {
+          setClosed((c) => c.slice(0, -1));
+          setTab(last);
+        }
+      }
     };
-    setLive(true);
-    const stop = follow(id, seen.current, {
-      event: (event, index) => {
-        if (index && index <= seen.current) return;
-        seen.current = index || seen.current + 1;
-        setEvents((list) => [...list, event]);
-        soon();
-      },
-      idle: () => {
-        setLive(false);
-        soon();
-      },
-      lost: () => setLive(false),
-    });
-    return () => {
-      stop();
-      window.clearTimeout(timer);
-      setLive(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tab, closed, closeTab, setTab]);
+
+  // Cite: select text in an agent's reply.
+  useEffect(() => {
+    const onUp = () => {
+      const sel = window.getSelection();
+      const text = sel?.toString().trim();
+      if (!sel || !text || !sel.rangeCount) return;
+      const node = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode?.parentElement;
+      const box = node?.closest("[data-agent-text]") as HTMLElement | null;
+      if (!box) return;
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      setCite({ x: rect.left + rect.width / 2, y: rect.top, text, agent: box.dataset.agentText! });
+      setCiteNote("");
     };
-  }, [id, active, loaded]);
+    document.addEventListener("mouseup", onUp);
+    return () => document.removeEventListener("mouseup", onUp);
+  }, []);
 
-  return { events, live };
-}
+  const send = async (message: { text: string; chips: Chip[]; attachments: Chip[] }) => {
+    const text = messageText(message);
+    if (!text) return;
+    try {
+      await api.addNote(id, to, text);
+      composer.current?.clear();
+      data.reloadNotes();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err));
+    }
+  };
 
-function Actions({
-  run,
-  busy,
-  act,
-}: {
-  run: RunDetail;
-  busy: string | null;
-  act: (name: string, call: () => Promise<unknown>) => void;
-}) {
-  const [rejecting, setRejecting] = useState(false);
-  const [prompt, setPrompt] = useState(run.prompt ?? "");
-  const over = run.phase === "done" || run.phase === "failed";
-  const waiting = run.phase === "awaiting_approval" && !run.active;
-  const stopped = !run.active && !over && !waiting;
+  if (data.error && !detail) return <Problem error={data.error} onRetry={() => void data.reload()} />;
+  if (!detail) return <Spinner label="Opening the run" />;
 
-  if (over && !run.active) return null;
+  const recipients = ["master", "workers", ...pages.map((p) => `page:${p}`), "reviewer", "verifier"];
+  const pending = notes.filter((n) => !n.delivered);
+  const delivered = notes.filter((n) => n.delivered);
+  const panelTabs = tabs;
+  const panel = (
+    <div className="panel" data-testid="right-panel">
+      <div className="panel-tabs" role="tablist">
+        {panelTabs.map((t) => (
+          <div key={t} className={`panel-tab ${t === tab ? "on" : ""}`} role="tab" aria-selected={t === tab}>
+            <button className="panel-tab-name" onClick={() => setTab(t)}>
+              {t.startsWith("file:") ? label(previews[t]?.path ?? t.slice(5)) : TAB_LABEL[t]}
+            </button>
+            <button className="chip-x" aria-label={`Close ${t}`} onClick={() => closeTab(t)}>
+              ×
+            </button>
+          </div>
+        ))}
+        {closed.length > 0 && (
+          <button className="ghost small" title="Reopen the last closed tab (⌘⇧T)" onClick={() => setTab(closed[closed.length - 1]!)}>
+            +
+          </button>
+        )}
+      </div>
+      <div className="panel-body">
+        {tab === "plan" && (detail.plan ? <PlanView plan={detail.plan} /> : <div className="pad muted">No plan yet. The master is still planning.</div>)}
+        {tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
+        {tab === "browser" && <BrowserTab run={id} detail={detail} entries={entries} />}
+        {tab === "search" && <SearchTab />}
+        {tab === "terminal" && <TerminalTab run={id} entries={entries} project={settings.data?.project ?? ""} onRan={() => void data.catchUp()} />}
+        {tab.startsWith("file:") && previews[tab] && <PreviewTab path={previews[tab]!.path} line={previews[tab]!.line} />}
+        {!panelTabs.includes(tab) && <div className="pad muted">Every tab is closed. ⌘⇧T reopens the last one.</div>}
+      </div>
+    </div>
+  );
 
   return (
-    <div className="actions card">
-      {waiting && (
-        <>
-          <p>
-            <strong>The plan is ready.</strong> Nothing is built until you approve it.
-            {run.estimate && ` It should take about ${tokens(run.estimate.tokens)} fresh tokens${run.estimate.usd ? ` and ${usd(run.estimate.usd)}` : ""}.`}
-          </p>
-          {rejecting ? (
-            <div className="stack">
-              <textarea rows={4} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="What to plan instead" />
-              <div className="row gap wrap">
-                <button className="primary" disabled={!!busy || !prompt.trim()} onClick={() => act("reject", () => api.reject(run.id, prompt))}>
-                  Plan again with this
-                </button>
-                <button className="ghost" disabled={!!busy} onClick={() => act("reject", () => api.reject(run.id))}>
-                  Drop the plan and wait
-                </button>
-                <button className="link" onClick={() => setRejecting(false)}>
-                  Keep the plan
-                </button>
-              </div>
+    <div className={`run ${narrow ? "narrow" : ""}`}>
+      <div className="run-main">
+        <header className="run-head">
+          <div className="grow">
+            <div className="eyebrow">{settings.data?.project ?? "run"}</div>
+            <h1 className="break">{id}</h1>
+            <div className="run-meta small">
+              <span className={`phase phase-${phase}`}>{phaseLabel(detail)}</span>
+              {detail.active && <span> · live</span>}
+              {detail.branch && <span> · {detail.branch}</span>}
+              <span> · {usd(ledger?.totals.cost_usd ?? detail.spent.cost_usd)} spent</span>
+              {detail.estimate && <span> · estimate {usd(detail.estimate.usd)}</span>}
             </div>
-          ) : (
-            <div className="row gap wrap">
-              <button className="primary big" disabled={!!busy} onClick={() => act("approve", () => api.approve(run.id))}>
-                {busy === "approve" ? "Approving…" : "Approve and build"}
-              </button>
-              <button className="ghost" disabled={!!busy} onClick={() => setRejecting(true)}>
-                Change the plan
-              </button>
-              <button className="ghost danger" disabled={!!busy} onClick={() => act("cancel", () => api.cancel(run.id))}>
+            {detail.prompt && (
+              <p className="prompt small">
+                <Rich text={detail.prompt.split("\n")[0] ?? ""} />
+              </p>
+            )}
+            {detail.error && (
+              <div className="error-line small">
+                <Rich text={detail.error} />
+              </div>
+            )}
+          </div>
+          <div className="row gap wrap">
+            {!detail.active && !["done", "failed", "awaiting_approval"].includes(detail.phase) && (
+              <button onClick={() => void api.resume(id).then(() => (data.refollow(), data.reload()))}>Resume</button>
+            )}
+            {(detail.active || detail.phase === "awaiting_approval") && (
+              <button className="ghost" onClick={() => void api.cancel(id).then(() => data.reload())}>
                 Cancel
               </button>
+            )}
+            {detail.phase === "done" && gh.data?.account && detail.branch && (
+              <button
+                className="primary"
+                onClick={() =>
+                  void api
+                    .draftPr(id)
+                    .then((r) => setPr(r.url))
+                    .catch((err) => toast("The pull request was not drafted", err.message))
+                }
+              >
+                Draft pull request
+              </button>
+            )}
+            {pr && <ExternalLink href={pr}>pull request</ExternalLink>}
+            {narrow && (
+              <button className="ghost" onClick={() => setSheet(true)}>
+                Panel
+              </button>
+            )}
+          </div>
+        </header>
+
+        {phase === "planning" && (
+          <div className="banner small">
+            Planning. The master's text appears below as it arrives; the locked plan replaces this line when it is ready.
+          </div>
+        )}
+        {detail.plan && <PlanView plan={detail.plan} arrived={data.planArrived} compact />}
+
+        <div className="agents">
+          {master && (
+            <AgentSurface surface={master} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === "master"}>
+              {phase === "awaiting_approval" && (
+                <ApprovalCard
+                  id={id}
+                  detail={detail}
+                  composer={composer}
+                  onDone={() => {
+                    void data.reload();
+                    data.refollow();
+                  }}
+                />
+              )}
+            </AgentSurface>
+          )}
+          {workers.length > 0 && (
+            <div className="workers">
+              {workers.map((s) => (
+                <AgentSurface key={s.id} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
+              ))}
             </div>
           )}
-        </>
-      )}
-      {run.active && (
-        <div className="row between wrap gap">
-          <span className="muted">{run.phase === "planning" ? "The master is planning." : "Agents are working."}</span>
-          <button className="ghost danger" disabled={!!busy} onClick={() => act("cancel", () => api.cancel(run.id))}>
-            {busy === "cancel" ? "Cancelling…" : "Cancel"}
-          </button>
-        </div>
-      )}
-      {stopped && (
-        <div className="row between wrap gap">
-          <span className="muted">This run stopped part way, perhaps because the daemon restarted.</span>
-          <div className="row gap">
-            <button className="primary" disabled={!!busy} onClick={() => act("resume", () => api.resume(run.id))}>
-              Resume
-            </button>
-            <button className="ghost danger" disabled={!!busy} onClick={() => act("cancel", () => api.cancel(run.id))}>
-              Cancel
-            </button>
+          <div className="workers">
+            {rest.map((s) => (
+              <AgentSurface key={s.id} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
+            ))}
           </div>
         </div>
-      )}
-    </div>
-  );
-}
 
-function Pages({ run }: { run: RunDetail }) {
-  const plans = new Map((run.plan?.pages ?? []).map((page) => [page.id, page]));
-  if (!run.plan) return <Empty title="No plan yet">{run.active ? "The master is planning." : "The run has no plan."}</Empty>;
-  const states = new Map(run.pages.map((page) => [page.id, page]));
-  const shots = useLoad(() => api.screens(run.id), [run.id, run.spent.calls]);
-  return (
-    <div className="stack">
-      <div className="list">
-        {run.plan.pages.map((plan) => (
-          <PageRow
-            key={plan.id}
-            runId={run.id}
-            plan={plan}
-            state={states.get(plan.id)}
-            shot={(shots.data ?? []).includes(plan.id)}
-            version={run.spent.calls}
-          />
-        ))}
-        {run.pages
-          .filter((page) => !plans.has(page.id))
-          .map((page) => (
-            <div key={page.id} className="item">
-              <span className="mono">{page.id}</span> <Badge tone={pageTone(page.state)}>{page.state}</Badge>
+        <section className="drafts">
+          {pending.map((n) => (
+            <div key={n.id} className="draft" data-testid="draft">
+              <div className="row between small">
+                <span className="muted">waiting for the next brief to {n.to}</span>
+                <span className="row gap">
+                  <button
+                    className="link small"
+                    onClick={() => {
+                      const text = window.prompt("Edit the note", n.text);
+                      if (text !== null) void api.editNote(id, n.id, text || undefined).then(data.reloadNotes);
+                    }}
+                  >
+                    edit
+                  </button>
+                  <button className="link small" onClick={() => void api.editNote(id, n.id).then(data.reloadNotes)}>
+                    remove
+                  </button>
+                </span>
+              </div>
+              <div className="pre-wrap">
+                <Rich text={n.text} />
+              </div>
             </div>
           ))}
-      </div>
-      {run.plan.contracts.length > 0 && (
-        <section>
-          <h2 className="section-title">Contracts</h2>
-          <p className="muted small">Shared files the master writes before any page is built. Every page imports them; the compiler holds pages to them.</p>
-          <div className="list">
-            {run.plan.contracts.map((file) => (
-              <details key={file.path} className="item">
-                <summary className="mono">{file.path}</summary>
-                <Code>{file.content}</Code>
-              </details>
-            ))}
-          </div>
-        </section>
-      )}
-    </div>
-  );
-}
-
-function PageRow({
-  runId,
-  plan,
-  state,
-  shot,
-  version,
-}: {
-  runId: string;
-  plan: PagePlan;
-  state?: RunDetail["pages"][number];
-  shot: boolean;
-  version: number;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <details className="item page-row" onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
-      <summary>
-        <div className="row between gap">
-          <div className="row gap">
-            {state && <Dot tone={pageTone(state.state)} />}
-            <strong>{plan.id}</strong>
-            <span className="mono muted">{plan.route}</span>
-          </div>
-          <div className="row gap small keep">
-            {state && state.tier !== "worker" && <Badge tone="ask">{state.tier}</Badge>}
-            {state && state.repairs > 0 && <span className="muted">{state.repairs} repair{state.repairs === 1 ? "" : "s"}</span>}
-            {state && <Badge tone={pageTone(state.state)}>{state.state}</Badge>}
-          </div>
-        </div>
-      </summary>
-      <div className="stack small">
-        <p>{plan.brief}</p>
-        <p className="muted">
-          May change <span className="mono">{plan.owned_glob}</span>
-        </p>
-        {plan.cites.length > 0 && (
-          <p className="muted">
-            Cites{" "}
-            {plan.cites.map((key, i) => (
-              <span key={key}>
-                {i > 0 && ", "}
-                <Link to={`/dictionary?q=${encodeURIComponent(key)}`} className="mono">
-                  {key}
-                </Link>
-              </span>
-            ))}
-          </p>
-        )}
-        {open && shot && <Screenshot runId={runId} page={plan.id} version={version} />}
-        {open && <Attempts runId={runId} page={plan.id} version={version} />}
-      </div>
-    </details>
-  );
-}
-
-function Screenshot({ runId, page, version }: { runId: string; page: string; version: number }) {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    let made: string | null = null;
-    api.screen(runId, page).then(
-      (value) => {
-        made = value;
-        setUrl(value);
-      },
-      () => setUrl(null),
-    );
-    return () => {
-      if (made) URL.revokeObjectURL(made);
-    };
-  }, [runId, page, version]);
-  if (!url) return null;
-  return (
-    <figure className="shot">
-      <img src={url} alt={`${page} in the browser`} loading="lazy" />
-      <figcaption className="muted small">As the browser check saw it</figcaption>
-    </figure>
-  );
-}
-
-const OUTCOME: Record<Attempt["outcome"], string> = { merged: "kept", discarded: "thrown away", flagged: "objected" };
-
-function Attempts({ runId, page, version }: { runId: string; page: string; version: number }) {
-  const attempts = useLoad(() => api.attempts(runId, page), [runId, page, version]);
-  const list = attempts.data ?? [];
-  if (list.length === 0) return null;
-  return (
-    <div className="stack">
-      <span className="section-title">Attempts</span>
-      <ol className="attempts">
-        {list.map((attempt, i) => (
-          <li key={i}>
-            <div className="row between gap wrap">
-              <span>
-                <span className="mono">{attempt.model}</span> <span className="muted">({attempt.tier})</span>
-              </span>
-              <Badge tone={attempt.outcome === "merged" ? "good" : attempt.outcome === "flagged" ? "ask" : "bad"}>
-                {OUTCOME[attempt.outcome] ?? attempt.outcome}
-              </Badge>
-            </div>
-            {attempt.fixing && <p className="muted small">Fixing: {attempt.fixing.split("\n")[0]}</p>}
-            {attempt.failure && <p className="error-line">{attempt.failure.split("\n")[0]}</p>}
-            {attempt.said && <p className="small">“{attempt.said.length > 280 ? `${attempt.said.slice(0, 280)}…` : attempt.said}”</p>}
-            {attempt.diff && (
-              <details>
-                <summary className="muted small">The change that was thrown away</summary>
-                <Code>{attempt.diff}</Code>
-              </details>
-            )}
-          </li>
-        ))}
-      </ol>
-    </div>
-  );
-}
-
-function Activity({ events }: { events: RunEvent[] }) {
-  if (events.length === 0) return <Empty title="Nothing has happened yet" />;
-  return (
-    <ol className="timeline">
-      {events.map((event, i) => {
-        const line = describe(event);
-        return (
-          <li key={i}>
-            <Dot tone={line.tone} />
-            <div>
-              <span>{line.title}</span>
-              {line.detail && !line.detail.includes("\n") && line.detail.length <= 140 && (
-                <div className="muted small">{line.detail}</div>
-              )}
-              {line.detail && (line.detail.includes("\n") || line.detail.length > 140) && (
-                <details>
-                  <summary className="muted small">details</summary>
-                  <Code>{line.detail}</Code>
-                </details>
-              )}
-            </div>
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
-function SpendTable({ title, rows }: { title: string; rows: Record<string, Spend> }) {
-  const entries = Object.entries(rows).sort((a, b) => b[1].cost_usd - a[1].cost_usd || b[1].tokens - a[1].tokens);
-  if (entries.length === 0) return null;
-  return (
-    <section>
-      <h2 className="section-title">{title}</h2>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th />
-              <th>Calls</th>
-              <th>Fresh</th>
-              <th>Cache</th>
-              <th>Cost</th>
-            </tr>
-          </thead>
-          <tbody>
-            {entries.map(([name, spend]) => (
-              <tr key={name}>
-                <td className="mono">{name}</td>
-                <td>{spend.calls}</td>
-                <td>{tokens(spend.tokens - spend.cache_read)}</td>
-                <td>{tokens(spend.cache_read)}</td>
-                <td>
-                  {usd(spend.cost_usd)}
-                  {spend.unpriced_calls > 0 && <span className="muted" title={`${spend.unpriced_calls} calls had no price`}> +?</span>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  );
-}
-
-function Cost({ id, calls }: { id: string; calls: number }) {
-  const ledger = useLoad(() => api.ledger(id), [id, calls]);
-  if (!ledger.data) return ledger.error ? <Problem error={ledger.error} onRetry={ledger.reload} /> : <Spinner />;
-  const { totals, entries } = ledger.data;
-  if (entries.length === 0) return <Empty title="No agent has run yet" />;
-  return (
-    <div className="stack">
-      <p className="muted small">
-        Fresh tokens are what the models read or wrote for the first time. A harness sends its own prompt again at every step and
-        the provider serves that from its cache at a lower rate, so cache reads are shown apart.
-      </p>
-      <SpendTable title="By role" rows={totals.by_role} />
-      <SpendTable title="By model" rows={totals.by_model} />
-      <section>
-        <h2 className="section-title">Every call</h2>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Role</th>
-                <th>Page</th>
-                <th>Model</th>
-                <th>Fresh</th>
-                <th>Cost</th>
-                <th>Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map((entry, i) => (
-                <tr key={i} className={entry.ok ? "" : "bad-row"}>
-                  <td>{entry.role}</td>
-                  <td className="mono">{entry.page ?? ""}</td>
-                  <td className="mono">{entry.model ? `${entry.harness} ${entry.model}` : entry.harness}</td>
-                  <td>{tokens(entry.input + entry.output + entry.cache_write)}</td>
-                  <td>{entry.cost_usd === null ? "?" : usd(entry.cost_usd)}</td>
-                  <td>{seconds(entry.seconds)}</td>
-                </tr>
+          {delivered.length > 0 && (
+            <details className="small">
+              <summary>{delivered.length} note(s) delivered</summary>
+              {delivered.map((n) => (
+                <div key={n.id} className="delivered">
+                  <span className="muted">to {n.to}: </span>
+                  <Rich text={n.text} />
+                </div>
               ))}
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </div>
-  );
-}
+            </details>
+          )}
+        </section>
 
-function Changes({ id, calls }: { id: string; calls: number }) {
-  const changes = useLoad(() => api.changes(id), [id, calls]);
-  if (!changes.data) return changes.error ? <Problem error={changes.error} onRetry={changes.reload} /> : <Spinner />;
-  if (changes.data.length === 0) return <Empty title="Nothing committed yet" />;
-  return (
-    <div className="list">
-      {changes.data.map((change: ChangeEntry, i) => (
-        <details key={i} className="item">
-          <summary>
-            <div className="row between gap">
-              <span>
-                <strong>{CHANGE[change.kind] ?? change.kind}</strong>
-                {change.page && <span className="mono muted"> {change.page}</span>}
-              </span>
-              <span className="muted small">{ago(change.at)}</span>
-            </div>
-            <div className="muted small">{change.summary}</div>
-          </summary>
-          <div className="stack small">
-            {change.model && <span>by {change.model}</span>}
-            {change.commit && (
-              <span>
-                commit <span className="mono">{change.commit.slice(0, 10)}</span>
-              </span>
-            )}
-            {change.files.length > 0 && <Code>{change.files.join("\n")}</Code>}
-            {change.keys.length > 0 && <span className="mono">{change.keys.join(", ")}</span>}
+        <div className="composer-bar">
+          <div className="row gap small">
+            <label className="muted" htmlFor="note-to">
+              Note to
+            </label>
+            <select id="note-to" value={to} onChange={(e) => setTo(e.target.value)}>
+              {recipients.map((r) => (
+                <option key={r} value={r}>
+                  {r === "workers" ? "every worker" : r}
+                </option>
+              ))}
+            </select>
+            <span className="muted">Delivered with the next approval or repair. It does not interrupt a reply.</span>
           </div>
-        </details>
-      ))}
+          <Composer
+            ref={composer}
+            bus
+            pages={pages}
+            agents={["master", "reviewer", "verifier", ...pages.map((p) => `worker:${p}`)]}
+            placeholder="A note for the next brief · @ file, page, agent or key · # pull request · / commands"
+            onSend={(m) => void send(m)}
+          />
+        </div>
+      </div>
+
+      {narrow ? (
+        <Sheet open={sheet} onClose={() => setSheet(false)}>
+          {panel}
+        </Sheet>
+      ) : (
+        <aside className="run-panel">{panel}</aside>
+      )}
+
+      {cite && (
+        <div className="cite-pop" style={{ left: Math.max(8, cite.x - 120), top: Math.max(8, cite.y - 76) }} onMouseUp={(e) => e.stopPropagation()}>
+          <input placeholder="Optional comment" value={citeNote} onChange={(e) => setCiteNote(e.target.value)} />
+          <div className="row gap">
+            <button
+              className="primary small"
+              onClick={() => {
+                const target = cite.agent;
+                setTo(target);
+                composer.current?.insert({
+                  kind: "cite",
+                  label: `“${cite.text.slice(0, 28)}${cite.text.length > 28 ? "…" : ""}”`,
+                  value: cite.text,
+                  to: target,
+                  comment: citeNote || undefined,
+                });
+                setCite(null);
+                window.getSelection()?.removeAllRanges();
+              }}
+            >
+              Cite
+            </button>
+            <button className="ghost small" onClick={() => setCite(null)}>
+              ×
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

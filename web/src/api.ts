@@ -278,6 +278,81 @@ export interface NewReview {
   verifier_model?: string;
 }
 
+/** Who an agent transcript entry is from. */
+export interface AgentTag {
+  id: string;
+  role: string;
+  page?: string | null;
+  harness?: string;
+  model?: string | null;
+  owned_glob?: string | null;
+  worktree?: string;
+  branch?: string | null;
+  call?: number;
+}
+
+export interface AgentEntry {
+  at: string;
+  agent: AgentTag;
+  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview";
+  text?: string;
+  brief?: string;
+  name?: string;
+  target?: string | null;
+  input?: unknown;
+  tool?: string;
+  allowed?: boolean;
+  ok?: boolean;
+  usage?: { input: number; output: number; cache_read: number; cache_write: number };
+  cost_usd?: number | null;
+  seconds?: number;
+  error?: string;
+  command?: string;
+  cwd?: string;
+  typed?: boolean;
+  code?: number | null;
+  step?: string;
+  routes?: { page: string; route: string }[];
+}
+
+export interface Note {
+  id: string;
+  to: string;
+  text: string;
+  at: string;
+  delivered: boolean;
+}
+
+export interface DaemonSettings {
+  project: string;
+  dictionary: string;
+  commons: string;
+  commons_remote: boolean;
+  config: string | null;
+  config_default: string;
+  store: string;
+  roles: Roles;
+  version: string;
+}
+
+export interface EditorInfo {
+  id: string;
+  name: string;
+  command: string;
+  installed: boolean;
+}
+
+export interface Skill {
+  name: string;
+  path: string;
+}
+
+export interface GhStatus {
+  installed: boolean;
+  account: string | null;
+  error?: string;
+}
+
 export const DEFAULT_ROLES: Roles = {
   worker: "agy",
   mid: "grok",
@@ -316,9 +391,19 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly body: unknown = null,
   ) {
     super(message);
   }
+}
+
+/** Call another daemon with its own address and token (for gallery cards of other daemons). */
+export async function callAt<T>(base: string, bearer: string | null, path: string): Promise<T> {
+  const response = await fetch(base.replace(/\/+$/, "") + path, {
+    headers: bearer ? { authorization: `Bearer ${bearer}` } : {},
+  });
+  if (!response.ok) throw new ApiError(response.status, `${response.status} ${response.statusText}`);
+  return (await response.json()) as T;
 }
 
 async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
@@ -340,7 +425,7 @@ async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Pr
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
     if (response.status === 401 && bearer) setToken(null);
-    throw new ApiError(response.status, data?.error ?? `${response.status} ${response.statusText}`);
+    throw new ApiError(response.status, data?.error ?? `${response.status} ${response.statusText}`, data);
   }
   return data as T;
 }
@@ -370,7 +455,7 @@ export const api = {
     if (!response.ok) throw new ApiError(response.status, "no screenshot");
     return URL.createObjectURL(await response.blob());
   },
-  approve: (id: string) => call("POST", `/api/runs/${enc(id)}/approve`, {}),
+  approve: (id: string, note?: string) => call("POST", `/api/runs/${enc(id)}/approve`, note ? { note } : {}),
   reject: (id: string, prompt?: string) => call("POST", `/api/runs/${enc(id)}/reject`, { prompt }),
   resume: (id: string) => call("POST", `/api/runs/${enc(id)}/resume`, {}),
   cancel: (id: string) => call("POST", `/api/runs/${enc(id)}/cancel`, {}),
@@ -384,6 +469,33 @@ export const api = {
     call<{ entries: DictionaryEntry[] }>("GET", `/api/dictionary?q=${enc(q)}`).then((r) => r.entries),
   entry: (key: string) => call<DictionaryEntry>("GET", `/api/dictionary/${enc(key)}`),
   errorography: () => call<Book>("GET", "/api/errorography"),
+
+  agents: (id: string, after = 0) =>
+    call<{ next: number; entries: AgentEntry[] }>("GET", `/api/runs/${enc(id)}/agents?after=${after}`),
+  notes: (id: string) => call<{ notes: Note[] }>("GET", `/api/runs/${enc(id)}/notes`).then((r) => r.notes),
+  addNote: (id: string, to: string, text: string) => call<Note>("POST", `/api/runs/${enc(id)}/notes`, { to, text }),
+  editNote: (id: string, note: string, text?: string) =>
+    call<{ notes: Note[] }>("POST", `/api/runs/${enc(id)}/notes/${enc(note)}`, text ? { text } : {}),
+  terminal: (id: string, command: string) =>
+    call<{ ok: boolean; code: number | null; output: string }>("POST", `/api/runs/${enc(id)}/terminal`, { command }),
+  diff: (id: string, scope: "run" | "page", page?: string) =>
+    call<{ scope: string; base: string; branch: string; diff: string }>(
+      "GET",
+      `/api/runs/${enc(id)}/diff?scope=${scope}${page ? `&page=${enc(page)}` : ""}`,
+    ),
+  draftPr: (id: string) => call<{ url: string }>("POST", `/api/runs/${enc(id)}/pr`, {}),
+  settings: () => call<DaemonSettings>("GET", "/api/settings"),
+  editors: () => call<{ editors: EditorInfo[]; default: string }>("GET", "/api/editors"),
+  open: (body: { path: string; line?: number; column?: number; editor?: string; reveal?: boolean }) =>
+    call<{ command: string; args: string[]; path: string }>("POST", "/api/open", body),
+  paths: (paths: string[]) =>
+    call<{ paths: Record<string, string | null>; project: string }>("POST", "/api/paths", { paths }),
+  file: (path: string) =>
+    call<{ path: string; full: string; content: string; truncated: boolean }>("GET", `/api/file?path=${enc(path)}`),
+  files: () => call<{ files: string[] }>("GET", "/api/files").then((r) => r.files),
+  skills: () => call<{ skills: Skill[] }>("GET", "/api/skills").then((r) => r.skills),
+  gh: () => call<GhStatus>("GET", "/api/gh"),
+  ghPr: (n: number) => call<{ number: number; title: string; url: string; state: string }>("GET", `/api/gh/pr/${n}`),
 
   reviews: () => call<{ reviews: ReviewSummary[] }>("GET", "/api/reviews").then((r) => r.reviews),
   review: (id: string) => call<ReviewJob>("GET", `/api/reviews/${enc(id)}`),
@@ -399,15 +511,24 @@ export const api = {
 export function follow(
   id: string,
   after: number,
-  on: { event: (event: RunEvent, index: number) => void; idle: (phase: Phase) => void; lost: () => void },
+  on: {
+    event: (event: RunEvent, index: number) => void;
+    agent?: (entry: AgentEntry) => void;
+    idle: (phase: Phase) => void;
+    lost: () => void;
+  },
+  agentsAfter = 0,
 ): () => void {
-  const params = new URLSearchParams({ after: String(after) });
+  const params = new URLSearchParams({ after: String(after), agents_after: String(agentsAfter) });
   const bearer = token();
   if (bearer) params.set("token", bearer);
   const source = new EventSource(`${server()}/api/runs/${enc(id)}/stream?${params}`);
   source.addEventListener("event", (message) => {
     const m = message as MessageEvent<string>;
     on.event(JSON.parse(m.data) as RunEvent, Number(m.lastEventId));
+  });
+  source.addEventListener("agent", (message) => {
+    on.agent?.(JSON.parse((message as MessageEvent<string>).data) as AgentEntry);
   });
   source.addEventListener("idle", (message) => {
     source.close();

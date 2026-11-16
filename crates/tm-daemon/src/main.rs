@@ -166,8 +166,13 @@ async fn run() -> anyhow::Result<Outcome> {
 fn eval_line(side: &tm_daemon::EvalSide) -> String {
     let state = if side.ok { "finished" } else { "failed" };
     let mut line = format!(
-        "{state}, {} passed, {} failed, {} check failures, {} tokens in {} calls",
-        side.passed, side.failed, side.check_failures, side.tokens, side.agent_calls
+        "{state}, {} passed, {} failed, {} check failures, {} tokens plus {} read from cache in {} calls",
+        side.passed,
+        side.failed,
+        side.check_failures,
+        side.fresh_tokens,
+        side.tokens - side.fresh_tokens,
+        side.agent_calls
     );
     if side.unpriced_calls < side.agent_calls {
         line.push_str(&format!(", ${:.2}", side.cost_usd));

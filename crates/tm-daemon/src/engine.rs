@@ -1185,7 +1185,10 @@ impl Driver {
 
     fn spend_line(&self) -> anyhow::Result<String> {
         let sum = totals(&self.records.ledger(&self.id)?);
-        let mut line = format!("{} agent calls, {} tokens", sum.calls, sum.tokens);
+        let mut line = format!("{} agent calls, {} tokens", sum.calls, sum.fresh);
+        if sum.cache_read > 0 {
+            line.push_str(&format!(" plus {} read from cache", sum.cache_read));
+        }
         if sum.unpriced_calls < sum.calls {
             line.push_str(&format!(", ${:.2}", sum.cost_usd));
             if sum.unpriced_calls > 0 {

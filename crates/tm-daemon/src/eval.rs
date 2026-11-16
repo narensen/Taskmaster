@@ -18,7 +18,10 @@ pub struct EvalSide {
     /// Check failures recorded for that side. Each one is a repair attempt that did not pass.
     pub check_failures: usize,
     pub agent_calls: u64,
+    /// Every token, cache reads included.
     pub tokens: u64,
+    /// `tokens` without the cache reads.
+    pub fresh_tokens: u64,
     /// The prices that were reported. `unpriced_calls` says how many calls it leaves out.
     pub cost_usd: f64,
     pub unpriced_calls: u64,
@@ -102,6 +105,7 @@ fn side(records: &Records, run_id: &str, harness: &str, outcome: &Outcome) -> an
         check_failures,
         agent_calls: spent.calls,
         tokens: spent.tokens,
+        fresh_tokens: spent.fresh,
         cost_usd: spent.cost_usd,
         unpriced_calls: spent.unpriced_calls,
         seconds: spent.seconds,

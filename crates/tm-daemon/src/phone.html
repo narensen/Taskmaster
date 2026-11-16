@@ -58,7 +58,7 @@ async function load() {
     const phase = run.phase.replace("_", " ") + (run.active ? " (running)" : "");
     line(block, run.id + "  " + phase, "phase " + (run.phase === "failed" ? "bad" : run.phase === "done" ? "ok" : ""));
     for (const page of run.pages) line(block, page.id + "  " + page.state, "muted");
-    if (run.spent.calls) line(block, run.spent.tokens.toLocaleString() + " tokens in " + run.spent.calls + " calls", "muted");
+    if (run.spent.calls) line(block, run.spent.fresh.toLocaleString() + " tokens, " + run.spent.cache_read.toLocaleString() + " read from cache, " + run.spent.calls + " calls", "muted");
     if (run.error) line(block, run.error, "bad");
     if (run.phase === "awaiting_approval" && !run.active) {
       const approve = document.createElement("button");

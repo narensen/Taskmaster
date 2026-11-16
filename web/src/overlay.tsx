@@ -1,11 +1,10 @@
 // What floats above the page: toasts (some with Undo), the right-click menu, and a small
 // bus that lets any part of a run hand a chip to the composer or a file to the preview.
 
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import gsap from "gsap";
-import { bezier, dur, ease } from "./motion";
-import { motionOn, useMotion } from "./prefs";
+import { bezier, dur } from "./motion";
+import { useMotion } from "./prefs";
 
 // A tiny store helper.
 function store<T>(initial: T) {
@@ -81,7 +80,7 @@ export function Toasts() {
             initial={on ? { opacity: 0, y: 8 } : false}
             animate={{ opacity: 1, y: 0 }}
             exit={on ? { opacity: 0, y: 6 } : { opacity: 1, transition: { duration: 0 } }}
-            transition={{ duration: on ? 0.16 : 0, ease: bezier.out }}
+            transition={{ duration: on ? dur.base : 0, ease: bezier.out }}
           >
             <div className="grow">
               <div>{t.text}</div>
@@ -169,11 +168,8 @@ function MenuList({ items, onDone }: { items: MenuItem[]; onDone: () => void }) 
 
 export function ContextMenu() {
   const state = menu.use();
+  const on = useMotion();
   const ref = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    if (!state || !ref.current || !motionOn()) return;
-    gsap.fromTo(ref.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
-  }, [state]);
   useEffect(() => {
     if (!state) return;
     const close = (event: Event) => {
@@ -190,13 +186,23 @@ export function ContextMenu() {
       window.removeEventListener("resize", closeMenu);
     };
   }, [state]);
-  if (!state) return null;
-  const x = Math.min(state.x, window.innerWidth - 240);
-  const y = Math.min(state.y, window.innerHeight - 40 * state.items.length - 16);
   return (
-    <div ref={ref} className="menu" style={{ left: Math.max(4, x), top: Math.max(4, y) }}>
-      <MenuList items={state.items} onDone={closeMenu} />
-    </div>
+    <AnimatePresence>
+      {state && (
+        <motion.div
+          key="menu"
+          ref={ref}
+          className="menu"
+          style={{ left: Math.max(4, Math.min(state.x, window.innerWidth - 240)), top: Math.max(4, Math.min(state.y, window.innerHeight - 40 * state.items.length - 16)) }}
+          initial={on ? { opacity: 0, y: 4 } : false}
+          animate={{ opacity: 1, y: 0 }}
+          exit={on ? { opacity: 0, y: 4 } : { opacity: 1, transition: { duration: 0 } }}
+          transition={{ duration: on ? dur.fast : 0, ease: bezier.out }}
+        >
+          <MenuList items={state.items} onDone={closeMenu} />
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 

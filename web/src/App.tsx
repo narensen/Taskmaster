@@ -417,7 +417,9 @@ export function App() {
               </motion.div>
             </AnimatePresence>
           </main>
-          {palette && <Palette state={palette} onClose={() => setPalette(null)} />}
+          <AnimatePresence>
+            {palette && <Palette key="palette" state={palette} onClose={() => setPalette(null)} />}
+          </AnimatePresence>
           <ContextMenu />
           <Toasts />
         </div>

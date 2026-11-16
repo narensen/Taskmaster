@@ -3,8 +3,9 @@
 // panel with the plan, the diff, the browser, web search, the terminal and file previews.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import gsap from "gsap";
+import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import { api, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
@@ -112,7 +113,10 @@ export function RunView({ id }: { id: string }) {
   const [citeNote, setCiteNote] = useState("");
   const [pr, setPr] = useState<string | null>(null);
   const panelBody = useRef<HTMLDivElement>(null);
-  const citeRef = useRef<HTMLDivElement>(null);
+  const runRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const [panelOpen, setPanelOpen] = useState(true);
+  const skipPanelEnter = useRef(true);
 
   // The right panel: fixed tabs plus file previews; the active one is kept per run.
   const [tabs, setTabs] = useState<string[]>([...FIXED]);
@@ -233,13 +237,52 @@ export function RunView({ id }: { id: string }) {
 
   useLayoutEffect(() => {
     if (!panelBody.current || !motionOn()) return;
-    gsap.fromTo(panelBody.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
+    const tween = gsap.fromTo(panelBody.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
+    return () => {
+      tween.kill();
+    };
   }, [tab]);
 
+  const panelWidth = () => Math.min(window.innerWidth * 0.4, 520);
+
+  const togglePanel = () => {
+    const root = runRef.current;
+    const el = panelRef.current;
+    if (narrow || !panelOpen || !root || !el || !motionOn()) {
+      setPanelOpen((open) => !open);
+      return;
+    }
+    const width = el.getBoundingClientRect().width || panelWidth();
+    gsap.set(root, { "--panel-w": `${width}px` });
+    gsap.to(el, { opacity: 0, duration: dur.base, ease: ease.out });
+    gsap.to(root, {
+      "--panel-w": "0px",
+      duration: dur.base,
+      ease: ease.out,
+      onComplete: () => {
+        gsap.set(root, { clearProps: "--panel-w" });
+        setPanelOpen(false);
+      },
+    });
+  };
+
   useLayoutEffect(() => {
-    if (!cite || !citeRef.current || !motionOn()) return;
-    gsap.fromTo(citeRef.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
-  }, [cite]);
+    if (!panelOpen || narrow) return;
+    if (skipPanelEnter.current) {
+      skipPanelEnter.current = false;
+      return;
+    }
+    const root = runRef.current;
+    const el = panelRef.current;
+    if (!root || !motionOn()) return;
+    gsap.set(root, { "--panel-w": "0px" });
+    const slide = gsap.to(root, { "--panel-w": `${panelWidth()}px`, duration: dur.base, ease: ease.out, clearProps: "--panel-w" });
+    const fade = el ? gsap.fromTo(el, { opacity: 0 }, { opacity: 1, duration: dur.base, ease: ease.out, clearProps: "opacity" }) : null;
+    return () => {
+      slide.kill();
+      fade?.kill();
+    };
+  }, [panelOpen, narrow]);
 
   // Cite: select text in an agent's reply.
   useEffect(() => {
@@ -309,7 +352,7 @@ export function RunView({ id }: { id: string }) {
   );
 
   return (
-    <div className={`run ${narrow ? "narrow" : ""}`}>
+    <div ref={runRef} className={`run ${narrow ? "narrow" : ""} ${!narrow && !panelOpen ? "panel-shut" : ""}`}>
       <div className="run-main">
         <div className="run-scroll">
         <header className="run-head">
@@ -357,9 +400,13 @@ export function RunView({ id }: { id: string }) {
               </button>
             )}
             {pr && <ExternalLink href={pr}>pull request</ExternalLink>}
-            {narrow && (
+            {narrow ? (
               <button className="ghost" onClick={() => setSheet(true)}>
                 Panel
+              </button>
+            ) : (
+              <button className="ghost icon" aria-label={panelOpen ? "Hide panel" : "Show panel"} title={panelOpen ? "Hide panel" : "Show panel"} onClick={togglePanel}>
+                {panelOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
               </button>
             )}
           </div>
@@ -471,11 +518,25 @@ export function RunView({ id }: { id: string }) {
           {panel}
         </Sheet>
       ) : (
-        <aside className="run-panel">{panel}</aside>
+        panelOpen && (
+          <aside ref={panelRef} className="run-panel">
+            {panel}
+          </aside>
+        )
       )}
 
+      <AnimatePresence>
       {cite && (
-        <div ref={citeRef} className="cite-pop" style={{ left: Math.max(8, cite.x - 120), top: Math.max(8, cite.y - 76) }} onMouseUp={(e) => e.stopPropagation()}>
+        <motion.div
+          key="cite"
+          className="cite-pop"
+          style={{ left: Math.max(8, cite.x - 120), top: Math.max(8, cite.y - 76) }}
+          onMouseUp={(e) => e.stopPropagation()}
+          initial={motionOn() ? { opacity: 0, y: 4 } : false}
+          animate={{ opacity: 1, y: 0 }}
+          exit={motionOn() ? { opacity: 0, y: 4 } : { opacity: 1, transition: { duration: 0 } }}
+          transition={{ duration: motionOn() ? dur.fast : 0, ease: bezier.out }}
+        >
           <input placeholder="Optional comment" value={citeNote} onChange={(e) => setCiteNote(e.target.value)} />
           <div className="row gap">
             <button
@@ -500,8 +561,9 @@ export function RunView({ id }: { id: string }) {
               ×
             </button>
           </div>
-        </div>
+        </motion.div>
       )}
+      </AnimatePresence>
     </div>
   );
 }

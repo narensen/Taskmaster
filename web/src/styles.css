@@ -631,13 +631,14 @@ button.group-head:hover { background: transparent; color: var(--ink); }
 
 .run {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--panel);
+  grid-template-columns: minmax(0, 1fr) var(--panel-w, var(--panel));
   flex: 1;
   height: 100%;
   min-height: 0;
   min-width: 0;
 }
-.run.narrow { grid-template-columns: minmax(0, 1fr); }
+.run.narrow,
+.run.panel-shut { grid-template-columns: minmax(0, 1fr); }
 .run-main {
   overflow: hidden;
   padding: 0;
@@ -663,6 +664,7 @@ button.group-head:hover { background: transparent; color: var(--ink); }
   min-height: 0;
   min-width: 0;
   display: flex;
+  overflow: hidden;
 }
 .run-head {
   display: flex;

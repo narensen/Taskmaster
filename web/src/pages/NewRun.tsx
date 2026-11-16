@@ -65,13 +65,15 @@ export function NewRun() {
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
-              <button type="button" className="model-pill" onClick={() => setAdvanced((v) => !v)}>
-                <Sparkles size={13} />
-                <span className="clip">{pill}</span>
-              </button>
-              <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
-                <ArrowUp size={15} />
-              </button>
+              <div className="composer-actions">
+                <button type="button" className="model-pill" onClick={() => setAdvanced((v) => !v)} title="Harnesses and models">
+                  <Sparkles size={13} />
+                  <span className="clip">{pill}</span>
+                </button>
+                <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
+                  <ArrowUp size={15} />
+                </button>
+              </div>
             </div>
           }
         />

@@ -422,6 +422,7 @@ button.group-head:hover { background: transparent; color: var(--ink); }
   color: var(--muted);
   font-size: 13px;
 }
+.crumb-ico { flex: none; color: var(--muted); }
 .crumb-sep { color: var(--muted); opacity: 0.7; }
 .crumb-here { color: var(--ink); font-weight: 500; }
 .route {
@@ -849,9 +850,16 @@ button.group-head:hover { background: transparent; color: var(--ink); }
 .composer-foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
   padding: 0 8px 8px;
+}
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
 }
 .model-pill {
   border-radius: 999px;
@@ -861,7 +869,7 @@ button.group-head:hover { background: transparent; color: var(--ink); }
   padding: 3px 10px;
   font-size: 12px;
   font-weight: 500;
-  max-width: min(420px, 70%);
+  max-width: min(280px, 58vw);
 }
 .model-pill:hover { color: var(--ink); background: var(--bg-hover); }
 .send-btn {
@@ -914,7 +922,7 @@ button.group-head:hover { background: transparent; color: var(--ink); }
   padding-bottom: 6vh;
 }
 .ask-hero {
-  width: min(640px, 100%);
+  width: min(680px, 100%);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -922,11 +930,17 @@ button.group-head:hover { background: transparent; color: var(--ink); }
 }
 .ask-hero h1 {
   text-align: center;
-  font-size: 28px;
+  font-size: 30px;
   font-weight: 600;
   letter-spacing: -0.03em;
 }
-.ask-sub { text-align: center; margin: -6px 0 4px; }
+.ask-sub { text-align: center; margin: -8px 0 8px; font-size: 13px; }
+.ask-hero .composer {
+  background: var(--bg-elev);
+  border-color: var(--line-strong);
+}
+.ask-hero .composer-input { min-height: 88px; padding-top: 14px; }
+.ask-hero .composer-input[data-empty="true"]::before { top: 14px; }
 .ask-advanced {
   display: flex;
   flex-direction: column;

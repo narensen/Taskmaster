@@ -10,6 +10,7 @@ import {
   CircleAlert,
   CircleCheck,
   Cpu,
+  Folder,
   GitBranch,
   GitPullRequest,
   LayoutGrid,
@@ -137,6 +138,7 @@ function hereLabel(path: string): string {
 function Crumbs({ project, here }: { project: string; here: string }) {
   return (
     <div className="crumbs">
+      <Folder size={14} className="crumb-ico" aria-hidden />
       <span className="clip">{project}</span>
       <span className="crumb-sep">/</span>
       <span className="clip crumb-here">{here}</span>

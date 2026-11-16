@@ -7,6 +7,8 @@ pub enum ToolKind {
     Read,
     Edit,
     Execute,
+    /// A fetch from the network.
+    Fetch,
     /// A call to the Dictionary's MCP server. The adapter recognises it, because each
     /// harness names MCP tools differently.
     Dictionary,
@@ -28,8 +30,14 @@ pub enum Decision {
     Deny,
 }
 
+#[async_trait::async_trait]
 pub trait PermissionGate: Send + Sync {
     fn decide(&self, request: &PermissionRequest) -> Decision;
+
+    /// Like `decide`, but a gate may wait for a person to answer. Adapters call this one.
+    async fn decide_async(&self, request: &PermissionRequest) -> Decision {
+        self.decide(request)
+    }
 }
 
 /// Confines a worker to its worktree: file access inside `root` only, no shell, and only
@@ -61,6 +69,28 @@ impl WorktreeGate {
         let dir = dir.into();
         self.readable.push(std::fs::canonicalize(&dir).unwrap_or_else(|_| normalize(&dir)));
         self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Why a call the gate refuses is still worth putting to a person: it runs a shell
+    /// command, fetches from the network, or writes outside the worktree. `None` for
+    /// anything else, such as a read outside the worktree or any edit by a read-only
+    /// agent, which stay refused.
+    pub fn risk(&self, request: &PermissionRequest) -> Option<&'static str> {
+        if self.read_only {
+            return None;
+        }
+        match request.kind {
+            ToolKind::Execute => Some("runs a shell command"),
+            ToolKind::Fetch => Some("fetches from the network"),
+            ToolKind::Edit if !request.paths.is_empty() && !request.paths.iter().all(|p| self.inside(p)) => {
+                Some("writes outside the worktree")
+            }
+            _ => None,
+        }
     }
 
     fn inside(&self, path: &Path) -> bool {

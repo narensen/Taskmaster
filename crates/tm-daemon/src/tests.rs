@@ -1651,6 +1651,181 @@ mod http {
         assert_eq!(client.text("/api/nope").await.0, 404);
         assert_eq!(client.get("/api/health").await.0, 200);
     }
+    /// A worker that asks the gate before a shell command, as an agent would, and says what it was told.
+    struct Asking {
+        inner: Fake,
+        asked: Arc<Mutex<Vec<(String, tm_harness::Decision)>>>,
+    }
+
+    #[async_trait]
+    impl Harness for Asking {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(&self, task: WorkerTask, gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Build page `") {
+                let id = task.brief.split("Build page `").nth(1).and_then(|r| r.split('`').next()).unwrap_or("").to_string();
+                let shell = tm_harness::PermissionRequest {
+                    tool: "Bash".into(),
+                    kind: tm_harness::ToolKind::Execute,
+                    paths: vec![],
+                    command: Some("npm test".into()),
+                };
+                let outside = tm_harness::PermissionRequest {
+                    tool: "Write".into(),
+                    kind: tm_harness::ToolKind::Edit,
+                    paths: vec!["/etc/hosts".into()],
+                    command: None,
+                };
+                let inside = tm_harness::PermissionRequest {
+                    tool: "Write".into(),
+                    kind: tm_harness::ToolKind::Edit,
+                    paths: vec![task.cwd.join("app/x.ts")],
+                    command: None,
+                };
+                for (label, request) in [("shell", &shell), ("outside", &outside), ("inside", &inside)] {
+                    let decision = gate.decide_async(request).await;
+                    self.asked.lock().unwrap().push((format!("{id}:{label}"), decision));
+                    let _ = events.send(HarnessEvent::PermissionDecided { tool: request.tool.clone(), allowed: decision == tm_harness::Decision::Allow }).await;
+                }
+            }
+            self.inner.run(task, gate, events).await
+        }
+    }
+
+    async fn pending(client: &Client, run: &str, n: usize) -> Vec<Value> {
+        for _ in 0..400 {
+            let (status, found) = client.get(&format!("/api/approvals?run={run}")).await;
+            assert_eq!(status, 200, "{found}");
+            if found["approvals"].as_array().unwrap().len() >= n {
+                return found["approvals"].as_array().unwrap().clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no approval appeared for {run}");
+    }
+
+    #[tokio::test]
+    async fn risky_tool_calls_wait_for_a_person_and_each_answer_is_kept() {
+        use tm_harness::Decision::{Allow, Deny};
+        let tmp = seeded("approvals");
+        let world = World::new(Mode::Write);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let code = auth.code().to_string();
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        let (w, a) = (world.clone(), asked.clone());
+        options.harness = Arc::new(move |_| Ok(Arc::new(Asking { inner: Fake(w.clone()), asked: a.clone() }) as Arc<dyn Harness>));
+        options.approvals = crate::approvals::Policy { mode: crate::approvals::Mode::Risky, timeout: Duration::from_secs(30) };
+        let server = Server::serve(options).await.unwrap();
+        let mut client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
+        assert_eq!(client.get("/api/approvals").await.0, 401);
+        client.token = Some(client.post("/api/pair", json!({ "code": code })).await.1["token"].as_str().unwrap().to_string());
+        let (_, settings) = client.get("/api/settings").await;
+        assert_eq!(settings["approvals"]["mode"], "risky");
+
+        // A shell command and a write outside the worktree wait; a write inside does not.
+        let planned = serde_json::to_value(plan(&[("c", &[])])).unwrap();
+        assert_eq!(client.post("/api/runs", json!({ "id": "one", "plan": planned, "yes": true })).await.0, 202);
+        let first = pending(&client, "one", 1).await;
+        assert_eq!((first[0]["tool"].as_str(), first[0]["kind"].as_str()), (Some("Bash"), Some("execute")));
+        assert_eq!(first[0]["command"], "npm test");
+        assert!(first[0]["reason"].as_str().unwrap().contains("shell"), "{first:?}");
+        assert_eq!(first[0]["agent"]["role"], "worker");
+        let (_, view) = client.get("/api/runs/one").await;
+        assert_eq!(view["pending_approvals"], 1);
+        assert_eq!(client.get("/api/approvals?run=other").await.1["approvals"], json!([]));
+        assert_eq!(client.get("/api/approvals?run=..%2Fx").await.0, 400);
+        let id = first[0]["id"].as_str().unwrap();
+        assert_eq!(client.post(&format!("/api/approvals/{id}/maybe"), json!({})).await.0, 404);
+        assert_eq!(client.post("/api/approvals/nope/approve", json!({})).await.0, 409);
+        let (status, answered) = client.post(&format!("/api/approvals/{id}/approve"), json!({})).await;
+        assert_eq!((status, answered["allowed"].as_bool()), (200, Some(true)), "{answered}");
+        assert_eq!(client.post(&format!("/api/approvals/{id}/approve"), json!({})).await.0, 409, "an answer is final");
+        let second = pending(&client, "one", 1).await;
+        assert_eq!(second[0]["kind"], "edit");
+        assert_eq!(second[0]["paths"][0], "/etc/hosts");
+        assert!(second[0]["reason"].as_str().unwrap().contains("outside the worktree"));
+        let id = second[0]["id"].as_str().unwrap();
+        assert_eq!(client.post(&format!("/api/approvals/{id}/deny"), json!({})).await.0, 200);
+        client.settled("one", "done").await;
+        let decisions = asked.lock().unwrap().clone();
+        assert_eq!(
+            decisions,
+            vec![("c:shell".into(), Allow), ("c:outside".into(), Deny), ("c:inside".into(), Allow)],
+            "the write inside the worktree was never asked about"
+        );
+
+        // The stream's transcript carries the question and the answer.
+        let (_, transcript) = client.get("/api/runs/one/agents").await;
+        let kinds: Vec<&str> = transcript["entries"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == "approval_requested").count(), 2, "{kinds:?}");
+        let resolved: Vec<&Value> = transcript["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "approval_resolved").collect();
+        assert_eq!((resolved[0]["allowed"].as_bool(), resolved[0]["by"].as_str()), (Some(true), Some("person")));
+        assert_eq!(resolved[1]["allowed"], false);
+
+        // The policy changes at once and survives in the settings file; nothing else in it is lost.
+        std::fs::create_dir_all(tmp.0.join(".taskmaster")).unwrap();
+        std::fs::write(tmp.0.join(".taskmaster/config.json"), r#"{"commons":{"report":false},"approvals":{"mode":"risky","timeout_secs":30}}"#).unwrap();
+        assert_eq!(client.post("/api/settings", json!({ "approvals": "sometimes" })).await.0, 400);
+        assert_eq!(client.post("/api/settings", json!({ "approval_timeout_secs": 0 })).await.0, 400);
+        let (status, changed) = client.post("/api/settings", json!({ "approvals": "never" })).await;
+        assert_eq!((status, changed["approvals"]["mode"].as_str()), (200, Some("never")), "{changed}");
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(tmp.0.join(".taskmaster/config.json")).unwrap()).unwrap();
+        assert_eq!((saved["approvals"]["mode"].as_str(), saved["approvals"]["timeout_secs"].as_u64(), saved["commons"]["report"].as_bool()), (Some("never"), Some(30), Some(false)));
+        asked.lock().unwrap().clear();
+        let planned = serde_json::to_value(plan(&[("d", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "two", "plan": planned, "yes": true })).await;
+        client.settled("two", "done").await;
+        assert_eq!(
+            asked.lock().unwrap().clone(),
+            vec![("d:shell".into(), Deny), ("d:outside".into(), Deny), ("d:inside".into(), Allow)],
+            "with `never`, nothing waits and the refusals stand"
+        );
+
+        // `always` asks about the write inside the worktree too, and a cancelled run refuses what waits.
+        assert_eq!(client.post("/api/settings", json!({ "approvals": "always" })).await.0, 200);
+        let planned = serde_json::to_value(plan(&[("e", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "three", "plan": planned, "yes": true })).await;
+        pending(&client, "three", 1).await;
+        asked.lock().unwrap().clear();
+        assert_eq!(client.post("/api/runs/three/cancel", json!({})).await.0, 202);
+        for _ in 0..400 {
+            if client.get("/api/approvals?run=three").await.1["approvals"].as_array().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(client.get("/api/approvals").await.1["approvals"].as_array().unwrap().iter().all(|a| a["run"] != "three"));
+    }
+
+    #[tokio::test]
+    async fn a_question_nobody_answers_is_refused_after_the_timeout() {
+        use tm_harness::{Decision, PermissionRequest, ToolKind, WorktreeGate};
+        let tmp = repo("approval-timeout");
+        let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));
+        live.approvals.set_policy(crate::approvals::Policy { mode: crate::approvals::Mode::Risky, timeout: Duration::from_millis(80) });
+        let gate = crate::approvals::ApprovalGate::new(WorktreeGate::new(&tmp.0, vec![]), live.clone(), "r1".into(), json!({ "id": "w" }));
+        let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("ls".into()) };
+        assert_eq!(gate.decide_async(&shell).await, Decision::Deny);
+        assert!(live.approvals.list(None).is_empty());
+        let (_, entries) = live.read("r1", 0);
+        assert_eq!(entries.last().unwrap()["by"], "timeout");
+        // A reviewer's gate never asks: it may not run commands at all.
+        let reviewer = crate::approvals::ApprovalGate::new(WorktreeGate::new(&tmp.0, vec![]).read_only(), live.clone(), "r1".into(), json!({}));
+        assert_eq!(reviewer.decide_async(&shell).await, Decision::Deny);
+        assert_eq!(live.read("r1", 0).0, 2, "no question was written for the reviewer");
+        // A network fetch is risky too; a read outside the worktree is simply refused.
+        let fetch = PermissionRequest { tool: "WebFetch".into(), kind: ToolKind::Fetch, paths: vec![], command: None };
+        assert_eq!(gate.decide_async(&fetch).await, Decision::Deny);
+        assert_eq!(live.read("r1", 0).1[2]["reason"], "fetches from the network");
+        let read = PermissionRequest { tool: "Read".into(), kind: ToolKind::Read, paths: vec!["/etc/passwd".into()], command: None };
+        let before = live.read("r1", 0).0;
+        assert_eq!(gate.decide_async(&read).await, Decision::Deny);
+        assert_eq!(live.read("r1", 0).0, before);
+    }
+
 }
 
 mod commons_service {

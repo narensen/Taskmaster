@@ -24,6 +24,37 @@ pub struct Settings {
     pub store: StoreSettings,
     pub auth: AuthSettings,
     pub commons: CommonsSettings,
+    pub approvals: ApprovalSettings,
+    pub preview: PreviewSettings,
+    /// The editor `Open` uses: one of the ids in `GET /api/editors`, or the name of a
+    /// program on this machine. Empty means `$VISUAL`, then `$EDITOR`, then whatever is
+    /// installed.
+    pub editor: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApprovalSettings {
+    /// `never` (the default: shell commands, network fetches and writes outside the
+    /// worktree are refused), `risky` (ask before those), or `always` (ask before every
+    /// tool call).
+    pub mode: String,
+    /// How long a question waits for an answer before it is refused.
+    pub timeout_secs: u64,
+}
+
+impl Default for ApprovalSettings {
+    fn default() -> Self {
+        ApprovalSettings { mode: "never".into(), timeout_secs: 600 }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PreviewSettings {
+    /// The command that starts a dev server, in place of the one the project's
+    /// `package.json` names. It gets the port as `$PORT`.
+    pub command: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +117,12 @@ impl Settings {
             return serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", path.display()));
         }
         Ok(Settings::default())
+    }
+
+    pub fn approval_policy(&self) -> anyhow::Result<crate::approvals::Policy> {
+        let mode = crate::approvals::Mode::parse(&self.approvals.mode)
+            .with_context(|| format!("approvals.mode `{}` is not always, risky or never", self.approvals.mode))?;
+        Ok(crate::approvals::Policy { mode, timeout: std::time::Duration::from_secs(self.approvals.timeout_secs.max(1)) })
     }
 
     /// `None` keeps the records as files under `.taskmaster/`.

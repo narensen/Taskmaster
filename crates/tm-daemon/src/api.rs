@@ -105,6 +105,12 @@ pub struct ServerOptions {
     /// A built frontend: a directory with an `index.html`. `None` serves the small
     /// built-in page.
     pub web: Option<PathBuf>,
+    /// When agents' risky tool calls wait for a person. The default asks nothing.
+    pub approvals: crate::approvals::Policy,
+    /// The settings file's `editor`: an editor id or a program name. Empty finds one.
+    pub editor: String,
+    /// The settings file's `preview.command`. Empty reads the project's `package.json`.
+    pub preview_command: String,
 }
 
 impl ServerOptions {
@@ -119,6 +125,9 @@ impl ServerOptions {
             commons: None,
             harness: Arc::new(tm_harness::harness),
             web: None,
+            approvals: crate::approvals::Policy::default(),
+            editor: String::new(),
+            preview_command: String::new(),
         }
     }
 }
@@ -136,6 +145,7 @@ impl Drop for Server {
         for active in self.app.active.lock().unwrap().values() {
             let _ = active.cancel.send(true);
         }
+        self.app.live.approvals.refuse_all();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
@@ -163,6 +173,9 @@ struct App {
     web: Option<PathBuf>,
     active: Mutex<HashMap<String, Active>>,
     live: Arc<Live>,
+    /// The editor override; the settings file's value until `POST /api/settings` changes it.
+    editor: Mutex<String>,
+    preview_command: String,
 }
 
 impl Server {
@@ -183,6 +196,7 @@ impl Server {
             None => Arc::new(crate::store::FileStore::in_project(&project)),
         };
         let live = Arc::new(Live::new(live_store));
+        live.approvals.set_policy(options.approvals);
         let app = Arc::new(App {
             dictionary: options.dictionary.unwrap_or_else(|| project.join(".taskmaster/dictionary")),
             commons: options.commons.unwrap_or_else(|| project.join(".taskmaster/commons")),
@@ -195,6 +209,8 @@ impl Server {
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
             live,
+            editor: Mutex::new(options.editor),
+            preview_command: options.preview_command,
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -238,7 +254,9 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/terminal", post(desk::terminal))
         .route("/api/runs/{id}/diff", get(desk::diff))
         .route("/api/runs/{id}/pr", post(desk::open_pr))
-        .route("/api/settings", get(desk::settings))
+        .route("/api/approvals", get(desk::approvals))
+        .route("/api/approvals/{id}/{decision}", post(desk::decide))
+        .route("/api/settings", get(desk::settings).post(desk::update_settings))
         .route("/api/editors", get(desk::editors))
         .route("/api/open", post(desk::open))
         .route("/api/paths", post(desk::paths))
@@ -431,6 +449,7 @@ impl App {
             "phase": run.phase,
             "cancelled": cancelled,
             "active": self.is_active(id),
+            "pending_approvals": self.live.approvals.count(id),
             "error": status.get("error"),
             "branch": status.get("branch"),
             "merged": status.get("merged"),
@@ -480,6 +499,7 @@ impl App {
         config.remote = self.remote.clone();
         config.cancel = cancelled;
         config.live = Some(self.live.clone());
+        self.live.approvals.reopen(id);
         active.insert(id.to_string(), Active { cancel, in_place });
         drop(active);
 
@@ -762,6 +782,7 @@ async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
         let active = app.active.lock().unwrap();
         if let Some(active) = active.get(&id) {
             let _ = active.cancel.send(true);
+            app.live.approvals.refuse_run(&id);
             return accepted(json!({ "id": id }));
         }
     }

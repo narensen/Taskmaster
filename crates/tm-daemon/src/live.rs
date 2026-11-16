@@ -34,6 +34,8 @@ pub struct Live {
     cache: Mutex<HashMap<String, Cached>>,
     write: Mutex<()>,
     calls: AtomicU64,
+    /// Risky calls waiting for a person. Shared with every agent call of every run.
+    pub approvals: Arc<crate::approvals::Approvals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +55,7 @@ impl Live {
             cache: Mutex::new(HashMap::new()),
             write: Mutex::new(()),
             calls: AtomicU64::new(0),
+            approvals: Arc::default(),
         }
     }
 

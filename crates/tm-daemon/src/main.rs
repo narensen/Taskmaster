@@ -202,6 +202,9 @@ async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Serv
     let mut options = ServerOptions::new(project.clone(), bind, auth);
     options.store = settings.store(&project)?;
     options.remote = settings.remote();
+    options.approvals = settings.approval_policy()?;
+    options.editor = settings.editor.clone();
+    options.preview_command = settings.preview.command.clone();
     options.dictionary = args.dictionary.clone();
     options.commons = args.commons.clone().or_else(home_commons);
     options.web = args.web.clone().or_else(installed_web);

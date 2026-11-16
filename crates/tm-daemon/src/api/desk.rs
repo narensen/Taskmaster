@@ -10,7 +10,10 @@
 //! POST /api/runs/{id}/terminal    {command}: run it in the project as the daemon's user
 //! GET  /api/runs/{id}/diff        ?scope=run|page&page=<id>
 //! POST /api/runs/{id}/pr          push the run's branch and open a draft pull request
-//! GET  /api/settings              where this daemon keeps things
+//! GET  /api/approvals             ?run=<id> risky tool calls waiting for a person
+//! POST /api/approvals/{id}/{approve|deny}   answer one
+//! GET  /api/settings              where this daemon keeps things, and the approval policy
+//! POST /api/settings              {approvals?: always|risky|never, approval_timeout_secs?}
 //! GET  /api/editors               the editors this machine can launch, and the default
 //! POST /api/open                  {path, line?, column?, editor?, reveal?}
 //! POST /api/paths                 {paths: [..]} -> {paths: {raw: full path or null}}
@@ -565,6 +568,97 @@ pub async fn skills(State(app): State<Arc<App>>) -> Reply {
     ok(json!({ "skills": found }))
 }
 
+// Approvals.
+
+pub async fn approvals(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
+    let run = query.get("run").map(String::as_str);
+    if let Some(run) = run
+        && !valid_key(run)
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, "run is not a run id"));
+    }
+    let policy = app.live.approvals.policy();
+    ok(json!({ "approvals": app.live.approvals.list(run), "mode": policy.mode.id(), "timeout_secs": policy.timeout.as_secs() }))
+}
+
+pub async fn decide(State(app): State<Arc<App>>, UrlPath((id, decision)): UrlPath<(String, String)>) -> Reply {
+    let allow = match decision.as_str() {
+        "approve" => true,
+        "deny" => false,
+        _ => return Err(fail(StatusCode::NOT_FOUND, "answer with approve or deny")),
+    };
+    match app.live.approvals.answer(&id, allow, "person") {
+        Some(view) => ok(json!({ "id": id, "allowed": allow, "approval": view })),
+        None => Err(fail(StatusCode::CONFLICT, "that question was already answered, timed out, or its run ended")),
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct SettingsBody {
+    approvals: Option<String>,
+    approval_timeout_secs: Option<u64>,
+}
+
+/// Change the approval policy now and keep it in the settings file that is in use (or
+/// the project's, when there is none), leaving every other part of that file alone.
+pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsBody>) -> Reply {
+    let mut policy = app.live.approvals.policy();
+    let mut changes = serde_json::Map::new();
+    if let Some(mode) = &body.approvals {
+        policy.mode = crate::approvals::Mode::parse(mode)
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "approvals is always, risky or never"))?;
+        changes.insert("mode".into(), json!(policy.mode.id()));
+    }
+    if let Some(secs) = body.approval_timeout_secs {
+        if !(1..=86_400).contains(&secs) {
+            return Err(fail(StatusCode::BAD_REQUEST, "approval_timeout_secs is between 1 and 86400"));
+        }
+        policy.timeout = Duration::from_secs(secs);
+        changes.insert("timeout_secs".into(), json!(secs));
+    }
+    if !changes.is_empty() {
+        save_setting(&app.project, "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        app.live.approvals.set_policy(policy);
+    }
+    settings(State(app)).await
+}
+
+/// The settings file in use: the project's if it has one, else the home directory's, else
+/// the project's, to be created.
+fn settings_file(project: &Path) -> PathBuf {
+    let project_file = project.join(".taskmaster/config.json");
+    [Some(project_file.clone()), home().map(|h| h.join(".taskmaster/config.json"))]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_file())
+        .unwrap_or(project_file)
+}
+
+/// Merge `values` into the object at `key` of the settings file.
+fn save_setting(project: &Path, key: &str, values: Value) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let file = settings_file(project);
+    let mut root: Value = match std::fs::read_to_string(&file) {
+        Ok(text) => serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", file.display()))?,
+        Err(_) => json!({}),
+    };
+    let object = root.as_object_mut().with_context(|| format!("{} is not a settings file", file.display()))?;
+    match (object.get_mut(key), values) {
+        (Some(Value::Object(existing)), Value::Object(new)) => existing.extend(new),
+        (_, values) => {
+            object.insert(key.into(), values);
+        }
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temp = file.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_string_pretty(&root)? + "\n")?;
+    std::fs::rename(&temp, &file)?;
+    Ok(())
+}
+
 pub async fn settings(State(app): State<Arc<App>>) -> Reply {
     let project_config = app.project.join(".taskmaster/config.json");
     let home_config = home().map(|h| h.join(".taskmaster/config.json"));
@@ -582,6 +676,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "config_default": project_config.display().to_string(),
         "store": if app.store.is_some() { "sqlite" } else { "files" },
         "roles": crate::Roles::default(),
+        "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

@@ -17,13 +17,14 @@ use tm_core::{
 };
 use tm_dictionary::{Catalog, CommonsRemote, Grant, LocalStore, McpState};
 use tm_harness::{
-    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, Usage, WorkerTask, WorktreeGate,
+    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, PermissionGate, Usage, WorkerTask, WorktreeGate,
 };
 use tm_verify::{ImportGraph, Owners, load_sources, outside_owned};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
+use crate::approvals::ApprovalGate;
 use crate::git;
 use crate::live::{Live, tool_target};
 use crate::reply::{self, Resolution};
@@ -2101,6 +2102,11 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
     for dir in HARNESS_STATE_DIRS {
         gate = gate.with_readable(format!("{home}/{dir}"));
     }
+    // With a policy that asks, risky calls wait for a person; otherwise the gate stands alone.
+    let gate: Arc<dyn PermissionGate> = match &request.feed {
+        Some(feed) => Arc::new(ApprovalGate::new(gate, feed.live.clone(), feed.run.clone(), feed.agent.clone())),
+        None => Arc::new(gate),
+    };
     let task = WorkerTask {
         brief: request.brief,
         cwd: request.cwd,
@@ -2144,7 +2150,7 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
         text
     });
     let started = Instant::now();
-    let run = request.harness.run(task, Arc::new(gate), tx).await;
+    let run = request.harness.run(task, gate, tx).await;
     let text = collect.await.unwrap_or_default();
     if let Some(feed) = &feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64() });

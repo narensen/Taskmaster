@@ -235,7 +235,7 @@ impl Session {
                 if prefix.is_some_and(|p| request.tool.starts_with(p)) {
                     request.kind = ToolKind::Dictionary;
                 }
-                let allowed = self.gate.decide(&request) == Decision::Allow;
+                let allowed = self.gate.decide_async(&request).await == Decision::Allow;
                 if !allowed {
                     self.denied += 1;
                 }
@@ -323,6 +323,7 @@ fn permission_request(tool_call: &Value) -> PermissionRequest {
         Some("read" | "search") => ToolKind::Read,
         Some("edit" | "delete" | "move") => ToolKind::Edit,
         Some("execute") => ToolKind::Execute,
+        Some("fetch") => ToolKind::Fetch,
         _ => ToolKind::Other,
     };
     let raw = &tool_call["rawInput"];

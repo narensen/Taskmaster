@@ -15,6 +15,7 @@
 //! [`api`] is the HTTP surface a frontend talks to.
 
 pub mod api;
+pub mod approvals;
 pub mod auth;
 pub mod commons;
 mod engine;

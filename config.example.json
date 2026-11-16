@@ -12,5 +12,13 @@
     "token": "replace-me-with-a-token-from-the-commons-account-page",
     "share": false,
     "report": true
+  },
+  "approvals": {
+    "mode": "never",
+    "timeout_secs": 600
+  },
+  "editor": "",
+  "preview": {
+    "command": ""
   }
 }

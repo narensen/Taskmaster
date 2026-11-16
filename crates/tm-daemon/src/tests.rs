@@ -2215,6 +2215,85 @@ mod http {
         assert!(none.start("r2", None).await.unwrap_err().to_string().contains("no dev server"));
     }
 
+    /// `pgrp` from `/proc/<pid>/stat`, the field after state and ppid.
+    fn process_group_of(pid: u32) -> Option<u32> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = text.rsplit_once(')')?.1;
+        rest.split_whitespace().nth(2)?.parse().ok()
+    }
+
+    #[tokio::test]
+    async fn stopping_a_preview_kills_the_whole_process_group() {
+        use crate::preview::Previews;
+        if !have_python() {
+            return;
+        }
+        let tmp = repo("preview-group");
+        let project = tmp.0.canonicalize().unwrap();
+        let pidfile = project.join("server.pid");
+        let script = project.join("serve.py");
+        // The shell traps SIGTERM and the server ignores SIGHUP, so killing only the shell
+        // would leave the server up. The server records its own pid and sits in the shell's group.
+        std::fs::write(
+            &script,
+            "import os, signal\n\
+             from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler\n\
+             signal.signal(signal.SIGHUP, signal.SIG_IGN)\n\
+             open(os.environ['PIDFILE'], 'w').write(str(os.getpid()))\n\
+             port = int(os.environ['PORT'])\n\
+             ThreadingHTTPServer(('127.0.0.1', port), SimpleHTTPRequestHandler).serve_forever()\n",
+        )
+        .unwrap();
+        let command = format!("PIDFILE='{}' python3 '{}' & trap 'exit 0' TERM; wait", pidfile.display(), script.display());
+        let previews = Previews::new(project, command);
+        let started = previews.start("r", None).await.unwrap();
+        until("the preview", || async { fetch(started.port, "/").await.is_some() }).await;
+        let child: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let group = process_group_of(child).unwrap();
+        assert_ne!(group, process_group_of(std::process::id()).unwrap(), "the dev server must not share the test's process group");
+        previews.stop("r");
+        until("the server process to die", || async { process_group_of(child).is_none() }).await;
+        until("the port to close", || async { fetch(started.port, "/").await.is_none() }).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_preview_handle_stops_its_dev_server() {
+        use crate::preview::Previews;
+        if !have_python() {
+            return;
+        }
+        let tmp = repo("preview-drop");
+        let project = tmp.0.canonicalize().unwrap();
+        let port = {
+            let previews = Previews::new(project, STUB.into());
+            let started = previews.start("r", None).await.unwrap();
+            until("the preview to run", || async { previews.status("r").unwrap().state == "running" }).await;
+            started.port
+        };
+        until("the port to close after the handle is dropped", || async { fetch(port, "/").await.is_none() }).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_start_returns_the_dev_server_already_running() {
+        use crate::preview::Previews;
+        if !have_python() {
+            return;
+        }
+        let tmp = repo("preview-once");
+        let project = tmp.0.canonicalize().unwrap();
+        let marker = project.join("starts.txt");
+        let command = format!("echo started >> '{}'; python3 -m http.server {{port}} --bind 127.0.0.1", marker.display());
+        let previews = Arc::new(Previews::new(project, command));
+        let (first, second) = tokio::join!(previews.start("run", None), previews.start("run", None));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first.port, second.port);
+        assert_ne!(first.port, 0);
+        assert_eq!(first.url, second.url);
+        until("the preview to run", || async { previews.status("run").unwrap().state == "running" }).await;
+        let started = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(started.lines().filter(|line| *line == "started").count(), 1, "{started}");
+    }
+
 }
 
 mod commons_service {

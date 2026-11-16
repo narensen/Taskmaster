@@ -43,6 +43,7 @@ struct Entry {
     log: Arc<Mutex<String>>,
 }
 
+/// Dev servers started for runs. Dropping the handle stops each one.
 pub struct Previews {
     project: PathBuf,
     command: String,
@@ -100,11 +101,14 @@ impl Previews {
     }
 
     /// Start the run's dev server from `branch` (a checkout of it) or, with `None`, from
-    /// the project. Does nothing when one is already starting or running.
+    /// the project. A second start while that server is starting or running returns it
+    /// instead of spawning another.
     pub async fn start(&self, run: &str, branch: Option<&str>) -> anyhow::Result<Status> {
-        if let Some(status) = self.status(run).filter(|s| matches!(s.state, "starting" | "running")) {
+        if let Some(status) = self.reserve(run).await {
             return Ok(status);
         }
+        // If this start returns before the process is recorded, free the slot.
+        let mut claim = ClearClaim { previews: self, run, live: true };
         let port = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             listener.local_addr()?.port()
@@ -130,7 +134,9 @@ impl Previews {
             if let Some(tree) = &tree {
                 let _ = git::remove_worktree(&self.project, tree);
             }
-            anyhow::bail!("this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file");
+            let reason = "this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file";
+            self.fail_start(run, reason);
+            anyhow::bail!("{reason}");
         };
         let mut process = Command::new("sh");
         process
@@ -155,7 +161,9 @@ impl Previews {
                 if let Some(tree) = &tree {
                     let _ = git::remove_worktree(&self.project, tree);
                 }
-                anyhow::bail!("could not start `{command}`: {err}");
+                let reason = format!("could not start `{command}`: {err}");
+                self.fail_start(run, &reason);
+                anyhow::bail!("{reason}");
             }
         };
         let status = Arc::new(Mutex::new(Status {
@@ -191,6 +199,7 @@ impl Previews {
         }
         let pid = child.id();
         self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid, log: log.clone() });
+        claim.live = false;
 
         // Watch it: running once it answers, stopped or failed once it exits.
         let project = self.project.clone();
@@ -263,9 +272,66 @@ impl Previews {
         }
     }
 
+    /// Take the slot for `run` before anything is spawned. `Some` is a server that is
+    /// already starting or running, and this call must not start a second one.
+    async fn reserve(&self, run: &str) -> Option<Status> {
+        loop {
+            enum Claim {
+                Mine,
+                Theirs(Status),
+            }
+            let claim = {
+                let mut runs = self.runs.lock().unwrap();
+                let theirs = runs.get(run).and_then(|entry| {
+                    let current = entry.status.lock().unwrap().clone();
+                    matches!(current.state, "starting" | "running").then_some(current)
+                });
+                if let Some(current) = theirs {
+                    Claim::Theirs(current)
+                } else {
+                    let status = Arc::new(Mutex::new(Status {
+                        state: "starting",
+                        port: 0,
+                        url: String::new(),
+                        command: String::new(),
+                        dir: String::new(),
+                        started: rfc3339_now(),
+                        reason: None,
+                    }));
+                    let log = Arc::new(Mutex::new(String::new()));
+                    runs.insert(run.to_string(), Entry { status, pid: None, log });
+                    Claim::Mine
+                }
+            };
+            match claim {
+                Claim::Mine => return None,
+                // The owner has the slot but has not bound a port yet.
+                Claim::Theirs(current) if current.port == 0 => tokio::time::sleep(Duration::from_millis(10)).await,
+                Claim::Theirs(current) => return Some(current),
+            }
+        }
+    }
+
+    /// The slot was claimed, but no process was spawned. Let a later start try again.
+    fn fail_start(&self, run: &str, reason: &str) {
+        let runs = self.runs.lock().unwrap();
+        let Some(entry) = runs.get(run) else { return };
+        let mut status = entry.status.lock().unwrap();
+        if status.state == "starting" {
+            status.state = "failed";
+            status.reason = Some(reason.to_string());
+        }
+    }
+
     /// The end of what a run's dev server printed.
     pub fn output(&self, run: &str) -> String {
         self.runs.lock().unwrap().get(run).map(|e| tail(&e.log.lock().unwrap())).unwrap_or_default()
+    }
+}
+
+impl Drop for Previews {
+    fn drop(&mut self) {
+        self.stop_all();
     }
 }
 
@@ -279,6 +345,21 @@ fn tail(text: &str) -> String {
         start += 1;
     }
     format!("…{}", &text[start..])
+}
+
+/// Frees a reserved slot when a start fails before it records a process.
+struct ClearClaim<'a> {
+    previews: &'a Previews,
+    run: &'a str,
+    live: bool,
+}
+
+impl Drop for ClearClaim<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            self.previews.fail_start(self.run, "the dev server did not start");
+        }
+    }
 }
 
 /// Ask a process group to end, and make sure it does.

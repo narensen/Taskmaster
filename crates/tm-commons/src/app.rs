@@ -97,6 +97,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/signin", get(signin))
+        .route("/auth/{provider}", get(start))
         .route("/auth/{provider}/start", get(start))
         .route("/auth/{provider}/callback", get(callback))
         .route("/authorize", get(authorize).post(authorize_confirm))
@@ -178,13 +179,17 @@ fn see_other(location: &str) -> Response {
 async fn form_session(app: &App, headers: &HeaderMap, form: &HashMap<String, String>) -> Option<Session> {
     let session = session(app, headers).await?;
     let sent = form.get("csrf")?;
-    (*sent == app.sealer.csrf(&session.raw)).then_some(session)
+    same(sent, &app.sealer.csrf(&session.raw)).then_some(session)
 }
 
 /// A path on this service, never another site.
 fn local_path(next: Option<&String>) -> String {
     match next {
-        Some(path) if path.starts_with('/') && !path.starts_with("//") && !path.contains('\\') => path.clone(),
+        // Browsers drop tabs and newlines from a URL, so `/\t/evil.example` would become
+        // `//evil.example`: no control characters at all.
+        Some(path) if path.starts_with('/') && !path.starts_with("//") && !path.contains('\\') && !path.chars().any(char::is_control) => {
+            path.clone()
+        }
         _ => "/account".into(),
     }
 }
@@ -214,6 +219,11 @@ pub fn daemon_redirect(raw: &str) -> Option<url::Url> {
         }
         _ => None,
     }
+}
+
+/// Equality that does not stop at the first difference.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn random_hex(n: usize) -> String {
@@ -277,41 +287,50 @@ async fn start(State(app): State<Arc<App>>, Path(provider): Path<String>, Query(
     response
 }
 
+/// Whatever happens, a sign-in in progress is used up by its callback, and nothing about
+/// the reply may be cached.
 async fn callback(
     State(app): State<Arc<App>>,
     Path(provider): Path<String>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(provider) = Provider::parse(&provider) else {
-        return problem(&app, None, StatusCode::NOT_FOUND, "Not available", "That way of signing in is not set up here.");
+    let mut response = finish_sign_in(&app, &provider, &headers, &q).await;
+    response.headers_mut().append(header::SET_COOKIE, set_cookie(&app, FLOW, "", 0));
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn finish_sign_in(app: &App, provider: &str, headers: &HeaderMap, q: &HashMap<String, String>) -> Response {
+    let Some(provider) = Provider::parse(provider) else {
+        return problem(app, None, StatusCode::NOT_FOUND, "Not available", "That way of signing in is not set up here.");
     };
     if q.contains_key("error") {
-        return problem(&app, None, StatusCode::BAD_REQUEST, "Signed out", "The sign-in was cancelled.");
+        return problem(app, None, StatusCode::BAD_REQUEST, "Signed out", "The sign-in was cancelled.");
     }
-    let flow = cookie(&headers, FLOW).and_then(|raw| app.sealer.open("signin", &raw));
-    let Some(flow) = flow.filter(|f| f["provider"] == provider.id() && q.get("state").is_some_and(|s| f["state"] == *s)) else {
-        return problem(&app, None, StatusCode::BAD_REQUEST, "Start again", "This sign-in has expired or was not started here.");
+    let flow = cookie(headers, FLOW).and_then(|raw| app.sealer.open("signin", &raw));
+    let Some(flow) = flow.filter(|f| f["provider"] == provider.id() && q.get("state").is_some_and(|s| f["state"].as_str().is_some_and(|expected| same(expected, s)))) else {
+        return problem(app, None, StatusCode::BAD_REQUEST, "Start again", "This sign-in has expired or was not started here.");
     };
     let Some(code) = q.get("code") else {
-        return problem(&app, None, StatusCode::BAD_REQUEST, "Start again", "The provider sent no code.");
+        return problem(app, None, StatusCode::BAD_REQUEST, "Start again", "The provider sent no code.");
     };
     let identity = match provider.identify(&app.http, &app.config, code).await {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("tm-commons: {} sign-in failed: {err:#}", provider.label());
-            return problem(&app, None, StatusCode::BAD_GATEWAY, "Could not sign in", &format!("{} did not confirm who you are. Try again.", provider.label()));
+            return problem(app, None, StatusCode::BAD_GATEWAY, "Could not sign in", &format!("{} did not confirm who you are. Try again.", provider.label()));
         }
     };
     let user = match app.db.upsert_user(&identity).await {
         Ok(user) => user,
         Err(err) => {
             eprintln!("tm-commons: cannot save a user: {err:#}");
-            return problem(&app, None, StatusCode::INTERNAL_SERVER_ERROR, "Could not sign in", "Something went wrong on our side.");
+            return problem(app, None, StatusCode::INTERNAL_SERVER_ERROR, "Could not sign in", "Something went wrong on our side.");
         }
     };
     if user.banned {
-        return problem(&app, None, StatusCode::FORBIDDEN, "Banned", "This account may not use the Commons.");
+        return problem(app, None, StatusCode::FORBIDDEN, "Banned", "This account may not use the Commons.");
     }
     let sealed = app.sealer.seal("session", &json!({ "uid": user.id, "exp": tm_token::now() + SESSION_DAYS * 86_400 }));
     let next = match flow["redirect"].as_str() {
@@ -319,8 +338,7 @@ async fn callback(
         None => local_path(flow["next"].as_str().map(str::to_string).as_ref()),
     };
     let mut response = see_other(&next);
-    response.headers_mut().append(header::SET_COOKIE, set_cookie(&app, SESSION, &sealed, SESSION_DAYS * 86_400));
-    response.headers_mut().append(header::SET_COOKIE, set_cookie(&app, FLOW, "", 0));
+    response.headers_mut().append(header::SET_COOKIE, set_cookie(app, SESSION, &sealed, SESSION_DAYS * 86_400));
     response
 }
 

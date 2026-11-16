@@ -13,7 +13,7 @@ It runs on a small Linux VPS behind Caddy, and keeps its data in Neon.
 | What | Where it comes from | Goes in |
 | --- | --- | --- |
 | A domain name, such as `commons.yourdomain.com` | Your registrar: an A record pointing at the VPS | `TM_COMMONS_URL`, the Caddyfile |
-| A Postgres connection string | Neon: the project's Connect dialog, with connection pooling off | `DATABASE_URL` |
+| A Postgres connection string | Neon: the project's Connect dialog, pooled is fine; also set the direct string as `DATABASE_URL_DIRECT` (optional, used only to create the tables) | `DATABASE_URL` |
 | A Google OAuth client ID and secret | Google Cloud console, see below | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` |
 | A GitHub OAuth app client ID and secret | GitHub, see below | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` |
 | The moderators | You | `TM_COMMONS_MODERATORS` |

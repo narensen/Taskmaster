@@ -23,7 +23,7 @@ async fn run() -> anyhow::Result<()> {
         Some("serve") => tm_commons::serve(Config::from_env()?).await,
         Some("check") => {
             let config = Config::from_env()?;
-            tm_commons::open_db(&config.database).await?;
+            tm_commons::open_db(&config.database, config.database_direct.as_deref()).await?;
             tm_token::Signer::from_seed(&config.signing_key)?;
             let providers: Vec<&str> = tm_commons::oauth::Provider::enabled(&config).iter().map(|p| p.label()).collect();
             println!("ok: {} with sign-in by {}", config.url, providers.join(" and "));

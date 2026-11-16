@@ -29,14 +29,27 @@ pub use config::Config;
 pub use db::{Db, Memory};
 
 /// `memory` keeps everything in this process; anything else is a Postgres URL.
-pub async fn open_db(url: &str) -> anyhow::Result<Arc<dyn Db>> {
-    let db: Arc<dyn Db> = if url == "memory" {
+///
+/// `direct` is an optional non-pooled URL used only to create the tables; the service
+/// itself then runs over `url`, which may be a transaction-mode pooler.
+pub async fn open_db(url: &str, direct: Option<&str>) -> anyhow::Result<Arc<dyn Db>> {
+    if url == "memory" {
         eprintln!("tm-commons: DATABASE_URL is `memory`: nothing survives a restart");
-        Arc::new(Memory::default())
-    } else {
-        Arc::new(pg::Postgres::connect(url).await?)
-    };
-    db.migrate().await?;
+        let db: Arc<dyn Db> = Arc::new(Memory::default());
+        db.migrate().await?;
+        return Ok(db);
+    }
+    match direct {
+        Some(direct) if direct != url => {
+            let migrator = pg::Postgres::connect(direct).await.context("DATABASE_URL_DIRECT")?;
+            migrator.migrate().await?;
+        }
+        _ => {}
+    }
+    let db: Arc<dyn Db> = Arc::new(pg::Postgres::connect(url).await?);
+    if direct.is_none_or(|d| d == url) {
+        db.migrate().await?;
+    }
     Ok(db)
 }
 
@@ -46,7 +59,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     }
     let bind = config.bind;
     let url = config.url.clone();
-    let db = open_db(&config.database).await?;
+    let db = open_db(&config.database, config.database_direct.as_deref()).await?;
     let app = Arc::new(App::new(config, db)?);
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("cannot listen on {bind}"))?;
     eprintln!("tm-commons: {url} (listening on {bind})");

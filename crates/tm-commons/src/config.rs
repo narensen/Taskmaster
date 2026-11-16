@@ -45,6 +45,9 @@ pub struct Config {
     pub bind: SocketAddr,
     /// A Postgres connection string, or `memory` to keep everything in this process.
     pub database: String,
+    /// Optional direct (non-pooled) Postgres URL, used only to run migrations. Neon's
+    /// pooled endpoint can refuse DDL; leave it unset to migrate over `database`.
+    pub database_direct: Option<String>,
     /// The Ed25519 seed that signs sign-in tokens. `tm-commons keygen` makes one.
     pub signing_key: String,
     /// Signs cookies. `tm-commons keygen` makes one.
@@ -113,6 +116,7 @@ impl Config {
             Some(addr) => addr.trim().parse().map_err(|_| anyhow::anyhow!("TM_COMMONS_BIND `{addr}` is not an address like 127.0.0.1:8740"))?,
             None => SocketAddr::from(([127, 0, 0, 1], 8740)),
         };
+        let database_direct = get("DATABASE_URL_DIRECT").filter(|v| !is_placeholder(v)).map(|v| v.trim().to_string());
         let moderators = get("TM_COMMONS_MODERATORS")
             .unwrap_or_default()
             .split(',')
@@ -127,6 +131,7 @@ impl Config {
             url,
             bind,
             database,
+            database_direct,
             signing_key,
             session_secret,
             google,

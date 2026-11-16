@@ -362,3 +362,127 @@ fn plain_http_is_only_for_this_machine_a_private_network_or_a_tailnet() {
         assert!(daemon_redirect(bad).is_none(), "{bad}");
     }
 }
+
+#[tokio::test]
+async fn the_sign_in_flow_is_bound_to_the_browser_that_started_it_and_cookies_are_locked_down() {
+    let base = service().await;
+    let mut me = Browser::new(&base);
+
+    // The way to the provider: right callback, narrow scopes, a fresh state each time, a cookie to match.
+    let first = me.get("/auth/github/start").await;
+    let url = url::Url::parse(&first.location).unwrap();
+    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["redirect_uri"], format!("{base}/auth/github/callback"));
+    assert_eq!(query["scope"], "read:user user:email");
+    assert_eq!(query["client_id"], "gh-id");
+    let state = query["state"].clone();
+    assert_eq!(state.len(), 32);
+    let alias = me.get("/auth/google").await;
+    let g: HashMap<_, _> = url::Url::parse(&alias.location).unwrap().query_pairs().into_owned().collect();
+    assert_eq!((g["scope"].as_str(), g["response_type"].as_str()), ("openid email profile", "code"));
+    assert_ne!(g["state"], state);
+
+    // Flow cookie: HttpOnly, Lax, short. (Plain HTTP on this machine, so not Secure here.)
+    let raw = me.http.get(format!("{base}/auth/github/start")).send().await.unwrap();
+    let cookie = raw.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax") && cookie.contains("Max-Age=600") && cookie.contains("Path=/"), "{cookie}");
+
+    // A callback with the Google state to the GitHub endpoint, or a missing code, or a provider's own error, is refused.
+    let mut other = Browser::new(&base);
+    let started = other.get("/auth/github/start").await;
+    let real: HashMap<_, _> = url::Url::parse(&started.location).unwrap().query_pairs().into_owned().collect();
+    assert_eq!(other.get(&format!("/auth/google/callback?code=good&state={}", real["state"])).await.status, 400);
+    assert_eq!(other.get(&format!("/auth/github/callback?state={}", real["state"])).await.status, 400);
+    let cancelled = other.get("/auth/github/callback?error=access_denied").await;
+    assert_eq!(cancelled.status, 400);
+    assert!(!other.cookies.contains_key("tm_signin"), "a callback uses up the sign-in");
+    // Used up: the same state cannot be replayed.
+    assert_eq!(other.get(&format!("/auth/github/callback?code=good&state={}", real["state"])).await.status, 400);
+
+    // Someone else's state means nothing without the matching cookie.
+    let mut thief = Browser::new(&base);
+    assert_eq!(thief.get(&format!("/auth/github/callback?code=good&state={}", real["state"])).await.status, 400);
+
+    // A good sign-in sets the session cookie with every flag, and the reply is not cached.
+    let mut ana = Browser::new(&base);
+    let started = ana.get("/auth/github/start").await;
+    let st = url::Url::parse(&started.location).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
+    let request = ana.http.get(format!("{base}/auth/github/callback?code=good&state={st}")).header("cookie", format!("tm_signin={}", ana.cookies["tm_signin"]));
+    let reply = request.send().await.unwrap();
+    assert_eq!(reply.headers().get("cache-control").unwrap(), "no-store");
+    let cookies: Vec<String> = reply.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
+    let session = cookies.iter().find(|c| c.starts_with("tm_session=")).unwrap();
+    assert!(session.contains("HttpOnly") && session.contains("SameSite=Lax") && session.contains("Path=/") && session.contains("Max-Age=2592000"), "{session}");
+    assert!(cookies.iter().any(|c| c.starts_with("tm_signin=;") && c.contains("Max-Age=0")));
+}
+
+#[tokio::test]
+async fn sign_in_never_redirects_off_site_and_sign_out_clears_the_session() {
+    let base = service().await;
+    for next in ["https://evil.example", "//evil.example", "/\\evil.example", "%2F%09%2Fevil.example", "%2F%0A%2Fevil.example", "javascript:1"] {
+        let mut browser = Browser::new(&base);
+        let landed = browser.sign_in("github", &format!("next={next}")).await;
+        assert_eq!((landed.status, landed.location.as_str()), (303, "/account"), "{next}");
+    }
+    let mut ana = Browser::new(&base);
+    ana.sign_in("github", "next=%2Fentries").await;
+    assert_eq!(ana.get("/account").await.status, 200);
+    let csrf = ana.csrf("/account").await;
+    // A forged sign-out does nothing; a real one clears the cookie.
+    ana.post("/signout", &[("csrf", "forged")]).await;
+    assert_eq!(ana.get("/account").await.status, 200);
+    let out = ana.post("/signout", &[("csrf", &csrf)]).await;
+    assert_eq!((out.status, out.location.as_str()), (303, "/"));
+    assert!(!ana.cookies.contains_key("tm_session"));
+    assert_eq!(ana.get("/account").await.status, 303);
+}
+
+#[test]
+fn the_moderators_are_found_by_github_login_or_verified_google_email_and_nobody_else() {
+    use crate::config::Config;
+    let vars: HashMap<&str, &str> = [
+        ("TM_COMMONS_URL", "https://commons.test"),
+        ("DATABASE_URL", "memory"),
+        ("TM_COMMONS_SIGNING_KEY", "k"),
+        ("TM_COMMONS_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+        ("GITHUB_CLIENT_ID", "i"),
+        ("GITHUB_CLIENT_SECRET", "s"),
+        ("TM_COMMONS_MODERATORS", "github:narensen, google:scartegy@gmail.com"),
+        ("DATABASE_URL_DIRECT", "postgresql://direct.example/db"),
+    ]
+    .into_iter()
+    .collect();
+    let config = Config::from_vars(|n| vars.get(n).map(|v| v.to_string())).unwrap();
+    assert_eq!(config.database_direct.as_deref(), Some("postgresql://direct.example/db"));
+    let claims = |sub: &str, login: Option<&str>, email: Option<&str>| tm_token::Claims {
+        iss: String::new(),
+        sub: sub.into(),
+        aud: DAEMON_AUDIENCE.into(),
+        iat: 0,
+        exp: 0,
+        login: login.map(Into::into),
+        email: email.map(Into::into),
+        name: None,
+    };
+    let allowed = |c: &tm_token::Claims| c.allowed_by(&config.moderators);
+    assert!(allowed(&claims("github:1", Some("NarenSen"), None)));
+    assert!(allowed(&claims("google:9", None, Some("Scartegy@Gmail.com"))));
+    assert!(!allowed(&claims("github:2", Some("narensen2"), None)));
+    assert!(!allowed(&claims("google:9", None, Some("other@gmail.com"))));
+    // An unverified Google email is never kept, so it can never match.
+    assert!(!allowed(&claims("google:9", None, None)));
+    // The GitHub rule is for GitHub accounts only, and the Google rule for Google accounts.
+    assert!(!allowed(&claims("google:9", Some("narensen"), None)));
+    // `google:<email>` is for Google accounts only: a GitHub account with that email is not accepted.
+    assert!(!allowed(&claims("github:3", Some("x"), Some("scartegy@gmail.com"))));
+}
+
+#[tokio::test]
+async fn the_database_is_migrated_over_the_direct_url_only_when_one_is_given() {
+    // `memory` has no direct endpoint; it must work with and without one.
+    assert!(crate::open_db("memory", None).await.is_ok());
+    assert!(crate::open_db("memory", Some("postgresql://unused.example/db")).await.is_ok());
+    // A direct URL that cannot be reached is a clear error, not a silent skip.
+    let err = crate::open_db("postgresql://u:p@127.0.0.1:1/x", Some("postgresql://u:p@127.0.0.1:1/x?sslmode=disable")).await.err().unwrap();
+    assert!(format!("{err:#}").contains("DATABASE_URL"), "{err:#}");
+}

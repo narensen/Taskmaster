@@ -83,6 +83,8 @@ export interface ComposerHandle {
   isEmpty: () => boolean;
   read: () => Message;
   attach: (chips: Chip[]) => void;
+  /** Replace the text with `text` and put the caret at its end. */
+  setText: (text: string) => void;
 }
 
 export interface ComposerProps {
@@ -223,6 +225,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     isEmpty: () => empty && attachments.length === 0,
     read,
     attach: (chips) => setAttachments((a) => [...a, ...chips]),
+    setText: (text) => {
+      if (!ref.current) return;
+      ref.current.textContent = text;
+      sync();
+      ref.current.focus();
+      const range = document.createRange();
+      range.selectNodeContents(ref.current);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    },
   }));
 
   useOn<Chip>("chip", (chip) => {

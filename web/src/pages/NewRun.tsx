@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, Sparkles } from "lucide-react";
+import { ArrowUp, GitMerge, ListChecks, Settings2, ShieldCheck, Sparkles, Users, X } from "lucide-react";
 import { api, DEFAULT_ROLES, type RoleName, type Roles } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
@@ -29,6 +29,7 @@ export function NewRun() {
   const chosen = master?.models.find((m) => m.id === models.master) ?? master?.models.find((m) => m.default) ?? master?.models[0];
   const modelName = chosen?.name ?? models.master ?? "default";
   const pill = `${master?.name ?? roles.master} · ${modelName}`;
+  const project = defaults.data?.project?.split(/[/\\]/).filter(Boolean).pop();
 
   useEffect(() => {
     composer.current?.focus();
@@ -55,8 +56,13 @@ export function NewRun() {
   return (
     <div className="page ask-page">
       <div className="ask-hero">
-        <h1>What should we build?</h1>
-        <p className="ask-sub muted">or start from the project as it is</p>
+        <div className="ask-mark" aria-hidden>
+          <img src="/icon.png" alt="" width={36} height={36} />
+        </div>
+        <h1>
+          What should we build{project ? <> in <span className="ask-project">{project}</span></> : null}?
+        </h1>
+        <p className="ask-sub muted">Describe the result. Taskmaster plans it, splits it across agents and checks it before merging.</p>
         <Composer
           ref={composer}
           bus
@@ -65,28 +71,48 @@ export function NewRun() {
           footer={
             <div className="composer-foot">
               <div className="composer-actions">
-                <button type="button" className="model-pill" onClick={() => setAdvanced((v) => !v)} title="Harnesses and models">
+                <button
+                  type="button"
+                  className={`model-pill ${advanced ? "on" : ""}`}
+                  aria-expanded={advanced}
+                  onClick={() => setAdvanced((v) => !v)}
+                  title="Harnesses and models"
+                >
                   <Sparkles size={13} />
                   <span className="clip">{pill}</span>
                 </button>
+                <span className="foot-sep" aria-hidden />
+                <span className="foot-note">
+                  <Users size={13} aria-hidden /> {parallel} at once
+                </span>
               </div>
               <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
-                <ArrowUp size={15} />
+                {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
               </button>
             </div>
           }
         />
-        <div className="row between gap wrap">
-          <label className="check small">
+        <div className="ask-options">
+          <label className={`toggle-chip ${yes ? "on" : ""}`}>
             <input type="checkbox" checked={yes} onChange={(e) => setYes(e.target.checked)} />
             Build without asking me to approve the plan
           </label>
-          <span className="hint">Enter sends · Shift+Enter breaks the line · ↑ recalls the last prompt</span>
+          <button type="button" className="ghost small" onClick={() => setAdvanced((v) => !v)} aria-expanded={advanced}>
+            <Settings2 size={13} aria-hidden /> Options
+          </button>
+          <span className="hint ask-keys">
+            <kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line · <kbd>↑</kbd> last prompt
+          </span>
         </div>
         <Problem error={action.error} />
         {advanced && (
-          <div className="ask-advanced">
-            <h2 className="section-title">Harnesses and models</h2>
+          <section className="ask-advanced" aria-label="Harnesses and models">
+            <div className="row between">
+              <h2 className="section-title">Harnesses and models</h2>
+              <button type="button" className="icon" aria-label="Close options" onClick={() => setAdvanced(false)}>
+                <X size={15} />
+              </button>
+            </div>
             <Problem error={providers.error} onRetry={providers.reload} />
             {providers.loading && <div className="muted small">Asking each harness for its models…</div>}
             <div className="roles">
@@ -123,9 +149,45 @@ export function NewRun() {
                 {action.busy ? "Starting…" : "Start planning"}
               </button>
             </div>
-          </div>
+          </section>
+        )}
+        {!advanced && (
+          <>
+            <div className="ask-ideas" aria-label="Starting points">
+              {IDEAS.map((idea) => (
+                <button key={idea} type="button" className="idea" onClick={() => composer.current?.setText(idea)}>
+                  {idea}
+                </button>
+              ))}
+            </div>
+            <ol className="ask-steps" aria-label="How a run goes">
+              <li>
+                <ListChecks size={15} aria-hidden />
+                <span><strong>Plan</strong> pages, contracts and a design spec you approve</span>
+              </li>
+              <li>
+                <Users size={15} aria-hidden />
+                <span><strong>Build</strong> in parallel, one agent per page</span>
+              </li>
+              <li>
+                <ShieldCheck size={15} aria-hidden />
+                <span><strong>Check</strong> with free static and browser checks</span>
+              </li>
+              <li>
+                <GitMerge size={15} aria-hidden />
+                <span><strong>Merge</strong> into your branch, review on demand</span>
+              </li>
+            </ol>
+          </>
         )}
       </div>
     </div>
   );
 }
+
+const IDEAS = [
+  "A landing page with a hero, three feature cards and a signup form",
+  "Add a settings page with a dark mode toggle",
+  "A small dashboard with a table and a chart",
+];
+

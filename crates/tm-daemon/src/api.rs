@@ -245,6 +245,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/reject", post(reject_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/search", get(web_search))
         .route("/api/providers", get(providers))
         .route("/api/templates", get(templates))
         .route("/api/dictionary", get(search_dictionary))
@@ -849,6 +850,36 @@ async fn providers(Query(query): Query<HashMap<String, String>>) -> Reply {
 
 async fn templates() -> Json<Value> {
     Json(json!({ "templates": crate::template::BUILT_IN }))
+}
+
+async fn web_search(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
+    let q = query.get("q").map(|q| q.trim().to_string()).unwrap_or_default();
+    if q.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "q is required"));
+    }
+    let endpoint = match query.get("endpoint").map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        Some(e) => e.to_string(),
+        None => crate::settings::Settings::load(&app.project).unwrap_or_default().search_endpoint(),
+    };
+    let url = crate::search::build_url(&endpoint, &q);
+    let shown = endpoint.split('?').next().unwrap_or("").to_string();
+    let fetched = tokio::task::spawn_blocking(move || {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(6))
+            .build()
+            .get(&url)
+            .set("accept", "application/json")
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_json::<Value>()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match fetched {
+        Ok(value) => ok(json!({ "endpoint": shown, "results": crate::search::parse(&value) })),
+        Err(e) => Err(fail(StatusCode::BAD_GATEWAY, format!("the search endpoint {shown} did not answer: {e}"))),
+    }
 }
 
 async fn search_dictionary(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {

@@ -2,10 +2,9 @@
 // search, the terminal transcript, and the read-only file preview.
 
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import { api, type AgentEntry, type RunDetail } from "../api";
+import { api, searchWeb, type AgentEntry, type RunDetail } from "../api";
 import { ExternalLink, Rich, label } from "../paths";
 import { emit, openMenu, toast } from "../overlay";
-import { Link } from "../router";
 import { usePrefs } from "../prefs";
 
 // Browser.
@@ -133,19 +132,7 @@ interface Result {
   title: string;
   url: string;
   snippet: string;
-}
-
-function parseResults(data: unknown): Result[] {
-  const d = (data ?? {}) as Record<string, unknown>;
-  const web = (d.web as { results?: unknown[] } | undefined)?.results;
-  const list = (Array.isArray(data) ? data : (web ?? d.results ?? d.items ?? d.organic_results ?? [])) as Record<string, unknown>[];
-  return list
-    .map((r) => ({
-      title: String(r.title ?? r.name ?? r.url ?? ""),
-      url: String(r.url ?? r.link ?? r.href ?? ""),
-      snippet: String(r.content ?? r.snippet ?? r.description ?? ""),
-    }))
-    .filter((r) => r.url.startsWith("http"));
+  engine: string;
 }
 
 export function SearchTab() {
@@ -154,31 +141,18 @@ export function SearchTab() {
   const [results, setResults] = useState<Result[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  if (!searchEndpoint) {
-    return (
-      <div className="pad" data-testid="search-empty">
-        <p>No search endpoint is saved, so web search is off.</p>
-        <p className="muted small">Search sends your query to an endpoint you choose (a SearXNG instance, for example). Nothing is scraped and no key is built in.</p>
-        <Link to="/settings#search" className="link-word">
-          Set one in Settings
-        </Link>
-      </div>
-    );
-  }
+  const [via, setVia] = useState("local SearXNG (127.0.0.1:8888)");
   const search = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!q.trim()) return;
     setBusy(true);
     setError(null);
     try {
-      const url = searchEndpoint.includes("{q}")
-        ? searchEndpoint.replace("{q}", encodeURIComponent(q))
-        : `${searchEndpoint}${searchEndpoint.includes("?") ? "&" : "?"}q=${encodeURIComponent(q)}`;
-      const response = await fetch(url, { headers: { accept: "application/json" } });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      setResults(parseResults(await response.json()));
+      const found = await searchWeb(q.trim(), searchEndpoint);
+      setVia(found.endpoint);
+      setResults(found.results.map((r) => ({ title: r.title, url: r.url, snippet: r.content, engine: r.engine })));
     } catch (err) {
-      setError(`The search endpoint did not answer: ${err instanceof Error ? err.message : String(err)}`);
+      setError(`${err instanceof Error ? err.message : String(err)}`);
       setResults(null);
     } finally {
       setBusy(false);
@@ -192,14 +166,17 @@ export function SearchTab() {
           {busy ? "…" : "Search"}
         </button>
       </form>
-      <div className="muted small pad-x">via {searchEndpoint.replace(/\?.*$/, "")}</div>
+      <div className="muted small pad-x">via {via}</div>
       {error && <div className="pad error-line">{error}</div>}
       {results && results.length === 0 && <div className="pad muted">No results.</div>}
       <ol className="results">
         {results?.map((r) => (
           <li key={r.url} className="result">
             <ExternalLink href={r.url}>{r.title}</ExternalLink>
-            <div className="muted small break">{r.url}</div>
+            <div className="muted small break">
+              {r.url}
+              {r.engine && <span className="muted small"> · {r.engine}</span>}
+            </div>
             {r.snippet && <p className="small">{r.snippet}</p>}
             <button
               className="ghost small"

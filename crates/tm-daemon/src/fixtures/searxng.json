@@ -1,0 +1,15 @@
+{
+  "query": "rust async",
+  "number_of_results": 3,
+  "results": [
+    {"url": "https://rust-lang.github.io/async-book/", "title": "Asynchronous Programming in Rust", "content": "An introduction to async programming in Rust.", "engine": "duckduckgo", "engines": ["duckduckgo", "google"], "score": 4.0, "category": "general"},
+    {"url": "https://tokio.rs/", "title": "Tokio", "engine": "brave", "engines": ["brave"], "score": 2.0, "category": "general"},
+    {"url": "ftp://example.org/async.txt", "title": "Not http", "content": "dropped", "engine": "mojeek", "engines": ["mojeek"], "score": 1.0, "category": "general"},
+    {"url": "https://docs.rs/futures", "title": "futures", "content": "Futures and streams.", "engines": ["bing", "google"], "score": 1.5, "category": "general"}
+  ],
+  "answers": [],
+  "corrections": [],
+  "infoboxes": [],
+  "suggestions": ["rust async await"],
+  "unresponsive_engines": [["qwant", "timeout"]]
+}

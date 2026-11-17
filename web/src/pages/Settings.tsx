@@ -215,7 +215,7 @@ export function Settings() {
         </Section>
       )}
 
-      <Section id="search" title="Search endpoint" note="The Web search tab sends your query here. Use {q} for the query, or it is added as ?q=. Kept in this browser.">
+      <Section id="search" title="Search endpoint" note="The Web search tab asks the daemon to search here. Empty = the daemon default (local SearXNG at http://127.0.0.1:8888/search?format=json&q={q}). Use {q} for the query, or it is added as ?q=. Kept in this browser.">
         <form
           className="row gap"
           onSubmit={(e) => {
@@ -224,7 +224,7 @@ export function Settings() {
             toast(endpoint.trim() ? "Search endpoint saved" : "Search endpoint removed");
           }}
         >
-          <input className="grow" placeholder="https://searx.example.org/search?format=json&q={q}" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
+          <input className="grow" placeholder="empty = http://127.0.0.1:8888/search?format=json&q={q}" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
           <button className="small">Save</button>
         </form>
       </Section>

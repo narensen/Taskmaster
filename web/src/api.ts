@@ -462,6 +462,19 @@ async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Pr
 
 const enc = encodeURIComponent;
 
+export interface SearchHit {
+  title: string;
+  url: string;
+  content: string;
+  engine: string;
+}
+
+export function searchWeb(q: string, endpoint: string) {
+  const params = new URLSearchParams({ q });
+  if (endpoint) params.set("endpoint", endpoint);
+  return call<{ endpoint: string; results: SearchHit[] }>("GET", `/api/search?${params}`);
+}
+
 export const api = {
   health: () => call<Health>("GET", "/api/health"),
   pair: (code: string) => call<{ token: string }>("POST", "/api/pair", { code }),

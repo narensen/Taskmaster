@@ -26,6 +26,7 @@ pub struct Settings {
     pub commons: CommonsSettings,
     pub approvals: ApprovalSettings,
     pub preview: PreviewSettings,
+    pub search: SearchSettings,
     /// The editor `Open` uses: one of the ids in `GET /api/editors`, or the name of a
     /// program on this machine. Empty means `$VISUAL`, then `$EDITOR`, then whatever is
     /// installed.
@@ -46,6 +47,29 @@ pub struct ApprovalSettings {
 impl Default for ApprovalSettings {
     fn default() -> Self {
         ApprovalSettings { mode: "never".into(), timeout_secs: 600 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SearchSettings {
+    /// The JSON search endpoint; `{q}` stands for the query. `TASKMASTER_SEARCH_URL` overrides it.
+    pub endpoint: String,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        SearchSettings { endpoint: "http://127.0.0.1:8888/search?format=json&q={q}".into() }
+    }
+}
+
+impl Settings {
+    /// The search endpoint: the environment first, then the settings file.
+    pub fn search_endpoint(&self) -> String {
+        match std::env::var("TASKMASTER_SEARCH_URL") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => self.search.endpoint.clone(),
+        }
     }
 }
 

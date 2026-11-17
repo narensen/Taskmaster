@@ -189,6 +189,8 @@ impl ApprovalGate {
 pub fn ask_reason(mode: Mode, kind: ToolKind, unsafe_edit: bool) -> Option<&'static str> {
     match (mode, kind) {
         (Mode::Never, _) => None,
+        // The gate holds the browser to the run's own preview; there is nothing to ask.
+        (_, ToolKind::Browser) => None,
         (Mode::Always, ToolKind::Dictionary) => None,
         (Mode::Always, _) => Some("asks before every tool call"),
         (Mode::Risky, ToolKind::Execute) => Some("runs a shell command"),
@@ -252,6 +254,7 @@ fn kind_name(kind: ToolKind) -> &'static str {
         ToolKind::Execute => "execute",
         ToolKind::Fetch => "fetch",
         ToolKind::Dictionary => "dictionary",
+        ToolKind::Browser => "browser",
         ToolKind::Other => "other",
     }
 }

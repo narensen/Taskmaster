@@ -260,7 +260,9 @@ impl Session {
                 let mut request = permission_request(&params["toolCall"]);
                 let prefix = self.dictionary_prefix.as_deref();
                 if prefix.is_some_and(|p| request.tool.starts_with(p)) {
-                    request.kind = ToolKind::Dictionary;
+                    request.kind = if is_browser_tool(&request.tool) { ToolKind::Browser } else { ToolKind::Dictionary };
+                } else if is_browser_tool(&request.tool) {
+                    request.kind = ToolKind::Browser;
                 }
                 let allowed = self.gate.decide_async(&request).await == Decision::Allow;
                 if !allowed {
@@ -383,7 +385,13 @@ fn permission_request(tool_call: &Value) -> PermissionRequest {
         kind,
         paths,
         command: raw["CommandLine"].as_str().or_else(|| raw["command"].as_str()).map(str::to_string),
+        url: raw["url"].as_str().or_else(|| raw["path"].as_str().filter(|p| p.starts_with('/'))).map(str::to_string),
     }
+}
+
+/// Taskmaster's browser tools, however the harness prefixes their names.
+pub fn is_browser_tool(name: &str) -> bool {
+    ["browser_open", "browser_click", "browser_type", "browser_screenshot", "browser_console"].iter().any(|tool| name.ends_with(tool))
 }
 
 /// Pick the one-off allow or reject option; never a standing "always" grant.

@@ -16,14 +16,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use crate::browser::Browser;
 use crate::checks::Timing;
 use tm_core::PageId;
 use tm_verify::Owners;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio_tungstenite::tungstenite::Message;
 
 /// Output kept from a failed step: the end, where the errors are.
 const KEEP: usize = 6000;
@@ -285,7 +284,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn free_port() -> anyhow::Result<u16> {
+pub(crate) async fn free_port() -> anyhow::Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     Ok(listener.local_addr()?.port())
 }
@@ -319,110 +318,8 @@ async fn start_app(tree: &Path) -> anyhow::Result<(Server, u16)> {
     bail!("the app did not start in 60 seconds: {}", tail(said.trim()))
 }
 
-struct Browser {
-    _process: tokio::process::Child,
-    _profile: PathBuf,
-    socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    next_id: u64,
-    events: Vec<Value>,
-}
-
-impl Drop for Browser {
-    fn drop(&mut self) {
-        let _ = self._process.start_kill();
-        let _ = std::fs::remove_dir_all(&self._profile);
-    }
-}
-
-impl Browser {
-    async fn launch(chrome: &Path) -> anyhow::Result<Browser> {
-        let profile = std::env::temp_dir().join(format!("tm-chrome-{}-{}", std::process::id(), free_port().await?));
-        let mut command = Command::new(chrome);
-        command.args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--hide-scrollbars",
-            "--window-size=1280,800",
-            "--remote-debugging-port=0",
-            "--remote-allow-origins=*",
-        ]);
-        command.arg(format!("--user-data-dir={}", profile.display()));
-        // Chrome refuses its own sandbox as root, which is how containers run.
-        if std::env::var("USER").as_deref() == Ok("root") {
-            command.arg("--no-sandbox");
-        }
-        command.arg("about:blank");
-        let mut process =
-            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().context("could not start Chrome")?;
-        let mut lines = BufReader::new(process.stderr.take().context("no stderr")?).lines();
-        let url = tokio::time::timeout(Duration::from_secs(20), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(at) = line.find("ws://") {
-                    return Some(line[at..].trim().to_string());
-                }
-            }
-            None
-        })
-        .await
-        .ok()
-        .flatten()
-        .context("Chrome did not open its DevTools port")?;
-        // Keep reading so Chrome never blocks on a full pipe.
-        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-        let (socket, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("cannot talk to Chrome")?;
-        Ok(Browser { _process: process, _profile: profile, socket, next_id: 0, events: Vec::new() })
-    }
-
-    async fn call(&mut self, method: &str, params: Value, session: Option<&str>) -> anyhow::Result<Value> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let mut message = json!({ "id": id, "method": method, "params": params });
-        if let Some(session) = session {
-            message["sessionId"] = json!(session);
-        }
-        self.socket.send(Message::Text(message.to_string().into())).await?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let next = tokio::time::timeout(left, self.socket.next()).await.with_context(|| format!("Chrome did not answer {method}"))?;
-            let Some(message) = next else { bail!("Chrome closed the connection") };
-            let Message::Text(text) = message? else { continue };
-            let value: Value = serde_json::from_str(&text)?;
-            if value["id"] == id {
-                if let Some(error) = value.get("error") {
-                    bail!("Chrome refused {method}: {error}");
-                }
-                return Ok(value["result"].clone());
-            }
-            if value.get("method").is_some() {
-                self.events.push(value);
-            }
-        }
-    }
-
-    /// Collect events until `done` sees one, or the time is up.
-    async fn wait_for(&mut self, within: Duration, done: impl Fn(&Value) -> bool) {
-        if self.events.iter().any(&done) {
-            return;
-        }
-        let deadline = Instant::now() + within;
-        while let Ok(Some(Ok(message))) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), self.socket.next()).await {
-            let Message::Text(text) = message else { continue };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-            let finished = done(&value);
-            self.events.push(value);
-            if finished {
-                return;
-            }
-        }
-    }
-}
-
 /// What went wrong on one page, from the events Chrome sent for its session.
-fn problems(events: &[Value], session: &str, url: &str, dynamic: bool) -> Vec<String> {
+pub(crate) fn problems(events: &[Value], session: &str, url: &str, dynamic: bool) -> Vec<String> {
     let mut out = Vec::new();
     for event in events.iter().filter(|e| e["sessionId"] == session) {
         let params = &event["params"];

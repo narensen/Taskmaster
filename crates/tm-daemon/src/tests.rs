@@ -764,7 +764,7 @@ async fn a_prompt_locks_the_plan_and_publishes_the_dictionary() {
     assert!(planner_calls(&world)[0].contains("Dictionary is empty"));
     // The small pass's first build runs at low effort too.
     let builds: Vec<String> = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).cloned().collect();
-    assert!(!builds.is_empty() && builds[0].ends_with("[effort=low][dictionary=true]"), "{builds:?}");
+    assert!(!builds.is_empty() && builds[0].contains("[effort=low][dictionary=true]"), "{builds:?}");
     assert_eq!(world.plans.load(Ordering::SeqCst), 1);
     assert_eq!(read(&tmp.0.join("contracts/types.ts")), "export type Id = string;\n");
     assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));
@@ -807,7 +807,7 @@ async fn an_existing_dictionary_entry_is_cited_without_a_rewrite() {
     assert!(calls[0].contains("export const theme = \"dark\""), "{}", calls[0]);
     // A stored entry no longer forces the slow pass: it is listed, and the master gets no tools.
     assert!(calls[0].contains("Plan this small product quickly."), "{}", calls[0]);
-    assert!(calls[0].ends_with("[effort=low][dictionary=false]"), "{}", calls[0]);
+    assert!(calls[0].contains("[effort=low][dictionary=false]"), "{}", calls[0]);
     assert!(calls[1].contains("different content"), "{}", calls[1]);
     assert_eq!(commons.get("theme").unwrap().unwrap().content, "export const theme = \"dark\";\n");
     let local = LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();
@@ -1287,6 +1287,36 @@ async fn the_planner_is_offered_enabled_skills_and_unknown_ones_are_dropped() {
 }
 
 #[tokio::test]
+async fn workers_on_a_web_project_get_a_browser_on_their_own_preview() {
+    if crate::runtime::chrome().is_none() {
+        eprintln!("no Chrome here; workers get no browser");
+        return;
+    }
+    let tmp = seeded("browser-web");
+    std::fs::write(tmp.0.join("package.json"), "{\"name\":\"shop\",\"private\":true}\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "web"]);
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let briefs: Vec<&String> = calls.iter().filter(|c| c.contains("Build page `")).collect();
+    assert_eq!(briefs.len(), 2);
+    let origins: Vec<&str> = briefs
+        .iter()
+        .map(|b| b.split("A browser is ready on your own page's preview, ").nth(1).and_then(|r| r.split(';').next()).expect("the browser is offered"))
+        .collect();
+    assert!(origins.iter().all(|o| o.starts_with("http://127.0.0.1:")), "{origins:?}");
+    assert_ne!(origins[0], origins[1], "each page has a preview of its own");
+
+    // A project with nothing for a browser to show gets none.
+    let plain = seeded("browser-plain");
+    let world = World::new(Mode::Write);
+    run(config(&plain.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert!(!world.calls.lock().unwrap().iter().any(|c| c.contains("A browser is ready")));
+}
+
+#[tokio::test]
 async fn an_error_that_was_there_before_the_run_is_left_alone() {
     let tmp = typed("shared-older", "lib/old.ts(1,1): error TS2304: Cannot find name 'gone'.", "false");
     let world = World::new(Mode::Write);
@@ -1684,7 +1714,8 @@ mod http {
         }
         let (_, files) = client.get("/api/files").await;
         assert!(files["files"].as_array().unwrap().iter().any(|f| f == "src/main.rs"), "{files}");
-        assert_eq!(client.get("/api/skills").await.1, json!({ "skills": [] }));
+        let (_, skills) = client.get("/api/skills").await;
+        assert!(!skills["skills"].as_array().unwrap().iter().any(|s| s["place"] == "store"), "{skills}");
         let (_, settings) = client.get("/api/settings").await;
         assert_eq!(settings["project"], tmp.0.canonicalize().unwrap().display().to_string().as_str());
     }
@@ -1968,18 +1999,21 @@ mod http {
                     kind: tm_harness::ToolKind::Execute,
                     paths: vec![],
                     command: Some("npm test".into()),
+                    url: None,
                 };
                 let outside = tm_harness::PermissionRequest {
                     tool: "Write".into(),
                     kind: tm_harness::ToolKind::Edit,
                     paths: vec!["/etc/hosts".into()],
                     command: None,
+                    url: None,
                 };
                 let inside = tm_harness::PermissionRequest {
                     tool: "Write".into(),
                     kind: tm_harness::ToolKind::Edit,
                     paths: vec![task.cwd.join(format!("app/{id}/x.ts"))],
                     command: None,
+                    url: None,
                 };
                 for (label, request) in [("shell", &shell), ("outside", &outside), ("inside", &inside)] {
                     let decision = gate.decide_async(request).await;
@@ -2104,7 +2138,7 @@ mod http {
         let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));
         live.approvals.set_policy(crate::approvals::Policy { mode: crate::approvals::Mode::Risky, timeout: Duration::from_millis(80) });
         let gate = crate::approvals::ApprovalGate::new(WorktreeGate::new(&tmp.0, vec![]), live.clone(), "r1".into(), json!({ "id": "w" }));
-        let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("ls".into()) };
+        let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("ls".into()), url: None };
         assert_eq!(gate.decide_async(&shell).await, Decision::Deny);
         assert!(live.approvals.list(None).is_empty());
         let (_, entries) = live.read("r1", 0);
@@ -2114,10 +2148,10 @@ mod http {
         assert_eq!(reviewer.decide_async(&shell).await, Decision::Deny);
         assert_eq!(live.read("r1", 0).0, 2, "no question was written for the reviewer");
         // A network fetch is risky too; a read outside the worktree is simply refused.
-        let fetch = PermissionRequest { tool: "WebFetch".into(), kind: ToolKind::Fetch, paths: vec![], command: None };
+        let fetch = PermissionRequest { tool: "WebFetch".into(), kind: ToolKind::Fetch, paths: vec![], command: None, url: None };
         assert_eq!(gate.decide_async(&fetch).await, Decision::Deny);
         assert_eq!(live.read("r1", 0).1[2]["reason"], "fetches from the network");
-        let read = PermissionRequest { tool: "Read".into(), kind: ToolKind::Read, paths: vec!["/etc/passwd".into()], command: None };
+        let read = PermissionRequest { tool: "Read".into(), kind: ToolKind::Read, paths: vec!["/etc/passwd".into()], command: None, url: None };
         let before = live.read("r1", 0).0;
         assert_eq!(gate.decide_async(&read).await, Decision::Deny);
         assert_eq!(live.read("r1", 0).0, before);

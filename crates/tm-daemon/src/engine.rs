@@ -74,6 +74,8 @@ struct AgentRequest {
     read_only: bool,
     /// Where the agent's events go as they arrive, tagged with who it is.
     feed: Option<Feed>,
+    /// The page's own preview origin, when the agent has the browser tool.
+    browser: Option<String>,
 }
 
 struct Feed {
@@ -185,6 +187,8 @@ struct Driver {
     live: Arc<Live>,
     /// The plan came from the small planning pass: first builds run at low reasoning effort.
     small: bool,
+    /// Each page's preview and tab for the browser tool. `None` without Chrome.
+    browsers: Option<Arc<crate::browser::PageBrowsers>>,
 }
 
 impl Drop for Driver {
@@ -244,6 +248,11 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         let _ = axum::serve(listener, tm_dictionary::router(served)).await;
     });
     let _server = AbortOnDrop(server);
+    // Workers on a web page get a browser on that page's own preview.
+    let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
+    if let Some(browsers) = &browsers {
+        mcp.extend(browsers.clone());
+    }
 
     let reviewer_token = fresh_token()?;
     let verifier_token = fresh_token()?;
@@ -294,6 +303,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         parallel,
         live,
         small: false,
+        browsers,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -770,6 +780,9 @@ impl Driver {
                 (format!("page:{page}"), None)
             };
             self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
+            if units.len() == 1 {
+                self.offer_browser(&page, &worktree, &mut request);
+            }
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
                 feed.agent["unit"] = serde_json::json!(unit);
             }
@@ -794,6 +807,9 @@ impl Driver {
             .await
             .context("a worker disappeared")?
             .context("a worker task panicked")?;
+        if let Some(browsers) = &self.browsers {
+            browsers.detach(&page);
+        }
         let product = match result {
             Ok(product) => product,
             Err(err) => {
@@ -1541,6 +1557,7 @@ impl Driver {
             stall: None,
             read_only: false,
             feed: None,
+            browser: None,
         };
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
@@ -1743,7 +1760,38 @@ impl Driver {
             stall: None,
             read_only: false,
             feed: None,
+            browser: None,
         })
+    }
+
+    /// Serve the worktree as the page's preview and give the agent the browser on it, when
+    /// this is a web project and Chrome is here.
+    fn offer_browser(&self, page: &str, cwd: &Path, request: &mut AgentRequest) {
+        let Some(browsers) = &self.browsers else { return };
+        if !self.looks_like_web(cwd) {
+            return;
+        }
+        let Ok(origin) = browsers.attach(page, cwd) else { return };
+        let route = self.page(page).map(|p| p.route.clone()).unwrap_or_else(|_| "/".into());
+        let dev = crate::preview::dev_command(cwd, "", 0).is_some();
+        let path = if dev { route } else { "/ (files are served as they are in your worktree, such as /app/index.html)".to_string() };
+        request.brief.push_str(&format!(
+            "\nA browser is ready on your own page's preview, {origin}; nothing else opens in it. Before you reply that you are done, \
+             look at what you built: browser_open with path {path}, then browser_console for errors, and browser_screenshot to see it. \
+             Fix what is wrong and look again. Use browser_click and browser_type to try what the page does.\n"
+        ));
+        request.browser = Some(origin);
+    }
+
+    /// A project a browser can show: one with a package.json, an HTML start page, or plan
+    /// files of the web's kinds.
+    fn looks_like_web(&self, cwd: &Path) -> bool {
+        if cwd.join("package.json").is_file() || crate::static_site::start_page(cwd).is_some() {
+            return true;
+        }
+        const WEB: [&str; 6] = [".html", ".css", ".tsx", ".jsx", ".vue", ".svelte"];
+        let Ok(plan) = self.plan() else { return false };
+        plan.contracts.iter().map(|c| c.path.as_str()).chain(plan.pages.iter().map(|p| p.owned_glob.as_str())).any(|text| WEB.iter().any(|ext| text.contains(ext)))
     }
 
     /// Copy the page's skills into the worktree, and the lines that point the agent at them.
@@ -1982,6 +2030,7 @@ impl Driver {
             stall: None,
             read_only: true,
             feed: None,
+            browser: None,
         })
     }
 
@@ -2556,6 +2605,9 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
     if request.read_only {
         gate = gate.read_only();
+    }
+    if let Some(origin) = &request.browser {
+        gate = gate.with_browser(origin.clone());
     }
     for dir in HARNESS_STATE_DIRS {
         gate = gate.with_readable(format!("{home}/{dir}"));

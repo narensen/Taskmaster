@@ -17,6 +17,7 @@
 pub mod api;
 pub mod approvals;
 pub mod auth;
+mod browser;
 pub mod commons;
 mod checks;
 mod engine;
@@ -214,6 +215,8 @@ pub struct Config {
     pub live: Option<Arc<live::Live>>,
     /// The skills store the planner may attach from. `None` attaches no skills.
     pub skills: Option<PathBuf>,
+    /// Give workers on a web page a browser on that page's own preview (needs Chrome).
+    pub browser: bool,
 }
 
 impl Config {
@@ -242,6 +245,7 @@ impl Config {
             cancel,
             live: None,
             skills: None,
+            browser: true,
         }
     }
 }

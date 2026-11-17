@@ -99,8 +99,8 @@ impl Harness for Scripted {
             tool(&events, "Bash", json!({ "command": "npm test" }), false).await;
             // A page whose brief says it asks the person waits on two risky calls (see the plan).
             if brief.contains("(asks the person)") && !brief.contains("You are unit `styles`") {
-                let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("npm install left-pad".into()) };
-                let outside = PermissionRequest { tool: "Write".into(), kind: ToolKind::Edit, paths: vec!["/etc/hosts".into()], command: None };
+                let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("npm install left-pad".into()), url: None };
+                let outside = PermissionRequest { tool: "Write".into(), kind: ToolKind::Edit, paths: vec!["/etc/hosts".into()], command: None, url: None };
                 for request in [shell, outside] {
                     let allowed = gate.decide_async(&request).await == Decision::Allow;
                     let _ = events.send(HarnessEvent::PermissionDecided { tool: request.tool, allowed }).await;

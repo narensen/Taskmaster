@@ -27,16 +27,28 @@ pub struct CiteRecord {
     pub found: bool,
 }
 
+/// More tools served beside the Dictionary's, under the same tokens. The daemon adds the
+/// browser this way, so every harness that can reach the Dictionary can reach it too.
+#[async_trait::async_trait]
+pub trait Extension: Send + Sync {
+    /// Tool descriptions, in `tools/list` form.
+    fn tools(&self, grant: &Grant) -> Vec<Value>;
+    /// Run `name` for `grant`. `None` when the tool is not this extension's. The value is
+    /// an MCP tool result (`{content, isError}`).
+    async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value>;
+}
+
 pub struct McpState {
     local: LocalStore,
     commons: Option<LocalStore>,
     tokens: Mutex<HashMap<String, Grant>>,
     cites: Mutex<Vec<CiteRecord>>,
+    extension: Mutex<Option<Arc<dyn Extension>>>,
 }
 
 impl McpState {
     pub fn new(store: LocalStore) -> Arc<Self> {
-        Arc::new(McpState { local: store, commons: None, tokens: Mutex::default(), cites: Mutex::default() })
+        Arc::new(McpState { local: store, commons: None, tokens: Mutex::default(), cites: Mutex::default(), extension: Mutex::default() })
     }
 
     pub fn with_commons(local: LocalStore, commons: LocalStore) -> Arc<Self> {
@@ -45,7 +57,12 @@ impl McpState {
             commons: Some(commons),
             tokens: Mutex::default(),
             cites: Mutex::default(),
+            extension: Mutex::default(),
         })
+    }
+
+    pub fn extend(&self, extension: Arc<dyn Extension>) {
+        *self.extension.lock().unwrap() = Some(extension);
     }
 
     pub fn grant(&self, token: &str, grant: Grant) {
@@ -83,6 +100,24 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
     let Some(id) = msg.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response(); // notification
     };
+    let extension = state.extension.lock().unwrap().clone();
+    if let Some(extension) = extension {
+        let method = msg["method"].as_str().unwrap_or_default();
+        if method == "tools/call" {
+            let name = msg["params"]["name"].as_str().unwrap_or_default();
+            if let Some(result) = extension.call(&grant, name, &msg["params"]["arguments"]).await {
+                return Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response();
+            }
+        }
+        if method == "tools/list"
+            && let Ok(mut listed) = dispatch(&state, &grant, &msg)
+        {
+            if let Some(tools) = listed["tools"].as_array_mut() {
+                tools.extend(extension.tools(&grant));
+            }
+            return Json(json!({ "jsonrpc": "2.0", "id": id, "result": listed })).into_response();
+        }
+    }
     let reply = match dispatch(&state, &grant, &msg) {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => {
@@ -249,6 +284,33 @@ mod tests {
         assert_eq!(cites.len(), 2);
         assert_eq!(cites[0].grant.page, "dashboard");
         assert!(cites[0].found && !cites[1].found);
+    }
+
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl Extension for Echo {
+        fn tools(&self, grant: &Grant) -> Vec<Value> {
+            vec![json!({ "name": "echo", "description": format!("for {}", grant.page), "inputSchema": { "type": "object" } })]
+        }
+        async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
+            (name == "echo").then(|| json!({ "content": [{ "type": "text", "text": format!("{} {}", grant.page, args["say"]) }], "isError": false }))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_extension_adds_tools_under_the_same_tokens() {
+        let (state, app) = setup();
+        state.extend(Arc::new(Echo));
+        let (_, listed) = rpc(&app, Some("tok-a"), json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+        let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["cite", "index", "search", "echo"]);
+        let echo = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "echo", "arguments": { "say": "hi" } } });
+        let (_, said) = rpc(&app, Some("tok-a"), echo.clone()).await;
+        assert_eq!(said["result"]["content"][0]["text"], "dashboard \"hi\"");
+        assert_eq!(rpc(&app, None, echo).await.0, StatusCode::UNAUTHORIZED);
+        // The Dictionary's own tools still answer.
+        assert_eq!(rpc(&app, Some("tok-a"), call("greeting_contract")).await.1["result"]["content"][0]["text"], "export const G = 1;");
     }
 
     #[tokio::test]

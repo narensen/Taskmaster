@@ -12,6 +12,8 @@ pub enum ToolKind {
     /// A call to the Dictionary's MCP server. The adapter recognises it, because each
     /// harness names MCP tools differently.
     Dictionary,
+    /// Taskmaster's browser tool. Allowed only on the run's own preview origin.
+    Browser,
     Other,
 }
 
@@ -22,6 +24,8 @@ pub struct PermissionRequest {
     /// Files the call touches, when the harness reports them.
     pub paths: Vec<PathBuf>,
     pub command: Option<String>,
+    /// The address a browser call opens, when it names one.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,13 +53,16 @@ pub struct WorktreeGate {
     /// Extra read-only locations, e.g. the harness's own state directory.
     readable: Vec<PathBuf>,
     read_only: bool,
+    /// The one origin the browser tool may open (`http://127.0.0.1:<port>`). `None` refuses
+    /// every browser call.
+    browser: Option<String>,
 }
 
 impl WorktreeGate {
     pub fn new(root: impl Into<PathBuf>, allowed_tool_prefixes: Vec<String>) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root));
-        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new(), read_only: false }
+        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new(), read_only: false, browser: None }
     }
 
     /// Refuse every edit, for reviewers and verifiers.
@@ -68,6 +75,12 @@ impl WorktreeGate {
     pub fn with_readable(mut self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         self.readable.push(std::fs::canonicalize(&dir).unwrap_or_else(|_| normalize(&dir)));
+        self
+    }
+
+    /// Allow the browser tool, on `origin` only.
+    pub fn with_browser(mut self, origin: impl Into<String>) -> Self {
+        self.browser = Some(origin.into().trim_end_matches('/').to_string());
         self
     }
 
@@ -116,6 +129,16 @@ impl WorktreeGate {
 
 impl PermissionGate for WorktreeGate {
     fn decide(&self, request: &PermissionRequest) -> Decision {
+        // Before the prefixes: the browser tool is served beside the Dictionary, but it
+        // may only open the run's own preview.
+        if request.kind == ToolKind::Browser {
+            let allowed = match (&self.browser, &request.url) {
+                (Some(_), None) => true,
+                (Some(origin), Some(url)) => same_origin(origin, url),
+                (None, _) => false,
+            };
+            return if allowed { Decision::Allow } else { Decision::Deny };
+        }
         if self.allowed_tool_prefixes.iter().any(|p| request.tool.starts_with(p.as_str())) {
             return Decision::Allow;
         }
@@ -135,6 +158,18 @@ impl PermissionGate for WorktreeGate {
             }
             _ => Decision::Deny,
         }
+    }
+}
+
+/// Whether `url` is on `origin` (`scheme://host:port`), or is a path on it.
+pub fn same_origin(origin: &str, url: &str) -> bool {
+    if url.starts_with('/') && !url.starts_with("//") {
+        return true;
+    }
+    let origin = origin.trim_end_matches('/');
+    match url.strip_prefix(origin) {
+        Some(rest) => rest.is_empty() || rest.starts_with(['/', '?', '#']),
+        None => false,
     }
 }
 
@@ -163,6 +198,7 @@ mod tests {
             kind,
             paths: paths.iter().map(PathBuf::from).collect(),
             command: None,
+            url: None,
         }
     }
 
@@ -219,6 +255,30 @@ mod tests {
         assert_eq!(g.decide(&read), Decision::Allow);
         let write = request("write_file", ToolKind::Edit, &["/nonexistent/state/brain/x.md"]);
         assert_eq!(g.decide(&write), Decision::Deny);
+    }
+
+    #[test]
+    fn the_browser_opens_only_the_preview_origin() {
+        let browse = |url: Option<&str>| PermissionRequest {
+            tool: "mcp__dictionary__browser_open".into(),
+            kind: ToolKind::Browser,
+            paths: vec![],
+            command: None,
+            url: url.map(str::to_string),
+        };
+        // Without a preview, no browser at all, even through the Dictionary's prefix.
+        assert_eq!(gate().decide(&browse(Some("/"))), Decision::Deny);
+        let g = gate().with_browser("http://127.0.0.1:4321/");
+        assert_eq!(g.decide(&browse(None)), Decision::Allow);
+        assert_eq!(g.decide(&browse(Some("/cart?x=1"))), Decision::Allow);
+        assert_eq!(g.decide(&browse(Some("http://127.0.0.1:4321/cart"))), Decision::Allow);
+        assert_eq!(g.decide(&browse(Some("http://127.0.0.1:4321"))), Decision::Allow);
+        assert_eq!(g.decide(&browse(Some("http://127.0.0.1:43210/"))), Decision::Deny);
+        assert_eq!(g.decide(&browse(Some("http://127.0.0.1:8737/api/runs"))), Decision::Deny);
+        assert_eq!(g.decide(&browse(Some("https://example.com/"))), Decision::Deny);
+        assert_eq!(g.decide(&browse(Some("//example.com/"))), Decision::Deny);
+        assert_eq!(g.decide(&browse(Some("http://127.0.0.1:4321@evil.test/"))), Decision::Deny);
+        assert!(g.risk(&browse(Some("https://example.com/"))).is_none(), "never put to a person");
     }
 
     #[cfg(unix)]

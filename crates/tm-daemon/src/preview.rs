@@ -121,10 +121,10 @@ impl Previews {
         }
         // If this start returns before the process is recorded, free the slot.
         let mut claim = ClearClaim { previews: self, run, live: true };
-        let port = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            listener.local_addr()?.port()
-        };
+        // Held until the server is chosen: the static server serves on it, so no other
+        // process can take the port in between.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
         let (dir, tree) = match branch {
             Some(branch) => {
                 let tree = git::worktree_dir(&self.project(), run, "preview");
@@ -144,7 +144,7 @@ impl Previews {
         };
         let Some(command) = dev_command(&dir, &self.command, port) else {
             if crate::static_site::has_no_scripts(&dir) && crate::static_site::start_page(&dir).is_some() {
-                return self.start_static(run, port, dir, tree, claim).await;
+                return self.start_static(run, listener, dir, tree, claim).await;
             }
             if let Some(tree) = &tree {
                 let _ = git::remove_worktree(&self.project(), tree);
@@ -153,6 +153,8 @@ impl Previews {
             self.fail_start(run, reason);
             anyhow::bail!("{reason}");
         };
+        // The dev server binds the port itself.
+        drop(listener);
         let mut process = Command::new("sh");
         process
             .arg("-c")
@@ -263,7 +265,7 @@ impl Previews {
     }
 
     /// Serve the project's files from this process, on `port`.
-    async fn start_static(&self, run: &str, port: u16, dir: PathBuf, tree: Option<PathBuf>, mut claim: ClearClaim<'_>) -> anyhow::Result<Status> {
+    async fn start_static(&self, run: &str, listener: tokio::net::TcpListener, dir: PathBuf, tree: Option<PathBuf>, mut claim: ClearClaim<'_>) -> anyhow::Result<Status> {
         /// Removes the throwaway checkout when the server task ends or is aborted.
         struct Cleanup(PathBuf, Option<PathBuf>);
         impl Drop for Cleanup {
@@ -275,7 +277,7 @@ impl Previews {
             }
         }
         let cleanup = Cleanup(self.project(), tree);
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let port = listener.local_addr()?.port();
         let root = dir.clone();
         let task = tokio::spawn(async move {
             let _cleanup = cleanup;

@@ -1,11 +1,10 @@
 /* Taskmaster design system.
-   Dark is near-black graphite. Light is paper and ink, and its tokens stay as they are.
-   One signature colour in each theme, used sparingly for focus, live work and selection:
-   rhodochrosite on graphite, verdigris on paper. Status colours keep their own lanes
-   (laurel green, brick red, ochre) so live never reads as done. Flat fills and hairline
-   rules, a crisp focus ring, and no accent halo on dark cards. Inter for chrome, a mono
-   for code. Scale: 4px spacing, 11/12/13/14/16/20/24/30 type, 6/8/12/16 radius, three
-   elevations. No blue anywhere. */
+   Dark is near-black graphite, ink and stone only — no colour except status. Light is
+   paper and ink, and its tokens stay as they are: verdigris for focus, live work and
+   selection. Status colours keep their own lanes (laurel green, brick red, ochre) so
+   live never reads as done. Flat fills and hairline rules, a crisp focus ring, and no
+   accent halo on dark cards. Inter for chrome, a mono for code. Scale: 4px spacing,
+   11/12/13/14/16/20/24/30 type, 6/8/12/16 radius, three elevations. No blue anywhere. */
 
 :root {
   --bg: #09090a;
@@ -25,8 +24,8 @@
   --paper: var(--bg);
   --soft: var(--bg-elev);
   --link: #dcdce2;
-  --accent: #e0a0b4;
-  --accent-ink: #35141f;
+  --accent: #c4c4cb;
+  --accent-ink: #09090a;
   --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
   --accent-line: color-mix(in srgb, var(--accent) 38%, transparent);
   --accent-glow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--accent);

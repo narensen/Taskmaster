@@ -14,10 +14,10 @@ export function PlanView({ plan, arrived, compact }: { plan: Plan; arrived?: boo
   useLayoutEffect(() => {
     if (!arrived || !ref.current || !motionOn()) return;
     const tl = gsap.timeline();
-    tl.from(ref.current, { opacity: 0, y: 14, duration: dur.slow, ease: ease.out })
-      .from(ref.current.querySelectorAll("tbody tr"), { opacity: 0, x: -10, stagger: 0.06, duration: dur.base, ease: ease.out }, "-=0.15")
-      .fromTo(ref.current.querySelector(".lock-rule"), { scaleX: 0 }, { scaleX: 1, transformOrigin: "left", duration: 0.5, ease: ease.inOut }, "-=0.2")
-      .from(ref.current.querySelectorAll("p.small, .file-tag"), { opacity: 0, y: 6, stagger: 0.04, duration: dur.base, ease: ease.out }, "-=0.3");
+    tl.from(ref.current, { opacity: 0, y: 8, duration: dur.base, ease: ease.out })
+      .from(ref.current.querySelectorAll("tbody tr"), { opacity: 0, x: -6, stagger: 0.03, duration: dur.fast, ease: ease.out }, "-=0.08")
+      .fromTo(ref.current.querySelector(".lock-rule"), { scaleX: 0 }, { scaleX: 1, transformOrigin: "left", duration: dur.slow, ease: ease.out }, "-=0.08")
+      .from(ref.current.querySelectorAll("p.small, .file-tag"), { opacity: 0, y: 4, stagger: 0.02, duration: dur.fast, ease: ease.out }, "-=0.1");
     return () => {
       tl.kill();
     };

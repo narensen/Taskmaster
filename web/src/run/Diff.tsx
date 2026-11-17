@@ -257,8 +257,8 @@ export function DiffTab({
                 }}
               >
                 <KnownPath path={f.path} />
-                <span className="muted small">
-                  +{f.added} −{f.removed}
+                <span className="small">
+                  <span className="diff-add">+{f.added}</span> <span className="diff-del">−{f.removed}</span>
                 </span>
                 <label className="check small">
                   <input

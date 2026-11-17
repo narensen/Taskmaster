@@ -2,6 +2,9 @@
 // bus that lets any part of a run hand a chip to the composer or a file to the preview.
 
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { bezier, dur } from "./motion";
+import { useMotion } from "./prefs";
 
 // A tiny store helper.
 function store<T>(initial: T) {
@@ -66,30 +69,40 @@ export function undoLatest(): boolean {
 
 export function Toasts() {
   const list = toasts.use();
+  const on = useMotion();
   return (
     <div className="toasts" role="status" aria-live="polite">
-      {list.map((t) => (
-        <div key={t.id} className="toast">
-          <div className="grow">
-            <div>{t.text}</div>
-            {t.detail && <div className="muted small break">{t.detail}</div>}
-          </div>
-          {t.undo && (
-            <button
-              className="ghost small"
-              onClick={() => {
-                t.undo!();
-                dismiss(t.id);
-              }}
-            >
-              Undo
+      <AnimatePresence initial={false}>
+        {list.map((t) => (
+          <motion.div
+            key={t.id}
+            className="toast"
+            initial={on ? { opacity: 0, y: 8 } : false}
+            animate={{ opacity: 1, y: 0 }}
+            exit={on ? { opacity: 0, y: 6 } : { opacity: 1, transition: { duration: 0 } }}
+            transition={{ duration: on ? dur.base : 0, ease: bezier.out }}
+          >
+            <div className="grow">
+              <div>{t.text}</div>
+              {t.detail && <div className="muted small break">{t.detail}</div>}
+            </div>
+            {t.undo && (
+              <button
+                className="ghost small"
+                onClick={() => {
+                  t.undo!();
+                  dismiss(t.id);
+                }}
+              >
+                Undo
+              </button>
+            )}
+            <button className="ghost small" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
+              ×
             </button>
-          )}
-          <button className="ghost small" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
-            ×
-          </button>
-        </div>
-      ))}
+          </motion.div>
+        ))}
+      </AnimatePresence>
     </div>
   );
 }
@@ -155,6 +168,7 @@ function MenuList({ items, onDone }: { items: MenuItem[]; onDone: () => void }) 
 
 export function ContextMenu() {
   const state = menu.use();
+  const on = useMotion();
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!state) return;
@@ -172,13 +186,23 @@ export function ContextMenu() {
       window.removeEventListener("resize", closeMenu);
     };
   }, [state]);
-  if (!state) return null;
-  const x = Math.min(state.x, window.innerWidth - 240);
-  const y = Math.min(state.y, window.innerHeight - 40 * state.items.length - 16);
   return (
-    <div ref={ref} className="menu" style={{ left: Math.max(4, x), top: Math.max(4, y) }}>
-      <MenuList items={state.items} onDone={closeMenu} />
-    </div>
+    <AnimatePresence>
+      {state && (
+        <motion.div
+          key="menu"
+          ref={ref}
+          className="menu"
+          style={{ left: Math.max(4, Math.min(state.x, window.innerWidth - 240)), top: Math.max(4, Math.min(state.y, window.innerHeight - 40 * state.items.length - 16)) }}
+          initial={on ? { opacity: 0, y: 4 } : false}
+          animate={{ opacity: 1, y: 0 }}
+          exit={on ? { opacity: 0, y: 4 } : { opacity: 1, transition: { duration: 0 } }}
+          transition={{ duration: on ? dur.fast : 0, ease: bezier.out }}
+        >
+          <MenuList items={state.items} onDone={closeMenu} />
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -220,13 +244,39 @@ export function useOn<T>(name: string, handler: Handler<T>) {
 }
 
 export function Sheet({ open, onClose, children }: { open: boolean; onClose: () => void; children: ReactNode }) {
-  if (!open) return null;
+  const on = useMotion();
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
   return (
-    <div className="sheet-back" onClick={onClose}>
-      <div className="sheet" onClick={(e) => e.stopPropagation()}>
-        <div className="sheet-grip" onClick={onClose} />
-        {children}
-      </div>
-    </div>
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          className="sheet-back"
+          onClick={onClose}
+          initial={on ? { opacity: 0 } : false}
+          animate={{ opacity: 1 }}
+          exit={on ? { opacity: 0 } : undefined}
+          transition={{ duration: on ? 0.16 : 0, ease: bezier.out }}
+        >
+          <motion.div
+            className="sheet"
+            onClick={(e) => e.stopPropagation()}
+            initial={on ? { y: 28 } : false}
+            animate={{ y: 0 }}
+            exit={on ? { y: 20 } : undefined}
+            transition={{ duration: on ? 0.18 : 0, ease: bezier.out }}
+          >
+            <div className="sheet-grip" onClick={onClose} />
+            {children}
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }

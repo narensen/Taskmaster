@@ -3,11 +3,13 @@
 // or Dictionary key; # and digits a pull request gh can see; / at the start a command or a
 // skill. A big paste or a dropped file becomes an attachment.
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { api, type Skill } from "./api";
 import { commands, type Command } from "./commands";
+import { bezier, dur } from "./motion";
 import { emit, toast, useOn, type Chip } from "./overlay";
-import { prefs, rememberPrompt } from "./prefs";
+import { prefs, rememberPrompt, useMotion } from "./prefs";
 
 export const BIG_PASTE = 32 * 1024;
 
@@ -94,6 +96,8 @@ export interface ComposerProps {
   bus?: boolean;
   onChipClick?: (chip: Chip) => void;
   className?: string;
+  /** Controls under the field: a model pill, a send button. */
+  footer?: ReactNode;
 }
 
 function chipNode(chip: Chip): HTMLSpanElement {
@@ -151,6 +155,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const [drag, setDrag] = useState(false);
   const historyAt = useRef<number | null>(null);
   const saved = useRef<Range | null>(null);
+  const motionOk = useMotion();
 
   const pages = useMemo(() => props.pages ?? [], [props.pages]);
   const agents = useMemo(() => props.agents ?? ["master", "worker", "mid", "reviewer", "verifier"], [props.agents]);
@@ -440,8 +445,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           ))}
         </div>
       )}
-      {popup && options.length > 0 && (
-        <div className="popup" role="listbox">
+      <AnimatePresence>
+        {popup && options.length > 0 && (
+        <motion.div
+          key="suggest"
+          className="popup"
+          role="listbox"
+          initial={motionOk ? { opacity: 0, y: 4 } : false}
+          animate={{ opacity: 1, y: 0 }}
+          exit={motionOk ? { opacity: 0, y: 4 } : { opacity: 1, transition: { duration: 0 } }}
+          transition={{ duration: motionOk ? dur.fast : 0, ease: bezier.out }}
+        >
           {options.map((o, i) => (
             <button
               key={o.id}
@@ -457,8 +471,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               <span className="muted small">{o.group}</span>
             </button>
           ))}
-        </div>
-      )}
+        </motion.div>
+        )}
+      </AnimatePresence>
       <div
         ref={ref}
         className="composer-input"
@@ -492,6 +507,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         onPaste={onPaste}
         onBlur={() => window.setTimeout(() => setPopup(null), 150)}
       />
+      {props.footer}
     </div>
   );
 });

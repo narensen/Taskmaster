@@ -1,18 +1,15 @@
-// Motion tokens shared by GSAP and Framer Motion. They mirror --t-* and --ease-* in
-// styles.css, so a number changed here should be changed there. Seconds, not milliseconds.
+// Motion tokens shared by GSAP and Motion. Short and ease-out: 120–220ms.
+// Seconds, not milliseconds. A number changed here should stay in this range.
 
-export const dur = { fast: 0.14, base: 0.22, slow: 0.38 } as const;
+export const dur = { fast: 0.12, base: 0.18, slow: 0.22 } as const;
 
-/** GSAP ease names and the equivalent cubic-bezier for Framer. */
+/** GSAP ease names and the equivalent cubic-bezier for Motion. */
 export const ease = {
-  out: "power3.out",
-  inOut: "power3.inOut",
-  spring: "back.out(1.4)",
+  out: "power2.out",
+  inOut: "power2.inOut",
 } as const;
 
 export const bezier = {
-  out: [0.22, 1, 0.36, 1],
-  inOut: [0.65, 0, 0.35, 1],
-} as const;
-
-export const springy = { type: "spring", stiffness: 420, damping: 34, mass: 0.8 } as const;
+  out: [0.22, 1, 0.36, 1] as [number, number, number, number],
+  inOut: [0.4, 0, 0.2, 1] as [number, number, number, number],
+};

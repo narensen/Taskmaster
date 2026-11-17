@@ -1,14 +1,17 @@
 // Command-K: runs, pages and commands. A leading > shows only commands. / outside a text
 // field opens it on commands and skills.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import gsap from "gsap";
 import { commands, useRunContext } from "./commands";
 import { skills } from "./composer";
 import { emit } from "./overlay";
 import { navigate } from "./router";
 import { ordered, useRuns } from "./runs";
 import { phaseLabel } from "./format";
-import { usePrefs } from "./prefs";
+import { useMotion, usePrefs } from "./prefs";
+import { bezier, dur, ease } from "./motion";
 import type { Skill } from "./api";
 
 export interface PaletteState {
@@ -29,6 +32,8 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
   const [active, setActive] = useState(0);
   const [skillList, setSkills] = useState<Skill[]>([]);
   const input = useRef<HTMLInputElement>(null);
+  const box = useRef<HTMLDivElement>(null);
+  const on = useMotion();
   const { runs } = useRuns();
   const ctx = useRunContext();
   const { showArchived } = usePrefs();
@@ -37,6 +42,16 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
     input.current?.focus();
     void skills().then(setSkills);
   }, []);
+
+  useLayoutEffect(() => {
+    if (!box.current || !on) return;
+    const opts = box.current.querySelectorAll("[role=option]");
+    if (!opts.length) return;
+    const tween = gsap.fromTo(opts, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, stagger: 0.012, ease: ease.out, clearProps: "opacity,transform" });
+    return () => {
+      tween.kill();
+    };
+  }, [on]);
 
   const items = useMemo<Item[]>(() => {
     const onlyCommands = q.startsWith(">") || q.startsWith("/");
@@ -81,8 +96,25 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
   };
 
   return (
-    <div className="palette-back" onMouseDown={onClose}>
-      <div className="palette" role="dialog" aria-label="Command palette" onMouseDown={(e) => e.stopPropagation()}>
+    <motion.div
+      className="palette-back"
+      onMouseDown={onClose}
+      initial={on ? { opacity: 0 } : false}
+      animate={{ opacity: 1 }}
+      exit={on ? { opacity: 0 } : { opacity: 1, transition: { duration: 0 } }}
+      transition={{ duration: on ? dur.fast : 0, ease: bezier.out }}
+    >
+      <motion.div
+        ref={box}
+        className="palette"
+        role="dialog"
+        aria-label="Command palette"
+        onMouseDown={(e) => e.stopPropagation()}
+        initial={on ? { opacity: 0, y: 8 } : false}
+        animate={{ opacity: 1, y: 0 }}
+        exit={on ? { opacity: 0, y: 6 } : { opacity: 1, transition: { duration: 0 } }}
+        transition={{ duration: on ? dur.base : 0, ease: bezier.out }}
+      >
         <input
           ref={input}
           className="palette-input"
@@ -122,7 +154,7 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
             </button>
           ))}
         </div>
-      </div>
-    </div>
+      </motion.div>
+    </motion.div>
   );
 }

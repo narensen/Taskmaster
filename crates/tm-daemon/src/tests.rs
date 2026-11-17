@@ -517,6 +517,18 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     assert!(read(&tmp.0.join("app/a/index.html")).contains("<h1>"));
     assert!(read(&tmp.0.join("app/a/main.js")).contains("console.log"));
     assert_eq!(log(&tmp.0).matches("taskmaster: built page a").count(), 1);
+    // Each unit is a separate agent in the transcript, tagged with its unit and glob.
+    let said = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
+    let starts: Vec<serde_json::Value> = said
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|e| e["kind"] == "start" && e["agent"]["page"] == "a")
+        .collect();
+    let mut ids: Vec<&str> = starts.iter().filter_map(|e| e["agent"]["id"].as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["page:a/logic", "page:a/markup"], "{said}");
+    let markup = starts.iter().find(|e| e["agent"]["unit"] == "markup").unwrap();
+    assert_eq!(markup["agent"]["owned_glob"], "app/a/index.html");
 }
 
 #[tokio::test]

@@ -699,7 +699,16 @@ impl Driver {
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
         self.batches.remove(&page);
         for (index, (mut request, worktree)) in prepared.into_iter().enumerate() {
-            self.tag(&mut request, &format!("page:{page}"), tier_name(tier), Some(&page), Some(&units[index].owned_glob));
+            // Each unit is its own agent: `page:<page>/<unit>` when the page is split.
+            let (agent, unit) = if units.len() > 1 {
+                (format!("page:{page}/{}", units[index].id), Some(units[index].id.as_str()))
+            } else {
+                (format!("page:{page}"), None)
+            };
+            self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
+            if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
+                feed.agent["unit"] = serde_json::json!(unit);
+            }
             let bill = request.bill(Role::builder(tier), Some(&page));
             let (page, slots) = (page.clone(), self.slots.clone());
             self.jobs.spawn(async move {

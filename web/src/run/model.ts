@@ -78,11 +78,12 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
   for (const id of order) byId.set(id, make(id));
   const calls = new Map<string, Call>();
   for (const e of entries) {
-    const id = e.agent.id;
+    // A split page's units (`page:<page>/<unit>`) are separate agents shown on the page's surface.
+    const id = e.agent.id.startsWith("page:") ? e.agent.id.split("/")[0]! : e.agent.id;
     if (id === "runtime" || id === "person") continue;
     if (!byId.has(id)) byId.set(id, make(id));
     const s = byId.get(id)!;
-    const key = `${id}#${e.agent.call ?? 0}`;
+    const key = `${e.agent.id}#${e.agent.call ?? 0}`;
     let call = calls.get(key);
     if (!call) {
       call = { call: e.agent.call ?? 0, tag: e.agent, items: [], at: e.at };

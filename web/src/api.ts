@@ -294,6 +294,8 @@ export interface AgentTag {
   harness?: string;
   model?: string | null;
   owned_glob?: string | null;
+  /** The work unit, when a page is split across parallel workers. */
+  unit?: string | null;
   worktree?: string;
   branch?: string | null;
   call?: number;

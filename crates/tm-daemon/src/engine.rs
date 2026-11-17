@@ -477,7 +477,7 @@ impl Driver {
     fn planner_brief(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
         if self.small_pass(prompt) {
             let template = self.template.as_ref().map(|t| t.brief()).unwrap_or_default();
-            let mut brief = crate::small::small_brief(prompt, &self.entry_listing()?, &template);
+            let mut brief = crate::small::small_brief(prompt, &self.entry_listing()?, &template, self.parallel);
             if !errors.is_empty() {
                 brief.push_str("\nThe last plan was rejected:\n");
                 for error in errors {
@@ -520,8 +520,9 @@ impl Driver {
              \nRules: at least one page; page ids use letters, digits, `_` and `-`; \
              owned_glob and contract paths are relative and do not contain `..`; \
              every cited key is an existing entry or one of the dictionary items; \
-             briefs and contents are non-empty. Optionally give a page `units`: 2-4 work units, each {\"id\",\"owned_glob\",\"brief\"}, built by parallel workers. Split by file or concern (for example markup+styles, scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and inside the page glob (braces list files: `{app/index.html,app/styles.css}`); the page owned_glob must cover them all. Omit `units` when splitting is unsafe.\n",
+             briefs and contents are non-empty.\n",
         );
+        brief.push_str(&crate::small::units_rule(self.parallel));
         if !errors.is_empty() {
             brief.push_str("\nThe last plan was rejected:\n");
             for error in errors {

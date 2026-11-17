@@ -21,7 +21,24 @@ pub const SMALL_EFFORT: &str = "low";
 
 /// The short planning brief. `entries` lists stored Dictionary entries, one per item, already
 /// formatted; they are given in full here, so the master needs no tools at all.
-pub fn small_brief(prompt: &str, entries: &[String], template: &str) -> String {
+/// How a plan may split a page into work units, given the run's `slots` parallel workers.
+/// More units than slots would queue behind each other, so the cap is the slot count.
+pub fn units_rule(slots: usize) -> String {
+    let most = slots.min(4);
+    if most < 2 {
+        return "Do not give pages `units`: this run builds with one worker at a time.\n".into();
+    }
+    let range = if most == 2 { "2".to_string() } else { format!("2-{most}") };
+    format!(
+        "Optionally give a page `units`: {range} work units (never more than {most}, the parallel workers this run has), \
+         each {{\"id\",\"owned_glob\",\"brief\"}}, built by parallel workers. Split by file or concern (for example markup+styles, \
+         scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and \
+         inside the page glob (braces list files: `{{app/index.html,app/styles.css}}`); the page owned_glob must cover them \
+         all. Omit `units` when splitting is unsafe.\n"
+    )
+}
+
+pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usize) -> String {
     let mut brief = format!(
         "Plan this small product quickly. Be brief. Do not call any tools: everything you need is below.\n\nRequest:\n{prompt}\n\n"
     );
@@ -45,10 +62,15 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str) -> String {
          {\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\"}],\
          \"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n\
          Rules: at least one page; page ids use letters, digits, `_` and `-`; owned_glob and contract paths are \
-         relative with no `..`; every cited key is listed above or in `dictionary`; briefs are non-empty. Optionally give a page `units`: 2-4 work units, each {\"id\",\"owned_glob\",\"brief\"}, built by parallel workers. Split by file or concern (for example markup+styles, scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and inside the page glob (braces list files: `{app/index.html,app/styles.css}`); the page owned_glob must cover them all. Omit `units` when splitting is unsafe. \
-         Parallel units finish sooner: when a page has separate markup and styles, scripts, and docs, split it into units \
-         and pin every id, file name and interface they share in a contract, a cited entry or each unit's brief.\n",
+         relative with no `..`; every cited key is listed above or in `dictionary`; briefs are non-empty.\n",
     );
+    brief.push_str(&units_rule(slots));
+    if slots >= 2 {
+        brief.push_str(
+            "Parallel units finish sooner: when a page has separate markup and styles, scripts, and docs, split it into units \
+             and pin every id, file name and interface they share in a contract, a cited entry or each unit's brief.\n",
+        );
+    }
     brief
 }
 
@@ -68,14 +90,23 @@ mod tests {
 
     #[test]
     fn small_brief_is_short_and_needs_no_tools() {
-        let brief = small_brief("tiny todo", &[], "");
+        let brief = small_brief("tiny todo", &[], "", 3);
         assert!(brief.contains("Dictionary is empty"));
         assert!(brief.contains("Do not call any tools"));
         assert!(!brief.contains("Search the Dictionary"));
         assert!(brief.len() < 1700);
-        let listed = small_brief("tiny todo", &["- `todo-dom` (commons, component_api): ids\nul#todo-list\n".into()], "");
+        let listed = small_brief("tiny todo", &["- `todo-dom` (commons, component_api): ids\nul#todo-list\n".into()], "", 3);
         assert!(!listed.contains("Dictionary is empty"));
         assert!(listed.contains("`todo-dom`"));
         assert!(listed.contains("never copy them"));
+    }
+
+    #[test]
+    fn units_are_capped_at_the_parallel_workers() {
+        assert!(units_rule(3).contains("2-3 work units"));
+        assert!(units_rule(8).contains("2-4 work units"));
+        assert!(units_rule(2).contains(": 2 work units"));
+        assert!(units_rule(1).contains("Do not give pages `units`"));
+        assert!(!small_brief("tiny todo", &[], "", 1).contains("Parallel units finish sooner"));
     }
 }

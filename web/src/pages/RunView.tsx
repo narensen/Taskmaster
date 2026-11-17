@@ -9,7 +9,7 @@ import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import { api, type ReviewJob, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
-import { phaseLabel, usd } from "../format";
+import { isUnpriced, phaseLabel, spendLabel, tokens, usd } from "../format";
 import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
@@ -417,7 +417,7 @@ export function RunView({ id }: { id: string }) {
         )}
       </div>
       <div className="panel-body" ref={panelBody}>
-        {tab === "plan" && (detail.plan ? <PlanView plan={detail.plan} /> : <div className="pad muted">No plan yet. The master is still planning.</div>)}
+        {tab === "plan" && (detail.plan ? <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} /> : <div className="pad muted">No plan yet. The master is still planning.</div>)}
         {tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
         {tab === "browser" && <BrowserTab run={id} detail={detail} entries={entries} />}
         {tab === "search" && <SearchTab />}
@@ -442,8 +442,13 @@ export function RunView({ id }: { id: string }) {
             <div className="run-meta small">
               {detail.active && <span>live</span>}
               {detail.branch && <span>{detail.branch}</span>}
-              <span>{usd(ledger?.totals.cost_usd ?? detail.spent.cost_usd)} spent</span>
-              {detail.estimate && <span>estimate {usd(detail.estimate.usd)}</span>}
+              <span>{spendLabel(ledger?.totals ?? detail.spent)}</span>
+              {detail.estimate &&
+                (isUnpriced(ledger?.totals ?? detail.spent) ? (
+                  <span>estimate about {tokens(detail.estimate.tokens)} tokens</span>
+                ) : (
+                  <span>estimate {usd(detail.estimate.usd)}</span>
+                ))}
             </div>
             {detail.prompt && (
               <p className="prompt small">
@@ -496,7 +501,7 @@ export function RunView({ id }: { id: string }) {
             Planning. The master's text appears below as it arrives; the locked plan replaces this line when it is ready.
           </div>
         )}
-        {detail.plan && <PlanView plan={detail.plan} arrived={data.planArrived} compact />}
+        {detail.plan && <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} arrived={data.planArrived} compact />}
 
         <ToolApprovals list={toolApprovals.list} answer={toolApprovals.answer} />
         <LivePreview id={id} detail={detail} />

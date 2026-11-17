@@ -9,7 +9,7 @@ import { motionOn } from "../prefs";
 import { dur, ease } from "../motion";
 import { tokens, usd } from "../format";
 
-export function PlanView({ plan, arrived, compact }: { plan: Plan; arrived?: boolean; compact?: boolean }) {
+export function PlanView({ plan, arrived, compact, unpriced }: { plan: Plan; arrived?: boolean; compact?: boolean; unpriced?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     if (!arrived || !ref.current || !motionOn()) return;
@@ -27,7 +27,7 @@ export function PlanView({ plan, arrived, compact }: { plan: Plan; arrived?: boo
       <div className="plan-head">
         <span className="strong">Locked plan</span>
         <span className="muted small">
-          {plan.pages.length} page{plan.pages.length === 1 ? "" : "s"} · about {tokens(plan.estimate.tokens)} tokens · {usd(plan.estimate.usd)}
+          {plan.pages.length} page{plan.pages.length === 1 ? "" : "s"} · about {tokens(plan.estimate.tokens)} tokens{unpriced ? "" : ` · ${usd(plan.estimate.usd)}`}
         </span>
       </div>
       <div className="lock-rule" />

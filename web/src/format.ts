@@ -6,6 +6,26 @@ export function usd(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
+/** Minimal shape of a spend total: the ledger's Totals/Spend both fit. */
+export interface SpendLike {
+  calls: number;
+  tokens: number;
+  cost_usd: number;
+  unpriced_calls?: number;
+}
+
+/** True when the provider reported no price: tokens were used but no dollars were reported. */
+export function isUnpriced(spent: SpendLike | null | undefined): boolean {
+  if (!spent || (spent.cost_usd ?? 0) > 0) return false;
+  return spent.tokens > 0 || (spent.unpriced_calls ?? 0) > 0;
+}
+
+/** "$0.42 spent", or "123k tokens · 7 calls" when the provider reports no price. */
+export function spendLabel(spent: SpendLike): string {
+  if (!isUnpriced(spent)) return `${usd(spent.cost_usd)} spent`;
+  return `${tokens(spent.tokens)} tokens · ${spent.calls} call${spent.calls === 1 ? "" : "s"}`;
+}
+
 export function tokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;

@@ -8,7 +8,7 @@ import { Inbox } from "lucide-react";
 import { api, callAt, type RunSummary } from "../api";
 import { Link } from "../router";
 import { ExternalLink } from "../paths";
-import { phaseLabel, usd } from "../format";
+import { isUnpriced, phaseLabel, tokens, usd } from "../format";
 import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, setPrefs, usePrefs } from "../prefs";
 import { ordered, toggleFlag, useRuns } from "../runs";
@@ -90,7 +90,7 @@ function RunCard({ run, group, index }: { run: RunSummary; group: string; index:
         <div className="grow">
           <div className="strong clip">{run.id}</div>
           <div className="muted small">
-            {group.toLowerCase()} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {usd(run.spent.cost_usd)}
+            {group.toLowerCase()} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {isUnpriced(run.spent) ? `${tokens(run.spent.tokens)} tokens` : usd(run.spent.cost_usd)}
           </div>
         </div>
         <button className="icon" onClick={() => toggleFlag(run.id, "pinned")}>

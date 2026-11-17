@@ -205,6 +205,7 @@ mod tests {
                     brief: String::new(),
                     done: String::new(),
                     units: vec![],
+                    skills: vec![],
                 })
                 .collect(),
             estimate: Estimate { tokens: 0, usd: 0.0 },

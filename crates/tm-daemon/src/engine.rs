@@ -410,7 +410,8 @@ impl Driver {
                 errors = vec!["the planner did not finish".into()];
             } else {
                 match reply::parse_plan(&text) {
-                    Ok((plan, drafts)) => {
+                    Ok((mut plan, drafts)) => {
+                        self.settle_skills(&mut plan, prompt);
                         let existing = self.existing_content(&plan, &drafts)?;
                         match check_plan(&plan, &drafts, &existing) {
                             Ok(()) => {
@@ -480,6 +481,56 @@ impl Driver {
     }
 
     fn planner_brief(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
+        let mut brief = self.planner_brief_inner(prompt, errors)?;
+        brief.push_str(&self.skills_offer(prompt));
+        Ok(brief)
+    }
+
+    /// The enabled skills the planner may attach to pages, and those the person named.
+    fn skills_offer(&self, prompt: &str) -> String {
+        let Some(store) = self.skills_store() else { return String::new() };
+        let enabled = store.enabled();
+        if enabled.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "\nSkills are installed. A page may list some in `\"skills\":[\"name\"]`; its agent then reads that SKILL.md \
+             before it starts. Attach a skill only where it clearly applies to that page's work, and none otherwise:\n",
+        );
+        for skill in &enabled {
+            let about: String = skill.description.chars().take(200).collect();
+            out.push_str(&format!("- {}: {}\n", skill.name, if about.is_empty() { "no description" } else { &about }));
+        }
+        let asked: Vec<String> = crate::skills::asked_for(prompt).into_iter().filter(|n| enabled.iter().any(|s| &s.name == n)).collect();
+        if !asked.is_empty() {
+            out.push_str(&format!("The request asks for {}: attach each to every page it applies to.\n", asked.join(", ")));
+        }
+        out
+    }
+
+    fn skills_store(&self) -> Option<crate::skills::Store> {
+        let root = self.config.skills.clone()?;
+        Some(crate::skills::Store::new(root, Arc::new(crate::skills::Web)))
+    }
+
+    /// Keep only skills that are installed and enabled, and give the ones the person asked
+    /// for to every page when the planner attached them nowhere.
+    fn settle_skills(&self, plan: &mut Plan, prompt: &str) {
+        let enabled: Vec<String> = self.skills_store().map(|s| s.enabled().into_iter().map(|s| s.name).collect()).unwrap_or_default();
+        for page in &mut plan.pages {
+            page.skills.retain(|n| enabled.contains(n));
+            page.skills.dedup();
+        }
+        for name in crate::skills::asked_for(prompt).into_iter().filter(|n| enabled.contains(n)) {
+            if !plan.pages.iter().any(|p| p.skills.contains(&name)) {
+                for page in &mut plan.pages {
+                    page.skills.push(name.clone());
+                }
+            }
+        }
+    }
+
+    fn planner_brief_inner(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
         if self.small_pass(prompt) {
             let template = self.template.as_ref().map(|t| t.brief()).unwrap_or_default();
             let mut brief = crate::small::small_brief(prompt, &self.entry_listing()?, &template, self.parallel);
@@ -521,7 +572,7 @@ impl Driver {
              Every page, and every unit, is one agent: its `brief` is that agent's whole task and `done` is one line \
              saying how it knows it is finished.\n\
              {\"design\":\"...\",\"contracts\":[{\"path\":\"app/types.ts\",\"content\":\"...\"}],\
-             \"pages\":[{\"id\":\"home\",\"route\":\"/home\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\",\"done\":\"...\"}],\
+             \"pages\":[{\"id\":\"home\",\"route\":\"/home\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\",\"done\":\"...\",\"skills\":[]}],\
              \"estimate\":{\"tokens\":0,\"usd\":0},\
              \"dictionary\":[{\"key\":\"theme\",\"kind\":\"hint\",\"summary\":\"...\",\"content\":\"...\",\"stack\":\"next\"}]}\n\
              \nRules: at least one page; page ids use letters, digits, `_` and `-`; \
@@ -1677,7 +1728,8 @@ impl Driver {
         let wanted: Vec<&str> = if errors.is_some() { vec![target.as_str(), "workers"] } else { vec!["workers"] };
         let notes = self.live.take_notes(&self.id, &wanted);
         let owned = self.owned_files(page, unit, units, &cwd);
-        let brief = self.with_notes(self.worker_brief(page, unit, units, tier, errors, &owned)?, &notes);
+        let mut brief = self.with_notes(self.worker_brief(page, unit, units, tier, errors, &owned)?, &notes);
+        brief.push_str(&self.deliver_skills(page, &cwd));
         let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
         Ok(AgentRequest {
             harness: self.harness_for(tier),
@@ -1692,6 +1744,24 @@ impl Driver {
             read_only: false,
             feed: None,
         })
+    }
+
+    /// Copy the page's skills into the worktree, and the lines that point the agent at them.
+    fn deliver_skills(&self, page: &str, cwd: &Path) -> String {
+        let Ok(names) = self.page(page).map(|p| p.skills.clone()) else { return String::new() };
+        if names.is_empty() {
+            return String::new();
+        }
+        let Some(store) = self.skills_store() else { return String::new() };
+        let given = store.deliver(&names, cwd);
+        if given.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("\nSkills for this page. Read each SKILL.md before the work it covers, and follow it:\n");
+        for (name, about) in given {
+            out.push_str(&format!("- `.taskmaster/skills/{name}/SKILL.md`{}\n", if about.is_empty() { String::new() } else { format!(": {about}") }));
+        }
+        out
     }
 
     /// Files already in the worktree that this agent owns, so it need not look for them.

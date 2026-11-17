@@ -78,7 +78,7 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
          `contracts` are shared source files, only for interfaces used by more than one file or worker; otherwise `[]`. \
          Each page or unit is one agent: `brief` is its whole task in a few lines, `done` one line saying when it is finished. \
          Keep contracts short. Leave `estimate` at zero.\n\
-         {\"design\":\"...\",\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\",\"done\":\"...\"}],\
+         {\"design\":\"...\",\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\",\"done\":\"...\",\"skills\":[]}],\
          \"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n\
          Rules: at least one page; ids use letters, digits, `_` and `-`; globs and contract paths are relative, no `..`; \
          cited keys are listed above or in `dictionary`; briefs are non-empty.\n",

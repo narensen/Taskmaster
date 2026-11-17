@@ -99,6 +99,7 @@ async fn run() -> anyhow::Result<Outcome> {
     };
     check_models(&args.roles, &args.models).await?;
     let mut config = Config::new(&args.project);
+    config.skills = Some(tm_daemon::skills::default_root());
     config.plan = match &args.plan {
         Some(path) => Some(
             serde_json::from_reader(std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?)

@@ -71,6 +71,7 @@ pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {
         ".taskmaster/dictionary/",
         ".taskmaster/commons/",
         ".taskmaster/evals/",
+        ".taskmaster/skills/",
         ".taskmaster/errorography.json",
         ".taskmaster/citations.json",
         ".taskmaster/pairing.json",

@@ -33,6 +33,7 @@ mod small;
 mod static_site;
 pub mod search;
 pub mod settings;
+pub mod skills;
 pub mod sqlite;
 pub mod store;
 pub mod template;
@@ -211,6 +212,8 @@ pub struct Config {
     /// Where agents' text, thoughts and tool calls are written as they happen. `None`
     /// writes them next to the run's records.
     pub live: Option<Arc<live::Live>>,
+    /// The skills store the planner may attach from. `None` attaches no skills.
+    pub skills: Option<PathBuf>,
 }
 
 impl Config {
@@ -238,6 +241,7 @@ impl Config {
             models: Models::default(),
             cancel,
             live: None,
+            skills: None,
         }
     }
 }

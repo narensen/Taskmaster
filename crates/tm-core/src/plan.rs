@@ -162,6 +162,7 @@ mod tests {
                 brief: "Implement home.".into(),
                 done: String::new(),
                 units: vec![],
+                skills: vec![],
             }],
             estimate: Estimate { tokens: 1, usd: 0.0 },
             design: String::new(),
@@ -193,6 +194,7 @@ mod tests {
             brief: "  ".into(),
             done: String::new(),
             units: vec![],
+            skills: vec![],
         });
         broken.contracts.push(ContractFile { path: "contracts/types.ts".into(), content: " \n".into() });
         broken.estimate.usd = -1.0;

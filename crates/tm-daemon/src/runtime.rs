@@ -552,6 +552,7 @@ mod tests {
             brief: String::new(),
             done: String::new(),
             units: vec![],
+            skills: vec![],
         };
         Owners::from_plan(&Plan {
             contracts: vec![],

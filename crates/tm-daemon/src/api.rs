@@ -34,7 +34,8 @@
 //! POST /api/commons/entries       an entry another daemon promoted
 //! ```
 //!
-//! Installing, updating and signing in to harness CLIs is in `api/setup.rs`.
+//! Installing, updating and signing in to harness CLIs is in `api/setup.rs`, and the
+//! skills store in `api/skills.rs`.
 //!
 //! The control surface's own routes (the agent transcript, notes, the terminal, diffs,
 //! opening files in an editor, completions, gh) are listed in `api/desk.rs`.
@@ -84,6 +85,7 @@ use tokio::sync::{oneshot, watch};
 
 mod desk;
 mod setup;
+mod skills;
 
 #[cfg(test)]
 pub(crate) use desk::{Style, choose_editor, redact, sensitive};
@@ -121,6 +123,10 @@ pub struct ServerOptions {
     pub preview_command: String,
     /// Chooses the commands of install, update and sign-in jobs. Tests pass their own.
     pub setup_planner: Option<crate::jobs::Planner>,
+    /// The skills store shared by every harness.
+    pub skills: PathBuf,
+    /// Where skills are searched for and fetched from. Tests pass canned answers.
+    pub skills_fetch: Arc<dyn crate::skills::Fetch>,
 }
 
 impl ServerOptions {
@@ -139,6 +145,8 @@ impl ServerOptions {
             editor: String::new(),
             preview_command: String::new(),
             setup_planner: None,
+            skills: crate::skills::default_root(),
+            skills_fetch: Arc::new(crate::skills::Web),
         }
     }
 }
@@ -194,6 +202,8 @@ struct App {
     /// Running review jobs, so cancelling one (or its run) can stop the agents.
     reviews: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     jobs: Arc<crate::jobs::Jobs>,
+    skills_root: PathBuf,
+    skills_fetch: Arc<dyn crate::skills::Fetch>,
 }
 
 impl Server {
@@ -236,6 +246,8 @@ impl Server {
             previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
             reviews: Mutex::new(HashMap::new()),
             jobs: Arc::new(crate::jobs::Jobs::new(options.setup_planner.unwrap_or_else(crate::jobs::default_planner))),
+            skills_root: options.skills,
+            skills_fetch: options.skills_fetch,
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -293,7 +305,14 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/paths", post(desk::paths))
         .route("/api/file", get(desk::file))
         .route("/api/files", get(desk::files))
-        .route("/api/skills", get(desk::skills))
+        .route("/api/skills", get(skills::list))
+        .route("/api/skills/search", get(skills::search))
+        .route("/api/skills/updates", get(skills::updates))
+        .route("/api/skills/install", post(skills::install))
+        .route("/api/skills/{name}/enable", post(skills::enable))
+        .route("/api/skills/{name}/update", post(skills::update))
+        .route("/api/skills/{name}/remove", post(skills::remove))
+        .route("/api/skills/{name}/import", post(skills::import))
         .route("/api/gh", get(desk::gh_status))
         .route("/api/gh/pr/{number}", get(desk::gh_pr))
         .route("/api/setup", get(setup::overview))
@@ -599,6 +618,7 @@ impl App {
             .map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
         let (cancel, cancelled) = watch::channel(matches!(decision, Decision::Cancel));
         let mut config = Config::new(self.project());
+        config.skills = Some(self.skills_root.clone());
         config.run_id = id.to_string();
         config.plan = request.plan;
         config.prompt = request.prompt;

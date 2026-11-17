@@ -158,6 +158,7 @@ mod tests {
             brief: String::new(),
             done: String::new(),
             units: vec![],
+            skills: vec![],
         };
         Plan {
             contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new() }],

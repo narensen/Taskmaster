@@ -22,7 +22,6 @@
 //! POST /api/paths                 {paths: [..]} -> {paths: {raw: full path or null}}
 //! GET  /api/file                  ?path=<p> a file's text, for a read-only preview
 //! GET  /api/files                 files git knows in the project
-//! GET  /api/skills                SKILL.md names under .agents/skills and .claude/skills
 //! GET  /api/gh                    whether gh is installed and signed in, and as whom
 //! GET  /api/gh/pr/{number}        one pull request of the project's repository
 //! ```
@@ -792,27 +791,6 @@ pub async fn files(State(app): State<Arc<App>>) -> Reply {
     ok(json!({ "files": list }))
 }
 
-pub async fn skills(State(app): State<Arc<App>>) -> Reply {
-    let mut found = Vec::new();
-    for root in [".agents/skills", ".claude/skills"] {
-        let Ok(dirs) = std::fs::read_dir(app.project().join(root)) else { continue };
-        for dir in dirs.flatten() {
-            let file = dir.path().join("SKILL.md");
-            let Ok(text) = std::fs::read_to_string(&file) else { continue };
-            let named = text
-                .lines()
-                .take(20)
-                .find_map(|line| line.strip_prefix("name:").map(|n| n.trim().trim_matches('"').to_string()))
-                .filter(|n| !n.is_empty());
-            let name = named.unwrap_or_else(|| dir.file_name().to_string_lossy().into_owned());
-            let path = format!("{root}/{}/SKILL.md", dir.file_name().to_string_lossy());
-            found.push(json!({ "name": name, "path": path }));
-        }
-    }
-    found.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    ok(json!({ "skills": found }))
-}
-
 // The live preview.
 
 fn preview_view(app: &App, id: &str) -> Value {
@@ -1056,6 +1034,7 @@ mod tests {
                 brief: "b".into(),
                 done: String::new(),
                 units: vec![],
+                skills: vec![],
             }],
             estimate: tm_core::Estimate { tokens: 1000, usd: 0.5 },
             design: String::new(),

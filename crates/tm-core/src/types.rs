@@ -75,6 +75,10 @@ pub struct PagePlan {
     /// means one worker owns the whole page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<WorkUnit>,
+    /// Installed skills the planner attached: names from the skills store. The page's
+    /// agents find each one's SKILL.md in their worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// One worker's share of a page: a disjoint set of files and what to build in them.
@@ -306,6 +310,7 @@ mod unit_tests {
             brief: "b".into(),
             done: String::new(),
             units,
+            skills: vec![],
         }
     }
 

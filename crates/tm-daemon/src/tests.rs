@@ -145,7 +145,8 @@ impl World {
     async fn respond(&self, task: &WorkerTask) -> anyhow::Result<Script> {
         let brief = task.brief.clone();
         // How the call was made rides on the recorded brief, after the text the daemon sent.
-        let how = format!("\n[effort={}][dictionary={}]", task.effort.as_deref().unwrap_or("default"), task.dictionary.is_some());
+        let skills = std::fs::read_dir(task.cwd.join(".taskmaster/skills")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        let how = format!("\n[effort={}][dictionary={}][skills={skills}]", task.effort.as_deref().unwrap_or("default"), task.dictionary.is_some());
         self.calls.lock().unwrap().push(format!("{brief}{how}"));
         if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             return Ok(Script::text(&self.plan_reply()));
@@ -323,6 +324,7 @@ fn plan(pages: &[(&str, &[&str])]) -> Plan {
                 brief: format!("Implement {id}."),
                 done: String::new(),
                 units: vec![],
+                skills: vec![],
             })
             .collect(),
         estimate: Estimate { tokens: 10, usd: 0.01 },
@@ -1233,6 +1235,58 @@ async fn a_contract_nobody_can_repair_fails_the_run() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_page_s_skills_are_in_its_worktree_and_brief_and_never_merged() {
+    let tmp = seeded("skills");
+    let store_dir = tmp.0.join("../").canonicalize().unwrap().join(format!("{}-store", tmp.0.file_name().unwrap().to_string_lossy()));
+    let canned = Arc::new(crate::skills::tests::Canned::default());
+    crate::skills::tests::canned_repo(&canned, "v1", "---\nname: tidy-css\ndescription: Keep stylesheets ordered.\n---\n");
+    let store = crate::skills::Store::new(&store_dir, canned);
+    store.install("acme/kit", "tidy-css").unwrap();
+    let mut planned = plan(&[("a", &[]), ("b", &[])]);
+    planned.pages[0].skills = vec!["tidy-css".into(), "not-installed".into()];
+    let mut cfg = config(&tmp.0, planned, true, 2);
+    cfg.skills = Some(store_dir.clone());
+    let world = World::new(Mode::Write);
+    let outcome = run(cfg, &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let a = calls.iter().find(|c| c.contains("Build page `a`")).unwrap();
+    assert!(a.contains("`.taskmaster/skills/tidy-css/SKILL.md`: Keep stylesheets ordered."), "{a}");
+    assert!(a.contains("[skills=tidy-css]"), "{a}");
+    let b = calls.iter().find(|c| c.contains("Build page `b`")).unwrap();
+    assert!(!b.contains(".taskmaster/skills") && b.contains("[skills=]"), "{b}");
+    // The copy stays out of the project.
+    assert!(!tmp.0.join(".taskmaster/skills").exists());
+    assert!(!git_out(&tmp.0, &["log", "--name-only", "--format="]).contains("SKILL.md"));
+    std::fs::remove_dir_all(store_dir).ok();
+}
+
+#[tokio::test]
+async fn the_planner_is_offered_enabled_skills_and_unknown_ones_are_dropped() {
+    let tmp = seeded("skills-plan");
+    let store_dir = std::env::temp_dir().join(format!("tm-skills-plan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let canned = Arc::new(crate::skills::tests::Canned::default());
+    crate::skills::tests::canned_repo(&canned, "v1", "---\nname: tidy-css\ndescription: Keep stylesheets ordered.\n---\n");
+    crate::skills::Store::new(&store_dir, canned).install("acme/kit", "tidy-css").unwrap();
+    let mut cfg = Config::new(&tmp.0);
+    cfg.prompt = Some("A notes app. Use $tidy-css.".into());
+    cfg.skills = Some(store_dir.clone());
+    cfg.timeout = Duration::from_secs(30);
+    let world = World::new(Mode::Plan);
+    let outcome = run(cfg, &world).await.unwrap();
+    assert!(matches!(outcome, Outcome::NeedsApproval { .. }), "{outcome:?}");
+    let calls = world.calls.lock().unwrap().clone();
+    let brief = calls.iter().find(|c| c.contains("Skills are installed.")).expect("the planner saw the skills");
+    assert!(brief.contains("- tidy-css: Keep stylesheets ordered."), "{brief}");
+    assert!(brief.contains("The request asks for tidy-css"), "{brief}");
+    // The planner attached nothing, so the skill the person named goes to every page.
+    let saved: Plan = serde_json::from_str(&read(&tmp.0.join(".taskmaster/runs/current/plan.json"))).unwrap();
+    assert!(saved.pages.iter().all(|p| p.skills == vec!["tidy-css".to_string()]), "{:?}", saved.pages);
+    std::fs::remove_dir_all(store_dir).ok();
+}
+
+#[tokio::test]
 async fn an_error_that_was_there_before_the_run_is_left_alone() {
     let tmp = typed("shared-older", "lib/old.ts(1,1): error TS2304: Cannot find name 'gone'.", "false");
     let world = World::new(Mode::Write);
@@ -1311,11 +1365,56 @@ mod http {
         let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
         let code = auth.code().to_string();
         let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        options.skills = tmp.0.join(".skills-store");
         let world = world.clone();
         options.harness = Arc::new(move |_| Ok(Arc::new(Fake(world.clone())) as Arc<dyn Harness>));
         let server = Server::serve(options).await.unwrap();
         let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
         (server, Client { addr, token: None }, code)
+    }
+
+    #[tokio::test]
+    async fn skills_are_searched_installed_toggled_updated_and_removed_over_the_api() {
+        let tmp = seeded("skills-api");
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let code = auth.code().to_string();
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        let canned = Arc::new(crate::skills::tests::Canned::default());
+        crate::skills::tests::canned_repo(&canned, "v1", "---\nname: tidy-css\ndescription: Keep stylesheets ordered.\n---\n");
+        canned.set("https://skills.sh/api/search?q=tidy", r#"{"skills":[{"source":"acme/kit","skillId":"tidy-css","name":"tidy-css","installs":7}]}"#);
+        options.skills = tmp.0.join(".skills-store");
+        options.skills_fetch = canned.clone();
+        let server = Server::serve(options).await.unwrap();
+        let mut client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        assert_eq!(client.get("/api/skills/search?q=t").await.0, 400);
+        let (status, found) = client.get("/api/skills/search?q=tidy").await;
+        assert_eq!(status, 200, "{found}");
+        assert_eq!(found["hits"][0]["installed"], false);
+        assert_eq!(client.post("/api/skills/install", json!({ "repo": "acme/kit", "skill": "../x" })).await.0, 400);
+        let (status, skill) = client.post("/api/skills/install", json!({ "repo": "acme/kit", "skill": "tidy-css" })).await;
+        assert_eq!(status, 200, "{skill}");
+        assert_eq!((skill["name"].as_str(), skill["enabled"].as_bool()), (Some("tidy-css"), Some(true)));
+        assert_eq!(client.get("/api/skills/search?q=tidy").await.1["hits"][0]["installed"], true);
+        let (_, listed) = client.get("/api/skills").await;
+        let stored: Vec<&Value> = listed["skills"].as_array().unwrap().iter().filter(|s| s["place"] == "store").collect();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["description"], "Keep stylesheets ordered.");
+
+        assert_eq!(client.post("/api/skills/tidy-css/enable", json!({ "enabled": false })).await.1["enabled"], false);
+        assert_eq!(client.get("/api/skills/updates").await.1["updates"], json!({}));
+        crate::skills::tests::canned_repo(&canned, "v2", "---\nname: tidy-css\ndescription: Keep stylesheets ordered, v2.\n---\n");
+        assert_eq!(client.get("/api/skills/updates").await.1["updates"]["tidy-css"], "v2");
+        let (status, updated) = client.post("/api/skills/tidy-css/update", json!({})).await;
+        assert_eq!(status, 200, "{updated}");
+        assert_eq!(updated["description"], "Keep stylesheets ordered, v2.");
+        assert_eq!(updated["enabled"], false, "an update keeps the switch where it was");
+        assert_eq!(client.post("/api/skills/tidy-css/remove", json!({})).await.0, 200);
+        assert_eq!(client.post("/api/skills/tidy-css/remove", json!({})).await.0, 404);
+        let (_, left) = client.get("/api/skills").await;
+        assert!(!left["skills"].as_array().unwrap().iter().any(|s| s["place"] == "store"), "{left}");
     }
 
     #[tokio::test]

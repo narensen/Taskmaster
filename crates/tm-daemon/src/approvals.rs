@@ -160,13 +160,41 @@ impl ApprovalGate {
         if mode == Mode::Never || self.inner.is_read_only() {
             return None;
         }
-        match (base, self.inner.risk(request)) {
-            (Decision::Deny, Some(reason)) => Some(reason.to_string()),
-            (Decision::Allow, _) if mode == Mode::Always && request.kind != ToolKind::Dictionary => {
-                Some("asks before every tool call".to_string())
-            }
-            _ => None,
+        let risk = self.inner.risk(request);
+        // Always asks about what the gate allows, and about the refusals worth a question.
+        // Other refusals (a read outside the worktree) stay refused.
+        if mode == Mode::Always && base == Decision::Deny && risk.is_none() {
+            return None;
         }
+        let reason = ask_reason(mode, request.kind, risk.is_some() || self.outside_glob(request))?;
+        Some(risk.filter(|_| mode == Mode::Risky).unwrap_or(reason).to_string())
+    }
+
+    /// Whether an edit touches a path outside the page's owned glob. An agent with no
+    /// glob (the master, in shared files) is not confined to one.
+    fn outside_glob(&self, request: &PermissionRequest) -> bool {
+        if request.kind != ToolKind::Edit {
+            return false;
+        }
+        let Some(glob) = self.agent["owned_glob"].as_str().and_then(|g| globset::Glob::new(g).ok()) else { return false };
+        let matcher = glob.compile_matcher();
+        request.paths.iter().any(|p| self.inner.relative(p).is_none_or(|rel| !matcher.is_match(rel)))
+    }
+}
+
+/// The rule: why a call must wait for a person under `mode`, or `None` to let the gate's
+/// answer stand. `unsafe_edit` is true when an edit lands outside the worktree or outside
+/// the page's owned glob. `Risky` asks about shell commands, network fetches and such
+/// edits; reads and in-glob edits pass. `Always` asks about everything but the Dictionary.
+pub fn ask_reason(mode: Mode, kind: ToolKind, unsafe_edit: bool) -> Option<&'static str> {
+    match (mode, kind) {
+        (Mode::Never, _) => None,
+        (Mode::Always, ToolKind::Dictionary) => None,
+        (Mode::Always, _) => Some("asks before every tool call"),
+        (Mode::Risky, ToolKind::Execute) => Some("runs a shell command"),
+        (Mode::Risky, ToolKind::Fetch) => Some("fetches from the network"),
+        (Mode::Risky, ToolKind::Edit) if unsafe_edit => Some("writes outside the page's files"),
+        (Mode::Risky, _) => None,
     }
 }
 
@@ -225,5 +253,34 @@ fn kind_name(kind: ToolKind) -> &'static str {
         ToolKind::Fetch => "fetch",
         ToolKind::Dictionary => "dictionary",
         ToolKind::Other => "other",
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    #[test]
+    fn risky_asks_for_shell_network_and_out_of_glob_writes() {
+        assert!(ask_reason(Mode::Risky, ToolKind::Execute, false).is_some());
+        assert!(ask_reason(Mode::Risky, ToolKind::Fetch, false).is_some());
+        assert!(ask_reason(Mode::Risky, ToolKind::Edit, true).is_some());
+    }
+
+    #[test]
+    fn risky_allows_reads_and_in_glob_writes() {
+        assert!(ask_reason(Mode::Risky, ToolKind::Edit, false).is_none());
+        assert!(ask_reason(Mode::Risky, ToolKind::Read, false).is_none());
+        assert!(ask_reason(Mode::Risky, ToolKind::Dictionary, false).is_none());
+    }
+
+    #[test]
+    fn always_and_never_are_unchanged() {
+        assert!(ask_reason(Mode::Always, ToolKind::Read, false).is_some());
+        assert!(ask_reason(Mode::Always, ToolKind::Edit, false).is_some());
+        assert!(ask_reason(Mode::Always, ToolKind::Dictionary, false).is_none());
+        for kind in [ToolKind::Read, ToolKind::Edit, ToolKind::Execute, ToolKind::Fetch] {
+            assert!(ask_reason(Mode::Never, kind, true).is_none());
+        }
     }
 }

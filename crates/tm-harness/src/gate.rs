@@ -93,6 +93,11 @@ impl WorktreeGate {
         }
     }
 
+    /// The path relative to the worktree root, or `None` when it lies outside it.
+    pub fn relative(&self, path: &Path) -> Option<PathBuf> {
+        self.resolve(path).strip_prefix(&self.root).ok().map(Path::to_path_buf)
+    }
+
     fn inside(&self, path: &Path) -> bool {
         self.resolve(path).starts_with(&self.root)
     }

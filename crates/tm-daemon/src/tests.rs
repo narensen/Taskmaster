@@ -1694,7 +1694,7 @@ mod http {
                 let inside = tm_harness::PermissionRequest {
                     tool: "Write".into(),
                     kind: tm_harness::ToolKind::Edit,
-                    paths: vec![task.cwd.join("app/x.ts")],
+                    paths: vec![task.cwd.join(format!("app/{id}/x.ts"))],
                     command: None,
                 };
                 for (label, request) in [("shell", &shell), ("outside", &outside), ("inside", &inside)] {

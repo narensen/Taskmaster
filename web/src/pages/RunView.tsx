@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import gsap from "gsap";
-import { CircleCheck, CircleX, Coins, GitBranch, GitCompare, GitMerge, Loader2, PanelRightClose, PanelRightOpen, ScanSearch, ShieldAlert } from "lucide-react";
+import { CircleCheck, CircleX, Coins, GitBranch, GitCompare, GitMerge, Loader2, PanelRightClose, PanelRightOpen, ShieldAlert } from "lucide-react";
 import { api, type ReviewJob, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
@@ -14,6 +14,7 @@ import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
 import { motionOn, prefs, setPrefs } from "../prefs";
+import { RoleMark } from "../marks";
 import { bezier, dur, ease, fadeUp } from "../motion";
 import { Dot, Loading, Problem, useLoad } from "../ui";
 import { takeAttachments } from "../App";
@@ -80,7 +81,7 @@ function ReviewCard({ id }: { id: string }) {
     <section className={`review-card ${running ? "is-running" : ""}`} data-testid="review-card" aria-label="Code review">
       <div className="review-card-head">
         <span className="review-ico" aria-hidden>
-          {running ? <Loader2 size={16} className="spin-ico" /> : <ScanSearch size={16} />}
+          {running ? <Loader2 size={16} className="spin-ico" /> : <RoleMark role="reviewer" size={16} />}
         </span>
         <div className="grow">
           <div className="strong">Code review</div>

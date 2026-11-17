@@ -3,13 +3,13 @@
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Bot, Crown, ScanSearch, ShieldCheck } from "lucide-react";
 import { api, type Attempt, type RunDetail } from "../api";
 import { KnownPath, Rich, looksLikePath, masked } from "../paths";
 import { emit, toast } from "../overlay";
 import { tokens, usd } from "../format";
 import { bezier, fadeUp, stagger } from "../motion";
 import { motionOn } from "../prefs";
+import { RoleMark, markFor } from "../marks";
 import type { Item, Surface } from "./model";
 
 function byline(s: Surface, detail: RunDetail | null): { harness: string; model: string } {
@@ -133,7 +133,7 @@ export function AgentSurface({
       <header className="agent-head">
         <div className="agent-title">
           <span className="agent-avatar" aria-hidden>
-            {s.id === "master" ? <Crown size={14} /> : s.id === "reviewer" ? <ScanSearch size={14} /> : s.id === "verifier" ? <ShieldCheck size={14} /> : <Bot size={14} />}
+            <RoleMark role={markFor(s.id, s.page ? detail?.pages.find((p) => p.id === s.page)?.tier : undefined)} size={15} />
           </span>
           <span className="strong grow clip">{s.title}</span>
           <span className="agent-state">

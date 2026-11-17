@@ -4,8 +4,9 @@
 
 import { useLayoutEffect, useRef } from "react";
 import gsap from "gsap";
-import { Bot, CircleCheck, FileCode2, Lock, Palette } from "lucide-react";
+import { CircleCheck, FileCode2, Lock, Palette } from "lucide-react";
 import { planAgents, type Plan } from "../api";
+import { RoleMark } from "../marks";
 import { KnownPath } from "../paths";
 import { motionOn } from "../prefs";
 import { dur, ease } from "../motion";
@@ -44,7 +45,7 @@ export function PlanView({
       {agents.map((agent) => (
         <article key={agent.id} className="plan-agent">
           <div className="plan-agent-head">
-            <Bot size={14} aria-hidden />
+            <RoleMark role="worker" size={14} />
             <span className="mono strong clip">{agent.id}</span>
           </div>
           <span className="mono muted clip plan-owns" title={agent.owned_glob}>
@@ -116,7 +117,7 @@ export function PlanView({
       ) : (
         <>
           <div className="plan-label">
-            <Bot size={13} aria-hidden /> Agents
+            <RoleMark role="worker" size={13} /> Agents
           </div>
           {agentList}
           {designBlock}

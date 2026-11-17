@@ -2359,6 +2359,9 @@ mark.current { outline: 1px solid var(--ask); }
 }
 .role-pick:last-child { border-bottom: 0; padding-bottom: 0; }
 .role-name { display: flex; flex-direction: column; }
+.role-label { display: inline-flex; align-items: center; gap: 6px; }
+.role-label .role-mark { color: var(--muted); flex: none; }
+.role-mark { display: block; flex: none; }
 .role-pick .error-line { grid-column: 1 / -1; }
 .settings-layout { display: grid; grid-template-columns: 188px minmax(0, 1fr); gap: var(--s6); align-items: start; }
 .settings-toc {

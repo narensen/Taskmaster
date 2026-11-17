@@ -1,6 +1,7 @@
 // Choosing a harness and a model for a role, only from what the providers API returned.
 
 import type { Provider, RoleName } from "./api";
+import { RoleMark } from "./marks";
 
 export const ROLES: { id: RoleName; label: string; hint: string }[] = [
   { id: "master", label: "Master", hint: "Plans, locks the contracts, repairs shared files." },
@@ -37,7 +38,10 @@ export function RolePicker({
   return (
     <div className="role-pick">
       <div className="role-name">
-        <span className="strong">{role.label}</span>
+        <span className="strong role-label">
+          <RoleMark role={role.id} size={14} />
+          {role.label}
+        </span>
         <span className="muted small">{role.hint}</span>
       </div>
       <select aria-label={`${role.label} harness`} value={harness} onChange={(e) => onChange(e.target.value, null)}>

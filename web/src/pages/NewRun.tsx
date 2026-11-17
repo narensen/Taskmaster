@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, GitMerge, ListChecks, Settings2, ShieldCheck, Sparkles, Users, X } from "lucide-react";
+import { ArrowUp, GitMerge, ListChecks, Settings2, Users, X } from "lucide-react";
+import { RoleMark } from "../marks";
 import { api, DEFAULT_ROLES, type RoleName, type Roles } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
@@ -78,7 +79,7 @@ export function NewRun() {
                   onClick={() => setAdvanced((v) => !v)}
                   title="Harnesses and models"
                 >
-                  <Sparkles size={13} />
+                  <RoleMark role="master" size={14} />
                   <span className="clip">{pill}</span>
                 </button>
                 <span className="foot-sep" aria-hidden />
@@ -166,11 +167,11 @@ export function NewRun() {
                 <span><strong>Plan</strong> pages, contracts and a design spec you approve</span>
               </li>
               <li>
-                <Users size={15} aria-hidden />
+                <RoleMark role="worker" size={15} />
                 <span><strong>Build</strong> in parallel, one agent per page</span>
               </li>
               <li>
-                <ShieldCheck size={15} aria-hidden />
+                <RoleMark role="verifier" size={15} />
                 <span><strong>Check</strong> with free static and browser checks</span>
               </li>
               <li>

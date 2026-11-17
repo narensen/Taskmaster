@@ -2,9 +2,95 @@
   <img src="assets/logo.png" alt="Taskmaster" width="420">
 </p>
 
+<h3 align="center">Describe the product once. Let many models build it, and have a different one check the work.</h3>
+
+<p align="center">
+  <img src="assets/screenshots/01-gallery-desktop.png" alt="The Taskmaster gallery of runs" width="860">
+</p>
+
+## What it is
+
 Taskmaster is a multi-model coding harness. You describe the product once. A planner locks the contracts and the Dictionary. Workers build one page each, in parallel, and cite only those locked entries. A different model reviews the connections, and another confirms the findings before a page is asked to repair them.
 
 The run is a state machine. The models do the writing. Taskmaster decides the next step and records it, so a crashed run resumes from the log instead of from a model's memory.
+
+## Features
+
+- **Locked plan.** Contracts and Dictionary entries are committed before any page is built, and each page is granted only the keys it cites.
+- **Parallel pages.** Each page builds in its own git worktree on a run branch, `taskmaster/<run id>`. Only files matching the page's glob are merged. Up to four build at once.
+- **Five harnesses.** `claude`, `agy`, `grok`, `codex` and `opencode`, each assigned per role (master, mid, worker, reviewer, verifier).
+- **Independent review.** The reviewer and the verifier are different harnesses, so one model does not grade its own page.
+- **Checks that cost nothing.** `tsc`, eslint, clippy, ruff, the project's own `build` and `test`, and headless-Chrome checks of a Next.js app, run before a run finishes.
+- **Per-tool approval.** `approvals.mode` can ask a person before risky tool calls (shell, network, writes outside the worktree) instead of refusing them.
+- **Live preview.** A run's dev server can be started from the app and is stopped with the run.
+- **Cost ledger.** Every agent call is recorded with tokens, seconds and price when the harness reports one.
+- **Dictionary and Commons.** An immutable, content-addressed store of contracts, plus a shared Commons you can opt in to.
+- **Errorography.** Each model's repeated mistakes are handed back to it on its next attempt.
+- **Resumable.** `events.jsonl` is the run; replaying it rebuilds the state.
+- **Review any repo.** `tm-review` reviews a diff, a range or a pull request without a Taskmaster plan.
+- **Desktop and phone app.** A React app served by the daemon; pair a phone over Tailscale.
+
+## Screenshots
+
+| | |
+| --- | --- |
+| ![Locked plan awaiting approval](assets/screenshots/03-locked-plan-approval.png) | ![Live preview tab](assets/screenshots/06-preview-tab.png) |
+| **Locked plan.** Approve or reject with a note. | **Preview.** The run's dev server beside the run. |
+| ![Diff with a comment on a line](assets/screenshots/08-diff-gutter-comment.png) | ![Command palette](assets/screenshots/14-palette.png) |
+| **Diff.** Comment on a line in the gutter. | **Palette.** Jump to runs, pages and commands. |
+
+<p align="center">
+  <img src="assets/screenshots/21-phone-run.png" alt="A run on a phone" width="300"><br>
+  <em>The same app on a phone.</em>
+</p>
+
+## Quickstart
+
+You need `cargo` and `git`. Install the CLIs of the harnesses you want to use; `tm-daemon providers` prints the install and sign-in commands.
+
+```bash
+scripts/install.sh                       # builds tm-daemon and tm-review, plus the app if npm is present
+tm-daemon . --prompt "A small notes app with a list and an editor."
+tm-daemon . --yes                        # approve the recorded plan and build it
+```
+
+Or use the app:
+
+```bash
+cd web && npm ci && npm run build
+tm-daemon serve . --web web/dist         # http://127.0.0.1:8737, pair with the printed code
+```
+
+`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, and 2 when the plan is waiting for `--yes`.
+
+## Architecture
+
+```text
+ web (React + Vite) ──HTTP/SSE──┐
+ tm-daemon CLI ─────────────────┤
+                                ▼
+                         tm-daemon ── executor, ledger, API, git worktrees
+                          │   │   │
+          decides next ───┘   │   └── tm-dictionary (store, Commons, MCP)
+          tm-core             │
+          (no I/O)            └── tm-harness ──► claude · agy · grok · codex · opencode
+                                  tm-verify (globs, import graph)
+                                  tm-review (any repo)
+
+ tm-commons ── shared Commons + sign-in service (tm-token: Ed25519 JWTs)
+```
+
+| Crate | Role |
+| --- | --- |
+| `tm-core` | The plan, the Dictionary rules, and the run state machine. No I/O. |
+| `tm-harness` | Headless adapters for Claude Code, Antigravity, Grok, Codex, and OpenCode. |
+| `tm-daemon` | The executor, the ledger, and the API. The binary is `tm-daemon`. |
+| `tm-commons` | The Commons and sign-in service everyone shares. The binary is `tm-commons`. |
+| `tm-dictionary` | The local store, the Commons client, and the MCP server. |
+| `tm-verify` | Ownership globs and the import graph. |
+| `tm-review` | Review of any git repository. The binary is `tm-review`. |
+| `tm-token` | Sign-in tokens: Ed25519 JWTs and the published key. |
+| `web/` | The app (React, TypeScript, Vite). Not a crate. |
 
 ## A run
 
@@ -164,15 +250,28 @@ Without `--web`, the daemon serves `$TASKMASTER_WEB` or `~/.local/share/taskmast
 
 To work on the app, run `npm run dev` in `web/` next to `tm-daemon serve`. Vite sends `/api` to `127.0.0.1:8737`, or to `$TASKMASTER_DAEMON`. A build served from somewhere else can name the daemon on its sign-in screen; the API allows any origin, because it authenticates with tokens, not cookies.
 
-## Storage, accounts and the Commons
+## Configuration
 
-These are set in `.taskmaster/config.json` in the project, or in `~/.taskmaster/config.json`. Without the file nothing changes. `config.example.json` lists every field with a placeholder. A placeholder counts as not set, so you can copy the file and fill in one part at a time.
+Settings live in `.taskmaster/config.json` in the project, or `~/.taskmaster/config.json`. Without the file nothing changes. Copy `config.example.json` and fill in one part at a time; a placeholder counts as not set. Never commit real tokens.
 
-| Part | Default | Set up |
+| Key | Default | Meaning |
 | --- | --- | --- |
-| Records | Files under `.taskmaster/` | `"store": {"kind": "sqlite"}` keeps them in one SQLite file. |
-| The Commons | A directory on this machine | `"commons": {"remote", "token", "share", "report"}` connects to the Taskmaster Commons, which everyone shares. |
-| Sign-in | A pairing code, and one token per device | `"auth": {"issuer", "allow"}` also lets you in with your Commons account. Only the accounts in `allow` get in. |
+| `store.kind`, `store.path` | `files` | `"sqlite"` keeps records in one SQLite file (`.taskmaster/taskmaster.db`). |
+| `auth.issuer`, `auth.allow` | pairing code only | Also accept Commons sign-in; only accounts in `allow` (`github:<login>`, `google:<email>`) get in. |
+| `commons.remote`, `commons.token`, `commons.share`, `commons.report` | local Commons | Connect to the shared Commons; `share` sends promoted entries, `report` reports pass results. |
+| `approvals.mode`, `approvals.timeout_secs` | `never`, 600 | `never` refuses risky calls, `risky` asks first, `always` asks for every tool call. Unanswered questions are refused after the timeout. |
+| `editor` | `$VISUAL`, then `$EDITOR` | The editor the app's Open action uses. |
+| `preview.command` | the project's `dev` script | Command that starts the preview server; it gets the port as `$PORT`. |
+
+Environment variables:
+
+| Variable | Used by | Meaning |
+| --- | --- | --- |
+| `TASKMASTER_WEB` | `tm-daemon serve` | Built app to serve when `--web` is not given (else `~/.local/share/taskmaster/web`). |
+| `TASKMASTER_DAEMON` | `npm run dev` in `web/` | Daemon the Vite dev server proxies `/api` to (default `http://127.0.0.1:8737`). |
+| `TASKMASTER_CHROME` | runtime checks | Chrome binary, when it is not on `PATH`. |
+| `TASKMASTER_GH` | pull-request actions | GitHub CLI program, default `gh` (mainly for tests). |
+| `TM_COMMONS_URL`, `TM_COMMONS_BIND`, `TM_COMMONS_SESSION_SECRET`, `TM_COMMONS_SIGNING_KEY`, `TM_COMMONS_MODERATORS`, `TM_COMMONS_DAILY_LIMIT` | `tm-commons` | Server settings; see `deploy/commons/`. |
 
 ### The Taskmaster Commons
 
@@ -228,21 +327,6 @@ tm-review <repo | url> [--base <rev>] [--head <rev>] [--pr <n>] [--dirty]
 
 Commits the daemon makes need `user.name` and `user.email` on that repository. Taskmaster does not write git config.
 
-## Crates
-
-| Crate | Role |
-| --- | --- |
-| `tm-core` | The plan, the Dictionary rules, and the run state machine. No I/O. |
-| `tm-daemon` | The executor, the ledger, and the API. The binary is `tm-daemon`. |
-| `tm-dictionary` | The local store, the Commons, and the MCP server. |
-| `tm-harness` | Headless adapters for Claude Code, Antigravity, Grok, Codex, and OpenCode. |
-| `tm-verify` | Ownership globs and the import graph. |
-| `tm-review` | Review of any git repository. The binary is `tm-review`. |
-| `tm-commons` | The Commons and sign-in service everyone shares. The binary is `tm-commons`. |
-| `tm-token` | Sign-in tokens: Ed25519 JWTs and the published key. |
-
-`web/` is the app, which is not a crate.
-
 ## Install
 
 ```bash
@@ -251,13 +335,16 @@ scripts/install.sh
 
 This builds both binaries and copies them to `~/.local/bin`, or to the directory you pass. It needs `cargo` and `git`. With `npm` present it also builds the app into `~/.local/share/taskmaster/web`, where `serve` finds it. Antigravity, Grok Build and OpenCode are confined with bubblewrap, so those three also need `bwrap`. A tag starting with `v` builds a Linux release on GitHub.
 
-To build without installing:
+To build without installing: `cargo build --release -p tm-daemon -p tm-review`. A harness is found on `PATH`, and also in `~/.local/bin` and `~/.opencode/bin`.
+
+## Contributing
 
 ```bash
-cargo build --release -p tm-daemon -p tm-review
+cargo test --workspace        # Rust
+cd web && npm ci && npm run typecheck && npm run build
 ```
 
-The binaries are `target/release/tm-daemon` and `target/release/tm-review`. A harness is found on `PATH`, and also in `~/.local/bin` and `~/.opencode/bin`, where their installers put them.
+Run `npm run dev` in `web/` next to `tm-daemon serve .` to work on the app. `tm-core` does no I/O; keep it that way. Commits the daemon makes need `user.name` and `user.email` set on the repository.
 
 ## License
 

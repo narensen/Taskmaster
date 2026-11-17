@@ -43,6 +43,16 @@ pub fn has_head(repo: &Path) -> bool {
     git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok()
 }
 
+/// The checked-out branch name, if the project is a git repo and HEAD is not detached.
+pub fn current_branch(repo: &Path) -> Option<String> {
+    let name = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?.trim().to_string();
+    if name.is_empty() || name == "HEAD" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Keep the daemon's own run state and dictionary out of `git status`. Local exclude only;
 /// the project's committed gitignore is left alone. Architecture and change docs stay visible.
 pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {

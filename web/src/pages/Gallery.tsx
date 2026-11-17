@@ -4,17 +4,18 @@
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
 import { motion } from "framer-motion";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Folder, Inbox, Pin, PinOff, X } from "lucide-react";
-import { api, callAt, DEFAULT_ROLES, type RunSummary } from "../api";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Folder, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
+import { api, callAt, DEFAULT_ROLES, type ApprovalMode, type RunSummary } from "../api";
+import { RoleMark } from "../marks";
 import { Link, navigate } from "../router";
 import { ExternalLink } from "../paths";
-import { isUnpriced, phaseLabel, phaseTone, tokens, usd } from "../format";
+import { isUnpriced, phaseLabel, tokens, usd } from "../format";
 import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, setPrefs, usePrefs } from "../prefs";
 import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
-import { Dot, Empty, Problem, useAction, useLoad } from "../ui";
+import { Problem, useAction, useLoad } from "../ui";
 
 const shots = new Map<string, string | null>();
 const prompts = new Map<string, string | null>();
@@ -53,7 +54,7 @@ function useShot(run: RunSummary): { shot: string | null | undefined; prompt: st
   return { shot, prompt };
 }
 
-function RunCard({ run, group, index }: { run: RunSummary; group: string; index: number }) {
+function RunCard({ run, index }: { run: RunSummary; group?: string; index: number }) {
   const { shot, prompt } = useShot(run);
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
@@ -68,7 +69,7 @@ function RunCard({ run, group, index }: { run: RunSummary; group: string; index:
         delay: on ? stagger(index) : 0,
         layout: { duration: on ? dur.base : 0, ease: bezier.out },
       }}
-      className={`card gallery-card ${group === "Needs approval" ? "ask" : ""}`}
+      className="card gallery-card"
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
       onDrop={(e) => {
         if (e.dataTransfer.files.length) {
@@ -83,17 +84,8 @@ function RunCard({ run, group, index }: { run: RunSummary; group: string; index:
         ) : (
           <div className="frame typed" data-testid="typed-frame">
             <div className="typed-line">{prompt ?? (prompt === null ? "A run from a plan file" : " ")}</div>
-            <div className="typed-phase">
-              <Dot tone={run.cancelled ? "quiet" : group === "Working" ? "busy" : phaseTone(run.phase)} />
-              {phaseLabel(run)}
-            </div>
+            <div className="typed-phase">{phaseLabel(run)}</div>
           </div>
-        )}
-        {shot && (
-          <span className={`frame-badge tone-${run.cancelled ? "quiet" : phaseTone(run.phase)}`}>
-            <Dot tone={run.cancelled ? "quiet" : group === "Working" ? "busy" : phaseTone(run.phase)} />
-            {phaseLabel(run)}
-          </span>
         )}
       </Link>
       <div className="card-foot">
@@ -102,7 +94,7 @@ function RunCard({ run, group, index }: { run: RunSummary; group: string; index:
             {run.id}
           </Link>
           <div className="card-meta clip">
-            {group.toLowerCase()} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {isUnpriced(run.spent) ? `${tokens(run.spent.tokens)} tokens` : usd(run.spent.cost_usd)}
+            {phaseLabel(run)} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {isUnpriced(run.spent) ? `${tokens(run.spent.tokens)} tokens` : usd(run.spent.cost_usd)}
           </div>
         </div>
         <div className="card-actions">
@@ -285,10 +277,17 @@ function ShowAll({
   );
 }
 
+function accessLabel(mode?: ApprovalMode) {
+  if (mode === "never") return "Full access";
+  if (mode === "always") return "Always ask";
+  return "Ask on risky tools";
+}
+
 export function Gallery() {
   const { runs } = useRuns();
   const p = usePrefs();
   const settings = useLoad(api.settings, []);
+  const providers = useLoad(() => api.providers(), []);
   const list = byRecent(ordered(runs, p.showArchived));
   const archived = ordered(runs, true).filter((x) => x.group === "Archived").length;
   const daemons = [...p.daemons].sort((a, b) => Number(b.pinned) - Number(a.pinned));
@@ -297,12 +296,26 @@ export function Gallery() {
   const project = settings.data?.project;
   const name = project ? project.split(/[/\\]/).filter(Boolean).pop() ?? project : null;
   const projectLabel = name ?? null;
+  const branch = settings.data?.branch ?? null;
+  const access = accessLabel(settings.data?.approvals?.mode);
+  const roles = { ...DEFAULT_ROLES, ...(settings.data?.roles ?? {}) };
+  const masterId = roles.master;
+  const master = (providers.data ?? []).find((item) => item.id === masterId);
+  const masterModel = settings.data?.models?.master;
+  const chosen = master?.models.find((m) => m.id === masterModel) ?? master?.models.find((m) => m.default) ?? master?.models[0];
+  const modelPill = `${master?.name ?? masterId} · ${chosen?.name ?? masterModel ?? "default"}`;
+
 
   const strip = useRef<HTMLDivElement>(null);
   const showAllBtn = useRef<HTMLButtonElement>(null);
   const composer = useRef<ComposerHandle>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const [allOpen, setAllOpen] = useState(false);
   const action = useAction();
+
+  useEffect(() => {
+    composer.current?.focus();
+  }, []);
 
   const onStripKey = (e: ReactKeyboardEvent) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -340,8 +353,8 @@ export function Gallery() {
           {runs.length > 0 && (
             <div className="head-stats" aria-label="Run summary">
               <span><strong>{runs.length}</strong> run{runs.length === 1 ? "" : "s"}</span>
-              {working > 0 && <span className="stat-busy"><Dot tone="busy" /> {working} working</span>}
-              {waiting > 0 && <span className="stat-ask"><Dot tone="ask" /> {waiting} need{waiting === 1 ? "s" : ""} approval</span>}
+              {working > 0 && <span>{working} working</span>}
+              {waiting > 0 && <span>{waiting} need{waiting === 1 ? "s" : ""} approval</span>}
             </div>
           )}
         </div>
@@ -382,37 +395,63 @@ export function Gallery() {
         </section>
       )}
 
-      {runs.length === 0 && (
-        <Empty title="No runs yet" icon={<Inbox size={18} strokeWidth={1.5} />}>
-          Describe what to build in the box below. Taskmaster plans it, splits it across agents, and each run gets a card here.
-        </Empty>
-      )}
-
       <div className="home-ask">
         <h2>
           What should we build{projectLabel ? <> in <span className="ask-project">{projectLabel}</span></> : null}?
         </h2>
+        <p className="ask-sub">Describe the result. Taskmaster will plan it first.</p>
         <Composer
           ref={composer}
           bus
-          placeholder="Ask anything. @ files, # pull requests, / commands"
+          placeholder="Ask anything. @ files, $ skills, / commands"
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
               <div className="composer-actions">
-                <Link to="/runs/new" className="muted small">
-                  More options
-                </Link>
-                <span className="hint ask-keys">
-                  <kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line
-                </span>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  multiple
+                  className="sr-only"
+                  aria-hidden
+                  tabIndex={-1}
+                  onChange={(e) => {
+                    if (e.target.files?.length) void composer.current?.addFiles(e.target.files);
+                    e.target.value = "";
+                  }}
+                />
+                <button type="button" className="icon attach-btn" aria-label="Attach files" onClick={() => fileRef.current?.click()}>
+                  <Paperclip size={16} />
+                </button>
               </div>
-              <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
-                {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
-              </button>
+              <div className="composer-end">
+                <Link to="/runs/new" className="model-pill" title="Harnesses and models">
+                  <RoleMark role="master" size={14} />
+                  <span className="clip">{modelPill}</span>
+                </Link>
+                <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
+                  {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
+                </button>
+              </div>
             </div>
           }
         />
+        <div className="home-meta">
+          <span className="home-meta-left">
+            <span>Current checkout</span>
+            {project && <span className="mono clip" title={project}>{name}</span>}
+            {branch && (
+              <span className="home-meta-branch clip">
+                <GitBranch size={12} aria-hidden />
+                {branch}
+              </span>
+            )}
+          </span>
+          <span className="home-meta-access">
+            <Shield size={12} aria-hidden />
+            {access}
+          </span>
+        </div>
         <Problem error={action.error} />
       </div>
 

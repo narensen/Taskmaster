@@ -372,6 +372,8 @@ export interface Note {
 
 export interface DaemonSettings {
   project: string;
+  /** Checked-out branch of the project, when it is a git repository. */
+  branch?: string | null;
   dictionary: string;
   commons: string;
   commons_remote: boolean;

@@ -996,6 +996,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
     let role_defaults = crate::settings::Settings::load(&app.project).unwrap_or_default();
     ok(json!({
         "project": app.project.display().to_string(),
+        "branch": crate::git::current_branch(&app.project),
         "dictionary": app.dictionary.display().to_string(),
         "commons": app.commons.display().to_string(),
         "commons_remote": app.remote.is_some(),

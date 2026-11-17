@@ -83,6 +83,7 @@ export interface ComposerHandle {
   isEmpty: () => boolean;
   read: () => Message;
   attach: (chips: Chip[]) => void;
+  addFiles: (files: FileList | File[]) => Promise<void>;
   /** Replace the text with `text` and put the caret at its end. */
   setText: (text: string) => void;
 }
@@ -225,6 +226,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     isEmpty: () => empty && attachments.length === 0,
     read,
     attach: (chips) => setAttachments((a) => [...a, ...chips]),
+    addFiles: async (files) => {
+      const chips = await Promise.all([...files].map(readFile));
+      setAttachments((a) => [...a, ...chips]);
+    },
     setText: (text) => {
       if (!ref.current) return;
       ref.current.textContent = text;

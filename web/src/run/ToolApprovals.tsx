@@ -88,7 +88,9 @@ export function ToolApprovals({ list, answer }: { list: ToolApproval[]; answer: 
             >
               <div className="row between gap wrap">
                 <div className="row gap tool-approval-head">
-                  <ShieldAlert size={14} aria-hidden />
+                  <span className="approval-ico small-ico" aria-hidden>
+                    <ShieldAlert size={14} />
+                  </span>
                   <span className="strong">{a.tool}</span>
                   <span className="badge ask">{a.kind}</span>
                   <span className="muted small">{agentLabel(a.agent)}</span>
@@ -108,17 +110,6 @@ export function ToolApprovals({ list, answer }: { list: ToolApproval[]; answer: 
               <div className="tool-approval-reason">{a.reason}</div>
               <div className="row gap tool-approval-actions">
                 <button
-                  className="primary small"
-                  data-testid="tool-approve"
-                  disabled={busy === a.id}
-                  onClick={() => {
-                    setBusy(a.id);
-                    void answer(a.id, true).finally(() => setBusy(null));
-                  }}
-                >
-                  Approve
-                </button>
-                <button
                   className="small"
                   data-testid="tool-deny"
                   disabled={busy === a.id}
@@ -129,7 +120,23 @@ export function ToolApprovals({ list, answer }: { list: ToolApproval[]; answer: 
                 >
                   Deny
                 </button>
+                <button
+                  className="primary small"
+                  data-testid="tool-approve"
+                  disabled={busy === a.id}
+                  onClick={() => {
+                    setBusy(a.id);
+                    void answer(a.id, true).finally(() => setBusy(null));
+                  }}
+                >
+                  Approve
+                </button>
               </div>
+              {Number.isFinite(left) && a.timeout_secs > 0 && (
+                <div className="countdown" aria-hidden>
+                  <div className="countdown-fill" style={{ width: `${Math.min(100, (100 * left) / a.timeout_secs)}%` }} />
+                </div>
+              )}
             </motion.div>
           );
         })}

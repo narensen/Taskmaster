@@ -3,6 +3,7 @@
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
+import { Bot, Crown, ScanSearch, ShieldCheck } from "lucide-react";
 import { api, type Attempt, type RunDetail } from "../api";
 import { KnownPath, Rich, looksLikePath, masked } from "../paths";
 import { emit, toast } from "../overlay";
@@ -128,8 +129,14 @@ export function AgentSurface({
     >
       <header className="agent-head">
         <div className="agent-title">
-          <span className="strong">{s.title}</span>
-          <span className="agent-state">{s.state}</span>
+          <span className="agent-avatar" aria-hidden>
+            {s.id === "master" ? <Crown size={14} /> : s.id === "reviewer" ? <ScanSearch size={14} /> : s.id === "verifier" ? <ShieldCheck size={14} /> : <Bot size={14} />}
+          </span>
+          <span className="strong grow clip">{s.title}</span>
+          <span className="agent-state">
+            <span className="agent-state-dot" aria-hidden />
+            {s.state}
+          </span>
         </div>
         <div className="agent-byline muted small">
           {harness} · {model}

@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Play, Square, ExternalLink as Out } from "lucide-react";
+import { MonitorPlay, Play, Square, ExternalLink as Out } from "lucide-react";
 import { api, type PreviewView, type RunDetail } from "../api";
 import { toast } from "../overlay";
 import { motionOn } from "../prefs";
@@ -53,12 +53,15 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
     <section className="live-preview" data-testid="live-preview" data-state={view.state}>
       <div className="row between gap wrap">
         <div className="row gap">
+          <span className="lp-ico" aria-hidden>
+            <MonitorPlay size={14} />
+          </span>
           <span className="strong">Live preview</span>
           <span className={`badge ${TONE[view.state]}`} data-testid="live-preview-state">
             {view.state === "none" ? "not started" : view.state}
           </span>
           {live && view.url && (
-            <a href={view.url} target="_blank" rel="noreferrer" className="small row gap" data-testid="live-preview-url">
+            <a href={view.url} target="_blank" rel="noreferrer" className="small row gap lp-url mono" data-testid="live-preview-url">
               {view.url} <Out size={12} aria-hidden />
             </a>
           )}
@@ -81,7 +84,7 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
         </div>
       </div>
       {!live && reason && <div className="muted small">{reason}</div>}
-      {view.command && <div className="muted small clip">{view.command}</div>}
+      {view.command && <div className="muted small clip mono lp-cmd">$ {view.command}</div>}
       {view.state === "failed" && (
         <div className="live-preview-fail small" data-testid="live-preview-failure">
           <div className="strong">{view.reason ?? "The dev server failed."}</div>

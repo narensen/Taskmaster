@@ -305,6 +305,18 @@ export interface NewRun {
   template?: string;
 }
 
+export interface NewProject {
+  name: string;
+  prompt?: string;
+  yes?: boolean;
+  roles?: Partial<Roles>;
+  models?: Models;
+  parallel?: number;
+  timeout_secs?: number;
+  template?: string;
+  switch?: boolean;
+}
+
 export interface NewReview {
   target?: string;
   base?: string;
@@ -372,6 +384,8 @@ export interface Note {
 
 export interface DaemonSettings {
   project: string;
+  /** Parent directory where new projects are created. */
+  workspace?: string;
   /** Checked-out branch of the project, when it is a git repository. */
   branch?: string | null;
   dictionary: string;
@@ -530,6 +544,7 @@ export const api = {
   runs: () => call<{ runs: RunSummary[] }>("GET", "/api/runs").then((r) => r.runs),
   run: (id: string) => call<RunDetail>("GET", `/api/runs/${enc(id)}`),
   createRun: (body: NewRun) => call<{ id: string }>("POST", "/api/runs", body),
+  createProject: (body: NewProject) => call<{ project: string; id?: string }>("POST", "/api/projects", body),
   events: (id: string, after = 0) =>
     call<{ next: number; events: RunEvent[] }>("GET", `/api/runs/${enc(id)}/events?after=${after}`),
   ledger: (id: string) => call<{ totals: Totals; entries: LedgerEntry[] }>("GET", `/api/runs/${enc(id)}/ledger`),

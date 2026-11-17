@@ -1524,6 +1524,33 @@ mod http {
     }
 
     #[tokio::test]
+    async fn a_new_project_is_created_as_a_repository_under_the_workspace() {
+        let tmp = repo("api-new-project");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let (_, settings) = client.get("/api/settings").await;
+        let workspace = PathBuf::from(settings["workspace"].as_str().unwrap());
+        assert_eq!(workspace, tmp.0.parent().unwrap().canonicalize().unwrap());
+
+        assert_eq!(client.post("/api/projects", json!({ "name": "../escape" })).await.0, 400);
+        assert_eq!(client.post("/api/projects", json!({ "name": "bad/name" })).await.0, 400);
+
+        let name = format!("tm-new-{}", std::process::id());
+        let dest = workspace.join(&name);
+        let (status, body) = client.post("/api/projects", json!({ "name": name, "switch": false })).await;
+        assert_eq!(status, 200, "{body}");
+        let path = PathBuf::from(body["project"].as_str().unwrap());
+        assert_eq!(path, dest.canonicalize().unwrap());
+        assert!(path.join(".git").exists());
+        assert!(crate::git::has_head(&path));
+        let (_, still) = client.get("/api/settings").await;
+        assert_eq!(still["project"], tmp.0.canonicalize().unwrap().display().to_string().as_str());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
     async fn the_terminal_runs_what_a_person_types_and_keeps_it_in_the_transcript() {
         let tmp = repo("api-terminal");
         let world = World::new(Mode::Write);

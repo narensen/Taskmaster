@@ -47,7 +47,7 @@ struct Entry {
 
 /// Dev servers started for runs. Dropping the handle stops each one.
 pub struct Previews {
-    project: PathBuf,
+    project: Mutex<PathBuf>,
     command: String,
     runs: Mutex<HashMap<String, Entry>>,
 }
@@ -90,12 +90,22 @@ pub fn dev_command(dir: &Path, configured: &str, port: u16) -> Option<String> {
 
 impl Previews {
     pub fn new(project: PathBuf, command: String) -> Self {
-        Previews { project, command, runs: Mutex::new(HashMap::new()) }
+        Previews { project: Mutex::new(project), command, runs: Mutex::new(HashMap::new()) }
+    }
+
+    fn project(&self) -> PathBuf {
+        self.project.lock().unwrap().clone()
+    }
+
+    /// Point later previews at another project. Running preview servers are stopped first.
+    pub fn retarget(&self, project: PathBuf) {
+        self.stop_all();
+        *self.project.lock().unwrap() = project;
     }
 
     /// Whether this project has a dev server to start.
     pub fn available(&self) -> bool {
-        dev_command(&self.project, &self.command, 0).is_some() || crate::static_site::has_no_scripts(&self.project)
+        dev_command(&self.project(), &self.command, 0).is_some() || crate::static_site::has_no_scripts(&self.project())
     }
 
     pub fn status(&self, run: &str) -> Option<Status> {
@@ -117,27 +127,27 @@ impl Previews {
         };
         let (dir, tree) = match branch {
             Some(branch) => {
-                let tree = git::worktree_dir(&self.project, run, "preview");
+                let tree = git::worktree_dir(&self.project(), run, "preview");
                 if tree.exists() {
-                    let _ = git::remove_worktree(&self.project, &tree);
+                    let _ = git::remove_worktree(&self.project(), &tree);
                     let _ = std::fs::remove_dir_all(&tree);
                 }
-                git::add_worktree(&self.project, &tree, branch)?;
-                let installed = self.project.join("node_modules");
+                git::add_worktree(&self.project(), &tree, branch)?;
+                let installed = self.project().join("node_modules");
                 #[cfg(unix)]
                 if installed.is_dir() && !tree.join("node_modules").exists() {
                     let _ = std::os::unix::fs::symlink(&installed, tree.join("node_modules"));
                 }
                 (tree.clone(), Some(tree))
             }
-            None => (self.project.clone(), None),
+            None => (self.project(), None),
         };
         let Some(command) = dev_command(&dir, &self.command, port) else {
             if crate::static_site::has_no_scripts(&dir) && crate::static_site::start_page(&dir).is_some() {
                 return self.start_static(run, port, dir, tree, claim).await;
             }
             if let Some(tree) = &tree {
-                let _ = git::remove_worktree(&self.project, tree);
+                let _ = git::remove_worktree(&self.project(), tree);
             }
             let reason = "this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file";
             self.fail_start(run, reason);
@@ -164,7 +174,7 @@ impl Previews {
             Ok(child) => child,
             Err(err) => {
                 if let Some(tree) = &tree {
-                    let _ = git::remove_worktree(&self.project, tree);
+                    let _ = git::remove_worktree(&self.project(), tree);
                 }
                 let reason = format!("could not start `{command}`: {err}");
                 self.fail_start(run, &reason);
@@ -207,7 +217,7 @@ impl Previews {
         claim.live = false;
 
         // Watch it: running once it answers, stopped or failed once it exits.
-        let project = self.project.clone();
+        let project = self.project();
         let (watched, watched_log) = (status.clone(), log);
         tokio::spawn(async move {
             let deadline = Instant::now() + START_WITHIN;
@@ -264,7 +274,7 @@ impl Previews {
                 }
             }
         }
-        let cleanup = Cleanup(self.project.clone(), tree);
+        let cleanup = Cleanup(self.project(), tree);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
         let root = dir.clone();
         let task = tokio::spawn(async move {

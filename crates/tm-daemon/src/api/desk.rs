@@ -252,12 +252,12 @@ pub async fn terminal(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
         return Err(fail(StatusCode::BAD_REQUEST, "type a command"));
     }
     let agent = json!({ "id": PERSON, "role": PERSON });
-    let cwd = app.project.display().to_string();
+    let cwd = app.project().display().to_string();
     app.live.push(&id, &agent, "command", json!({ "command": command, "cwd": cwd, "typed": true }));
     let child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
-        .current_dir(&app.project)
+        .current_dir(&app.project())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -297,7 +297,7 @@ pub async fn diff(
     Query(query): Query<HashMap<String, String>>,
 ) -> Reply {
     app.known(&id)?;
-    let meta = app.records.meta(&id)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "this run has not started building"))?;
+    let meta = app.records().meta(&id)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "this run has not started building"))?;
     let (Some(base), Some(branch)) = (meta.base.clone(), meta.branch.clone()) else {
         return Err(fail(StatusCode::CONFLICT, "this run built in the project's own working tree, so it has no branch to compare"));
     };
@@ -309,9 +309,7 @@ pub async fn diff(
         "run" => {}
         "page" => {
             let page = query.get("page").filter(|page| valid_key(page)).ok_or_else(|| fail(StatusCode::BAD_REQUEST, "name a page"))?;
-            let mut files: Vec<String> = app
-                .records
-                .changes(&id)?
+            let mut files: Vec<String> = app.records().changes(&id)?
                 .into_iter()
                 .filter(|change| change.page.as_deref() == Some(page.as_str()))
                 .flat_map(|change| change.files)
@@ -327,14 +325,14 @@ pub async fn diff(
         _ => return Err(fail(StatusCode::BAD_REQUEST, "scope is run or page; an attempt's diff is in its attempts")),
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let text = git(&app.project, &refs).map_err(|err| fail(StatusCode::CONFLICT, err))?;
-    let text = crate::git::unroot_worktrees(&app.project, &text);
+    let text = git(&app.project(), &refs).map_err(|err| fail(StatusCode::CONFLICT, err))?;
+    let text = crate::git::unroot_worktrees(&app.project(), &text);
     ok(json!({ "scope": scope, "base": base, "branch": branch, "diff": text }))
 }
 
 /// What to compare against: the run branch while it exists, else the commit it ended on.
 pub fn run_head(app: &App, id: &str, branch: &str) -> Option<String> {
-    if git(&app.project, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_ok() {
+    if git(&app.project(), &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_ok() {
         return Some(branch.to_string());
     }
     app.live.tip(id)
@@ -373,13 +371,13 @@ fn gh_account(project: &Path) -> Value {
 }
 
 pub async fn gh_status(State(app): State<Arc<App>>) -> Reply {
-    let project = app.project.clone();
+    let project = app.project().clone();
     let status = tokio::task::spawn_blocking(move || gh_account(&project)).await.unwrap_or(Value::Null);
     ok(status)
 }
 
 pub async fn gh_pr(State(app): State<Arc<App>>, UrlPath(number): UrlPath<u64>) -> Reply {
-    let project = app.project.clone();
+    let project = app.project().clone();
     let found = tokio::task::spawn_blocking(move || {
         gh(&project, &["pr", "view", &number.to_string(), "--json", "number,title,url,state"])
     })
@@ -425,12 +423,12 @@ pub async fn open_pr(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) 
         return Err(fail(StatusCode::CONFLICT, "a pull request is drafted once the run is done"));
     }
     let plan = run.plan.clone().ok_or_else(|| fail(StatusCode::CONFLICT, "this run has no plan"))?;
-    let meta = app.records.meta(&id)?;
+    let meta = app.records().meta(&id)?;
     let branch = meta.and_then(|meta| meta.branch).ok_or_else(|| fail(StatusCode::CONFLICT, "this run has no branch"))?;
     let prompt = app.request_for(&id)?.prompt;
     let (title, body) = pr_text(&id, prompt.as_deref(), &plan);
     let head = run_head(&app, &id, &branch).ok_or_else(|| fail(StatusCode::CONFLICT, format!("branch `{branch}` is gone and its last commit was not kept")))?;
-    let project = app.project.clone();
+    let project = app.project().clone();
     let made = tokio::task::spawn_blocking(move || -> Result<String, String> {
         if gh_account(&project)["account"].is_null() {
             return Err("gh is not signed in on this machine".into());
@@ -695,7 +693,7 @@ fn failed_dependency(message: String, command: &str, path: &str) -> Reply {
 
 /// Open a file in an editor on this machine, the one that holds the project.
 pub async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenBody>) -> Reply {
-    let Some(file) = resolve(&app.project, &body.path) else {
+    let Some(file) = resolve(&app.project(), &body.path) else {
         return Err(fail(StatusCode::NOT_FOUND, format!("{} is not a file here", clip_text(&body.path))));
     };
     let full = file.display().to_string();
@@ -751,16 +749,16 @@ pub struct PathsBody {
 pub async fn paths(State(app): State<Arc<App>>, Json(body): Json<PathsBody>) -> Reply {
     let (mut out, mut rel) = (serde_json::Map::new(), serde_json::Map::new());
     for raw in body.paths.into_iter().take(500) {
-        let found = resolve(&app.project, &raw);
-        rel.insert(raw.clone(), json!(found.as_ref().map(|path| relative(&app.project, path))));
+        let found = resolve(&app.project(), &raw);
+        rel.insert(raw.clone(), json!(found.as_ref().map(|path| relative(&app.project(), path))));
         out.insert(raw, json!(found.map(|path| path.display().to_string())));
     }
-    ok(json!({ "paths": out, "relative": rel, "project": app.project.display().to_string() }))
+    ok(json!({ "paths": out, "relative": rel, "project": app.project().display().to_string() }))
 }
 
 pub async fn file(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
     let raw = query.get("path").cloned().unwrap_or_default();
-    let Some(file) = resolve(&app.project, &raw) else {
+    let Some(file) = resolve(&app.project(), &raw) else {
         return Err(fail(StatusCode::NOT_FOUND, format!("{} is not a file here", clip_text(&raw))));
     };
     if sensitive(&file) {
@@ -781,7 +779,7 @@ pub async fn file(State(app): State<Arc<App>>, Query(query): Query<HashMap<Strin
     }
     ok(json!({
         "path": raw,
-        "relative": relative(&app.project, &file),
+        "relative": relative(&app.project(), &file),
         "full": file.display().to_string(),
         "content": String::from_utf8_lossy(cut),
         "truncated": size > PREVIEW_LIMIT,
@@ -789,7 +787,7 @@ pub async fn file(State(app): State<Arc<App>>, Query(query): Query<HashMap<Strin
 }
 
 pub async fn files(State(app): State<Arc<App>>) -> Reply {
-    let text = git(&app.project, &["ls-files", "--cached", "--others", "--exclude-standard"]).unwrap_or_default();
+    let text = git(&app.project(), &["ls-files", "--cached", "--others", "--exclude-standard"]).unwrap_or_default();
     let list: Vec<&str> = text.lines().take(20_000).collect();
     ok(json!({ "files": list }))
 }
@@ -797,7 +795,7 @@ pub async fn files(State(app): State<Arc<App>>) -> Reply {
 pub async fn skills(State(app): State<Arc<App>>) -> Reply {
     let mut found = Vec::new();
     for root in [".agents/skills", ".claude/skills"] {
-        let Ok(dirs) = std::fs::read_dir(app.project.join(root)) else { continue };
+        let Ok(dirs) = std::fs::read_dir(app.project().join(root)) else { continue };
         for dir in dirs.flatten() {
             let file = dir.path().join("SKILL.md");
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
@@ -841,7 +839,7 @@ pub async fn start_preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<Str
     if !app.previews.available() {
         return Err(fail(StatusCode::CONFLICT, "this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file"));
     }
-    let meta = app.records.meta(&id)?;
+    let meta = app.records().meta(&id)?;
     if meta.is_none() || matches!(run.phase, RunPhase::Planning | RunPhase::AwaitingApproval) {
         return Err(fail(StatusCode::CONFLICT, "there is nothing to preview until the run has started building"));
     }
@@ -849,7 +847,7 @@ pub async fn start_preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<Str
         return Err(fail(StatusCode::CONFLICT, "the run is still building; preview it when it stops"));
     }
     // A run still on its branch is previewed from that branch; a merged one from the project.
-    let branch = meta.and_then(|m| m.branch).filter(|branch| crate::git::branch_exists(&app.project, branch));
+    let branch = meta.and_then(|m| m.branch).filter(|branch| crate::git::branch_exists(&app.project(), branch));
     match app.previews.start(&id, branch.as_deref()).await {
         Ok(_) => accepted(preview_view(&app, &id)),
         Err(err) => Err(fail(StatusCode::CONFLICT, format!("{err:#}"))),
@@ -922,11 +920,11 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         if !editor.is_empty() && editor_from_value(editor, "settings").is_none() {
             return Err(fail(StatusCode::BAD_REQUEST, format!("`{editor}` is not an editor installed on this machine")));
         }
-        save_setting(&app.project, "editor", json!(editor)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        save_setting(&app.project(), "editor", json!(editor)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
         *app.editor.lock().unwrap() = editor.to_string();
     }
     if body.roles.is_some() || body.models.is_some() {
-        let mut saved = crate::settings::Settings::load(&app.project).unwrap_or_default();
+        let mut saved = crate::settings::Settings::load(&app.project()).unwrap_or_default();
         if let Some(roles) = body.roles {
             for id in [&roles.worker, &roles.mid, &roles.master, &roles.reviewer, &roles.verifier] {
                 if !tm_harness::HARNESSES.contains(&id.as_str()) {
@@ -938,13 +936,13 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         if let Some(models) = body.models {
             saved.models = models;
         }
-        let save = |key: &str, value: Value| save_setting(&app.project, key, value);
+        let save = |key: &str, value: Value| save_setting(&app.project(), key, value);
         save("roles", json!(saved.roles))
             .and_then(|()| save("models", json!(saved.models)))
             .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if !changes.is_empty() {
-        save_setting(&app.project, "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
         app.live.approvals.set_policy(policy);
     }
     settings(State(app)).await
@@ -986,19 +984,20 @@ fn save_setting(project: &Path, key: &str, values: Value) -> anyhow::Result<()> 
 }
 
 pub async fn settings(State(app): State<Arc<App>>) -> Reply {
-    let project_config = app.project.join(".taskmaster/config.json");
+    let project_config = app.project().join(".taskmaster/config.json");
     let home_config = home().map(|h| h.join(".taskmaster/config.json"));
     let config = [Some(project_config.clone()), home_config]
         .into_iter()
         .flatten()
         .find(|path| path.is_file())
         .map(|path| path.display().to_string());
-    let role_defaults = crate::settings::Settings::load(&app.project).unwrap_or_default();
+    let role_defaults = crate::settings::Settings::load(&app.project()).unwrap_or_default();
     ok(json!({
-        "project": app.project.display().to_string(),
-        "branch": crate::git::current_branch(&app.project),
-        "dictionary": app.dictionary.display().to_string(),
-        "commons": app.commons.display().to_string(),
+        "project": app.project().display().to_string(),
+        "workspace": app.workspace.display().to_string(),
+        "branch": crate::git::current_branch(&app.project()),
+        "dictionary": app.dictionary().display().to_string(),
+        "commons": app.commons().display().to_string(),
         "commons_remote": app.remote.is_some(),
         "config": config,
         "config_default": project_config.display().to_string(),

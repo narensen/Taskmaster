@@ -288,3 +288,31 @@ pub fn unroot_worktrees(project: &Path, text: &str) -> String {
     }
     out
 }
+
+/// Create a new git repository at `path` and make an empty initial commit so later
+/// runs have a `HEAD` to branch from. Identity is copied from `from` when that
+/// repository (or the process's git config) has one; this never invents a name.
+pub fn init_repo(path: &Path, from: Option<&Path>) -> anyhow::Result<()> {
+    if path.join(".git").exists() {
+        bail!("{} is already a git repository", path.display());
+    }
+    git(path, &["init", "-q", "-b", "main"])?;
+    if let Some(from) = from {
+        if let Ok(name) = git(from, &["config", "user.name"]) {
+            let name = name.trim();
+            if !name.is_empty() {
+                git(path, &["config", "user.name", name])?;
+            }
+        }
+        if let Ok(email) = git(from, &["config", "user.email"]) {
+            let email = email.trim();
+            if !email.is_empty() {
+                git(path, &["config", "user.email", email])?;
+            }
+        }
+    }
+    git(path, &["commit", "--allow-empty", "-q", "-m", "Start of the project."])?;
+    let _ = ensure_exclude(path);
+    Ok(())
+}
+

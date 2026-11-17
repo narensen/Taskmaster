@@ -99,6 +99,7 @@ export interface ComposerProps {
   bus?: boolean;
   onChipClick?: (chip: Chip) => void;
   className?: string;
+  onChange?: (message: Message) => void;
   /** Controls under the field: a model pill, a send button. */
   footer?: ReactNode;
 }
@@ -168,6 +169,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (!el) return;
     const blank = !el.textContent?.trim() && !el.querySelector("[data-chip]");
     setEmpty(blank);
+    props.onChange?.(read());
   };
 
   const caretRange = (): Range | null => {

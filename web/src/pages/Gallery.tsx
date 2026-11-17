@@ -277,6 +277,16 @@ function ShowAll({
   );
 }
 
+function slugify(text: string): string {
+  const slug = text
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug;
+}
+
 function accessLabel(mode?: ApprovalMode) {
   if (mode === "never") return "Approvals off";
   if (mode === "always") return "Ask on every call";
@@ -311,11 +321,18 @@ export function Gallery() {
   const composer = useRef<ComposerHandle>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [allOpen, setAllOpen] = useState(false);
+  const [mode, setMode] = useState<"this" | "new">("this");
+  const [newName, setNewName] = useState("");
+  const [nameTouched, setNameTouched] = useState(false);
   const action = useAction();
 
   useEffect(() => {
     composer.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (settings.data && !settings.data.project) setMode("new");
+  }, [settings.data]);
 
   const onStripKey = (e: ReactKeyboardEvent) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -332,6 +349,15 @@ export function Gallery() {
       const roles = { ...DEFAULT_ROLES, ...(settings.data?.roles ?? {}) };
       const models = settings.data?.models ?? {};
       const chosen = Object.fromEntries(Object.entries(models).filter(([, model]) => model));
+      if (mode === "new") {
+        const name = newName.trim() || slugify(prompt);
+        if (!name) throw new Error("Name the project first.");
+        const created = await api.createProject({ name, prompt, roles, models: chosen });
+        if (!created.id) throw new Error("The project was created, but the first run did not start.");
+        composer.current?.clear();
+        navigate(`/runs/${encodeURIComponent(created.id)}`);
+        return;
+      }
       const { id } = await api.createRun({ prompt, roles, models: chosen });
       composer.current?.clear();
       navigate(`/runs/${encodeURIComponent(id)}`);
@@ -360,50 +386,66 @@ export function Gallery() {
         </div>
       </header>
 
-      {list.length > 0 && (
-        <section className="home-recent" aria-label="Recent runs">
-          <div className="home-recent-head">
-            <h2>Recent</h2>
-            <div className="home-recent-actions">
-              <button type="button" className="icon" aria-label="Previous runs" onClick={() => scrollStrip(strip.current, -1)}>
-                <ArrowLeft size={16} />
-              </button>
-              <button type="button" className="icon" aria-label="Next runs" onClick={() => scrollStrip(strip.current, 1)}>
-                <ArrowRight size={16} />
-              </button>
-              <button ref={showAllBtn} type="button" className="ghost small" data-testid="show-all" onClick={() => setAllOpen(true)}>
-                Show all
-                <ChevronRight size={14} aria-hidden />
-              </button>
-            </div>
-          </div>
-          <div
-            ref={strip}
-            className="home-strip"
-            data-testid="run-strip"
-            tabIndex={0}
-            aria-label="Recently used runs"
-            onKeyDown={onStripKey}
-          >
-            {list.map(({ run, group }, i) => (
-              <RunCard key={run.id} run={run} group={group} index={i} />
-            ))}
-            {daemons.map((d, i) => (
-              <DaemonCard key={d.url} {...d} index={list.length + i} />
-            ))}
-          </div>
-        </section>
-      )}
-
       <div className="home-ask">
-        <h2>
-          Describe the next run{projectLabel ? <> for <span className="ask-project">{projectLabel}</span></> : null}
+        <h2 data-testid="home-heading">
+          {mode === "new" ? (
+            "Start something new"
+          ) : (
+            <>Describe the next run{projectLabel ? <> for <span className="ask-project">{projectLabel}</span></> : null}</>
+          )}
         </h2>
-        <p className="ask-sub">A master will plan it; workers take the pages.</p>
+        <div className="home-mode" role="tablist" aria-label="Choose a project">
+          <button
+            type="button"
+            role="tab"
+            data-testid="project-mode-this"
+            className={mode === "this" ? "on" : ""}
+            aria-selected={mode === "this"}
+            disabled={!project}
+            onClick={() => setMode("this")}
+          >
+            This project{name ? `: ${name}` : ""}
+          </button>
+          <span className="home-mode-sep" aria-hidden>
+            ·
+          </span>
+          <button
+            type="button"
+            role="tab"
+            data-testid="project-mode-new"
+            className={mode === "new" ? "on" : ""}
+            aria-selected={mode === "new"}
+            onClick={() => setMode("new")}
+          >
+            New project
+          </button>
+        </div>
+        {mode === "new" && (
+          <label className="home-name">
+            <span>Name</span>
+            <input
+              data-testid="new-project-name"
+              value={newName}
+              onChange={(e) => {
+                setNameTouched(true);
+                setNewName(e.target.value);
+              }}
+              placeholder="a folder name"
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </label>
+        )}
+        <p className="ask-sub">
+          {mode === "new" ? "Name the project, then tell the master what to build." : "A master will plan it; workers take the pages."}
+        </p>
         <Composer
           ref={composer}
           bus
           placeholder="Tell the master what to plan. @ files, $ skills, / commands"
+          onChange={(m) => {
+            if (mode === "new" && !nameTouched) setNewName(slugify(m.text));
+          }}
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
@@ -453,6 +495,41 @@ export function Gallery() {
           </span>
         </div>
         <Problem error={action.error} />
+      {list.length > 0 && (
+        <section className="home-recent" aria-label="Recent runs">
+          <div className="home-recent-head">
+            <h2>Recent</h2>
+            <div className="home-recent-actions">
+              <button type="button" className="icon" aria-label="Previous runs" onClick={() => scrollStrip(strip.current, -1)}>
+                <ArrowLeft size={16} />
+              </button>
+              <button type="button" className="icon" aria-label="Next runs" onClick={() => scrollStrip(strip.current, 1)}>
+                <ArrowRight size={16} />
+              </button>
+              <button ref={showAllBtn} type="button" className="ghost small" data-testid="show-all" onClick={() => setAllOpen(true)}>
+                Show all
+                <ChevronRight size={14} aria-hidden />
+              </button>
+            </div>
+          </div>
+          <div
+            ref={strip}
+            className="home-strip"
+            data-testid="run-strip"
+            tabIndex={0}
+            aria-label="Recently used runs"
+            onKeyDown={onStripKey}
+          >
+            {list.map(({ run, group }, i) => (
+              <RunCard key={run.id} run={run} group={group} index={i} />
+            ))}
+            {daemons.map((d, i) => (
+              <DaemonCard key={d.url} {...d} index={list.length + i} />
+            ))}
+          </div>
+        </section>
+      )}
+
       </div>
 
       {archived > 0 || p.showArchived ? (

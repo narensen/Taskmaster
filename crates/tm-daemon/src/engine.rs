@@ -1692,6 +1692,8 @@ impl Driver {
              Cite only these Dictionary keys, and follow them: {cites}.\n\
              Contracts already in the tree:\n{contract_list}\n\
              {body}\n\
+             File paths in this brief and in Dictionary entries are from the project root; a link or import inside a file \
+             is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n\
              If a Dictionary entry is wrong, stop and reply with {{\"flag\":{{\"key\":\"...\",\"issue\":\"...\"}}}} and do not edit other pages.\n",
             id = page.id,
             route = page.route,

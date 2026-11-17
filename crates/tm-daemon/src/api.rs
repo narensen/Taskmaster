@@ -498,6 +498,8 @@ impl App {
             "error": status.get("error"),
             "branch": status.get("branch"),
             "merged": status.get("merged"),
+            "base": status.get("base"),
+            "merge_commit": status.get("merge_commit"),
             "pages": pages,
             "estimate": run.plan.as_ref().map(|plan| &plan.estimate),
             "spent": totals(&self.records.ledger(id)?),

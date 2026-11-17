@@ -73,6 +73,9 @@ export interface RunSummary {
   error: string | null;
   branch: string | null;
   merged: boolean | null;
+  /** The branch the run was merged into, and the short merge commit. */
+  base?: string | null;
+  merge_commit?: string | null;
   pages: PageView[];
   estimate: Estimate | null;
   spent: Totals;

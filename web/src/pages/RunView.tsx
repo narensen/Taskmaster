@@ -441,7 +441,24 @@ export function RunView({ id }: { id: string }) {
             </div>
             <div className="run-meta small">
               {detail.active && <span>live</span>}
-              {detail.branch && <span>{detail.branch}</span>}
+              {detail.merged && detail.merge_commit ? (
+                <span className="merged-into" data-testid="merged-into">
+                  Merged into {detail.base || "the project"}{" "}
+                  <button
+                    type="button"
+                    className="mono merge-hash"
+                    title="Copy commit hash"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(detail.merge_commit ?? "");
+                      toast("Copied", detail.merge_commit ?? "", 2500);
+                    }}
+                  >
+                    {detail.merge_commit}
+                  </button>
+                </span>
+              ) : (
+                detail.branch && <span>{detail.branch}</span>
+              )}
               <span>{spendLabel(ledger?.totals ?? detail.spent)}</span>
               {detail.estimate &&
                 (isUnpriced(ledger?.totals ?? detail.spent) ? (

@@ -1005,6 +1005,10 @@ async fn a_run_builds_on_its_own_branch_and_is_merged_when_it_finishes() {
     let status = Records::files(&tmp.0).status("current").unwrap().unwrap();
     assert_eq!((status["branch"].as_str(), status["merged"].as_bool()), (Some("taskmaster/current"), Some(true)));
     assert!(Records::files(&tmp.0).citations().unwrap().pages.contains_key("a"));
+    let head = git_out(&tmp.0, &["rev-parse", "HEAD"]);
+    let commit = status["merge_commit"].as_str().unwrap();
+    assert!(commit.len() >= 7 && head.trim().starts_with(commit));
+    assert_eq!(status["base"].as_str(), Some(git_out(&tmp.0, &["rev-parse", "--abbrev-ref", "HEAD"]).trim()));
 }
 
 #[tokio::test]

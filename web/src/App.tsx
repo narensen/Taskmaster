@@ -263,7 +263,7 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
                         </span>
                         <span className="run-copy">
                           <span className="clip run-title">{run.id}</span>
-                          {run.branch && (
+                          {run.branch && !(run.merged && run.merge_commit) && (
                             <span className="run-branch clip">
                               <GitBranch size={11} />
                               {run.branch}

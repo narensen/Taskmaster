@@ -147,6 +147,8 @@ struct Driver {
     /// Set once the run's branch has been offered to the project: the branch, and
     /// whether it was merged.
     delivery: Option<(String, bool)>,
+    /// The base branch and short commit the run was merged as, once it was.
+    merge_commit: Option<(String, String)>,
     /// Citations of pages built on the run's branch. They are written to the project's
     /// record only once the branch is merged: until then the project does not have the
     /// pages, and a later run must not skip them.
@@ -256,6 +258,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         project,
         branch: meta.branch.clone(),
         delivery: None,
+        merge_commit: None,
         staged: BTreeMap::new(),
         template,
         id,
@@ -1794,11 +1797,15 @@ impl Driver {
             Some((branch, merged)) => {
                 body["branch"] = serde_json::json!(branch);
                 body["merged"] = serde_json::json!(merged);
+                if let Some((base, commit)) = &self.merge_commit {
+                    body["base"] = serde_json::json!(base);
+                    body["merge_commit"] = serde_json::json!(commit);
+                }
             }
             // A finished run that is driven again has nothing new to deliver.
             None => {
                 let before = self.records.status(&self.id)?.unwrap_or_default();
-                for key in ["branch", "merged"] {
+                for key in ["branch", "merged", "base", "merge_commit"] {
                     if let Some(value) = before.get(key) {
                         body[key] = value.clone();
                     }
@@ -2059,6 +2066,11 @@ impl Driver {
                 && let Err(err) = self.live.set_tip(&self.id, &tip)
             {
                 eprintln!("taskmaster: the branch tip was not kept, so this run's diff needs the branch: {err:#}");
+            }
+            let base = git::git(&self.project, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+            let commit = git::git(&self.project, &["rev-parse", "--short=8", "HEAD"]).unwrap_or_default();
+            if !commit.trim().is_empty() {
+                self.merge_commit = Some((base.trim().to_string(), commit.trim().to_string()));
             }
             let _ = git::git(&self.project, &["branch", "-D", &branch]);
             self.branch = None;

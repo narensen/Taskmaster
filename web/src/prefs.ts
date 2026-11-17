@@ -38,6 +38,8 @@ export interface Prefs {
   panelTab: Record<string, string>;
   viewed: Record<string, string>;
   showArchived: boolean;
+  /** When this browser last opened a run, for the home strip. */
+  recentRuns: Record<string, number>;
 }
 
 const KEY = "taskmaster.prefs";
@@ -55,6 +57,7 @@ const DEFAULTS: Prefs = {
   panelTab: {},
   viewed: {},
   showArchived: false,
+  recentRuns: {},
 };
 
 function load(): Prefs {
@@ -104,6 +107,12 @@ export function rememberPrompt(prompt: string) {
   const text = prompt.trim();
   if (!text) return;
   setPrefs((p) => ({ history: [...p.history.filter((h) => h !== text), text].slice(-50) }));
+}
+
+
+export function rememberRun(id: string) {
+  if (!id) return;
+  setPrefs((p) => ({ recentRuns: { ...p.recentRuns, [id]: Date.now() } }));
 }
 
 export function setRunFlag(id: string, flag: keyof RunFlags, value: boolean) {

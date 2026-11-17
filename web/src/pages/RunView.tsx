@@ -13,7 +13,7 @@ import { isUnpriced, pageTone, phaseLabel, phaseTone, spendLabel, tokens, usd } 
 import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
-import { motionOn, prefs, setPrefs } from "../prefs";
+import { motionOn, prefs, rememberRun, setPrefs } from "../prefs";
 import { RoleMark } from "../marks";
 import { bezier, dur, ease, fadeUp } from "../motion";
 import { Dot, Loading, Problem, useLoad } from "../ui";
@@ -275,6 +275,10 @@ export function RunView({ id }: { id: string }) {
     },
     [id],
   );
+
+  useEffect(() => {
+    rememberRun(id);
+  }, [id]);
 
   const list = useMemo(() => surfaces(detail, entries, ledger?.entries ?? []), [detail, entries, ledger]);
   const master = list.find((s) => s.id === "master");

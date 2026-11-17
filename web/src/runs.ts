@@ -30,6 +30,13 @@ export function ordered(runs: RunSummary[], showArchived: boolean): { run: RunSu
     .sort((a, b) => ORDER.indexOf(a.group) - ORDER.indexOf(b.group) || b.run.id.localeCompare(a.run.id));
 }
 
+
+/** The home strip: last opened in this browser, then the usual gallery order. */
+export function byRecent(list: { run: RunSummary; group: Group }[]): { run: RunSummary; group: Group }[] {
+  const recent = prefs().recentRuns ?? {};
+  return [...list].sort((a, b) => (recent[b.run.id] ?? 0) - (recent[a.run.id] ?? 0) || list.indexOf(a) - list.indexOf(b));
+}
+
 const VERB: Record<keyof RunFlags, [string, string]> = {
   pinned: ["Pinned", "Unpinned"],
   settled: ["Settled", "Unsettled"],

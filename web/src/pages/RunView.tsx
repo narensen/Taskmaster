@@ -5,17 +5,17 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import gsap from "gsap";
-import { PanelRightClose, PanelRightOpen } from "lucide-react";
+import { CircleCheck, CircleX, Coins, GitBranch, GitCompare, GitMerge, Loader2, PanelRightClose, PanelRightOpen, ScanSearch, ShieldAlert } from "lucide-react";
 import { api, type ReviewJob, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
-import { isUnpriced, phaseLabel, spendLabel, tokens, usd } from "../format";
+import { isUnpriced, pageTone, phaseLabel, phaseTone, spendLabel, tokens, usd } from "../format";
 import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
 import { motionOn, prefs, setPrefs } from "../prefs";
 import { bezier, dur, ease, fadeUp } from "../motion";
-import { Problem, Spinner, useLoad } from "../ui";
+import { Dot, Loading, Problem, useLoad } from "../ui";
 import { takeAttachments } from "../App";
 import { AgentSurface } from "../run/AgentSurface";
 import { DiffTab, type Scope } from "../run/Diff";
@@ -75,37 +75,98 @@ function ReviewCard({ id }: { id: string }) {
     }
   };
   const confirmed = job?.report?.findings.filter((f) => f.outcome === "confirmed") ?? [];
+  const running = job?.status === "running";
   return (
-    <div className="banner small" data-testid="review-card">
-      <div className="row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <strong>Code review</strong>
-        {job?.status === "running" ? (
+    <section className={`review-card ${running ? "is-running" : ""}`} data-testid="review-card" aria-label="Code review">
+      <div className="review-card-head">
+        <span className="review-ico" aria-hidden>
+          {running ? <Loader2 size={16} className="spin-ico" /> : <ScanSearch size={16} />}
+        </span>
+        <div className="grow">
+          <div className="strong">Code review</div>
+          <div className="muted small">
+            {running
+              ? "One reviewer is reading the whole diff. This takes a few minutes."
+              : "On demand: one reviewer reads the whole diff and reports only confirmed problems."}
+          </div>
+        </div>
+        {running ? (
           <>
-            <span data-testid="review-running">Review in progress…</span>
+            <span className="sr-only" data-testid="review-running">Review in progress…</span>
+            <span className="badge busy" aria-hidden>
+              <Dot tone="busy" /> Reviewing
+            </span>
             <button className="ghost small" data-testid="review-cancel" onClick={() => void api.cancelReview(job.id).then(() => load(job.id))}>
               Cancel review
             </button>
           </>
         ) : (
-          <button className="ghost small" data-testid="review-button" disabled={busy} onClick={() => void start()}>
+          <button className={job ? "small" : "primary small"} data-testid="review-button" disabled={busy} onClick={() => void start()}>
             {job ? "Review again" : "Review"}
           </button>
         )}
       </div>
       {job?.status === "failed" && <div className="error-line" data-testid="review-error">Review failed: {job.error}</div>}
       {job?.status === "done" && (
-        <div data-testid="review-result">
-          {confirmed.length === 0 ? "Review finished: no confirmed problems." : `Review finished: ${confirmed.length} confirmed problem(s).`}
-          <ul>
-            {confirmed.map((f, i) => (
-              <li key={i}>
-                {f.file}:{f.line} {f.failure}
-              </li>
-            ))}
-          </ul>
+        <div className={`review-result ${confirmed.length ? "bad" : "good"}`} data-testid="review-result">
+          <div className="review-verdict">
+            {confirmed.length === 0 ? <CircleCheck size={15} aria-hidden /> : <ShieldAlert size={15} aria-hidden />}
+            <span>{confirmed.length === 0 ? "Review finished: no confirmed problems." : `Review finished: ${confirmed.length} confirmed problem(s).`}</span>
+          </div>
+          {confirmed.length > 0 && (
+            <ul className="review-findings">
+              {confirmed.map((f, i) => (
+                <li key={i}>
+                  <span className="mono">
+                    {f.file}:{f.line}
+                  </span>{" "}
+                  {f.failure}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
-    </div>
+    </section>
+  );
+}
+
+/** What a finished run produced and what to do next. */
+function DoneSummary({ detail, onDiff }: { detail: RunDetail; onDiff: () => void }) {
+  const ok = detail.phase === "done";
+  const passed = detail.pages.filter((p) => p.state === "passed").length;
+  return (
+    <section className={`done-card ${ok ? "good" : "bad"}`} data-testid="done-summary" aria-label="Run result">
+      <span className="done-ico" aria-hidden>
+        {ok ? <CircleCheck size={20} /> : <CircleX size={20} />}
+      </span>
+      <div className="grow">
+        <div className="done-title">
+          {ok
+            ? detail.merged && detail.merge_commit
+              ? `Merged into ${detail.base || "the project"}`
+              : "Run finished"
+            : detail.cancelled
+              ? "Run cancelled"
+              : "Run failed"}
+        </div>
+        <div className="muted small">
+          {passed} of {detail.pages.length} page{detail.pages.length === 1 ? "" : "s"} passed their checks
+          {detail.pages.some((p) => p.repairs > 0) ? ` · ${detail.pages.reduce((n, p) => n + p.repairs, 0)} repair(s)` : ""}
+        </div>
+        <div className="done-pages">
+          {detail.pages.map((p) => (
+            <span key={p.id} className="page-pill">
+              <Dot tone={pageTone(p.state)} />
+              {p.id}
+            </span>
+          ))}
+        </div>
+      </div>
+      <button className="small" onClick={onDiff}>
+        <GitCompare size={14} aria-hidden /> View diff
+      </button>
+    </section>
   );
 }
 
@@ -149,9 +210,16 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
       animate={{ ...fadeUp.animate, scale: 1 }}
       transition={{ duration: motionOn() ? fadeUp.transition.duration : 0, ease: bezier.out }}
     >
-      <div className="strong">The master asks to build this plan</div>
-      <div className="small muted">
-        {plan ? `${plan.pages.length} page(s): ${plan.pages.map((p) => `${p.id} → ${p.owned_glob}`).join(", ")}` : "a plan"} · Build stays blocked until you approve.
+      <div className="approval-head">
+        <span className="approval-ico" aria-hidden>
+          <ShieldAlert size={16} />
+        </span>
+        <div className="grow">
+          <div className="strong">The master asks to build this plan</div>
+          <div className="small muted">
+            {plan ? `${plan.pages.length} page(s): ${plan.pages.map((p) => `${p.id} → ${p.owned_glob}`).join(", ")}` : "a plan"} · Build stays blocked until you approve.
+          </div>
+        </div>
       </div>
       <textarea
         rows={2}
@@ -160,11 +228,11 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
         onChange={(e) => setReply(e.target.value)}
       />
       <div className="row gap wrap approval-actions">
-        <button className="primary" disabled={busy} onClick={() => void approve()}>
-          Approve
-        </button>
         <button disabled={busy} onClick={() => void reject()}>
           {reply.trim() ? "Reject with reply" : "Reject"}
+        </button>
+        <button className="primary" disabled={busy} onClick={() => void approve()}>
+          Approve
         </button>
       </div>
     </motion.div>
@@ -391,7 +459,13 @@ export function RunView({ id }: { id: string }) {
   };
 
   if (data.error && !detail) return <Problem error={data.error} onRetry={() => void data.reload()} />;
-  if (!detail) return <Spinner label="Opening the run" />;
+  if (!detail)
+    return (
+      <div className="page">
+        <Loading rows={2} label="Opening the run" />
+        <Loading rows={2} tall label="Opening the run" />
+      </div>
+    );
 
   const recipients = ["master", "workers", ...pages.map((p) => `page:${p}`), "reviewer", "verifier"];
   const pending = notes.filter((n) => !n.delivered);
@@ -437,12 +511,16 @@ export function RunView({ id }: { id: string }) {
             <div className="eyebrow">{settings.data?.project ?? "run"}</div>
             <div className="run-title">
               <h1 className="break">{id}</h1>
-              <span className={`phase phase-${phase}`}>{phaseLabel(detail)}</span>
+              <span className={`phase phase-${phase}`}>
+                <Dot tone={detail.cancelled ? "quiet" : detail.active && phase !== "awaiting_approval" ? "busy" : phaseTone(detail.phase)} />
+                {phaseLabel(detail)}
+              </span>
             </div>
             <div className="run-meta small">
-              {detail.active && <span>live</span>}
+              {detail.active && <span className="live-tag">live</span>}
               {detail.merged && detail.merge_commit ? (
                 <span className="merged-into" data-testid="merged-into">
+                  <GitMerge size={12} aria-hidden />
                   Merged into {detail.base || "the project"}{" "}
                   <button
                     type="button"
@@ -457,9 +535,17 @@ export function RunView({ id }: { id: string }) {
                   </button>
                 </span>
               ) : (
-                detail.branch && <span>{detail.branch}</span>
+                detail.branch && (
+                  <span className="mono">
+                    <GitBranch size={12} aria-hidden />
+                    {detail.branch}
+                  </span>
+                )
               )}
-              <span>{spendLabel(ledger?.totals ?? detail.spent)}</span>
+              <span>
+                <Coins size={12} aria-hidden />
+                {spendLabel(ledger?.totals ?? detail.spent)}
+              </span>
               {detail.estimate &&
                 (isUnpriced(ledger?.totals ?? detail.spent) ? (
                   <span>estimate about {tokens(detail.estimate.tokens)} tokens</span>
@@ -468,7 +554,7 @@ export function RunView({ id }: { id: string }) {
                 ))}
             </div>
             {detail.prompt && (
-              <p className="prompt small">
+              <p className="prompt">
                 <Rich text={detail.prompt.split("\n")[0] ?? ""} />
               </p>
             )}
@@ -514,31 +600,34 @@ export function RunView({ id }: { id: string }) {
         </header>
 
         {phase === "planning" && (
-          <div className="banner small">
-            Planning. The master's text appears below as it arrives; the locked plan replaces this line when it is ready.
+          <div className="banner status-strip small" role="status">
+            <span className="spin" aria-hidden />
+            <span>
+              <strong>Planning.</strong> The master's text appears below as it arrives; the locked plan replaces this line when it is ready.
+            </span>
           </div>
         )}
-        {detail.plan && <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} arrived={data.planArrived} compact />}
+        {["done", "failed"].includes(detail.phase) && !detail.active && <DoneSummary detail={detail} onDiff={() => (openTab("diff"), setPanelOpen(true))} />}
+        {["done", "failed"].includes(detail.phase) && detail.branch && <ReviewCard id={id} />}
+        {phase === "awaiting_approval" && (
+          <ApprovalCard
+            id={id}
+            detail={detail}
+            composer={composer}
+            onDone={() => {
+              void data.reload();
+              data.refollow();
+            }}
+          />
+        )}
+        {detail.plan && <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} arrived={data.planArrived} compact open={phase === "awaiting_approval"} />}
 
         <ToolApprovals list={toolApprovals.list} answer={toolApprovals.answer} />
         <LivePreview id={id} detail={detail} />
-        {["done", "failed"].includes(detail.phase) && detail.branch && <ReviewCard id={id} />}
 
         <div className="agents">
           {master && (
-            <AgentSurface index={0} surface={master} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === "master"}>
-              {phase === "awaiting_approval" && (
-                <ApprovalCard
-                  id={id}
-                  detail={detail}
-                  composer={composer}
-                  onDone={() => {
-                    void data.reload();
-                    data.refollow();
-                  }}
-                />
-              )}
-            </AgentSurface>
+            <AgentSurface index={0} surface={master} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === "master"} />
           )}
           {workers.length > 0 && (
             <div className="workers">

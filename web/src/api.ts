@@ -89,6 +89,8 @@ export interface Plan {
   contracts: ContractFile[];
   pages: PagePlan[];
   estimate: Estimate;
+  /** The planner's design spec every agent follows, when anything is shown in a browser. */
+  design?: string;
 }
 
 export type Roles = Record<RoleName, string>;

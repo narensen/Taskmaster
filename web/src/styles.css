@@ -394,6 +394,7 @@ kbd {
   height: 100vh;
   height: 100dvh;
   background: var(--bg);
+  color: var(--ink);
   min-width: 0;
 }
 .topbar { display: none; }
@@ -2412,13 +2413,15 @@ mark.current { outline: 1px solid var(--ask); }
   display: grid;
   place-items: center;
   padding: 24px;
-  background: var(--bg);
+  background:
+    radial-gradient(50% 40% at 50% 0%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 70%),
+    var(--bg);
 }
 .signin-card {
   width: min(400px, 100%);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   background: var(--bg-elev);
-  border-radius: var(--r-lg);
+  border-radius: var(--r-xl);
   box-shadow: var(--shadow-2);
   padding: var(--s6);
   display: flex;

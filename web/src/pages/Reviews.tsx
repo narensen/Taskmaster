@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ClipboardList, GitCompare } from "lucide-react";
 import { api, DEFAULT_ROLES, type Judged } from "../api";
 import { ago } from "../format";
 import { Link, navigate } from "../router";
@@ -23,7 +24,7 @@ export function Reviews() {
       {open && <NewReviewForm />}
       <Problem error={reviews.error} onRetry={reviews.reload} />
       {reviews.loading && !reviews.data && <Spinner />}
-      {reviews.data && reviews.data.length === 0 && !open && <Empty title="No reviews yet" />}
+      {reviews.data && reviews.data.length === 0 && !open && <Empty title="No reviews yet" icon={<ClipboardList size={18} strokeWidth={1.5} />} />}
       <div className="cards">
         {(reviews.data ?? []).map((review) => (
           <Link key={review.id} to={`/reviews/${encodeURIComponent(review.id)}`} className="card">
@@ -160,7 +161,7 @@ export function ReviewView({ id }: { id: string }) {
       </header>
       {j.status === "running" && <Spinner label="Reviewing. This takes a few minutes." />}
       {j.error && <p className="error-line">{j.error}</p>}
-      {j.report && !j.report.reviewed && <Empty title="Nothing changed, so nothing was reviewed" />}
+      {j.report && !j.report.reviewed && <Empty title="Nothing changed, so nothing was reviewed" icon={<GitCompare size={18} strokeWidth={1.5} />} />}
       {j.report?.reviewed && (
         <>
           <h2 className="section-title">

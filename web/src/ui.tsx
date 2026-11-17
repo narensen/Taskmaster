@@ -18,9 +18,14 @@ export function Spinner({ label }: { label?: string }) {
   );
 }
 
-export function Empty({ title, children }: { title: string; children?: ReactNode }) {
+export function Empty({ title, children, icon }: { title: string; children?: ReactNode; icon?: ReactNode }) {
   return (
     <div className="empty">
+      {icon && (
+        <span className="empty-ico" aria-hidden>
+          {icon}
+        </span>
+      )}
       <strong>{title}</strong>
       {children && <p>{children}</p>}
     </div>

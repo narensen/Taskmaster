@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BookOpen, SearchX } from "lucide-react";
 import { api, type DictionaryEntry } from "../api";
 import { Badge, Code, Empty, Problem, Spinner, useLoad } from "../ui";
 
@@ -39,7 +40,7 @@ export function Dictionary() {
       <Problem error={found.error} onRetry={found.reload} />
       {found.loading && !found.data && <Spinner />}
       {found.data && found.data.length === 0 && (
-        <Empty title={search ? "Nothing matches" : "The Dictionary is empty"}>
+        <Empty title={search ? "Nothing matches" : "The Dictionary is empty"} icon={search ? <SearchX size={18} strokeWidth={1.5} /> : <BookOpen size={18} strokeWidth={1.5} />}>
           {search ? undefined : "A run's plan publishes the first entries."}
         </Empty>
       )}

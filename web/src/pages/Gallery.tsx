@@ -2,14 +2,14 @@
 // shows the run's latest page screenshot, or a typed frame with the first line of the
 // prompt and the phase. Nothing here scans the disk.
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import gsap from "gsap";
+import { Inbox } from "lucide-react";
 import { api, callAt, type RunSummary } from "../api";
 import { Link } from "../router";
 import { ExternalLink } from "../paths";
 import { phaseLabel, usd } from "../format";
-import { bezier, dur, ease } from "../motion";
+import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, setPrefs, usePrefs } from "../prefs";
 import { ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
@@ -52,14 +52,21 @@ function useShot(run: RunSummary): { shot: string | null | undefined; prompt: st
   return { shot, prompt };
 }
 
-function RunCard({ run, group }: { run: RunSummary; group: string }) {
+function RunCard({ run, group, index }: { run: RunSummary; group: string; index: number }) {
   const { shot, prompt } = useShot(run);
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
+  const on = motionOn();
   return (
     <motion.article
       layout
-      transition={{ layout: { duration: dur.base, ease: bezier.out } }}
+      initial={on ? fadeUp.initial : false}
+      animate={fadeUp.animate}
+      transition={{
+        ...fadeUp.transition,
+        delay: on ? stagger(index) : 0,
+        layout: { duration: on ? dur.base : 0, ease: bezier.out },
+      }}
       className={`card gallery-card ${group === "Needs approval" ? "ask" : ""}`}
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
       onDrop={(e) => {
@@ -97,14 +104,25 @@ function RunCard({ run, group }: { run: RunSummary; group: string }) {
   );
 }
 
-function DaemonCard({ url, token, pinned }: { url: string; token: string | null; pinned: boolean }) {
+function DaemonCard({ url, token, pinned, index }: { url: string; token: string | null; pinned: boolean; index: number }) {
   const state = useLoad(() => callAt<{ runs: RunSummary[] }>(url, token, "/api/runs"), [url, token], 15000);
+  const on = motionOn();
   return (
-    <motion.article layout transition={{ layout: { duration: dur.base, ease: bezier.out } }} className="card gallery-card">
+    <motion.article
+      layout
+      className="card gallery-card"
+      initial={on ? fadeUp.initial : false}
+      animate={fadeUp.animate}
+      transition={{
+        ...fadeUp.transition,
+        delay: on ? stagger(index) : 0,
+        layout: { duration: on ? dur.base : 0, ease: bezier.out },
+      }}
+    >
       <div className="frame typed">
         <div className="typed-line">{url}</div>
         <div className="typed-phase">
-          {state.error ? "not reachable with the saved token" : state.data ? `${state.data.runs.length} runs` : "…"}
+          {state.error ? "not reachable with the saved token" : state.data ? `${state.data.runs.length} runs` : <span className="skeleton">…</span>}
         </div>
       </div>
       <div className="card-foot">
@@ -127,35 +145,30 @@ export function Gallery() {
   const { runs } = useRuns();
   const p = usePrefs();
   const settings = useLoad(api.settings, []);
-  const grid = useRef<HTMLDivElement>(null);
   const list = ordered(runs, p.showArchived);
   const archived = ordered(runs, true).filter((x) => x.group === "Archived").length;
   const daemons = [...p.daemons].sort((a, b) => Number(b.pinned) - Number(a.pinned));
-  const animated = useRef(false);
-
-  useLayoutEffect(() => {
-    if (animated.current || !grid.current || !list.length) return;
-    animated.current = true;
-    if (!motionOn()) return;
-    gsap.from(grid.current.querySelectorAll(".gallery-card"), { opacity: 0, y: 8, duration: dur.base, stagger: 0.03, ease: ease.out, clearProps: "opacity,transform" });
-  }, [list.length]);
 
   return (
     <div className="page wide">
       <header className="page-head">
         <div className="grow">
           <div className="eyebrow">Project</div>
-          <h1 className="break">{settings.data?.project ?? "…"}</h1>
+          <h1 className="break">{settings.data?.project ?? <span className="skeleton">…</span>}</h1>
         </div>
         <Link to="/runs/new" className="button primary">
           New run
         </Link>
       </header>
-      {runs.length === 0 && <Empty title="No runs yet">Start one with New run. Each run gets a card here.</Empty>}
-      <div className="gallery" ref={grid}>
+      {runs.length === 0 && (
+        <Empty title="No runs yet" icon={<Inbox size={18} strokeWidth={1.5} />}>
+          Start one with New run. Each run gets a card here.
+        </Empty>
+      )}
+      <div className="gallery">
         <AnimatePresence>
-          {list.map(({ run, group }) => (
-            <RunCard key={run.id} run={run} group={group} />
+          {list.map(({ run, group }, i) => (
+            <RunCard key={run.id} run={run} group={group} index={i} />
           ))}
         </AnimatePresence>
       </div>
@@ -169,8 +182,8 @@ export function Gallery() {
         <>
           <h2 className="section-title">Other daemons</h2>
           <div className="gallery">
-            {daemons.map((d) => (
-              <DaemonCard key={d.url} {...d} />
+            {daemons.map((d, i) => (
+              <DaemonCard key={d.url} {...d} index={i} />
             ))}
           </div>
         </>

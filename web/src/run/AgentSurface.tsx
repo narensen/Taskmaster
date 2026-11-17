@@ -7,6 +7,8 @@ import { api, type Attempt, type RunDetail } from "../api";
 import { KnownPath, Rich, looksLikePath, masked } from "../paths";
 import { emit, toast } from "../overlay";
 import { tokens, usd } from "../format";
+import { bezier, fadeUp, stagger } from "../motion";
+import { motionOn } from "../prefs";
 import type { Item, Surface } from "./model";
 
 function byline(s: Surface, detail: RunDetail | null): { harness: string; model: string } {
@@ -90,6 +92,7 @@ export function AgentSurface({
   maxTokens,
   events,
   focused,
+  index = 0,
   children,
 }: {
   surface: Surface;
@@ -97,6 +100,7 @@ export function AgentSurface({
   maxTokens: number;
   events: number;
   focused: boolean;
+  index?: number;
   children?: React.ReactNode;
 }) {
   const s = surface;
@@ -104,12 +108,18 @@ export function AgentSurface({
   const glob = s.tag?.owned_glob ?? detail?.plan?.pages.find((p) => p.id === s.page)?.owned_glob ?? null;
   const route = detail?.plan?.pages.find((p) => p.id === s.page)?.route;
   const [showBrief, setShowBrief] = useState(false);
+  const on = motionOn();
   return (
     <motion.section
       layout="position"
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1], layout: { duration: 0.18, ease: [0.22, 1, 0.36, 1] } }}
+      initial={on ? fadeUp.initial : false}
+      animate={fadeUp.animate}
+      transition={{
+        duration: on ? fadeUp.transition.duration : 0,
+        ease: bezier.out,
+        delay: on ? stagger(index) : 0,
+        layout: { duration: on ? 0.18 : 0, ease: bezier.out },
+      }}
       className={`agent state-${s.state} ${focused ? "focused" : ""}`}
       id={`agent-${s.id}`}
       data-agent={s.id}

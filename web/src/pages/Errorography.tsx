@@ -1,3 +1,4 @@
+import { CircleCheck } from "lucide-react";
 import { api, PROMOTE_AT } from "../api";
 import { Badge, Code, Empty, Problem, Spinner, useLoad } from "../ui";
 
@@ -16,7 +17,11 @@ export function Errorography() {
       </p>
       <Problem error={book.error} onRetry={book.reload} />
       {book.loading && !book.data && <Spinner />}
-      {book.data && models.length === 0 && <Empty title="No mistakes recorded">Failed checks are recorded here as runs go.</Empty>}
+      {book.data && models.length === 0 && (
+        <Empty title="No mistakes recorded" icon={<CircleCheck size={18} strokeWidth={1.5} />}>
+          Failed checks are recorded here as runs go.
+        </Empty>
+      )}
       {models.map(([model, list]) => (
         <section key={model}>
           <h2 className="section-title mono">{model}</h2>

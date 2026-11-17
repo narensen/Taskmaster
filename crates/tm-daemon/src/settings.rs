@@ -31,6 +31,10 @@ pub struct Settings {
     /// program on this machine. Empty means `$VISUAL`, then `$EDITOR`, then whatever is
     /// installed.
     pub editor: String,
+    /// The harness for each role when a run does not say. Grok for every role by default.
+    pub roles: crate::Roles,
+    /// The model for each role when a run does not say; none means the provider's default.
+    pub models: crate::Models,
 }
 
 #[derive(Debug, Clone, Deserialize)]

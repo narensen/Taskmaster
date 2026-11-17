@@ -894,6 +894,10 @@ pub struct SettingsBody {
     approval_timeout_secs: Option<u64>,
     /// An editor id, a program name or path, or empty to go back to `$VISUAL`, `$EDITOR` and what is installed.
     editor: Option<String>,
+    /// Role defaults for new runs: `{worker, mid, master, reviewer, verifier}`, each a harness id.
+    roles: Option<crate::Roles>,
+    /// Model per role; `null` is the provider's default.
+    models: Option<crate::Models>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -920,6 +924,24 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         }
         save_setting(&app.project, "editor", json!(editor)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
         *app.editor.lock().unwrap() = editor.to_string();
+    }
+    if body.roles.is_some() || body.models.is_some() {
+        let mut saved = crate::settings::Settings::load(&app.project).unwrap_or_default();
+        if let Some(roles) = body.roles {
+            for id in [&roles.worker, &roles.mid, &roles.master, &roles.reviewer, &roles.verifier] {
+                if !tm_harness::HARNESSES.contains(&id.as_str()) {
+                    return Err(fail(StatusCode::BAD_REQUEST, format!("unknown harness `{id}`: use one of {}", tm_harness::HARNESSES.join(", "))));
+                }
+            }
+            saved.roles = roles;
+        }
+        if let Some(models) = body.models {
+            saved.models = models;
+        }
+        let save = |key: &str, value: Value| save_setting(&app.project, key, value);
+        save("roles", json!(saved.roles))
+            .and_then(|()| save("models", json!(saved.models)))
+            .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if !changes.is_empty() {
         save_setting(&app.project, "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -971,6 +993,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         .flatten()
         .find(|path| path.is_file())
         .map(|path| path.display().to_string());
+    let role_defaults = crate::settings::Settings::load(&app.project).unwrap_or_default();
     ok(json!({
         "project": app.project.display().to_string(),
         "dictionary": app.dictionary.display().to_string(),
@@ -979,7 +1002,8 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "config": config,
         "config_default": project_config.display().to_string(),
         "store": if app.store.is_some() { "sqlite" } else { "files" },
-        "roles": crate::Roles::default(),
+        "roles": role_defaults.roles,
+        "models": role_defaults.models,
         "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "version": env!("CARGO_PKG_VERSION"),

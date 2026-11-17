@@ -336,6 +336,7 @@ export interface DaemonSettings {
   config_default: string;
   store: string;
   roles: Roles;
+  models?: Models;
   version: string;
   approvals?: { mode: ApprovalMode; timeout_secs: number };
 }
@@ -386,11 +387,11 @@ export interface GhStatus {
 }
 
 export const DEFAULT_ROLES: Roles = {
-  worker: "agy",
+  worker: "grok",
   mid: "grok",
-  master: "claude",
-  reviewer: "claude",
-  verifier: "agy",
+  master: "grok",
+  reviewer: "grok",
+  verifier: "grok",
 };
 
 // Where the daemon is, and the token it gave this device. Kept in localStorage so a
@@ -533,6 +534,7 @@ export const api = {
     call<{ approvals: ToolApproval[]; mode: ApprovalMode; timeout_secs: number }>("GET", `/api/approvals?run=${enc(run)}`),
   approveTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/approve`, {}),
   denyTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/deny`, {}),
+  setRoleDefaults: (body: { roles: Roles; models: Models }) => call<DaemonSettings>("POST", "/api/settings", body),
   setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
   preview: (id: string) => call<PreviewView>("GET", `/api/runs/${enc(id)}/preview`),
   startPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview`, {}),

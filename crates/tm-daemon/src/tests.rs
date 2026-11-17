@@ -1247,7 +1247,24 @@ mod http {
         assert_eq!(status, 202, "{made}");
         let waiting = client.settled("web", "awaiting_approval").await;
         assert_eq!(waiting["plan"]["pages"].as_array().unwrap().len(), 2);
-        assert_eq!(waiting["roles"]["worker"], "agy");
+        assert_eq!(waiting["roles"]["worker"], "grok");
+
+        // Role defaults are Grok, are kept in the settings file, and apply to runs that name no roles.
+        let (_, defaults) = client.get("/api/settings").await;
+        assert_eq!(defaults["roles"], json!({ "worker": "grok", "mid": "grok", "master": "grok", "reviewer": "grok", "verifier": "grok" }));
+        assert_eq!(client.post("/api/settings", json!({ "roles": { "worker": "nope" } })).await.0, 400);
+        let (status, saved) = client.post("/api/settings", json!({ "roles": { "worker": "claude" }, "models": { "worker": null } })).await;
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!((saved["roles"]["worker"].as_str(), saved["roles"]["master"].as_str(), saved["models"]["worker"].as_str()), (Some("claude"), Some("grok"), None));
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(tmp.0.join(".taskmaster/config.json")).unwrap()).unwrap();
+        assert_eq!(config["roles"]["worker"], "claude");
+        assert_eq!(client.get("/api/settings").await.1["roles"]["worker"], "claude");
+        assert_eq!(crate::settings::Settings::load(&tmp.0).unwrap().roles.worker, "claude");
+        let (status, made) = client.post("/api/runs", json!({ "id": "web2", "plan": planned })).await;
+        assert_eq!(status, 202, "{made}");
+        assert_eq!(client.settled("web2", "awaiting_approval").await["roles"]["worker"], "claude");
+        let (_, put_back) = client.post("/api/settings", json!({ "roles": { "worker": "grok", "mid": "grok", "master": "grok", "reviewer": "grok", "verifier": "grok" }, "models": {} })).await;
+        assert_eq!(put_back["roles"]["worker"], "grok");
         assert!(!tmp.0.join("app/a/page.ts").exists());
         assert_eq!(client.post("/api/runs", json!({ "id": "web", "plan": planned })).await.0, 409);
         assert_eq!(client.post("/api/runs", json!({ "id": "../x", "plan": planned })).await.0, 400);
@@ -2402,5 +2419,19 @@ mod commons_service {
         assert_eq!(seen.unwrap().id, "github:naren-id");
         assert!(auth.identify(&token("someone")).is_none());
         assert_eq!(auth.describe()["sign_in"], base.as_str());
+    }
+}
+
+#[cfg(test)]
+mod role_defaults {
+    #[test]
+    fn every_role_defaults_to_grok_and_survives_a_save_and_load() {
+        let roles = crate::Roles::default();
+        for id in [&roles.worker, &roles.mid, &roles.master, &roles.reviewer, &roles.verifier] {
+            assert_eq!(id, "grok");
+        }
+        let settings: crate::settings::Settings = serde_json::from_str(r#"{"roles":{"master":"claude"}}"#).unwrap();
+        assert_eq!((settings.roles.master.as_str(), settings.roles.worker.as_str()), ("claude", "grok"));
+        assert_eq!(crate::settings::Settings::default().roles, roles);
     }
 }

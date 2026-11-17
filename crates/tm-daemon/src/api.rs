@@ -603,11 +603,21 @@ struct NewRun {
     plan: Option<Plan>,
     /// Build as soon as the plan is ready, without waiting for approval.
     yes: bool,
-    roles: Roles,
-    models: Models,
+    /// Any role left out comes from the settings file's role defaults.
+    roles: serde_json::Map<String, Value>,
+    models: serde_json::Map<String, Value>,
     parallel: Option<usize>,
     timeout_secs: Option<u64>,
     template: Option<String>,
+}
+
+/// The saved defaults with the request's own choices laid over them.
+fn with_defaults<T: serde::Serialize + serde::de::DeserializeOwned>(saved: &T, chosen: serde_json::Map<String, Value>) -> anyhow::Result<T> {
+    let mut merged = serde_json::to_value(saved)?;
+    if let Some(object) = merged.as_object_mut() {
+        object.extend(chosen);
+    }
+    Ok(serde_json::from_value(merged)?)
 }
 
 async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Reply {
@@ -625,15 +635,20 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     if prompt.is_some() == body.plan.is_some() {
         return Err(fail(StatusCode::BAD_REQUEST, "send a prompt or a plan, and not both"));
     }
-    check_models(&body.roles, &body.models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    let saved = crate::settings::Settings::load(&app.project).unwrap_or_default();
+    let bad_request = |err: anyhow::Error| fail(StatusCode::BAD_REQUEST, format!("{err:#}"));
+    // A request that names roles but no models does not inherit the saved models, which belong to the saved harnesses.
+    let models: Models = if body.roles.is_empty() { with_defaults(&saved.models, body.models).map_err(bad_request)? } else { with_defaults(&Models::default(), body.models).map_err(bad_request)? };
+    let roles: Roles = with_defaults(&saved.roles, body.roles).map_err(bad_request)?;
+    check_models(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     }
     let request = RunRequest {
         prompt,
         plan: body.plan,
-        roles: body.roles,
-        models: body.models,
+        roles,
+        models,
         parallel: body.parallel,
         timeout_secs: body.timeout_secs,
         template: body.template,
@@ -1026,7 +1041,7 @@ impl App {
 }
 
 fn start_review(app: &Arc<App>, body: NewReview, run: Option<String>) -> Reply {
-    let defaults = Roles::default();
+    let defaults = crate::settings::Settings::load(&app.project).unwrap_or_default().roles;
     let reviewer_name = body.reviewer.unwrap_or(defaults.reviewer);
     let verifier_name = body.verifier.unwrap_or(defaults.verifier);
     let bad = |err: anyhow::Error| fail(StatusCode::BAD_REQUEST, format!("{err:#}"));

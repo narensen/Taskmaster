@@ -3,25 +3,24 @@ import { ArrowUp, Sparkles } from "lucide-react";
 import { api, DEFAULT_ROLES, type RoleName, type Roles } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
-import { usePrefs } from "../prefs";
 import { Field, Problem, useAction, useLoad } from "../ui";
 import { ROLES, RolePicker, allowed } from "../roles";
 
 export function NewRun() {
   const providers = useLoad(() => api.providers(), []);
   const templates = useLoad(api.templates, []);
-  const prefs = usePrefs();
   const [template, setTemplate] = useState("");
   const [parallel, setParallel] = useState(3);
   const [yes, setYes] = useState(false);
-  const [roles, setRoles] = useState<Roles>(() => {
-    const r = { ...DEFAULT_ROLES };
-    for (const role of ROLES) if (prefs.roleDefaults[role.id]) r[role.id] = prefs.roleDefaults[role.id]!.harness;
-    return r;
-  });
-  const [models, setModels] = useState<Partial<Record<RoleName, string | null>>>(() =>
-    Object.fromEntries(ROLES.map((r) => [r.id, prefs.roleDefaults[r.id]?.model ?? null])),
-  );
+  const defaults = useLoad(api.settings, []);
+  const [roles, setRoles] = useState<Roles>({ ...DEFAULT_ROLES });
+  const [models, setModels] = useState<Partial<Record<RoleName, string | null>>>({});
+  const [touched, setTouched] = useState(false);
+  useEffect(() => {
+    if (!defaults.data || touched) return;
+    setRoles({ ...DEFAULT_ROLES, ...defaults.data.roles });
+    setModels(defaults.data.models ?? {});
+  }, [defaults.data, touched]);
   const composer = useRef<ComposerHandle>(null);
   const action = useAction();
   const [advanced, setAdvanced] = useState(false);
@@ -99,6 +98,7 @@ export function NewRun() {
                   harness={roles[role.id]}
                   model={models[role.id] ?? null}
                   onChange={(harness, model) => {
+                    setTouched(true);
                     setRoles({ ...roles, [role.id]: harness });
                     setModels({ ...models, [role.id]: model });
                   }}

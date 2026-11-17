@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, server, type ApprovalMode, setServer, setToken, DEFAULT_ROLES, type RoleName } from "../api";
+import { api, server, type ApprovalMode, setServer, setToken, DEFAULT_ROLES, type RoleName, type Roles, type Models } from "../api";
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
 import { ROLES, RolePicker } from "../roles";
@@ -58,7 +58,23 @@ export function Settings() {
     if (window.location.hash) document.querySelector(window.location.hash)?.scrollIntoView();
   }, []);
 
-  const roleDefault = (role: RoleName) => p.roleDefaults[role] ?? { harness: daemon.data?.roles[role] ?? DEFAULT_ROLES[role], model: null };
+  // Role defaults live in the daemon's settings file; this browser keeps no copy of its own.
+  const [saved, setSaved] = useState<{ roles: Roles; models: Models } | null>(null);
+  useEffect(() => {
+    if (daemon.data && !saved) setSaved({ roles: { ...DEFAULT_ROLES, ...daemon.data.roles }, models: daemon.data.models ?? {} });
+  }, [daemon.data, saved]);
+  const roleDefault = (role: RoleName) => ({
+    harness: saved?.roles[role] ?? daemon.data?.roles[role] ?? DEFAULT_ROLES[role],
+    model: saved?.models[role] ?? null,
+  });
+  const saveRole = (role: RoleName, harness: string, model: string | null) => {
+    const next = { roles: { ...(saved?.roles ?? DEFAULT_ROLES), [role]: harness }, models: { ...(saved?.models ?? {}), [role]: model } };
+    setSaved(next);
+    api.setRoleDefaults(next).then(
+      () => toast("Role defaults saved", `${role}: ${harness}${model ? ` · ${model}` : ""}`),
+      (err) => toast("Role defaults were not saved", err instanceof Error ? err.message : String(err)),
+    );
+  };
 
   return (
     <div className="page narrow settings">
@@ -140,7 +156,7 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Default harness and model" note="Used by New Run in this browser. Only harnesses and models the providers list returned can be chosen.">
+      <Section title="Default harness and model" note="Kept by the daemon and used by every New Run, in any browser. Only harnesses and models the providers list returned can be chosen.">
         <Problem error={providers.error} onRetry={providers.reload} />
         <div className="roles">
           {ROLES.map((role) => {
@@ -152,7 +168,7 @@ export function Settings() {
                 providers={providers.data ?? []}
                 harness={d.harness}
                 model={d.model}
-                onChange={(harness, model) => setPrefs({ roleDefaults: { ...p.roleDefaults, [role.id]: { harness, model } } })}
+                onChange={(harness, model) => saveRole(role.id, harness, model)}
               />
             );
           })}

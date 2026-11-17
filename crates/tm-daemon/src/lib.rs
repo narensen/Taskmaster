@@ -99,16 +99,10 @@ pub struct Roles {
 }
 
 impl Default for Roles {
-    /// The worker is the cheap one. The reviewer and the verifier are different harnesses,
-    /// so one model does not check its own work.
+    /// Every role is Grok Build until the settings file or the request says otherwise.
     fn default() -> Self {
-        Roles {
-            worker: "agy".into(),
-            mid: "grok".into(),
-            master: "claude".into(),
-            reviewer: "claude".into(),
-            verifier: "agy".into(),
-        }
+        let grok = || "grok".to_string();
+        Roles { worker: grok(), mid: grok(), master: grok(), reviewer: grok(), verifier: grok() }
     }
 }
 

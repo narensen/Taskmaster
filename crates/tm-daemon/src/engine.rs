@@ -1763,6 +1763,13 @@ impl Driver {
                 None => brief.push_str(&format!("\nDictionary `{key}` is not published yet.\n")),
             }
         }
+        if !page.cites.is_empty() {
+            // Each lookup is another model turn; the entries are already here.
+            brief.push_str(
+                "\nThe cited entries above are complete: do not look them up again with the Dictionary tools. \
+                 Read the contracts you use, then write your files.\n",
+            );
+        }
         Ok(brief)
     }
 

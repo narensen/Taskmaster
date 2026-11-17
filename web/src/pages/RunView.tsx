@@ -491,13 +491,13 @@ export function RunView({ id }: { id: string }) {
         )}
       </div>
       <div className="panel-body" ref={panelBody}>
-        {tab === "plan" && (detail.plan ? <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} /> : <div className="pad muted">No plan yet. The master is still planning.</div>)}
+        {tab === "plan" && (detail.plan ? <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} /> : <div className="tab-empty"><span className="spin" aria-hidden /> No plan yet. The master is still planning.</div>)}
         {tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
         {tab === "browser" && <BrowserTab run={id} detail={detail} entries={entries} />}
         {tab === "search" && <SearchTab />}
         {tab === "terminal" && <TerminalTab run={id} entries={entries} project={settings.data?.project ?? ""} onRan={() => void data.catchUp()} />}
         {tab.startsWith("file:") && previews[tab] && <PreviewTab path={previews[tab]!.path} line={previews[tab]!.line} />}
-        {!panelTabs.includes(tab) && <div className="pad muted">Every tab is closed. ⌘⇧T reopens the last one.</div>}
+        {!panelTabs.includes(tab) && <div className="tab-empty">Every tab is closed. <kbd>⌘</kbd><kbd>⇧</kbd><kbd>T</kbd> reopens the last one.</div>}
       </div>
     </div>
   );
@@ -553,16 +553,6 @@ export function RunView({ id }: { id: string }) {
                   <span>estimate {usd(detail.estimate.usd)}</span>
                 ))}
             </div>
-            {detail.prompt && (
-              <p className="prompt">
-                <Rich text={detail.prompt.split("\n")[0] ?? ""} />
-              </p>
-            )}
-            {detail.error && (
-              <div className="error-line small">
-                <Rich text={detail.error} />
-              </div>
-            )}
           </div>
           <div className="run-actions">
             {!detail.active && !["done", "failed", "awaiting_approval"].includes(detail.phase) && (
@@ -597,6 +587,16 @@ export function RunView({ id }: { id: string }) {
               </button>
             )}
           </div>
+          {detail.prompt && (
+            <p className="prompt">
+              <Rich text={detail.prompt.split("\n")[0] ?? ""} />
+            </p>
+          )}
+          {detail.error && (
+            <div className="error-line small">
+              <Rich text={detail.error} />
+            </div>
+          )}
         </header>
 
         {phase === "planning" && (

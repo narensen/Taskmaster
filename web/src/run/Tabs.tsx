@@ -163,17 +163,19 @@ export function SearchTab() {
       <form className="toolbar" onSubmit={search}>
         <input className="grow" placeholder="Search the web" value={q} onChange={(e) => setQ(e.target.value)} />
         <button className="primary small" disabled={busy}>
-          {busy ? "…" : "Search"}
+          {busy ? <span className="spin" aria-hidden /> : null}
+          Search
         </button>
       </form>
       <div className="muted small pad-x">via {via}</div>
       {error && <div className="pad error-line">{error}</div>}
-      {results && results.length === 0 && <div className="pad muted">No results.</div>}
+      {results && results.length === 0 && <div className="tab-empty">No results. Try fewer or different words.</div>}
+      {!results && !error && <div className="tab-empty">Search the web from inside the run. Attach a result and it rides along with your next note.</div>}
       <ol className="results">
         {results?.map((r) => (
           <li key={r.url} className="result">
             <ExternalLink href={r.url}>{r.title}</ExternalLink>
-            <div className="muted small break">
+            <div className="muted small break result-url">
               {r.url}
               {r.engine && <span className="muted small"> · {r.engine}</span>}
             </div>
@@ -222,7 +224,7 @@ export function TerminalTab({ run, entries, project, onRan }: { run: string; ent
   return (
     <div className="terminal-tab">
       <div className="term" aria-label="Commands the daemon ran">
-        {lines.length === 0 && <div className="muted">The daemon has not run a command for this run yet.</div>}
+        {lines.length === 0 && <div className="tab-empty">The daemon has not run a command for this run yet.</div>}
         {lines.map((l, i) => (
           <Fragment key={i}>
             {l.kind === "command" ? (

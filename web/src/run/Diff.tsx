@@ -240,8 +240,8 @@ export function DiffTab({
         />
         {find && <span className="muted small">{hits ? `${(hit % hits) + 1}/${hits}` : "0/0"}</span>}
       </div>
-      {error && <div className="muted pad">{error}</div>}
-      {!error && files.length === 0 && <div className="muted pad">No changes in this scope.</div>}
+      {error && <div className="tab-empty">{error}</div>}
+      {!error && files.length === 0 && <div className="tab-empty">No changes in this scope.</div>}
       <div className="diff-body" ref={body}>
         {files.map((f) => {
           const viewed = isViewed(f);

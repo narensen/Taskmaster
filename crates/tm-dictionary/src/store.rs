@@ -52,8 +52,8 @@ impl LocalStore {
         };
         let dir = self.root.join(key);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join(format!("{hash}.json")), serde_json::to_vec_pretty(&entry)?)?;
-        fs::write(dir.join("HEAD"), &hash)?;
+        write_atomic(&dir.join(format!("{hash}.json")), &serde_json::to_vec_pretty(&entry)?)?;
+        write_atomic(&dir.join("HEAD"), hash.as_bytes())?;
         Ok(hash)
     }
 
@@ -118,8 +118,8 @@ impl LocalStore {
         }
         let dir = self.root.join(&entry.key);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join(format!("{}.json", entry.hash)), serde_json::to_vec_pretty(entry)?)?;
-        fs::write(dir.join("HEAD"), &entry.hash)?;
+        write_atomic(&dir.join(format!("{}.json", entry.hash)), &serde_json::to_vec_pretty(entry)?)?;
+        write_atomic(&dir.join("HEAD"), entry.hash.as_bytes())?;
         Ok(())
     }
 
@@ -151,6 +151,20 @@ impl LocalStore {
 }
 
 /// Keys become directory names, so they must not be able to name anything else.
+/// Write `bytes` to `path` so a reader sees the old file or the new one, never a torn one.
+/// Entries are rewritten while parallel workers read them (pass counts, Commons pulls).
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    fs::write(&tmp, bytes).with_context(|| format!("cannot write {}", tmp.display()))?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
+    Ok(())
+}
+
 fn check_key(key: &str) -> anyhow::Result<()> {
     if tm_core::valid_key(key) {
         Ok(())

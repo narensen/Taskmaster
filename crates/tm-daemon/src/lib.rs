@@ -27,6 +27,7 @@ mod reply;
 mod resume;
 mod runtime;
 mod secret;
+mod small;
 mod static_site;
 pub mod search;
 pub mod settings;

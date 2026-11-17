@@ -379,6 +379,9 @@ impl Driver {
                 self.config.models.master.clone(),
                 &token,
             )?;
+            if self.small_pass(prompt) {
+                request.dictionary = None;
+            }
             self.tag(&mut request, "master", "planner", None);
             let bill = request.bill(Role::Planner, None);
             let asked = ask(request).await;
@@ -418,7 +421,38 @@ impl Driver {
         bail!("plan is not usable:\n{}", errors.join("\n"))
     }
 
+    /// Project files other than a README and dotfiles, at the top level.
+    fn existing_files(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(&self.tree) else { return 0 };
+        entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                !name.starts_with('.') && !name.starts_with("readme")
+            })
+            .count()
+    }
+
+    /// Small prompts on an empty project take the light planning pass.
+    /// Stored Dictionary entries keep the full pass, so the master sees them.
+    fn small_pass(&self, prompt: &str) -> bool {
+        crate::small::is_small_prompt(prompt, self.existing_files())
+            && self.catalog().and_then(|c| c.search("")).map(|found| found.is_empty()).unwrap_or(false)
+    }
+
     fn planner_brief(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
+        if self.small_pass(prompt) {
+            let template = self.template.as_ref().map(|t| t.brief()).unwrap_or_default();
+            let mut brief = crate::small::small_brief(prompt, true, &template);
+            if !errors.is_empty() {
+                brief.push_str("\nThe last plan was rejected:\n");
+                for error in errors {
+                    brief.push_str(&format!("- {error}\n"));
+                }
+                brief.push_str("Reply with a corrected JSON object.\n");
+            }
+            return Ok(brief);
+        }
         let mut brief = format!(
             "Plan this product and lock its contracts.\n\n\
              Request:\n{prompt}\n\n\

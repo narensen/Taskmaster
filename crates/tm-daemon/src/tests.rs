@@ -141,7 +141,7 @@ impl World {
     async fn respond(&self, task: &WorkerTask) -> anyhow::Result<Script> {
         let brief = task.brief.clone();
         self.calls.lock().unwrap().push(brief.clone());
-        if brief.contains("Plan this product and lock its contracts.") {
+        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             return Ok(Script::text(&self.plan_reply()));
         }
         if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
@@ -651,7 +651,7 @@ fn planner_calls(world: &World) -> Vec<String> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|call| call.contains("Plan this product and lock its contracts."))
+        .filter(|call| call.contains("Plan this product and lock its contracts.") || call.contains("Plan this small product quickly."))
         .cloned()
         .collect()
 }
@@ -675,6 +675,7 @@ async fn a_prompt_locks_the_plan_and_publishes_the_dictionary() {
     let world = World::new(Mode::Plan);
     let outcome = run(prompt_config(&tmp.0, "Build page a with a greeting.", true), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(planner_calls(&world)[0].contains("Dictionary is empty"));
     assert_eq!(world.plans.load(Ordering::SeqCst), 1);
     assert_eq!(read(&tmp.0.join("contracts/types.ts")), "export type Id = string;\n");
     assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));

@@ -54,6 +54,9 @@ impl Harness for Codex {
         if let Some(model) = &task.model {
             cmd.args(["--model", model]);
         }
+        if let Some(effort) = &task.effort {
+            cmd.args(["-c", &format!("model_reasoning_effort={effort:?}")]);
+        }
         if let Some(dict) = &task.dictionary {
             // TOML string values; `{:?}` quotes and escapes them.
             cmd.arg("-c").arg(format!("mcp_servers.{}.url={:?}", dict.name, dict.url));

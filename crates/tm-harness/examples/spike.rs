@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         brief: prompt.clone(),
         cwd,
         model,
+        effort: None,
         dictionary,
         timeout: Duration::from_secs(240),
         read_only: false,

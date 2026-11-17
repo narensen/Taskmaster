@@ -197,6 +197,7 @@ async fn ask(
         brief,
         cwd: worktree,
         model,
+        effort: None,
         dictionary: None,
         timeout: AGENT_TIMEOUT,
         read_only: true,

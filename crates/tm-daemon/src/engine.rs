@@ -66,6 +66,7 @@ struct AgentRequest {
     brief: String,
     cwd: PathBuf,
     model: Option<String>,
+    effort: Option<String>,
     dictionary: Option<DictionaryAccess>,
     timeout: Duration,
     read_only: bool,
@@ -386,7 +387,9 @@ impl Driver {
                 &token,
             )?;
             if self.small_pass(prompt) {
+                // Every stored entry is in the brief, so the master answers in one turn.
                 request.dictionary = None;
+                request.effort = Some(crate::small::SMALL_EFFORT.to_string());
             }
             self.tag(&mut request, "master", "planner", None, None);
             let bill = request.bill(Role::Planner, None);
@@ -439,17 +442,38 @@ impl Driver {
             .count()
     }
 
-    /// Small prompts on an empty project take the light planning pass.
-    /// Stored Dictionary entries keep the full pass, so the master sees them.
+    /// Small prompts on an empty project take the light planning pass. Stored Dictionary
+    /// entries go into its brief in full, so they do not force the slow, tool-driven pass.
     fn small_pass(&self, prompt: &str) -> bool {
         crate::small::is_small_prompt(prompt, self.existing_files())
-            && self.catalog().and_then(|c| c.search("")).map(|found| found.is_empty()).unwrap_or(false)
+    }
+
+    /// Stored Dictionary entries, one formatted item each, for a planning brief.
+    fn entry_listing(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .catalog()?
+            .search("")?
+            .iter()
+            .map(|entry| {
+                let place = match entry.tier {
+                    DictTier::Commons => "commons",
+                    DictTier::Local => "local",
+                };
+                format!(
+                    "- `{key}` ({place}, {kind}): {summary}\n{content}\n",
+                    key = entry.key,
+                    kind = kind_name(entry.kind),
+                    summary = entry.summary,
+                    content = entry.content,
+                )
+            })
+            .collect())
     }
 
     fn planner_brief(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
         if self.small_pass(prompt) {
             let template = self.template.as_ref().map(|t| t.brief()).unwrap_or_default();
-            let mut brief = crate::small::small_brief(prompt, true, &template);
+            let mut brief = crate::small::small_brief(prompt, &self.entry_listing()?, &template);
             if !errors.is_empty() {
                 brief.push_str("\nThe last plan was rejected:\n");
                 for error in errors {
@@ -466,22 +490,12 @@ impl Driver {
              If you include an existing key, its content must match exactly.\n\n\
              Dictionary entries already stored:\n"
         );
-        let found = self.catalog()?.search("")?;
+        let found = self.entry_listing()?;
         if found.is_empty() {
             brief.push_str("- none\n");
         }
         for entry in &found {
-            let place = match entry.tier {
-                DictTier::Commons => "commons",
-                DictTier::Local => "local",
-            };
-            brief.push_str(&format!(
-                "- `{key}` ({place}, {kind}): {summary}\n{content}\n",
-                key = entry.key,
-                kind = kind_name(entry.kind),
-                summary = entry.summary,
-                content = entry.content,
-            ));
+            brief.push_str(entry);
         }
         if found.len() == 20 {
             brief.push_str("Further entries may be stored. Search the Dictionary before adding a key.\n");
@@ -1446,6 +1460,7 @@ impl Driver {
             brief,
             cwd: worktree.clone(),
             model: self.config.models.master.clone(),
+            effort: None,
             dictionary: Some(self.access(&self.master_token.clone())),
             timeout: self.config.timeout,
             read_only: false,
@@ -1639,6 +1654,7 @@ impl Driver {
             brief,
             cwd,
             model: self.model_for(tier),
+            effort: None,
             dictionary: Some(self.access(&token)),
             timeout: self.config.timeout,
             read_only: false,
@@ -1794,6 +1810,7 @@ impl Driver {
             brief,
             cwd: cwd.to_path_buf(),
             model,
+            effort: None,
             dictionary: Some(self.access(token)),
             timeout: self.config.timeout,
             read_only: true,
@@ -2330,6 +2347,7 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
         brief: request.brief,
         cwd: request.cwd,
         model: request.model,
+        effort: request.effort,
         dictionary: request.dictionary,
         timeout: request.timeout,
         read_only: request.read_only,

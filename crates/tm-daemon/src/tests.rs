@@ -142,7 +142,9 @@ impl World {
 
     async fn respond(&self, task: &WorkerTask) -> anyhow::Result<Script> {
         let brief = task.brief.clone();
-        self.calls.lock().unwrap().push(brief.clone());
+        // How the call was made rides on the recorded brief, after the text the daemon sent.
+        let how = format!("\n[effort={}][dictionary={}]", task.effort.as_deref().unwrap_or("default"), task.dictionary.is_some());
+        self.calls.lock().unwrap().push(format!("{brief}{how}"));
         if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             return Ok(Script::text(&self.plan_reply()));
         }
@@ -745,6 +747,9 @@ async fn an_existing_dictionary_entry_is_cited_without_a_rewrite() {
     let calls = planner_calls(&world);
     assert_eq!(calls.len(), 2);
     assert!(calls[0].contains("export const theme = \"dark\""), "{}", calls[0]);
+    // A stored entry no longer forces the slow pass: it is listed, and the master gets no tools.
+    assert!(calls[0].contains("Plan this small product quickly."), "{}", calls[0]);
+    assert!(calls[0].ends_with("[effort=low][dictionary=false]"), "{}", calls[0]);
     assert!(calls[1].contains("different content"), "{}", calls[1]);
     assert_eq!(commons.get("theme").unwrap().unwrap().content, "export const theme = \"dark\";\n");
     let local = LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();

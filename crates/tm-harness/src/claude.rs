@@ -54,6 +54,9 @@ impl Harness for ClaudeCode {
         if let Some(model) = &task.model {
             cmd.args(["--model", model]);
         }
+        if let Some(effort) = &task.effort {
+            cmd.args(["--effort", effort]);
+        }
         if let Some(dict) = &task.dictionary {
             let config = json!({ "mcpServers": { &dict.name: {
                 "type": "http",

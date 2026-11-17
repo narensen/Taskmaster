@@ -29,6 +29,8 @@ pub struct AcpHarness {
     /// How this harness names an MCP server's tools, with `{server}` for the server name.
     /// A tool whose name starts with this, for the Dictionary server, is a Dictionary call.
     pub mcp_tool_prefix: &'static str,
+    /// The flag that sets reasoning effort, inserted after the first argument. `None` ignores effort.
+    pub effort_flag: Option<&'static str>,
 }
 
 impl AcpHarness {
@@ -39,6 +41,7 @@ impl AcpHarness {
             args: vec!["acp".into()],
             sandbox: Some(Sandbox::antigravity()?),
             mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
         })
     }
 
@@ -50,6 +53,8 @@ impl AcpHarness {
             args: vec!["agent".into(), "stdio".into()],
             sandbox: Some(Sandbox::grok()?),
             mcp_tool_prefix: "{server}__",
+            // `grok agent --reasoning-effort low stdio`
+            effort_flag: Some("--reasoning-effort"),
         })
     }
 
@@ -62,19 +67,31 @@ impl AcpHarness {
             args: vec!["acp".into()],
             sandbox: Some(Sandbox::opencode()?),
             mcp_tool_prefix: "{server}_",
+            effort_flag: None,
         })
     }
 
+    /// The agent's arguments, with the effort flag after the subcommand when one is asked for.
+    fn args_for(&self, task: &WorkerTask) -> Vec<String> {
+        let mut args = self.args.clone();
+        if let (Some(flag), Some(effort)) = (self.effort_flag, &task.effort) {
+            let at = args.len().min(1);
+            args.splice(at..at, [flag.to_string(), effort.clone()]);
+        }
+        args
+    }
+
     fn command(&self, task: &WorkerTask) -> anyhow::Result<Command> {
+        let args = self.args_for(task);
         let Some(sandbox) = &self.sandbox else {
             let binary = resolve_binary(&self.binary)?;
             let mut cmd = Command::new(binary);
-            cmd.args(&self.args).current_dir(&task.cwd);
+            cmd.args(&args).current_dir(&task.cwd);
             return Ok(cmd);
         };
         let binary = resolve_binary(&self.binary)?;
         let mut cmd = Command::new("bwrap");
-        cmd.args(sandbox.bwrap_args(&binary, &self.args, &task.cwd, task.read_only));
+        cmd.args(sandbox.bwrap_args(&binary, &args, &task.cwd, task.read_only));
         Ok(cmd)
     }
 }
@@ -349,6 +366,30 @@ fn choose_option(options: &Value, allowed: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_takes_effort_on_the_agent_subcommand() {
+        let harness = AcpHarness {
+            id: "grok-build",
+            binary: "grok".into(),
+            args: vec!["agent".into(), "stdio".into()],
+            sandbox: None,
+            mcp_tool_prefix: "{server}__",
+            effort_flag: Some("--reasoning-effort"),
+        };
+        let mut task = WorkerTask {
+            brief: String::new(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(1),
+            read_only: true,
+        };
+        assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
+        task.effort = Some("low".into());
+        assert_eq!(harness.args_for(&task), ["agent", "--reasoning-effort", "low", "stdio"]);
+    }
 
     // Shapes recorded from Antigravity 1.5.9.
     fn shell_call() -> Value {

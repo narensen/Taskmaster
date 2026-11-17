@@ -98,6 +98,8 @@ pub struct WorkerTask {
     /// The worker's worktree. It is the only place the worker may read or write.
     pub cwd: PathBuf,
     pub model: Option<String>,
+    /// Reasoning effort (`low`, `medium`, `high`) for harnesses that take one. `None` keeps the default.
+    pub effort: Option<String>,
     pub dictionary: Option<DictionaryAccess>,
     pub timeout: Duration,
     /// Reviewers and verifiers: the worktree is mounted read-only and edit tools are removed.

@@ -89,7 +89,7 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
         placeholder="Reply in words to reject it and plan again with your note"
         onChange={(e) => setReply(e.target.value)}
       />
-      <div className="row gap wrap">
+      <div className="row gap wrap approval-actions">
         <button className="primary" disabled={busy} onClick={() => void approve()}>
           Approve
         </button>
@@ -365,13 +365,15 @@ export function RunView({ id }: { id: string }) {
         <header className="run-head">
           <div className="grow">
             <div className="eyebrow">{settings.data?.project ?? "run"}</div>
-            <h1 className="break">{id}</h1>
-            <div className="run-meta small">
+            <div className="run-title">
+              <h1 className="break">{id}</h1>
               <span className={`phase phase-${phase}`}>{phaseLabel(detail)}</span>
-              {detail.active && <span> · live</span>}
-              {detail.branch && <span> · {detail.branch}</span>}
-              <span> · {usd(ledger?.totals.cost_usd ?? detail.spent.cost_usd)} spent</span>
-              {detail.estimate && <span> · estimate {usd(detail.estimate.usd)}</span>}
+            </div>
+            <div className="run-meta small">
+              {detail.active && <span>live</span>}
+              {detail.branch && <span>{detail.branch}</span>}
+              <span>{usd(ledger?.totals.cost_usd ?? detail.spent.cost_usd)} spent</span>
+              {detail.estimate && <span>estimate {usd(detail.estimate.usd)}</span>}
             </div>
             {detail.prompt && (
               <p className="prompt small">
@@ -384,9 +386,9 @@ export function RunView({ id }: { id: string }) {
               </div>
             )}
           </div>
-          <div className="row gap wrap">
+          <div className="run-actions">
             {!detail.active && !["done", "failed", "awaiting_approval"].includes(detail.phase) && (
-              <button onClick={() => void api.resume(id).then(() => (data.refollow(), data.reload()))}>Resume</button>
+              <button className="ghost" onClick={() => void api.resume(id).then(() => (data.refollow(), data.reload()))}>Resume</button>
             )}
             {(detail.active || detail.phase === "awaiting_approval") && (
               <button className="ghost" onClick={() => void api.cancel(id).then(() => data.reload())}>

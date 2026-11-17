@@ -70,10 +70,10 @@ export function NewRun() {
                   <Sparkles size={13} />
                   <span className="clip">{pill}</span>
                 </button>
-                <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
-                  <ArrowUp size={15} />
-                </button>
               </div>
+              <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
+                <ArrowUp size={15} />
+              </button>
             </div>
           }
         />

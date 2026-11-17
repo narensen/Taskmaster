@@ -105,8 +105,8 @@ export function ToolApprovals({ list, answer }: { list: ToolApproval[]; answer: 
                   ))}
                 </ul>
               )}
-              <div className="small muted">{a.reason}</div>
-              <div className="row gap">
+              <div className="tool-approval-reason">{a.reason}</div>
+              <div className="row gap tool-approval-actions">
                 <button
                   className="primary small"
                   data-testid="tool-approve"

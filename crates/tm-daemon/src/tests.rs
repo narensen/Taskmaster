@@ -45,6 +45,8 @@ enum Mode {
     PlanClash,
     /// Every reply has no pages.
     PlanBad,
+    /// Page `a`'s first agent stalls waiting on its model.
+    Stall,
 }
 
 struct World {
@@ -158,6 +160,11 @@ impl World {
             return Ok(Script { text: "done".into(), files: vec![(path.into(), Some(body.into()))] });
         }
         if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
+            if matches!(self.mode, Mode::Stall) && id == "a" && self.a.load(Ordering::SeqCst) == 0 {
+                assert!(task.stall.is_some(), "a worker runs with a stall limit");
+                self.a.fetch_add(1, Ordering::SeqCst);
+                return Err(tm_harness::Stalled(Duration::from_secs(60)).into());
+            }
             return self.build(id).await;
         }
         if brief.contains("objected to Dictionary") {
@@ -425,6 +432,18 @@ async fn happy_path_locks_contracts_and_merges_each_page() {
     let status: serde_json::Value =
         serde_json::from_str(&read(&run_directory(&tmp.0, "current").join("status.json"))).unwrap();
     assert_eq!(status["ok"], true);
+}
+
+#[tokio::test]
+async fn a_stalled_agent_is_replaced_by_a_fresh_one() {
+    let tmp = repo("stall");
+    let world = World::new(Mode::Stall);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let builds = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(builds, 2);
+    let agents = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
+    assert!(agents.contains("\"kind\":\"stalled\""), "{agents}");
 }
 
 #[tokio::test]

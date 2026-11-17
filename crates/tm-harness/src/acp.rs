@@ -5,6 +5,7 @@
 //! The agent sends `session/request_permission` before shell commands and MCP calls; each
 //! one is answered by the [`PermissionGate`]. File access is confined by the [`Sandbox`].
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::gate::{Decision, PermissionGate, PermissionRequest, ToolKind};
 use crate::sandbox::{Sandbox, resolve_binary};
-use crate::{Harness, HarnessEvent, RunSummary, Usage, WorkerTask};
+use crate::{Harness, HarnessEvent, RunSummary, Stalled, Usage, WorkerTask};
 
 pub struct AcpHarness {
     pub id: &'static str,
@@ -123,6 +124,8 @@ impl Harness for AcpHarness {
             gate,
             events,
             denied: 0,
+            stall: task.stall,
+            tools: BTreeSet::new(),
         };
         let timeout = task.timeout;
         match tokio::time::timeout(timeout, session.drive(task)).await {
@@ -150,6 +153,10 @@ struct Session {
     gate: Arc<dyn PermissionGate>,
     events: mpsc::Sender<HarnessEvent>,
     denied: u32,
+    /// How long the agent may stay silent while it waits on its model.
+    stall: Option<std::time::Duration>,
+    /// Tool calls started and not yet finished. A running tool may be silent for a long time.
+    tools: BTreeSet<String>,
 }
 
 impl Session {
@@ -216,11 +223,15 @@ impl Session {
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
         loop {
-            let line = self
-                .lines
-                .next_line()
-                .await?
-                .ok_or_else(|| anyhow!("agent closed its output during `{method}`"))?;
+            let next = self.lines.next_line();
+            let line = match self.stall.filter(|_| self.tools.is_empty()) {
+                Some(limit) => match tokio::time::timeout(limit, next).await {
+                    Ok(line) => line,
+                    Err(_) => return Err(Stalled(limit).into()),
+                },
+                None => next.await,
+            };
+            let line = line?.ok_or_else(|| anyhow!("agent closed its output during `{method}`"))?;
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg.get("method").is_some() {
                 self.incoming(msg).await?;
@@ -237,6 +248,7 @@ impl Session {
         let params = &msg["params"];
         match msg["method"].as_str() {
             Some("session/update") => {
+                track_tool(&mut self.tools, &params["update"]);
                 if let Some(event) = update_event(&params["update"]) {
                     let _ = self.events.send(event).await;
                 }
@@ -288,6 +300,22 @@ impl Session {
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+}
+
+/// Keep the set of running tool calls current. A call is running from its first report
+/// until an update says it completed or failed.
+fn track_tool(tools: &mut BTreeSet<String>, update: &Value) {
+    let Some(id) = update["toolCallId"].as_str() else { return };
+    let finished = matches!(update["status"].as_str(), Some("completed" | "failed"));
+    match update["sessionUpdate"].as_str() {
+        Some("tool_call" | "tool_call_update") if finished => {
+            tools.remove(id);
+        }
+        Some("tool_call") => {
+            tools.insert(id.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -384,6 +412,7 @@ mod tests {
             effort: None,
             dictionary: None,
             timeout: std::time::Duration::from_secs(1),
+            stall: None,
             read_only: true,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
@@ -451,6 +480,46 @@ mod tests {
         let usage = read_usage(&grok);
         assert_eq!((usage.input, usage.cache_read), (17160, 58368));
         assert_eq!(usage.total(), 76035);
+    }
+
+    #[tokio::test]
+    async fn a_silent_agent_is_stopped_as_stalled() {
+        let script = r#"read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}'; read l; sleep 30"#;
+        let harness = AcpHarness {
+            id: "fake",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "{server}__",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "hi".into(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(20),
+            stall: Some(std::time::Duration::from_millis(300)),
+            read_only: true,
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        let started = std::time::Instant::now();
+        let err = harness.run(task, Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![])), tx).await.unwrap_err();
+        assert!(err.downcast_ref::<Stalled>().is_some(), "{err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_tool_runs_from_its_call_until_it_completes() {
+        let mut tools = BTreeSet::new();
+        track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "a", "status": "pending" }));
+        track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "b", "status": "completed" }));
+        assert_eq!(tools.len(), 1);
+        track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "a", "status": "in_progress" }));
+        assert_eq!(tools.len(), 1);
+        track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "a", "status": "failed" }));
+        assert!(tools.is_empty());
     }
 
     #[test]

@@ -69,6 +69,8 @@ struct AgentRequest {
     effort: Option<String>,
     dictionary: Option<DictionaryAccess>,
     timeout: Duration,
+    /// Silence, with no tool running, after which the agent is replaced by a fresh one.
+    stall: Option<Duration>,
     read_only: bool,
     /// Where the agent's events go as they arrive, tagged with who it is.
     feed: Option<Feed>,
@@ -1477,6 +1479,7 @@ impl Driver {
             effort: None,
             dictionary: Some(self.access(&self.master_token.clone())),
             timeout: self.config.timeout,
+            stall: None,
             read_only: false,
             feed: None,
         };
@@ -1672,6 +1675,7 @@ impl Driver {
             effort: (self.small && errors.is_none()).then(|| crate::small::SMALL_EFFORT.to_string()),
             dictionary: Some(self.access(&token)),
             timeout: self.config.timeout,
+            stall: None,
             read_only: false,
             feed: None,
         })
@@ -1837,6 +1841,7 @@ impl Driver {
             effort: None,
             dictionary: Some(self.access(token)),
             timeout: self.config.timeout,
+            stall: None,
             read_only: true,
             feed: None,
         })
@@ -1857,6 +1862,7 @@ impl Driver {
             "call": self.live.next_call(),
         });
         request.feed = Some(Feed { live: self.live.clone(), run: self.id.clone(), agent: tag });
+        request.stall = Some(if self.small { SMALL_STALL } else { STALL });
     }
 
     /// A brief with the notes a person queued for this agent.
@@ -2353,7 +2359,35 @@ fn failed(errors: impl Into<String>) -> WorkerOutcome {
     WorkerOutcome::CheckFailed { errors: errors.into() }
 }
 
-async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
+/// A model normally starts answering a small, low-effort brief within half a minute; a
+/// minute of silence with no tool running means the provider has queued the request.
+const SMALL_STALL: Duration = Duration::from_secs(60);
+/// Larger briefs at default effort can think for a while before the first token.
+const STALL: Duration = Duration::from_secs(180);
+/// Fresh agents started after a stall. The last one may wait for the whole timeout.
+const STALL_RESTARTS: usize = 2;
+
+/// Run one agent. One that stalls is stopped and replaced by a fresh agent with the same brief.
+async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
+    for restart in 0..=STALL_RESTARTS {
+        if restart == STALL_RESTARTS {
+            request.stall = None;
+        }
+        match ask_once(&request).await {
+            Err(err) if restart < STALL_RESTARTS && err.downcast_ref::<tm_harness::Stalled>().is_some() => {
+                let who = request.feed.as_ref().and_then(|f| f.agent["id"].as_str().map(str::to_string)).unwrap_or_else(|| "an agent".into());
+                eprintln!("taskmaster: {who} stalled ({err}); starting a fresh agent");
+                if let Some(feed) = &request.feed {
+                    feed.live.push(&feed.run, &feed.agent, "stalled", serde_json::json!({ "error": format!("{err:#}"), "restart": restart + 1 }));
+                }
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
+async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
     if request.read_only {
@@ -2368,15 +2402,16 @@ async fn ask(request: AgentRequest) -> anyhow::Result<Answer> {
         None => Arc::new(gate),
     };
     let task = WorkerTask {
-        brief: request.brief,
-        cwd: request.cwd,
-        model: request.model,
-        effort: request.effort,
-        dictionary: request.dictionary,
+        brief: request.brief.clone(),
+        cwd: request.cwd.clone(),
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        dictionary: request.dictionary.clone(),
         timeout: request.timeout,
+        stall: request.stall,
         read_only: request.read_only,
     };
-    let feed = request.feed;
+    let feed = &request.feed;
     if let Some(feed) = &feed {
         feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&task.brief, 4000) }));
     }

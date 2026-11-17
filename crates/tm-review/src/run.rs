@@ -200,6 +200,7 @@ async fn ask(
         effort: None,
         dictionary: None,
         timeout: AGENT_TIMEOUT,
+        stall: None,
         read_only: true,
     };
     let (tx, mut rx) = mpsc::channel(256);

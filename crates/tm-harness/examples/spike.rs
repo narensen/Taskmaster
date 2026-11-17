@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         effort: None,
         dictionary,
         timeout: Duration::from_secs(240),
+        stall: None,
         read_only: false,
     };
 

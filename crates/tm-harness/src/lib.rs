@@ -102,6 +102,9 @@ pub struct WorkerTask {
     pub effort: Option<String>,
     pub dictionary: Option<DictionaryAccess>,
     pub timeout: Duration,
+    /// Give up on the agent when it sends nothing for this long while no tool of its is
+    /// running: the provider has stalled. `None` waits for the whole `timeout`.
+    pub stall: Option<Duration>,
     /// Reviewers and verifiers: the worktree is mounted read-only and edit tools are removed.
     pub read_only: bool,
 }
@@ -113,6 +116,19 @@ impl WorkerTask {
         format!("{rules}{}", self.brief)
     }
 }
+
+/// The agent went silent while waiting on its model, so it was stopped. A fresh agent
+/// usually gets an answer at once: the provider queued this request, not the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stalled(pub Duration);
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the agent sent nothing for {}s while waiting on its model", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for Stalled {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {

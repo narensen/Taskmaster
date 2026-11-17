@@ -740,7 +740,7 @@ button.group-head:hover { background: transparent; color: var(--ink); }
 .call-head { display: flex; justify-content: space-between; gap: 8px; }
 .said { position: relative; margin: 4px 0; }
 .said-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.said .copy { position: absolute; right: 0; top: -2px; opacity: 0; }
+.said .copy { position: absolute; right: 0; top: -2px; opacity: 0; background: var(--bg, #0e0e11); border-radius: 4px; padding: 0 6px; }
 .said:hover .copy, .said:focus-within .copy { opacity: 1; }
 .thought {
   color: var(--muted);

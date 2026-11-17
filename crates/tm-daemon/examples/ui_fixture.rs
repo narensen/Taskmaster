@@ -16,8 +16,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use tm_daemon::{PairingAuth, Records, Server, ServerOptions};
-use tm_harness::{Harness, HarnessEvent, PermissionGate, RunSummary, Usage, WorkerTask};
+use tm_harness::{Decision, Harness, HarnessEvent, PermissionGate, PermissionRequest, ToolKind, RunSummary, Usage, WorkerTask};
 use tokio::sync::mpsc;
+
+/// Create this file to make the next plan carry a page that asks for two risky tool calls.
+const ASK_FLAG: [&str; 1] = ["/workspace/t3setup/fixture-ask-tools"];
 
 struct Scripted {
     id: &'static str,
@@ -64,7 +67,7 @@ impl Harness for Scripted {
     async fn run(
         &self,
         task: WorkerTask,
-        _gate: Arc<dyn PermissionGate>,
+        gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let brief = task.brief.clone();
@@ -81,7 +84,12 @@ impl Harness for Scripted {
             ] {
                 say(&events, text(chunk)).await;
             }
-            for part in PLAN.as_bytes().chunks(160) {
+            let plan = if ASK_FLAG.iter().any(|f| std::fs::remove_file(f).is_ok()) {
+                PLAN.replace(r#"{"id":"books","route":"/books","owned_glob":"app/books/**""#, r#"{"id":"shelf","route":"/shelf","owned_glob":"app/shelf/**""#).replace("A searchable list of books.", "A shelf of books (asks the person).")
+            } else {
+                PLAN.to_string()
+            };
+            for part in plan.as_bytes().chunks(160) {
                 say(&events, text(&String::from_utf8_lossy(part))).await;
             }
         } else if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
@@ -89,6 +97,15 @@ impl Harness for Scripted {
             say(&events, thought(&format!("Page `{id}` owns app/{id}/**. I read the contract first."))).await;
             tool(&events, "Read", json!({ "file_path": "contracts/types.ts" }), true).await;
             tool(&events, "Bash", json!({ "command": "npm test" }), false).await;
+            // A page whose brief says it asks the person waits on two risky calls (see the plan).
+            if brief.contains("(asks the person)") {
+                let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("npm install left-pad".into()) };
+                let outside = PermissionRequest { tool: "Write".into(), kind: ToolKind::Edit, paths: vec!["/etc/hosts".into()], command: None };
+                for request in [shell, outside] {
+                    let allowed = gate.decide_async(&request).await == Decision::Allow;
+                    let _ = events.send(HarnessEvent::PermissionDecided { tool: request.tool, allowed }).await;
+                }
+            }
             let first_cart = id == "cart" && self.cart.fetch_add(1, Ordering::SeqCst) == 0;
             let file = format!("app/{id}/page.tsx");
             let body = format!(
@@ -140,6 +157,8 @@ async fn main() -> anyhow::Result<()> {
     println!("code {}", auth.code());
     let mut options = ServerOptions::new(&project, ([127, 0, 0, 1], port).into(), auth);
     options.web = web;
+    // A harmless dev server for the live preview: a static file server on the given port.
+    options.preview_command = std::env::var("FIXTURE_PREVIEW").unwrap_or_else(|_| "python3 -m http.server {port} --bind 127.0.0.1".into());
     let (cart, reviews) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     options.harness = Arc::new(move |name: &str| {
         let id: &'static str = match name {

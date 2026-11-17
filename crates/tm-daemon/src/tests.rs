@@ -529,10 +529,19 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     let mut split = plan(&[("a", &[])]);
     split.pages[0].units = vec![
         WorkUnit { id: "markup".into(), owned_glob: "app/a/index.html".into(), brief: "The markup.".into(), done: String::new() },
-        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into(), done: String::new() },
+        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into(), done: "clicking add shows a todo".into() },
     ];
     let outcome = run(config(&tmp.0, split, true, 2), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
+    // Each unit's brief is self-contained: its own task and done line, the contracts in
+    // full, the other unit only by the files it owns.
+    let calls = world.calls.lock().unwrap().clone();
+    let logic = calls.iter().find(|c| c.contains("You are unit `logic`")).unwrap();
+    assert!(logic.contains("You are done when: clicking add shows a todo."), "{logic}");
+    assert!(logic.contains("export type Id = string;"), "{logic}");
+    assert!(logic.contains("Unit `markup` (another worker) owns `app/a/index.html`.") && !logic.contains("The markup."), "{logic}");
+    assert!(logic.contains("None of your files exist yet") && logic.contains("do not list, search or read other files"), "{logic}");
+    assert!(!logic.contains("Search the Commons"), "{logic}");
     assert!(world.max_inflight.load(Ordering::SeqCst) >= 2);
     assert!(read(&tmp.0.join("app/a/index.html")).contains("<h1>"));
     assert!(read(&tmp.0.join("app/a/main.js")).contains("console.log"));

@@ -91,6 +91,11 @@ pub struct Change {
     pub path: String,
 }
 
+/// Every file committed in the worktree's index, relative to its root.
+pub fn tracked_files(repo: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(git(repo, &["ls-files", "-z"])?.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect())
+}
+
 /// Staged and unstaged edits plus untracked files, against the worktree's `HEAD`.
 pub fn worktree_changes(repo: &Path) -> anyhow::Result<Vec<Change>> {
     let mut changes = parse_name_status(&git(repo, &["diff", "--no-renames", "--name-status", "-z", "HEAD"])?);

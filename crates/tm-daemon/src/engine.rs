@@ -1669,7 +1669,8 @@ impl Driver {
         let target = format!("page:{page}");
         let wanted: Vec<&str> = if errors.is_some() { vec![target.as_str(), "workers"] } else { vec!["workers"] };
         let notes = self.live.take_notes(&self.id, &wanted);
-        let brief = self.with_notes(self.worker_brief(page, unit, units, tier, errors)?, &notes);
+        let owned = self.owned_files(page, unit, units, &cwd);
+        let brief = self.with_notes(self.worker_brief(page, unit, units, tier, errors, &owned)?, &notes);
         let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
         Ok(AgentRequest {
             harness: self.harness_for(tier),
@@ -1686,21 +1687,39 @@ impl Driver {
         })
     }
 
-    fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>) -> anyhow::Result<String> {
+    /// Files already in the worktree that this agent owns, so it need not look for them.
+    fn owned_files(&self, page: &str, unit: usize, units: usize, cwd: &Path) -> Vec<String> {
+        let Ok(page) = self.page(page) else { return vec![] };
+        let glob = if units > 1 { page.work_units().get(unit).map(|u| u.owned_glob.clone()) } else { None };
+        let glob = glob.unwrap_or_else(|| page.owned_glob.clone());
+        let Ok(glob) = globset::Glob::new(&glob) else { return vec![] };
+        let matcher = glob.compile_matcher();
+        let locked = self.locked_files();
+        let files = git::tracked_files(cwd).unwrap_or_default();
+        files.into_iter().filter(|f| matcher.is_match(f) && !locked.contains(f)).take(40).collect()
+    }
+
+    /// One agent's whole context: its task, the files it owns, the contracts and Dictionary
+    /// entries it uses, in full, and when it is done. Nothing else from the repository.
+    fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String]) -> anyhow::Result<String> {
         let page = self.page(page_id)?.clone();
-        let contracts: Vec<String> = self.plan()?.contracts.iter().map(|c| c.path.clone()).collect();
+        let contracts = &self.plan()?.contracts;
         let cites = if page.cites.is_empty() { "none".to_string() } else { page.cites.join(", ") };
+        // Contracts are locked and short; giving them in full saves a read per file.
+        let inline = contracts.iter().map(|c| c.content.len()).sum::<usize>() <= CONTRACTS_INLINE;
         let contract_list = if contracts.is_empty() {
             "- none\n".to_string()
+        } else if inline {
+            contracts.iter().map(|c| format!("- `{}` (locked, do not edit):\n```\n{}\n```\n", c.path, c.content.trim_end())).collect()
         } else {
-            contracts.iter().map(|path| format!("- `{path}`\n")).collect()
+            contracts.iter().map(|c| format!("- `{}`\n", c.path)).collect()
         };
         let split = if units > 1 { page.work_units().get(unit).cloned() } else { None };
         let mut brief = format!(
             "Build page `{id}` for route `{route}`.\n\
              You may create or edit only files matching `{glob}`. Files outside it are discarded and the page fails its check.\n\
              Cite only these Dictionary keys, and follow them: {cites}.\n\
-             Contracts already in the tree:\n{contract_list}\n\
+             Contracts{given} in the tree:\n{contract_list}\n\
              {body}\n\
              File paths in this brief and in Dictionary entries are from the project root; a link or import inside a file \
              is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n\
@@ -1709,14 +1728,20 @@ impl Driver {
             route = page.route,
             glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
             body = page.brief,
+            given = if inline && !contracts.is_empty() { ", given in full and already" } else { " already" },
         );
+        if owned.is_empty() {
+            brief.push_str("None of your files exist yet: create them.\n");
+        } else {
+            brief.push_str(&format!("Your files that exist now: {}.\n", owned.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")));
+        }
         if let Some(mine) = &split {
             brief.push_str(&format!(
                 "\nThis page is split across {units} parallel workers who each own different files. You are unit `{}`: build only {}. {}\n",
                 mine.id, mine.owned_glob, mine.brief
             ));
             for other in page.work_units().iter().filter(|u| u.id != mine.id) {
-                brief.push_str(&format!("Unit `{}` (another worker) owns `{}`: {}\n", other.id, other.owned_glob, other.brief));
+                brief.push_str(&format!("Unit `{}` (another worker) owns `{}`.\n", other.id, other.owned_glob));
             }
             brief.push_str("Rely only on the locked contracts and Dictionary entries to line up with them; do not write their files.\n");
         }
@@ -1745,10 +1770,15 @@ impl Driver {
             }
         }
         let catalog = self.catalog()?;
-        brief.push_str("\nSearch the Commons before inventing a new contract.\n");
+        // A small or split build has its contracts settled by the plan: Commons suggestions
+        // would only be more to read.
+        let suggest = !self.small && split.is_none();
+        if suggest {
+            brief.push_str("\nSearch the Commons before inventing a new contract.\n");
+        }
         let query = format!("{} {}", page.brief, page.cites.join(" "));
         let mut shown = 0;
-        for entry in catalog.search(&query)? {
+        for entry in catalog.search(&query)?.into_iter().filter(|_| suggest) {
             if entry.tier != DictTier::Commons || page.cites.iter().any(|key| key == &entry.key) {
                 continue;
             }
@@ -1782,11 +1812,17 @@ impl Driver {
         }
         if !page.cites.is_empty() {
             // Each lookup is another model turn; the entries are already here.
-            brief.push_str(
-                "\nThe cited entries above are complete: do not look them up again with the Dictionary tools. \
-                 Read the contracts you use, then write your files.\n",
-            );
+            brief.push_str("\nThe cited entries above are complete: do not look them up again with the Dictionary tools.\n");
         }
+        let done = split.as_ref().map_or(page.done.as_str(), |u| u.done.as_str()).trim();
+        brief.push_str(&format!("\nYou are done when: {}.\n", if done.is_empty() { tm_core::DEFAULT_DONE } else { done }));
+        brief.push_str(if errors.is_some() {
+            "This brief is your whole context. Read only the files you own that you are fixing; do not list or search the directory.\n"
+        } else if inline || contracts.is_empty() {
+            "This brief is your whole context: do not list, search or read other files. Write your files directly.\n"
+        } else {
+            "This brief is your whole context: read only the contracts you use, do not list or search the directory, then write your files.\n"
+        });
         Ok(brief)
     }
 
@@ -2380,6 +2416,9 @@ fn agent_lines(plan: &Plan) -> String {
 fn failed(errors: impl Into<String>) -> WorkerOutcome {
     WorkerOutcome::CheckFailed { errors: errors.into() }
 }
+
+/// Contracts up to this many bytes in total are given in full in each worker's brief.
+const CONTRACTS_INLINE: usize = 12_000;
 
 /// A model normally starts answering a small, low-effort brief within half a minute; a
 /// minute of silence with no tool running means the provider has queued the request.

@@ -10,7 +10,10 @@ pub mod claude;
 pub mod codex;
 pub mod gate;
 pub mod providers;
+pub mod pty;
 pub mod sandbox;
+pub mod screen;
+pub mod setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;

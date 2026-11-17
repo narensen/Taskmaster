@@ -82,9 +82,7 @@ pub fn resolve_binary(name: &str) -> anyhow::Result<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     // Installers put a harness in its own directory and add that to the shell profile.
     // A daemon started from somewhere else does not have that profile, so look there too.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let installed = home.iter().flat_map(|home| [home.join(".local/bin"), home.join(".opencode/bin")]);
-    for dir in std::env::split_paths(&path).chain(installed) {
+    for dir in std::env::split_paths(&path).chain(crate::setup::install_dirs()) {
         if let Ok(found) = std::fs::canonicalize(dir.join(name))
             && found.is_file() {
                 return Ok(found);

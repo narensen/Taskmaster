@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::sandbox::resolve_binary;
+use crate::setup::{AuthProbe, Latest};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(20);
 const CLAUDE_CATALOG_URL: &str = "https://downloads.claude.ai/model-catalog/v1/catalog.json";
@@ -44,51 +45,104 @@ pub struct ProviderReport {
     pub error: Option<String>,
 }
 
-struct Provider {
-    id: &'static str,
-    name: &'static str,
-    binary: &'static str,
-    install: &'static str,
-    login: &'static str,
+pub(crate) struct Provider {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub binary: &'static str,
+    /// Installs the CLI on Linux and macOS: the provider's own published installer.
+    pub install: &'static str,
+    /// Arguments to the CLI that sign in, on a terminal.
+    pub login_args: &'static [&'static str],
+    pub update: &'static [&'static str],
+    pub version: &'static [&'static str],
+    /// Arguments that report the sign-in state without starting a session.
+    pub status: &'static [&'static str],
+    pub auth: AuthProbe,
+    pub latest: Latest,
+    /// Runtimes (from [`crate::setup::RUNTIMES`]) the installer needs. The five CLIs ship
+    /// as native programs, so none needs one today.
+    pub needs: &'static [&'static str],
 }
 
-const PROVIDERS: [Provider; 5] = [
+impl Provider {
+    /// The sign-in command as a person would type it.
+    pub fn login_line(&self) -> String {
+        std::iter::once(self.binary).chain(self.login_args.iter().copied()).collect::<Vec<_>>().join(" ")
+    }
+}
+
+pub(crate) const PROVIDERS: [Provider; 5] = [
     Provider {
         id: "claude",
         name: "Claude Code",
         binary: "claude",
         install: "curl -fsSL https://claude.ai/install.sh | bash",
-        login: "claude auth login",
+        login_args: &["auth", "login"],
+        update: &["update"],
+        version: &["--version"],
+        status: &["auth", "status"],
+        auth: AuthProbe::ClaudeJson,
+        latest: Latest::Npm("@anthropic-ai/claude-code"),
+        needs: &[],
     },
     Provider {
         id: "agy",
         name: "Antigravity",
         binary: "agy",
         install: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
-        login: "agy",
+        // Antigravity has no sign-in command: its first screen signs in.
+        login_args: &[],
+        update: &["update"],
+        version: &["--version"],
+        status: &["models"],
+        auth: AuthProbe::ListsModels,
+        latest: Latest::Unknown,
+        needs: &[],
     },
     Provider {
         id: "grok",
-        name: "Grok",
+        name: "Grok Build",
         binary: "grok",
         install: "curl -fsSL https://x.ai/cli/install.sh | bash",
-        login: "grok login",
+        login_args: &["login", "--device-auth"],
+        update: &["update"],
+        version: &["--version"],
+        status: &["models"],
+        auth: AuthProbe::GrokModels,
+        latest: Latest::GrokCheck,
+        needs: &[],
     },
     Provider {
         id: "codex",
         name: "Codex",
         binary: "codex",
         install: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
-        login: "codex login",
+        login_args: &["login", "--device-auth"],
+        update: &["update"],
+        version: &["--version"],
+        status: &["login", "status"],
+        auth: AuthProbe::CodexText,
+        latest: Latest::Npm("@openai/codex"),
+        needs: &[],
     },
     Provider {
         id: "opencode",
         name: "OpenCode",
         binary: "opencode",
         install: "curl -fsSL https://opencode.ai/v2/install | bash",
-        login: "opencode auth login",
+        login_args: &["auth", "login"],
+        update: &["upgrade"],
+        version: &["--version"],
+        status: &["auth", "list"],
+        auth: AuthProbe::OpencodeList,
+        latest: Latest::Npm("opencode-ai"),
+        needs: &[],
     },
 ];
+
+pub(crate) fn spec(id: &str) -> Option<&'static Provider> {
+    PROVIDERS.iter().find(|spec| spec.id == id)
+}
 
 /// Ask every harness which models it offers right now.
 pub async fn provider_reports() -> Vec<ProviderReport> {
@@ -160,7 +214,7 @@ fn report(spec: &Provider, installed: bool, models: Vec<ModelChoice>, error: Opt
         name: spec.name.to_string(),
         installed,
         install: spec.install.to_string(),
-        login: spec.login.to_string(),
+        login: spec.login_line(),
         models,
         error,
     }
@@ -485,7 +539,8 @@ mod tests {
         for id in crate::HARNESSES {
             let spec = PROVIDERS.iter().find(|spec| spec.id == id).unwrap_or_else(|| panic!("{id}"));
             assert!(!spec.install.is_empty());
-            assert!(!spec.login.is_empty());
+            assert!(!spec.login_line().is_empty());
+            assert!(!spec.version.is_empty() && !spec.update.is_empty() && !spec.status.is_empty());
             assert!(!spec.binary.is_empty());
         }
     }
@@ -620,7 +675,7 @@ claude-sonnet-4-6\tClaude Sonnet 4.6
     fn an_unlistable_provider_rejects_the_override() {
         let report = ProviderReport {
             id: "grok".into(),
-            name: "Grok".into(),
+            name: "Grok Build".into(),
             installed: true,
             install: "curl".into(),
             login: "grok login".into(),
@@ -636,7 +691,7 @@ claude-sonnet-4-6\tClaude Sonnet 4.6
     fn a_report_is_json_the_ui_can_read() {
         let report = ProviderReport {
             id: "grok".into(),
-            name: "Grok".into(),
+            name: "Grok Build".into(),
             installed: true,
             install: "curl -fsSL https://x.ai/cli/install.sh | bash".into(),
             login: "grok login".into(),

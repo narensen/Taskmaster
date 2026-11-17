@@ -19,13 +19,41 @@ const KEYS: [string, string][] = [
   ["Right-click or long-press", "Open, Open with, Reveal in folder, Copy path, Copy path with line"],
 ];
 
+const slug = (title: string) => title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
 function Section({ id, title, children, note }: { id?: string; title: string; children: React.ReactNode; note?: string }) {
   return (
-    <section className="settings-section" id={id}>
-      <h2 className="section-title">{title}</h2>
-      {children}
-      {note && <p className="muted small">{note}</p>}
+    <section className="settings-section" id={id ?? slug(title)} aria-labelledby={`h-${id ?? slug(title)}`}>
+      <div className="settings-head">
+        <h2 className="section-title" id={`h-${id ?? slug(title)}`}>
+          {title}
+        </h2>
+        {note && <p className="muted small">{note}</p>}
+      </div>
+      <div className="settings-body">{children}</div>
     </section>
+  );
+}
+
+const TOC: { group: string; items: [string, string][] }[] = [
+  { group: "Connection", items: [["account", "Account"], ["daemon-address", "Daemon address"], ["project-path", "Project path"], ["commons", "Commons"]] },
+  { group: "Agents", items: [["default-harness-and-model", "Harness and model"], ["tool-approvals", "Tool approvals"]] },
+  { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"]] },
+  { group: "Appearance", items: [["motion", "Motion"], ["density", "Density"], ["theme", "Theme"]] },
+  { group: "Help", items: [["keybindings", "Keybindings"]] },
+];
+
+function Keys({ text }: { text: string }) {
+  const parts = text.split(" / ");
+  return (
+    <span className="keys">
+      {parts.map((p, i) => (
+        <span key={i} className="keys-alt">
+          {i > 0 && <span className="muted"> or </span>}
+          <kbd>{p}</kbd>
+        </span>
+      ))}
+    </span>
   );
 }
 
@@ -77,10 +105,34 @@ export function Settings() {
   };
 
   return (
-    <div className="page narrow settings">
+    <div className="page settings">
       <header className="page-head">
-        <h1>Settings</h1>
+        <div className="grow">
+          <h1>Settings</h1>
+          <p className="page-lede">This daemon, its agents and tools, and how this browser looks.</p>
+        </div>
       </header>
+      <div className="settings-layout">
+      <nav className="settings-toc" aria-label="Settings sections">
+        {TOC.map((g) => (
+          <div key={g.group} className="toc-group">
+            <div className="toc-label">{g.group}</div>
+            {g.items.map(([id, title]) => (
+              <a
+                key={id}
+                href={`#${id}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              >
+                {title}
+              </a>
+            ))}
+          </div>
+        ))}
+      </nav>
+      <div className="settings-main">
 
       <Section title="Account">
         <div className="row between gap wrap">
@@ -279,7 +331,7 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Theme" note="Dark is the default. Blue marks focus, links and the active state.">
+      <Section title="Theme" note="Dark is the default. A warm ember accent marks focus and live work; everything else stays neutral.">
         <div className="seg" role="radiogroup" aria-label="Theme">
           {(["dark", "light"] as const).map((t) => (
             <button key={t} role="radio" aria-checked={p.theme === t} className={p.theme === t ? "on" : ""} onClick={() => setPrefs({ theme: t })}>
@@ -294,13 +346,17 @@ export function Settings() {
           <tbody>
             {KEYS.map(([k, what]) => (
               <tr key={k}>
-                <td className="strong nowrap">{k}</td>
+                <td className="nowrap">
+                  <Keys text={k} />
+                </td>
                 <td>{what}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </Section>
+      </div>
+      </div>
     </div>
   );
 }

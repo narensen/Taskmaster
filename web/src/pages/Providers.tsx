@@ -1,19 +1,28 @@
+import { RefreshCw } from "lucide-react";
 import { api } from "../api";
-import { Problem, Spinner, useLoad } from "../ui";
+import { Loading, Problem, useLoad } from "../ui";
 
 export function Providers() {
   const providers = useLoad(() => api.providers(), []);
   return (
     <div className="page">
       <header className="page-head">
-        <h1>Providers</h1>
-        <button className="ghost" onClick={() => void providers.reload()}>
-          Ask again
+        <div className="grow">
+          <h1>Providers</h1>
+          <p className="page-lede">What each harness on the project machine says right now. New Run only offers these harnesses and models.</p>
+        </div>
+        <button onClick={() => void providers.reload()}>
+          <RefreshCw size={14} aria-hidden /> Ask again
         </button>
       </header>
-      <p className="muted small">What each harness on the project machine says right now. New Run only offers these harnesses and models.</p>
+
       <Problem error={providers.error} onRetry={providers.reload} />
-      {providers.loading && !providers.data && <Spinner label="Asking each harness for its models" />}
+      {providers.loading && !providers.data && (
+        <div className="providers">
+          <Loading rows={1} tall label="Asking each harness for its models" />
+          <Loading rows={1} tall label="Asking each harness for its models" />
+        </div>
+      )}
       <div className="providers">
         {(providers.data ?? []).map((p) => {
           const def = p.models.find((m) => m.default);
@@ -23,7 +32,7 @@ export function Providers() {
                 <span>
                   <span className="strong">{p.name}</span> <span className="muted">{p.id}</span>
                 </span>
-                <span className={p.installed ? "strong" : "muted"}>{p.installed ? "installed" : "not installed"}</span>
+                <span className={`badge ${p.installed ? "good" : "quiet"}`}>{p.installed ? "installed" : "not installed"}</span>
               </header>
               <dl className="facts small">
                 <dt>install</dt>

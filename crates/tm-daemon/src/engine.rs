@@ -19,6 +19,7 @@ use tm_dictionary::{Catalog, CommonsRemote, Grant, LocalStore, McpState};
 use tm_harness::{
     DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, PermissionGate, Usage, WorkerTask, WorktreeGate,
 };
+use crate::checks::{self, Timing};
 use tm_verify::{ImportGraph, Owners, load_sources, outside_owned};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
@@ -93,10 +94,8 @@ struct Ran {
     pages: BTreeMap<PageId, String>,
     /// For the master: shared files the output names, and the output (with no file).
     shared: Vec<(String, String)>,
+    timings: Vec<Timing>,
 }
-
-/// How long the project's build or tests may take.
-const RUNTIME_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -121,6 +120,7 @@ fn first_lines(text: &str, n: usize) -> String {
 /// What the project's own tools said about the files a run wrote.
 #[derive(Default)]
 struct Checked {
+    timings: Vec<Timing>,
     /// Errors in a page's files, by page.
     pages: BTreeMap<PageId, String>,
     /// Errors in shared files the run wrote: the file, and the line to show.
@@ -1151,16 +1151,40 @@ impl Driver {
         Ok(())
     }
 
+    /// Free checks only: no model is called. Reports how long each check took.
     async fn verify_project(&mut self) -> anyhow::Result<(bool, BTreeMap<PageId, String>)> {
         eprintln!("taskmaster: verifying the project");
+        let mut timings = Vec::new();
+        let verdict = self.verify_checks(&mut timings).await;
+        let text = checks::report(&timings);
+        eprintln!("taskmaster: {text}");
+        self.terminal("output", serde_json::json!({ "ok": matches!(&verdict, Ok((true, _))), "text": text }));
+        verdict
+    }
+
+    async fn verify_checks(&mut self, timings: &mut Vec<Timing>) -> anyhow::Result<(bool, BTreeMap<PageId, String>)> {
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
         let sources = load_sources(&self.tree)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
-        let mut checked = self.mechanical_checks(&owners).await?;
+        // The static checks and the project's own build and tests do not wait for each other.
+        let steps = if self.config.runtime_checks { runtime::steps(&self.tree) } else { Vec::new() };
+        let (checked, built) = {
+            let tree = self.tree.clone();
+            let build = async {
+                if steps.is_empty() { None } else { Some(runtime::run_steps(&tree, &steps, checks::STEP_TIMEOUT).await) }
+            };
+            let (checked, built) = tokio::join!(self.mechanical_checks(&owners), build);
+            (checked?, built)
+        };
+        let mut checked = checked;
+        let mut built = built;
+        timings.append(&mut checked.timings);
         if !checked.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
             self.repair_shared(&checked.shared).await?;
             checked = self.mechanical_checks(&owners).await?;
+            timings.append(&mut checked.timings);
+            built = None; // the files changed, so the build is run again
         }
         for (page, errors) in checked.pages {
             let text = failing.entry(page).or_default();
@@ -1189,10 +1213,12 @@ impl Driver {
         }
         if failing.is_empty() && self.config.runtime_checks {
             let routes: Vec<(PageId, String)> = plan.pages.iter().map(|p| (p.id.clone(), p.route.clone())).collect();
-            let mut ran = self.runtime_checks(&owners, &routes).await?;
+            let mut ran = self.runtime_checks(&owners, &routes, built).await?;
+            timings.append(&mut ran.timings);
             if ran.pages.is_empty() && !ran.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
                 self.repair_shared(&ran.shared).await?;
-                ran = self.runtime_checks(&owners, &routes).await?;
+                ran = self.runtime_checks(&owners, &routes, None).await?;
+                timings.append(&mut ran.timings);
             }
             failing.extend(ran.pages);
             if failing.is_empty() && !ran.shared.is_empty() {
@@ -1261,7 +1287,12 @@ impl Driver {
     /// Failures in a page's files or at its route go to that page. Ones that name a shared
     /// file this run wrote go to the master. Anything else is in files the run did not
     /// write, or in the setup, and is reported without spending tokens on it.
-    async fn runtime_checks(&mut self, owners: &Owners, routes: &[(PageId, String)]) -> anyhow::Result<Ran> {
+    async fn runtime_checks(
+        &mut self,
+        owners: &Owners,
+        routes: &[(PageId, String)],
+        built: Option<(Vec<Timing>, Option<runtime::Failure>)>,
+    ) -> anyhow::Result<Ran> {
         let mut ran = Ran::default();
         let steps = runtime::steps(&self.tree);
         for step in &steps {
@@ -1270,7 +1301,23 @@ impl Driver {
                 serde_json::json!({ "command": format!("{} {}", step.program, step.args.join(" ")), "cwd": self.tree.display().to_string() }),
             );
         }
-        let failed = runtime::run_steps(&self.tree, &steps, RUNTIME_TIMEOUT).await;
+        // A static site's smoke check does not need a build, so it runs alongside one.
+        let alongside = checks::is_static_site(&self.tree);
+        let (steps_timed, failed, early_smoke) = match built {
+            Some((timed, failed)) => (timed, failed, None),
+            None if alongside => {
+                let (steps_run, smoke) = tokio::join!(
+                    runtime::run_steps(&self.tree, &steps, checks::STEP_TIMEOUT),
+                    self.smoke(routes)
+                );
+                (steps_run.0, steps_run.1, Some(smoke))
+            }
+            None => {
+                let (timed, failed) = runtime::run_steps(&self.tree, &steps, checks::STEP_TIMEOUT).await;
+                (timed, failed, None)
+            }
+        };
+        ran.timings.extend(steps_timed);
         if !steps.is_empty() {
             match &failed {
                 Some(failure) => self.terminal("output", serde_json::json!({ "ok": false, "step": failure.step, "text": failure.output })),
@@ -1303,7 +1350,11 @@ impl Driver {
             "command",
             serde_json::json!({ "command": format!("browser check: {} route(s)", routes.len()), "cwd": self.tree.display().to_string() }),
         );
-        let browsed = runtime::browse(&self.tree, routes).await;
+        let (browsed, smoke_timing) = match early_smoke {
+            Some(done) => done,
+            None => self.smoke(routes).await,
+        };
+        ran.timings.extend(smoke_timing);
         match &browsed {
             Ok(Some(browsed)) => {
                 let mut text: Vec<String> = browsed.notes.clone();
@@ -1338,6 +1389,24 @@ impl Driver {
             Err(err) => eprintln!("taskmaster: the browser check did not run: {err:#}"),
         }
         Ok(ran)
+    }
+
+    /// The browser smoke check, held to its own short timeout. A check that cannot run, or
+    /// runs out of time, is reported but does not fail the project.
+    async fn smoke(&self, routes: &[(PageId, String)]) -> (anyhow::Result<Option<runtime::Browsed>>, Option<Timing>) {
+        let began = Instant::now();
+        match tokio::time::timeout(checks::SMOKE_TIMEOUT, runtime::browse(&self.tree, routes)).await {
+            Ok(Ok(None)) => (Ok(None), Some(Timing::new("smoke", began.elapsed(), "skipped"))),
+            Ok(Ok(Some(browsed))) => {
+                let status = if browsed.pages.is_empty() && !browsed.screenshots.is_empty() { "ok" } else if browsed.pages.is_empty() { "skipped" } else { "failed" };
+                (Ok(Some(browsed)), Some(Timing::new("smoke", began.elapsed(), status)))
+            }
+            Ok(Err(err)) => (Err(err), Some(Timing::new("smoke", began.elapsed(), "skipped"))),
+            Err(_) => (
+                Err(anyhow::anyhow!("the smoke check did not finish in {} seconds", checks::SMOKE_TIMEOUT.as_secs())),
+                Some(Timing::new("smoke", began.elapsed(), "timeout")),
+            ),
+        }
     }
 
     /// Shared files this run wrote: the contracts and the template.
@@ -1454,11 +1523,37 @@ impl Driver {
         // Shared files are checked too: a page can be right and its contract wrong.
         built.extend(locked.iter().filter(|file| self.tree.join(file).is_file()).cloned());
         let (project, files) = (self.tree.clone(), built.into_iter().collect::<Vec<_>>());
-        self.terminal("command", serde_json::json!({ "command": format!("lint {} file(s)", files.len()), "cwd": project.display().to_string() }));
-        let report = tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&project, &files))
+        let picked: Vec<&str> = checks::select(&project, &files).into_iter().filter(|c| c.is_static()).map(|c| c.name()).collect();
+        if picked.is_empty() {
+            return Ok(Checked::default());
+        }
+        let began = Instant::now();
+        self.terminal("command", serde_json::json!({ "command": format!("{} on {} file(s)", picked.join("+"), files.len()), "cwd": project.display().to_string() }));
+        let sane = checks::html_sanity(&project, &files);
+        let lint_files = files.clone();
+        let lint_project = project.clone();
+        let linted = if picked == ["html"] {
+            Ok(Ok(tm_review::lint::Report { findings: vec![], notes: vec![] }))
+        } else {
+            tokio::time::timeout(
+                checks::STATIC_TIMEOUT,
+                tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&lint_project, &lint_files)),
+            )
             .await
-            .context("the project checks panicked")?;
-        let lines: Vec<String> = report.findings.iter().map(|f| format!("{}:{} {}", f.file, f.line, f.failure)).collect();
+        };
+        let (report, mut status) = match linted {
+            Ok(joined) => (joined.context("the project checks panicked")?, "ok"),
+            Err(_) => (
+                tm_review::lint::Report { findings: vec![], notes: vec![format!("the static checks did not finish in {} seconds", checks::STATIC_TIMEOUT.as_secs())] },
+                "timeout",
+            ),
+        };
+        let mut lines: Vec<String> = report.findings.iter().map(|f| format!("{}:{} {}", f.file, f.line, f.failure)).collect();
+        lines.extend(sane.iter().map(|(_, line)| line.clone()));
+        if !lines.is_empty() && status == "ok" {
+            status = "failed";
+        }
+        let timing = Timing::new(picked.join("+"), began.elapsed(), status);
         self.terminal(
             "output",
             serde_json::json!({ "ok": lines.is_empty(), "text": if lines.is_empty() { "no errors".to_string() } else { lines.join("\n") } }),
@@ -1466,8 +1561,19 @@ impl Driver {
         for note in &report.notes {
             eprintln!("taskmaster: check: {note}");
         }
-        let mut checked = Checked::default();
+        let mut checked = Checked { timings: vec![timing], ..Checked::default() };
         let mut older = 0;
+        for (file, line) in &sane {
+            match owners.owner(file) {
+                Some(page) => {
+                    let text = checked.pages.entry(page.clone()).or_default();
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                None if locked.contains(file) => checked.shared.push((file.clone(), line.clone())),
+                None => eprintln!("taskmaster: {line}"),
+            }
+        }
         for finding in &report.findings {
             let line = format!("{}:{} {}", finding.file, finding.line, finding.failure);
             match owners.owner(&finding.file) {

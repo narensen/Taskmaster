@@ -18,6 +18,7 @@ pub mod api;
 pub mod approvals;
 pub mod auth;
 pub mod commons;
+mod checks;
 mod engine;
 mod eval;
 mod git;

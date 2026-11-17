@@ -18,6 +18,7 @@ use anyhow::{Context, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use crate::checks::Timing;
 use tm_core::PageId;
 use tm_verify::Owners;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -97,8 +98,10 @@ fn tail(text: &str) -> String {
 
 /// Run the steps in order and stop at the first that fails: tests after a failed build
 /// say nothing new.
-pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> Option<Failure> {
+pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> (Vec<Timing>, Option<Failure>) {
+    let mut timings = Vec::new();
     for step in steps {
+        let began = Instant::now();
         eprintln!("taskmaster: running `{} {}`", step.program, step.args.join(" "));
         let child = Command::new(&step.program)
             .args(&step.args)
@@ -114,7 +117,10 @@ pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> Option
             .spawn();
         let mut child = match child {
             Ok(child) => child,
-            Err(err) => return Some(Failure { step: step.name.clone(), output: format!("could not start {}: {err}", step.program) }),
+            Err(err) => {
+                timings.push(Timing::new(&step.name, began.elapsed(), "failed"));
+                return (timings, Some(Failure { step: step.name.clone(), output: format!("could not start {}: {err}", step.program) }));
+            }
         };
         let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
         let read = async {
@@ -126,20 +132,26 @@ pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> Option
         match tokio::time::timeout(timeout, read).await {
             Ok((Ok(status), a, b)) if status.success() => {
                 let _ = (a, b);
+                timings.push(Timing::new(&step.name, began.elapsed(), "ok"));
             }
             Ok((_, a, b)) => {
                 let text = format!("{}\n{}", String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
-                return Some(Failure { step: step.name.clone(), output: tail(text.trim()) });
+                timings.push(Timing::new(&step.name, began.elapsed(), "failed"));
+                return (timings, Some(Failure { step: step.name.clone(), output: tail(text.trim()) }));
             }
             Err(_) => {
-                return Some(Failure {
-                    step: step.name.clone(),
-                    output: format!("`{} {}` did not finish in {} seconds", step.program, step.args.join(" "), timeout.as_secs()),
-                });
+                timings.push(Timing::new(&step.name, began.elapsed(), "timeout"));
+                return (
+                    timings,
+                    Some(Failure {
+                        step: step.name.clone(),
+                        output: format!("`{} {}` did not finish in {} seconds", step.program, step.args.join(" "), timeout.as_secs()),
+                    }),
+                );
             }
         }
     }
-    None
+    (timings, None)
 }
 
 /// Paths in output, as `./app/x/page.tsx:12:5`, `app/x/page.tsx(12,5)` or `src/x.rs:3`.
@@ -609,12 +621,16 @@ mod tests {
         let ok = Step { name: "build".into(), program: "sh".into(), args: vec!["-c".into(), "echo built".into()] };
         let bad = Step { name: "test".into(), program: "sh".into(), args: vec!["-c".into(), "echo 'app/cart/page.tsx:1 boom' >&2; exit 1".into()] };
         let never = Step { name: "after".into(), program: "sh".into(), args: vec!["-c".into(), "touch ran".into()] };
-        let failure = run_steps(&dir, &[ok, bad, never], Duration::from_secs(10)).await.unwrap();
+        let (timed, failure) = run_steps(&dir, &[ok, bad, never], Duration::from_secs(10)).await;
+        let failure = failure.unwrap();
+        assert_eq!(timed.iter().map(|t| (t.name.as_str(), t.status)).collect::<Vec<_>>(), vec![("build", "ok"), ("test", "failed")]);
         assert_eq!(failure.step, "test");
         assert!(failure.output.contains("boom"));
         assert!(!dir.join("ran").exists(), "nothing runs after a failure");
         let slow = Step { name: "build".into(), program: "sleep".into(), args: vec!["5".into()] };
-        assert!(run_steps(&dir, &[slow], Duration::from_millis(200)).await.unwrap().output.contains("did not finish"));
+        let (timed, slow_failure) = run_steps(&dir, &[slow], Duration::from_millis(200)).await;
+        assert!(slow_failure.unwrap().output.contains("did not finish"));
+        assert_eq!(timed[0].status, "timeout");
 
         std::fs::write(dir.join("package.json"), r#"{"scripts":{"build":"next build","test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
         assert!(steps(&dir).is_empty(), "nothing is installed yet");

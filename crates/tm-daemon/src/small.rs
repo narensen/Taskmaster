@@ -45,7 +45,9 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str) -> String {
          {\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\"}],\
          \"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n\
          Rules: at least one page; page ids use letters, digits, `_` and `-`; owned_glob and contract paths are \
-         relative with no `..`; every cited key is listed above or in `dictionary`; briefs are non-empty. Optionally give a page `units`: 2-4 work units, each {\"id\",\"owned_glob\",\"brief\"}, built by parallel workers. Split by file or concern (for example markup+styles, scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and inside the page glob (braces list files: `{app/index.html,app/styles.css}`); the page owned_glob must cover them all. Omit `units` when splitting is unsafe.\n",
+         relative with no `..`; every cited key is listed above or in `dictionary`; briefs are non-empty. Optionally give a page `units`: 2-4 work units, each {\"id\",\"owned_glob\",\"brief\"}, built by parallel workers. Split by file or concern (for example markup+styles, scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and inside the page glob (braces list files: `{app/index.html,app/styles.css}`); the page owned_glob must cover them all. Omit `units` when splitting is unsafe. \
+         Parallel units finish sooner: when a page has separate markup and styles, scripts, and docs, split it into units \
+         and pin every id, file name and interface they share in a contract, a cited entry or each unit's brief.\n",
     );
     brief
 }

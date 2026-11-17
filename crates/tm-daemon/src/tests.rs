@@ -719,6 +719,9 @@ async fn a_prompt_locks_the_plan_and_publishes_the_dictionary() {
     let outcome = run(prompt_config(&tmp.0, "Build page a with a greeting.", true), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     assert!(planner_calls(&world)[0].contains("Dictionary is empty"));
+    // The small pass's first build runs at low effort too.
+    let builds: Vec<String> = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).cloned().collect();
+    assert!(!builds.is_empty() && builds[0].ends_with("[effort=low][dictionary=true]"), "{builds:?}");
     assert_eq!(world.plans.load(Ordering::SeqCst), 1);
     assert_eq!(read(&tmp.0.join("contracts/types.ts")), "export type Id = string;\n");
     assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));

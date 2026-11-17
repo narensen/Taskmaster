@@ -181,6 +181,8 @@ struct Driver {
     trees: Vec<PathBuf>,
     parallel: usize,
     live: Arc<Live>,
+    /// The plan came from the small planning pass: first builds run at low reasoning effort.
+    small: bool,
 }
 
 impl Drop for Driver {
@@ -289,6 +291,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         trees: Vec::new(),
         parallel,
         live,
+        small: false,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -386,7 +389,8 @@ impl Driver {
                 self.config.models.master.clone(),
                 &token,
             )?;
-            if self.small_pass(prompt) {
+            self.small = self.small_pass(prompt);
+            if self.small {
                 // Every stored entry is in the brief, so the master answers in one turn.
                 request.dictionary = None;
                 request.effort = Some(crate::small::SMALL_EFFORT.to_string());
@@ -1663,7 +1667,8 @@ impl Driver {
             brief,
             cwd,
             model: self.model_for(tier),
-            effort: None,
+            // A small product's first build needs little deliberation; repairs think at the default.
+            effort: (self.small && errors.is_none()).then(|| crate::small::SMALL_EFFORT.to_string()),
             dictionary: Some(self.access(&token)),
             timeout: self.config.timeout,
             read_only: false,

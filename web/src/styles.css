@@ -1317,13 +1317,12 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
   flex: none;
   width: 36px;
   height: 36px;
-  border-radius: var(--r);
   display: grid;
   place-items: center;
   color: var(--good);
-  background: color-mix(in srgb, var(--good) 12%, transparent);
+  background: none;
 }
-.done-card.bad .done-ico { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.done-card.bad .done-ico { color: var(--bad); background: none; }
 .done-title { font-size: var(--fs-md); font-weight: 600; letter-spacing: -0.01em; }
 .done-pages { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .page-pill {
@@ -1345,13 +1344,12 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
   flex: none;
   width: 32px;
   height: 32px;
-  border-radius: var(--r);
   display: grid;
   place-items: center;
-  color: var(--ink-2);
-  background: var(--bg-active);
+  color: var(--ink);
+  background: none;
 }
-.review-card.is-running .review-ico { color: var(--accent); background: var(--accent-soft); }
+.review-card.is-running .review-ico { color: var(--accent); background: none; }
 .review-result { width: 100%; padding: 10px 12px; border-radius: var(--r); background: var(--tint); border: 1px solid var(--line); }
 .review-verdict { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 .review-result.good .review-verdict svg { color: var(--good); }
@@ -1394,14 +1392,13 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
   flex: none;
   width: 26px;
   height: 26px;
-  border-radius: var(--r-sm);
   display: grid;
   place-items: center;
-  color: var(--ink-2);
-  background: var(--bg-active);
-  border: 1px solid var(--line);
+  color: var(--ink);
+  background: none;
+  border: 0;
 }
-.state-working .agent-avatar { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+.state-working .agent-avatar { color: var(--accent); }
 .state-done .agent-avatar { color: var(--good); }
 .state-failed .agent-avatar { color: var(--bad); }
 .agent-state {
@@ -1513,11 +1510,10 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
   flex: none;
   width: 32px;
   height: 32px;
-  border-radius: var(--r);
   display: grid;
   place-items: center;
   color: var(--ask);
-  background: color-mix(in srgb, var(--ask) 14%, transparent);
+  background: none;
 }
 .agent .approval {
   box-shadow: var(--shadow-1);
@@ -1556,7 +1552,7 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
 }
 .tool-approval-head { align-items: center; min-width: 0; gap: 10px; }
 .tool-approval-head .strong { font-weight: 600; font-family: var(--mono); font-size: var(--fs-sm); }
-.approval-ico.small-ico { width: 26px; height: 26px; border-radius: var(--r-sm); }
+.approval-ico.small-ico { width: 26px; height: 26px; }
 .tool-approval-cmd {
   margin: 0;
   padding: 10px 12px;
@@ -1578,14 +1574,13 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
 .lp-ico {
   width: 26px;
   height: 26px;
-  border-radius: var(--r-sm);
   display: grid;
   place-items: center;
-  color: var(--ink-2);
-  background: var(--bg-active);
+  color: var(--ink);
+  background: none;
 }
 .live-preview[data-state="running"] { border-color: color-mix(in srgb, var(--good) 28%, var(--line)); }
-.live-preview[data-state="running"] .lp-ico { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.live-preview[data-state="running"] .lp-ico { color: var(--good); background: none; }
 .lp-url {
   padding: 2px 8px;
   border-radius: var(--r-sm);

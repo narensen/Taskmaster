@@ -27,6 +27,7 @@ mod reply;
 mod resume;
 mod runtime;
 mod secret;
+mod static_site;
 pub mod search;
 pub mod settings;
 pub mod sqlite;

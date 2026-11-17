@@ -265,6 +265,14 @@ impl Drop for Server {
     }
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn free_port() -> anyhow::Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     Ok(listener.local_addr()?.port())
@@ -451,10 +459,12 @@ fn problems(events: &[Value], session: &str, url: &str, dynamic: bool) -> Vec<St
     out
 }
 
-/// Open each page in Chrome. `None` when this is not a built Next.js app or there is no
-/// Chrome; the reason is printed.
+/// Open each page in Chrome. `None` when this is neither a built Next.js app nor a static
+/// site, or there is no Chrome; the reason is printed.
 pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<Option<Browsed>> {
-    if !is_built_next(tree) {
+    let next = is_built_next(tree);
+    let static_start = if next || !crate::static_site::has_no_scripts(tree) { None } else { crate::static_site::start_page(tree) };
+    if !next && static_start.is_none() {
         return Ok(None);
     }
     let Some(chrome) = chrome() else {
@@ -462,14 +472,28 @@ pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<
         return Ok(None);
     };
     let mut browsed = Browsed::default();
-    let (_server, port) = match start_app(tree).await {
-        Ok(started) => started,
-        Err(err) => {
-            browsed.notes.push(format!("{err:#}"));
-            return Ok(Some(browsed));
+    // A static site is served from here; a Next.js app is started.
+    let (_server, port, _site) = if static_start.is_some() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let site = tokio::spawn(crate::static_site::serve(listener, tree.to_path_buf()));
+        (None, port, Some(AbortOnDrop(site)))
+    } else {
+        match start_app(tree).await {
+            Ok((server, port)) => (Some(server), port, None),
+            Err(err) => {
+                browsed.notes.push(format!("{err:#}"));
+                return Ok(Some(browsed));
+            }
         }
     };
     let mut browser = Browser::launch(&chrome).await?;
+    // A static site has no routes of its own: its start page stands for the first page.
+    let static_routes: Vec<(PageId, String)> = match static_start {
+        Some(start) => routes.first().map(|(page, _)| (page.clone(), format!("/{start}"))).into_iter().collect(),
+        None => Vec::new(),
+    };
+    let routes = if static_start.is_some() { &static_routes[..] } else { routes };
     for (page, route) in routes {
         let (path, dynamic) = sample_path(route);
         let url = format!("http://127.0.0.1:{port}{path}");

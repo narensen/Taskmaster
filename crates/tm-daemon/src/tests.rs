@@ -2226,8 +2226,32 @@ mod http {
         assert!(reason.contains("code 3") && reason.contains("cannot bind"), "{reason}");
         // No dev server at all is an error before anything starts.
         let none = Previews::new(project, String::new());
-        assert!(!none.available());
+        assert!(none.available(), "no scripts means static files");
         assert!(none.start("r2", None).await.unwrap_err().to_string().contains("no dev server"));
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_dev_script_is_served_as_static_files() {
+        use crate::preview::Previews;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = repo("preview-static");
+        let project = tmp.0.canonicalize().unwrap();
+        std::fs::create_dir_all(project.join("app")).unwrap();
+        std::fs::write(project.join("app/index.html"), "<h1>hi</h1>").unwrap();
+        let previews = Previews::new(project, String::new());
+        let started = previews.start("s1", None).await.unwrap();
+        assert_eq!(started.state, "running");
+        let get = |path: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", started.port)).await.unwrap();
+            stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let mut text = String::new();
+            stream.read_to_string(&mut text).await.unwrap();
+            text
+        };
+        assert!(get("/app/index.html").await.contains("<h1>hi</h1>"));
+        assert!(get("/.git/HEAD").await.starts_with("HTTP/1.1 404"));
+        previews.stop("s1");
+        assert_eq!(previews.status("s1").unwrap().state, "stopped");
     }
 
     /// `pgrp` from `/proc/<pid>/stat`, the field after state and ppid.

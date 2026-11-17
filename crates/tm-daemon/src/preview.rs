@@ -4,7 +4,7 @@
 //! that still sits on its branch is previewed from a throwaway checkout of that branch,
 //! which borrows the project's installed packages and is removed when the server stops.
 //! The server listens on this machine only, on a port chosen here. Its command is the
-//! settings file's `preview.command`, or the project's own `dev` script.
+//! settings file's `preview.command`, or the project's own `dev` script. A project with neither is served as static files.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,8 @@ pub struct Status {
 struct Entry {
     status: Arc<Mutex<Status>>,
     pid: Option<u32>,
+    /// The built-in static server, when that is what runs.
+    task: Option<tokio::task::AbortHandle>,
     log: Arc<Mutex<String>>,
 }
 
@@ -93,7 +95,7 @@ impl Previews {
 
     /// Whether this project has a dev server to start.
     pub fn available(&self) -> bool {
-        dev_command(&self.project, &self.command, 0).is_some()
+        dev_command(&self.project, &self.command, 0).is_some() || crate::static_site::has_no_scripts(&self.project)
     }
 
     pub fn status(&self, run: &str) -> Option<Status> {
@@ -131,6 +133,9 @@ impl Previews {
             None => (self.project.clone(), None),
         };
         let Some(command) = dev_command(&dir, &self.command, port) else {
+            if crate::static_site::has_no_scripts(&dir) && crate::static_site::start_page(&dir).is_some() {
+                return self.start_static(run, port, dir, tree, claim).await;
+            }
             if let Some(tree) = &tree {
                 let _ = git::remove_worktree(&self.project, tree);
             }
@@ -198,7 +203,7 @@ impl Previews {
             });
         }
         let pid = child.id();
-        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid, log: log.clone() });
+        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid, task: None, log: log.clone() });
         claim.live = false;
 
         // Watch it: running once it answers, stopped or failed once it exits.
@@ -247,6 +252,41 @@ impl Previews {
         Ok(status)
     }
 
+    /// Serve the project's files from this process, on `port`.
+    async fn start_static(&self, run: &str, port: u16, dir: PathBuf, tree: Option<PathBuf>, mut claim: ClearClaim<'_>) -> anyhow::Result<Status> {
+        /// Removes the throwaway checkout when the server task ends or is aborted.
+        struct Cleanup(PathBuf, Option<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(tree) = &self.1 {
+                    let _ = git::remove_worktree(&self.0, tree);
+                    let _ = std::fs::remove_dir_all(tree);
+                }
+            }
+        }
+        let cleanup = Cleanup(self.project.clone(), tree);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let root = dir.clone();
+        let task = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            crate::static_site::serve(listener, root).await;
+        });
+        let status = Arc::new(Mutex::new(Status {
+            state: "running",
+            port,
+            url: format!("http://127.0.0.1:{port}/"),
+            command: "built-in static file server".into(),
+            dir: dir.display().to_string(),
+            started: rfc3339_now(),
+            reason: None,
+        }));
+        let log = Arc::new(Mutex::new(String::new()));
+        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid: None, task: Some(task.abort_handle()), log });
+        claim.live = false;
+        let status = status.lock().unwrap().clone();
+        Ok(status)
+    }
+
     /// Stop a run's dev server and everything it started. The checkout it ran from is
     /// removed as soon as the server is gone.
     pub fn stop(&self, run: &str) {
@@ -262,6 +302,9 @@ impl Previews {
         }
         if let Some(pid) = entry.pid {
             kill_group(pid);
+        }
+        if let Some(task) = &entry.task {
+            task.abort();
         }
     }
 
@@ -299,7 +342,7 @@ impl Previews {
                         reason: None,
                     }));
                     let log = Arc::new(Mutex::new(String::new()));
-                    runs.insert(run.to_string(), Entry { status, pid: None, log });
+                    runs.insert(run.to_string(), Entry { status, pid: None, task: None, log });
                     Claim::Mine
                 }
             };

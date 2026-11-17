@@ -1,5 +1,6 @@
-# /etc/caddy/Caddyfile. Replace the name with yours; Caddy gets the certificate itself.
-commons.example.invalid {
+# /etc/caddy/Caddyfile for taskmaster-commons.duckdns.org. Caddy gets the certificate itself
+# (ports 80 and 443 must be reachable from the internet).
+taskmaster-commons.duckdns.org {
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:8740
 	header {

@@ -1,4 +1,4 @@
-# /etc/systemd/system/tm-commons.service
+# /etc/systemd/system/tm-commons.service (installed by deploy.sh)
 [Unit]
 Description=Taskmaster Commons
 After=network-online.target

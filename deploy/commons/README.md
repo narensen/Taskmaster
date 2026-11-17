@@ -12,8 +12,8 @@ It runs on a small Linux VPS behind Caddy, and keeps its data in Neon.
 
 | What | Where it comes from | Goes in |
 | --- | --- | --- |
-| A domain name, such as `commons.yourdomain.com` | Your registrar: an A record pointing at the VPS | `TM_COMMONS_URL`, the Caddyfile |
-| A Postgres connection string | Neon: the project's Connect dialog, pooled is fine; also set the direct string as `DATABASE_URL_DIRECT` (optional, used only to create the tables) | `DATABASE_URL` |
+| A domain name, such as `taskmaster-commons.duckdns.org` | Your registrar: an A record pointing at the VPS | `TM_COMMONS_URL`, the Caddyfile |
+| A Postgres connection string | Neon: the project's Connect dialog, the pooled string; optionally also the direct string as `DATABASE_URL_DIRECT` (used only to create the tables) | `DATABASE_URL` |
 | A Google OAuth client ID and secret | Google Cloud console, see below | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` |
 | A GitHub OAuth app client ID and secret | GitHub, see below | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` |
 | The moderators | You | `TM_COMMONS_MODERATORS` |
@@ -25,16 +25,16 @@ One provider is enough to start. Leave the other one's values as placeholders.
 1. Go to APIs & Services, then OAuth consent screen. Choose External, name the app Taskmaster, and add the scopes `openid`, `email` and `profile`.
 2. Publish the app, or add yourself as a test user.
 3. Go to Credentials, then Create credentials, then OAuth client ID, and choose Web application.
-4. Set the authorized redirect URI to `https://commons.yourdomain.com/auth/google/callback`.
+4. Set the authorized redirect URI to `https://taskmaster-commons.duckdns.org/auth/google/callback`.
 
 **GitHub.** Go to Settings, then Developer settings, then OAuth Apps, then New OAuth App.
-1. Set the homepage to `https://commons.yourdomain.com`.
-2. Set the authorization callback URL to `https://commons.yourdomain.com/auth/github/callback`.
+1. Set the homepage to `https://taskmaster-commons.duckdns.org`.
+2. Set the authorization callback URL to `https://taskmaster-commons.duckdns.org/auth/github/callback`.
 3. Generate a client secret.
 
 The service asks GitHub only for `read:user` and `user:email`: who you are, and your verified email. It asks for nothing in anyone's repositories.
 
-**Neon.** Use the direct connection string; the service keeps its own small pool of connections. It creates its tables on first start.
+**Neon.** At runtime the service uses the pooled connection string (`DATABASE_URL`). The direct string (`DATABASE_URL_DIRECT`) is used only to create the tables at start. It creates its tables on first start.
 
 ## On the VPS
 
@@ -61,6 +61,41 @@ sudo systemctl reload caddy
 
 Open the address and sign in. A moderator sees Moderate in the menu.
 
+## Deploy with the script
+
+```bash
+deploy/commons/deploy.sh --dry-run   # first: shows what it would do
+deploy/commons/deploy.sh             # then for real
+```
+
+Flags: `--env-file` (the local file holding the secrets), `--commons-env` (where to write the generated `commons.env`), `--binary` (the `tm-commons` binary to ship), `--duckdns` (DuckDNS settings for the domain).
+
+Secrets are read from the local env file and written to a `chmod 600` `commons.env`. That file is copied with `scp` and installed on the VM as `/etc/tm-commons/commons.env`, mode 600.
+
+## Firewall
+
+On the VM, Oracle Linux:
+
+```bash
+sudo firewall-cmd --permanent --add-service=http --add-service=https && sudo firewall-cmd --reload
+```
+
+Ubuntu images use iptables:
+
+```bash
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo netfilter-persistent save
+```
+
+In the OCI console, add ingress rules to the subnet's security list for TCP 80 and 443 from `0.0.0.0/0`. Port 8740 (and SearXNG's 8888) stay localhost-only and are never opened.
+
+## OAuth callback URLs
+
+- Google authorized redirect URI: `https://taskmaster-commons.duckdns.org/auth/google/callback`
+- GitHub homepage: `https://taskmaster-commons.duckdns.org`
+- GitHub callback: `https://taskmaster-commons.duckdns.org/auth/github/callback`
+
 ## The weekly review
 
 `/moderate` lists three things:
@@ -80,8 +115,8 @@ What you can do with them:
 
 ```json
 {
-  "commons": { "remote": "https://commons.yourdomain.com", "token": "tmc_…", "share": true },
-  "auth": { "issuer": "https://commons.yourdomain.com", "allow": ["github:you"] }
+  "commons": { "remote": "https://taskmaster-commons.duckdns.org", "token": "tmc_…", "share": true },
+  "auth": { "issuer": "https://taskmaster-commons.duckdns.org", "allow": ["github:you"] }
 }
 ```
 

@@ -758,6 +758,15 @@ details.item[open] > summary::before { transform: rotate(45deg); top: 18px; }
 details.item > summary:hover { background: var(--tint); }
 details.item > .stack { padding: 0 var(--s4) var(--s4) 40px; }
 .item-sub { margin-top: 2px; }
+div.item { padding: 14px var(--s4); }
+.review-head { display: flex; flex-direction: column; gap: 6px; padding-bottom: var(--s4); border-bottom: 1px solid var(--line); }
+.review-meta { gap: 14px; }
+.finding { border-left: 0; display: flex; flex-direction: column; gap: 4px; }
+.finding.confirmed { border-color: color-mix(in srgb, var(--bad) 30%, var(--line)); }
+.finding.rejected { opacity: 0.75; }
+.finding-loc { color: var(--ink-2); }
+.report-text > summary { cursor: pointer; padding: 4px 0; }
+.report-text > summary:hover { color: var(--ink); }
 .keep { flex: none; }
 .count-pill {
   display: inline-flex;

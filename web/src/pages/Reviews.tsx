@@ -166,12 +166,13 @@ export function ReviewView({ id }: { id: string }) {
         <span className="crumb-sep">/</span>
         <span className="mono crumb-here">{j.id}</span>
       </nav>
-      <header className="run-head">
-        <div className="row between wrap gap">
-          <h1 className="mono clip">{j.target}</h1>
+      <header className="review-head">
+        <div className="row gap wrap">
+          <h1 className="clip">{j.target.split("/").filter(Boolean).pop() ?? j.target}</h1>
           <StatusBadge status={j.status} />
         </div>
-        <div className="row wrap gap muted small">
+        <div className="mono small muted break">{j.target}</div>
+        <div className="row wrap gap muted small review-meta">
           <span>
             {j.reviewer} reviewed, {j.verifier} checked
           </span>
@@ -221,7 +222,7 @@ export function ReviewView({ id }: { id: string }) {
         </>
       )}
       {j.text && (
-        <details>
+        <details className="report-text">
           <summary className="muted">The report as text</summary>
           <Code>{j.text}</Code>
         </details>
@@ -233,7 +234,7 @@ export function ReviewView({ id }: { id: string }) {
 function FindingItem({ finding }: { finding: Judged }) {
   return (
     <div className={`item finding ${finding.outcome}`}>
-      <div className="mono small">
+      <div className="mono small finding-loc">
         {finding.file}:{finding.line}
       </div>
       <p>{finding.failure}</p>

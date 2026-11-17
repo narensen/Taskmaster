@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { CircleAlert } from "lucide-react";
 import type { Tone } from "./format";
 
 export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {
@@ -18,9 +19,9 @@ export function Spinner({ label }: { label?: string }) {
   );
 }
 
-export function Empty({ title, children, icon }: { title: string; children?: ReactNode; icon?: ReactNode }) {
+export function Empty({ title, children, icon, action }: { title: string; children?: ReactNode; icon?: ReactNode; action?: ReactNode }) {
   return (
-    <div className="empty">
+    <div className="empty" role="status">
       {icon && (
         <span className="empty-ico" aria-hidden>
           {icon}
@@ -28,6 +29,18 @@ export function Empty({ title, children, icon }: { title: string; children?: Rea
       )}
       <strong>{title}</strong>
       {children && <p>{children}</p>}
+      {action && <div className="empty-actions">{action}</div>}
+    </div>
+  );
+}
+
+/** Placeholder rows while a list loads, so the layout does not jump when it arrives. */
+export function Loading({ rows = 3, tall = false, label = "Loading" }: { rows?: number; tall?: boolean; label?: string }) {
+  return (
+    <div className="loading-rows" role="status" aria-label={label}>
+      {Array.from({ length: rows }, (_, i) => (
+        <span key={i} className={`skeleton ${tall ? "tall" : ""}`} style={{ width: tall ? "100%" : `${88 - i * 14}%` }} />
+      ))}
     </div>
   );
 }
@@ -36,7 +49,8 @@ export function Problem({ error, onRetry }: { error: unknown; onRetry?: () => vo
   if (!error) return null;
   return (
     <div className="problem" role="alert">
-      <span>{error instanceof Error ? error.message : String(error)}</span>
+      <CircleAlert size={15} className="problem-ico" aria-hidden />
+      <span className="problem-text">{error instanceof Error ? error.message : String(error)}</span>
       {onRetry && (
         <button className="ghost small" onClick={onRetry}>
           Try again

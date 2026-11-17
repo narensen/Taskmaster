@@ -598,7 +598,7 @@ impl App {
         let harnesses = Harnesses::from_roles(&request.roles, &*self.harness)
             .map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
         let (cancel, cancelled) = watch::channel(matches!(decision, Decision::Cancel));
-        let mut config = Config::new(&self.project());
+        let mut config = Config::new(self.project());
         config.run_id = id.to_string();
         config.plan = request.plan;
         config.prompt = request.prompt;
@@ -1062,7 +1062,7 @@ async fn web_search(State(app): State<Arc<App>>, Query(query): Query<HashMap<Str
 }
 
 async fn search_dictionary(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
-    let catalog = Catalog::open(&app.dictionary(), &app.commons())?;
+    let catalog = Catalog::open(app.dictionary(), app.commons())?;
     let found = catalog.search(query.get("q").map(String::as_str).unwrap_or(""))?;
     ok(json!({ "entries": found }))
 }
@@ -1071,7 +1071,7 @@ async fn show_entry(State(app): State<Arc<App>>, UrlPath(key): UrlPath<String>) 
     if !valid_key(&key) {
         return Err(fail(StatusCode::NOT_FOUND, "no such entry"));
     }
-    match Catalog::open(&app.dictionary(), &app.commons())?.resolve(&key)? {
+    match Catalog::open(app.dictionary(), app.commons())?.resolve(&key)? {
         Some(entry) => ok(json!(entry)),
         None => Err(fail(StatusCode::NOT_FOUND, "no such entry")),
     }
@@ -1084,11 +1084,11 @@ async fn errorography(State(app): State<Arc<App>>) -> Reply {
 // The Commons, for other daemons.
 
 async fn commons_entries(State(app): State<Arc<App>>) -> Reply {
-    ok(json!({ "entries": LocalStore::open(&app.commons())?.entries()? }))
+    ok(json!({ "entries": LocalStore::open(app.commons())?.entries()? }))
 }
 
 async fn commons_add(State(app): State<Arc<App>>, Json(mut entry): Json<DictionaryEntry>) -> Reply {
-    let commons = LocalStore::open(&app.commons())?;
+    let commons = LocalStore::open(app.commons())?;
     if !valid_key(&entry.key) {
         return Err(fail(StatusCode::BAD_REQUEST, "an entry key uses letters, digits, `_` and `-`"));
     }

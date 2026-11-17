@@ -1,5 +1,5 @@
 // Path words. Any path an agent, a tool call, a diff, an error, a terminal line or a plan
-// writes becomes a blue word when the daemon says it is a real file. The word is the file
+// writes becomes a linked word when the daemon says it is a real file. The word is the file
 // name, with the shortest parent suffix that tells it apart from another file of the same
 // name. A line, a line and column, or a range stays on the word. A click asks the daemon to
 // open it in the editor chosen in Settings, on the machine that holds the project.

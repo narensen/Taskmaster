@@ -68,6 +68,9 @@ pub struct PagePlan {
     pub owned_glob: String,
     pub cites: Vec<DictKey>,
     pub brief: String,
+    /// How the page's agent knows it is finished: what must exist and work.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done: String,
     /// Optional split of this page into parallel work units with disjoint files. Empty
     /// means one worker owns the whole page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -81,6 +84,9 @@ pub struct WorkUnit {
     /// Files this unit may change. Braces list several: `{app/index.html,app/styles.css}`.
     pub owned_glob: String,
     pub brief: String,
+    /// How this unit's agent knows it is finished: what must exist and work.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done: String,
 }
 
 /// The most units a page is split into.
@@ -93,7 +99,12 @@ impl PagePlan {
         if units_disjoint(&self.units) {
             return self.units.clone();
         }
-        vec![WorkUnit { id: self.id.clone(), owned_glob: self.owned_glob.clone(), brief: self.brief.clone() }]
+        vec![WorkUnit {
+            id: self.id.clone(),
+            owned_glob: self.owned_glob.clone(),
+            brief: self.brief.clone(),
+            done: self.done.clone(),
+        }]
     }
 }
 
@@ -152,6 +163,38 @@ fn literal_cannot_match(path: &str, glob: &str) -> bool {
     let at = glob.find(['*', '?', '[', '{']).unwrap_or(glob.len());
     let prefix = &glob[..at];
     !(path.starts_with(prefix) || prefix.starts_with(path))
+}
+
+/// One agent a plan will start: who it is, what it builds, the files it owns, and how it
+/// knows it is finished.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentPlan {
+    /// The id it runs under: `page:<page>`, or `page:<page>/<unit>` when the page is split.
+    pub id: String,
+    pub page: PageId,
+    pub owned_glob: String,
+    pub task: String,
+    pub done: String,
+}
+
+/// What an agent is told when the plan gave it no done criteria.
+pub const DEFAULT_DONE: &str = "every file you own is written and does its part of the brief";
+
+impl Plan {
+    /// Every build agent the plan starts, in order.
+    pub fn agents(&self) -> Vec<AgentPlan> {
+        let mut out = Vec::new();
+        for page in &self.pages {
+            let units = page.work_units();
+            let split = units.len() > 1;
+            for unit in units {
+                let id = if split { format!("page:{}/{}", page.id, unit.id) } else { format!("page:{}", page.id) };
+                let done = if unit.done.trim().is_empty() { DEFAULT_DONE.to_string() } else { unit.done.trim().to_string() };
+                out.push(AgentPlan { id, page: page.id.clone(), owned_glob: unit.owned_glob, task: unit.brief.trim().to_string(), done });
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,7 +290,7 @@ mod unit_tests {
     use super::*;
 
     fn unit(id: &str, glob: &str) -> WorkUnit {
-        WorkUnit { id: id.into(), owned_glob: glob.into(), brief: "x".into() }
+        WorkUnit { id: id.into(), owned_glob: glob.into(), brief: "x".into(), done: String::new() }
     }
 
     fn page(units: Vec<WorkUnit>) -> PagePlan {
@@ -257,8 +300,23 @@ mod unit_tests {
             owned_glob: "{app/**,README.md}".into(),
             cites: vec![],
             brief: "b".into(),
+            done: String::new(),
             units,
         }
+    }
+
+    #[test]
+    fn a_plan_lists_one_agent_per_unit() {
+        let mut units = vec![unit("ui", "app/index.html"), unit("js", "app/main.js")];
+        units[1].done = "adding a todo shows it".into();
+        let plan = Plan { contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 } };
+        let agents = plan.agents();
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["page:todo/ui", "page:todo/js", "page:todo"]);
+        assert_eq!(agents.len(), 3);
+        assert_eq!(agents[0].done, DEFAULT_DONE);
+        assert_eq!(agents[1].done, "adding a todo shows it");
+        assert_eq!(agents[1].owned_glob, "app/main.js");
     }
 
     #[test]

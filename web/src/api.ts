@@ -53,7 +53,36 @@ export interface PagePlan {
   owned_glob: string;
   cites: string[];
   brief: string;
-  units?: { id: string; owned_glob: string; brief: string }[];
+  /** How the page's agent knows it is finished. */
+  done?: string;
+  units?: { id: string; owned_glob: string; brief: string; done?: string }[];
+}
+
+/** One agent a plan starts. Mirrors `Plan::agents` in tm-core. */
+export interface AgentPlan {
+  id: string;
+  page: string;
+  owned_glob: string;
+  task: string;
+  done: string;
+}
+
+const DEFAULT_DONE = "every file you own is written and does its part of the brief";
+
+/** The build agents a plan starts: one per unit of a split page, else one per page. */
+export function planAgents(plan: Plan): AgentPlan[] {
+  return plan.pages.flatMap((page) => {
+    const units = page.units ?? [];
+    const split = units.length >= 2 && units.length <= 4;
+    const list = split ? units : [{ id: page.id, owned_glob: page.owned_glob, brief: page.brief, done: page.done }];
+    return list.map((u) => ({
+      id: split ? `page:${page.id}/${u.id}` : `page:${page.id}`,
+      page: page.id,
+      owned_glob: u.owned_glob,
+      task: u.brief.trim(),
+      done: u.done?.trim() || DEFAULT_DONE,
+    }));
+  });
 }
 
 export interface Plan {

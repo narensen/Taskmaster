@@ -421,6 +421,9 @@ impl Driver {
                                     plan.pages.len(),
                                     published
                                 );
+                                for line in agent_lines(&plan).lines() {
+                                    eprintln!("taskmaster: {line}");
+                                }
                                 return Ok(plan);
                             }
                             Err(found) => errors = found,
@@ -514,9 +517,11 @@ impl Driver {
              Leave `estimate` at zero: Taskmaster works it out from what past runs cost. \
              `contracts` are shared source files. Each page owns one glob. \
              `dictionary` holds new entries those pages cite. \
-             `kind` is schema, routes, component_api, pattern, or hint.\n\
+             `kind` is schema, routes, component_api, pattern, or hint. \
+             Every page, and every unit, is one agent: its `brief` is that agent's whole task and `done` is one line \
+             saying how it knows it is finished.\n\
              {\"contracts\":[{\"path\":\"app/types.ts\",\"content\":\"...\"}],\
-             \"pages\":[{\"id\":\"home\",\"route\":\"/home\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\"}],\
+             \"pages\":[{\"id\":\"home\",\"route\":\"/home\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\",\"done\":\"...\"}],\
              \"estimate\":{\"tokens\":0,\"usd\":0},\
              \"dictionary\":[{\"key\":\"theme\",\"kind\":\"hint\",\"summary\":\"...\",\"content\":\"...\",\"stack\":\"next\"}]}\n\
              \nRules: at least one page; page ids use letters, digits, `_` and `-`; \
@@ -2117,6 +2122,7 @@ impl Driver {
             let cites = if page.cites.is_empty() { "-".to_string() } else { page.cites.join(", ") };
             out.push_str(&format!("- {} {} owns `{}` cites {}\n", page.id, page.route, page.owned_glob, cites));
         }
+        out.push_str(&agent_lines(plan));
         out.push_str(&format!("estimate: {} tokens, ${:.2}\n", plan.estimate.tokens, plan.estimate.usd));
         out
     }
@@ -2353,6 +2359,22 @@ impl Driver {
             eprintln!("taskmaster: `{key}` was not sent to the Commons: {err:#}");
         }
     }
+}
+
+/// The agents a plan starts, one line each: who, what files, what to do, when it is done.
+fn agent_lines(plan: &Plan) -> String {
+    let agents = plan.agents();
+    let mut out = format!("plan: {} agent{}\n", agents.len(), if agents.len() == 1 { "" } else { "s" });
+    for agent in &agents {
+        out.push_str(&format!(
+            "  {} owns `{}`: {} | done when {}\n",
+            agent.id,
+            agent.owned_glob,
+            clip(agent.task.lines().next().unwrap_or_default(), 160),
+            clip(agent.done.lines().next().unwrap_or_default(), 160)
+        ));
+    }
+    out
 }
 
 fn failed(errors: impl Into<String>) -> WorkerOutcome {

@@ -550,6 +550,7 @@ mod tests {
             owned_glob: glob.into(),
             cites: vec![],
             brief: String::new(),
+            done: String::new(),
             units: vec![],
         };
         Owners::from_plan(&Plan {

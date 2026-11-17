@@ -3,7 +3,7 @@
 
 import { useLayoutEffect, useRef } from "react";
 import gsap from "gsap";
-import type { Plan } from "../api";
+import { planAgents, type Plan } from "../api";
 import { KnownPath } from "../paths";
 import { motionOn } from "../prefs";
 import { dur, ease } from "../motion";
@@ -11,6 +11,7 @@ import { tokens, usd } from "../format";
 
 export function PlanView({ plan, arrived, compact, unpriced }: { plan: Plan; arrived?: boolean; compact?: boolean; unpriced?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
+  const agents = planAgents(plan);
   useLayoutEffect(() => {
     if (!arrived || !ref.current || !motionOn()) return;
     const tl = gsap.timeline();
@@ -27,7 +28,7 @@ export function PlanView({ plan, arrived, compact, unpriced }: { plan: Plan; arr
       <div className="plan-head">
         <span className="strong">Locked plan</span>
         <span className="muted small">
-          {plan.pages.length} page{plan.pages.length === 1 ? "" : "s"} · about {tokens(plan.estimate.tokens)} tokens{unpriced ? "" : ` · ${usd(plan.estimate.usd)}`}
+          {plan.pages.length} page{plan.pages.length === 1 ? "" : "s"} · {agents.length} agent{agents.length === 1 ? "" : "s"} · about {tokens(plan.estimate.tokens)} tokens{unpriced ? "" : ` · ${usd(plan.estimate.usd)}`}
         </span>
       </div>
       <div className="lock-rule" />
@@ -51,6 +52,28 @@ export function PlanView({ plan, arrived, compact, unpriced }: { plan: Plan; arr
                 <td>{page.route}</td>
                 <td>{page.owned_glob}</td>
                 <td>{page.cites.length ? page.cites.join(", ") : "none"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="table-wrap" data-testid="plan-agents">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>agent</th>
+              <th>owns</th>
+              <th>task</th>
+              <th>done when</th>
+            </tr>
+          </thead>
+          <tbody>
+            {agents.map((agent) => (
+              <tr key={agent.id}>
+                <td className="strong">{agent.id}</td>
+                <td>{agent.owned_glob}</td>
+                <td>{compact ? agent.task.split("\n")[0] : agent.task}</td>
+                <td>{agent.done}</td>
               </tr>
             ))}
           </tbody>

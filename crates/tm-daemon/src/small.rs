@@ -31,7 +31,7 @@ pub fn units_rule(slots: usize) -> String {
     let range = if most == 2 { "2".to_string() } else { format!("2-{most}") };
     format!(
         "Optionally give a page `units`: {range} work units (never more than {most}, the parallel workers this run has), \
-         each {{\"id\",\"owned_glob\",\"brief\"}}, built by parallel workers. Split by file or concern (for example markup+styles, \
+         each {{\"id\",\"owned_glob\",\"brief\",\"done\"}}, one agent per unit, built in parallel. Split by file or concern (for example markup+styles, \
          scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and \
          inside the page glob (braces list files: `{{app/index.html,app/styles.css}}`); the page owned_glob must cover them \
          all. Omit `units` when splitting is unsafe.\n"
@@ -58,11 +58,12 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
     brief.push_str(
         "\nReply with one JSON object only and do not edit files. Use as few pages as possible (one if it fits). \
          `contracts` are shared source files, only for interfaces used by more than one file or worker; otherwise `[]`. \
-         Keep each brief to a few concise lines and each contract short. Leave `estimate` at zero.\n\
-         {\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\"}],\
+         Each page or unit is one agent: `brief` is its whole task in a few lines, `done` one line saying when it is finished. \
+         Keep contracts short. Leave `estimate` at zero.\n\
+         {\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\",\"done\":\"...\"}],\
          \"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n\
-         Rules: at least one page; page ids use letters, digits, `_` and `-`; owned_glob and contract paths are \
-         relative with no `..`; every cited key is listed above or in `dictionary`; briefs are non-empty.\n",
+         Rules: at least one page; ids use letters, digits, `_` and `-`; globs and contract paths are relative, no `..`; \
+         cited keys are listed above or in `dictionary`; briefs are non-empty.\n",
     );
     brief.push_str(&units_rule(slots));
     if slots >= 2 {
@@ -94,7 +95,7 @@ mod tests {
         assert!(brief.contains("Dictionary is empty"));
         assert!(brief.contains("Do not call any tools"));
         assert!(!brief.contains("Search the Dictionary"));
-        assert!(brief.len() < 1700);
+        assert!(brief.len() < 1700, "{}", brief.len());
         let listed = small_brief("tiny todo", &["- `todo-dom` (commons, component_api): ids\nul#todo-list\n".into()], "", 3);
         assert!(!listed.contains("Dictionary is empty"));
         assert!(listed.contains("`todo-dom`"));

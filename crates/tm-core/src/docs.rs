@@ -156,6 +156,7 @@ mod tests {
             owned_glob: format!("app/{id}/**"),
             cites: cites.iter().map(|c| c.to_string()).collect(),
             brief: String::new(),
+            done: String::new(),
             units: vec![],
         };
         Plan {

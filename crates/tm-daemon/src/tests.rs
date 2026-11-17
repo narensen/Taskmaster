@@ -321,6 +321,7 @@ fn plan(pages: &[(&str, &[&str])]) -> Plan {
                 owned_glob: format!("app/{id}/**"),
                 cites: cites.iter().map(|c| (*c).to_string()).collect(),
                 brief: format!("Implement {id}."),
+                done: String::new(),
                 units: vec![],
             })
             .collect(),
@@ -527,8 +528,8 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     let world = World::new(Mode::Units(Arc::new(Barrier::new(2))));
     let mut split = plan(&[("a", &[])]);
     split.pages[0].units = vec![
-        WorkUnit { id: "markup".into(), owned_glob: "app/a/index.html".into(), brief: "The markup.".into() },
-        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into() },
+        WorkUnit { id: "markup".into(), owned_glob: "app/a/index.html".into(), brief: "The markup.".into(), done: String::new() },
+        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into(), done: String::new() },
     ];
     let outcome = run(config(&tmp.0, split, true, 2), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
@@ -570,7 +571,9 @@ async fn approval_waits_until_yes() {
     let world = World::new(Mode::Write);
     let planned = plan(&[("a", &[]), ("b", &[])]);
     let outcome = run(config(&tmp.0, planned.clone(), false, 2), &world).await.unwrap();
-    assert!(matches!(outcome, Outcome::NeedsApproval { .. }));
+    let Outcome::NeedsApproval { summary } = &outcome else { panic!("{outcome:?}") };
+    assert!(summary.contains("plan: 2 agents"), "{summary}");
+    assert!(summary.contains("page:a owns `app/a/**`") && summary.contains("| done when "), "{summary}");
     assert!(!tmp.0.join("app/a/page.ts").exists());
     let outcome = run(config(&tmp.0, planned, true, 2), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });

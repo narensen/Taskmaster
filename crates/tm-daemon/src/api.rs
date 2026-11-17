@@ -34,6 +34,8 @@
 //! POST /api/commons/entries       an entry another daemon promoted
 //! ```
 //!
+//! Installing, updating and signing in to harness CLIs is in `api/setup.rs`.
+//!
 //! The control surface's own routes (the agent transcript, notes, the terminal, diffs,
 //! opening files in an editor, completions, gh) are listed in `api/desk.rs`.
 //!
@@ -81,6 +83,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
 mod desk;
+mod setup;
 
 #[cfg(test)]
 pub(crate) use desk::{Style, choose_editor, redact, sensitive};
@@ -116,6 +119,8 @@ pub struct ServerOptions {
     pub editor: String,
     /// The settings file's `preview.command`. Empty reads the project's `package.json`.
     pub preview_command: String,
+    /// Chooses the commands of install, update and sign-in jobs. Tests pass their own.
+    pub setup_planner: Option<crate::jobs::Planner>,
 }
 
 impl ServerOptions {
@@ -133,6 +138,7 @@ impl ServerOptions {
             approvals: crate::approvals::Policy::default(),
             editor: String::new(),
             preview_command: String::new(),
+            setup_planner: None,
         }
     }
 }
@@ -152,6 +158,7 @@ impl Drop for Server {
         }
         self.app.live.approvals.refuse_all();
         self.app.previews.stop_all();
+        self.app.jobs.stop_all();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
@@ -186,6 +193,7 @@ struct App {
     previews: crate::preview::Previews,
     /// Running review jobs, so cancelling one (or its run) can stop the agents.
     reviews: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    jobs: Arc<crate::jobs::Jobs>,
 }
 
 impl Server {
@@ -227,6 +235,7 @@ impl Server {
             editor: Mutex::new(options.editor),
             previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
             reviews: Mutex::new(HashMap::new()),
+            jobs: Arc::new(crate::jobs::Jobs::new(options.setup_planner.unwrap_or_else(crate::jobs::default_planner))),
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -287,9 +296,16 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/skills", get(desk::skills))
         .route("/api/gh", get(desk::gh_status))
         .route("/api/gh/pr/{number}", get(desk::gh_pr))
+        .route("/api/setup", get(setup::overview))
+        .route("/api/setup/providers/{id}/{action}", post(setup::provider_action))
+        .route("/api/setup/runtimes/{id}/install", post(setup::runtime_install))
+        .route("/api/setup/jobs/{id}", get(setup::job))
+        .route("/api/setup/jobs/{id}/input", post(setup::input))
+        .route("/api/setup/jobs/{id}/cancel", post(setup::cancel))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
         .route("/api/runs/{id}/stream", get(run_stream))
+        .route("/api/setup/jobs/{id}/stream", get(setup::stream_job))
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
         .merge(private)

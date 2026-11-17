@@ -1319,6 +1319,73 @@ mod http {
     }
 
     #[tokio::test]
+    async fn providers_install_and_sign_in_through_jobs_that_run_only_listed_steps() {
+        use tm_harness::setup::Step;
+        let tmp = seeded("setup");
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let code = auth.code().to_string();
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        let sh = |label: &str, script: &str, terminal: bool| Step {
+            label: label.into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            terminal,
+        };
+        let login = sh("Signing in", "echo 'Visit https://login.example.com/activate'; echo 'Enter code QRST-4321'; read a; echo welcome $a", true);
+        let install = sh("Installing", "echo fetched; echo installed", false);
+        options.setup_planner = Some(Arc::new(move |target, action| match (target, action) {
+            (crate::jobs::Target::Provider("codex"), tm_harness::setup::Action::Login) => Some(vec![login.clone()]),
+            (crate::jobs::Target::Provider("codex"), tm_harness::setup::Action::Install) => Some(vec![install.clone()]),
+            _ => None,
+        }));
+        let server = Server::serve(options).await.unwrap();
+        let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let mut client = Client { addr, token: None };
+        assert_eq!(client.get("/api/setup").await.0, 401);
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        // Only known providers, runtimes and actions; a request never carries a command.
+        assert_eq!(client.post("/api/setup/providers/nope/install", json!({})).await.0, 404);
+        assert_eq!(client.post("/api/setup/providers/codex/exec", json!({ "command": "rm -rf ~" })).await.0, 404);
+        assert_eq!(client.post("/api/setup/runtimes/perl/install", json!({})).await.0, 404);
+        assert_eq!(client.post("/api/setup/providers/claude/update", json!({})).await.0, 409);
+
+        let (status, job) = client.post("/api/setup/providers/codex/login", json!({})).await;
+        assert_eq!(status, 202, "{job}");
+        let id = job["id"].as_str().unwrap().to_string();
+        assert_eq!(client.post("/api/setup/providers/codex/login", json!({})).await.0, 409);
+        let mut shown = Value::Null;
+        for _ in 0..200 {
+            shown = client.get(&format!("/api/setup/jobs/{id}")).await.1;
+            if shown["prompt"]["code"].is_string() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(shown["prompt"]["code"], "QRST-4321", "{shown}");
+        assert_eq!(shown["prompt"]["url"], "https://login.example.com/activate");
+        assert_eq!(shown["accepts_input"], true);
+        assert_eq!(client.post(&format!("/api/setup/jobs/{id}/input"), json!({ "text": "a\u{3}b" })).await.0, 400);
+        assert_eq!(client.post(&format!("/api/setup/jobs/{id}/input"), json!({ "key": "f12" })).await.0, 400);
+        assert_eq!(client.post(&format!("/api/setup/jobs/{id}/input"), json!({ "text": "sam", "key": "enter" })).await.0, 200);
+        let (_, streamed) = client.text(&format!("/api/setup/jobs/{id}/stream?token={}", client.token.clone().unwrap())).await;
+        assert!(streamed.contains("event: job"), "{streamed}");
+        assert!(streamed.contains("welcome sam"), "{streamed}");
+        let done = client.get(&format!("/api/setup/jobs/{id}")).await.1;
+        assert_eq!(done["state"], "done", "{done}");
+
+        let (status, job) = client.post("/api/setup/providers/codex/install", json!({})).await;
+        assert_eq!(status, 202, "{job}");
+        let id = job["id"].as_str().unwrap();
+        assert_eq!(client.post(&format!("/api/setup/jobs/{id}/input"), json!({ "text": "x" })).await.0, 409);
+        let (_, overview) = client.get("/api/setup").await;
+        assert_eq!(overview["providers"].as_array().unwrap().len(), 5);
+        assert_eq!(overview["runtimes"].as_array().unwrap().len(), 3);
+        assert!(overview["jobs"].as_array().unwrap().iter().any(|j| j["target"] == "codex"));
+    }
+
+    #[tokio::test]
     async fn a_device_pairs_starts_a_run_approves_it_and_reads_what_it_cost() {
         let tmp = seeded("api");
         LocalStore::open(tmp.0.join(".taskmaster/dictionary"))

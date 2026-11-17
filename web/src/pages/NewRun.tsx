@@ -61,13 +61,13 @@ export function NewRun() {
           <img src="/icon.png" alt="" width={36} height={36} />
         </div>
         <h1>
-          What should we build{project ? <> in <span className="ask-project">{project}</span></> : null}?
+          Describe the next run{project ? <> for <span className="ask-project">{project}</span></> : null}
         </h1>
-        <p className="ask-sub muted">Describe the result. Taskmaster plans it, splits it across agents and checks it before merging.</p>
+        <p className="ask-sub muted">A master will plan it, then workers build the pages and a reviewer checks the result.</p>
         <Composer
           ref={composer}
           bus
-          placeholder="Ask anything. @ files, # pull requests, / commands"
+          placeholder="Tell the master what to plan. @ files, # pull requests, / commands"
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">

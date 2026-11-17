@@ -278,8 +278,8 @@ function ShowAll({
 }
 
 function accessLabel(mode?: ApprovalMode) {
-  if (mode === "never") return "Full access";
-  if (mode === "always") return "Always ask";
+  if (mode === "never") return "Approvals off";
+  if (mode === "always") return "Ask on every call";
   return "Ask on risky tools";
 }
 
@@ -397,13 +397,13 @@ export function Gallery() {
 
       <div className="home-ask">
         <h2>
-          What should we build{projectLabel ? <> in <span className="ask-project">{projectLabel}</span></> : null}?
+          Describe the next run{projectLabel ? <> for <span className="ask-project">{projectLabel}</span></> : null}
         </h2>
-        <p className="ask-sub">Describe the result. Taskmaster will plan it first.</p>
+        <p className="ask-sub">A master will plan it; workers take the pages.</p>
         <Composer
           ref={composer}
           bus
-          placeholder="Ask anything. @ files, $ skills, / commands"
+          placeholder="Tell the master what to plan. @ files, $ skills, / commands"
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
@@ -438,7 +438,7 @@ export function Gallery() {
         />
         <div className="home-meta">
           <span className="home-meta-left">
-            <span>Current checkout</span>
+            <span>Project</span>
             {project && <span className="mono clip" title={project}>{name}</span>}
             {branch && (
               <span className="home-meta-branch clip">

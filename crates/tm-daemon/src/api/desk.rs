@@ -1058,6 +1058,7 @@ mod tests {
                 units: vec![],
             }],
             estimate: tm_core::Estimate { tokens: 1000, usd: 0.5 },
+            design: String::new(),
         };
         let (title, body) = pr_text("r1", Some("\nA bookshop with a cart\nmore"), &plan);
         assert_eq!(title, "A bookshop with a cart");

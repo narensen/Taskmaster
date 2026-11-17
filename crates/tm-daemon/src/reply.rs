@@ -15,6 +15,36 @@ struct RawPlan {
     estimate: Option<Estimate>,
     #[serde(default)]
     dictionary: Vec<DraftEntry>,
+    #[serde(default)]
+    design: Value,
+}
+
+/// The planner's design spec as text. Models write it as a string or as an object of
+/// sections (`{"palette": "...", "a11y": ["...", "..."]}`); both become `section: text` lines.
+fn design_text(value: &Value) -> String {
+    fn flat(value: &Value) -> String {
+        match value {
+            Value::String(s) => s.trim().to_string(),
+            Value::Array(items) => items.iter().map(flat).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("; "),
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| format!("{k} {}", flat(v)))
+                .collect::<Vec<_>>()
+                .join("; "),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    }
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| (k, flat(v)))
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| format!("- {k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => flat(other),
+    }
 }
 
 /// The last complete JSON value in `text` that opens with `open` and ends at the last `close`.
@@ -84,7 +114,8 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     let value = last_json(text, '{', '}').context("the plan reply had no JSON object")?;
     let raw: RawPlan = serde_json::from_value(value).context("the plan reply was not a plan")?;
     let estimate = raw.estimate.unwrap_or(Estimate { tokens: 0, usd: 0.0 });
-    Ok((Plan { contracts: raw.contracts, pages: raw.pages, estimate }, raw.dictionary))
+    let design = design_text(&raw.design);
+    Ok((Plan { contracts: raw.contracts, pages: raw.pages, estimate, design }, raw.dictionary))
 }
 
 pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {
@@ -164,5 +195,15 @@ mod tests {
         assert_eq!(dictionary[0].stack, "");
         assert!(parse_plan("no json here").is_err());
         assert!(parse_plan("{\"dictionary\":[{\"key\":\"greet\",\"kind\":\"nope\",\"summary\":\"x\",\"content\":\"y\"}]}").is_err());
+    }
+
+    #[test]
+    fn reads_a_design_spec_as_text_or_sections() {
+        let (plan, _) = parse_plan("{\"pages\":[],\"design\":\"palette #111\"}").unwrap();
+        assert_eq!(plan.design, "palette #111");
+        let (plan, _) = parse_plan("{\"pages\":[],\"design\":{\"palette\":\"bg #0b0b0c\",\"a11y\":[\"label inputs\",\"focus-visible ring\"]}}").unwrap();
+        assert_eq!(plan.design, "- a11y: label inputs; focus-visible ring\n- palette: bg #0b0b0c");
+        let (plan, _) = parse_plan("{\"pages\":[]}").unwrap();
+        assert!(plan.design.is_empty());
     }
 }

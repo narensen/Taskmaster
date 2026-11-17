@@ -209,6 +209,10 @@ pub struct Plan {
     pub contracts: Vec<ContractFile>,
     pub pages: Vec<PagePlan>,
     pub estimate: Estimate,
+    /// The planner's design spec, shared by every agent: palette, type, spacing, component
+    /// look, empty state, responsive layout and accessibility rules.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub design: String,
 }
 
 /// A worker's objection to a Dictionary entry, raised instead of editing around it.
@@ -309,7 +313,7 @@ mod unit_tests {
     fn a_plan_lists_one_agent_per_unit() {
         let mut units = vec![unit("ui", "app/index.html"), unit("js", "app/main.js")];
         units[1].done = "adding a todo shows it".into();
-        let plan = Plan { contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 } };
+        let plan = Plan { contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 }, design: String::new() };
         let agents = plan.agents();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["page:todo/ui", "page:todo/js", "page:todo"]);

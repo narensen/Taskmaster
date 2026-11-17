@@ -520,7 +520,7 @@ impl Driver {
              `kind` is schema, routes, component_api, pattern, or hint. \
              Every page, and every unit, is one agent: its `brief` is that agent's whole task and `done` is one line \
              saying how it knows it is finished.\n\
-             {\"contracts\":[{\"path\":\"app/types.ts\",\"content\":\"...\"}],\
+             {\"design\":\"...\",\"contracts\":[{\"path\":\"app/types.ts\",\"content\":\"...\"}],\
              \"pages\":[{\"id\":\"home\",\"route\":\"/home\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\",\"done\":\"...\"}],\
              \"estimate\":{\"tokens\":0,\"usd\":0},\
              \"dictionary\":[{\"key\":\"theme\",\"kind\":\"hint\",\"summary\":\"...\",\"content\":\"...\",\"stack\":\"next\"}]}\n\
@@ -529,6 +529,7 @@ impl Driver {
              every cited key is an existing entry or one of the dictionary items; \
              briefs and contents are non-empty.\n",
         );
+        brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
         if !errors.is_empty() {
             brief.push_str("\nThe last plan was rejected:\n");
@@ -1568,7 +1569,11 @@ impl Driver {
         }
         let began = Instant::now();
         self.terminal("command", serde_json::json!({ "command": format!("{} on {} file(s)", picked.join("+"), files.len()), "cwd": project.display().to_string() }));
-        let sane = checks::html_sanity(&project, &files);
+        let mut sane = checks::html_sanity(&project, &files);
+        // Quality bars are held only where a page is plain files the checks can read whole.
+        if checks::is_static_site(&project) {
+            sane.extend(checks::html_quality(&project, &files));
+        }
         let lint_files = files.clone();
         let lint_project = project.clone();
         let linted = if picked == ["html"] {
@@ -1816,8 +1821,20 @@ impl Driver {
             // Each lookup is another model turn; the entries are already here.
             brief.push_str("\nThe cited entries above are complete: do not look them up again with the Dictionary tools.\n");
         }
+        let design = self.plan()?.design.trim().to_string();
+        if !design.is_empty() {
+            brief.push_str(&format!(
+                "\nDesign spec, shared by every agent of this run. Follow it exactly; do not invent another look:\n{design}\n"
+            ));
+            brief.push_str(crate::small::QUALITY_BARS);
+        }
         let done = split.as_ref().map_or(page.done.as_str(), |u| u.done.as_str()).trim();
-        brief.push_str(&format!("\nYou are done when: {}.\n", if done.is_empty() { tm_core::DEFAULT_DONE } else { done }));
+        let done = if done.is_empty() { tm_core::DEFAULT_DONE } else { done }.trim_end_matches('.');
+        if design.is_empty() {
+            brief.push_str(&format!("\nYou are done when: {done}.\n"));
+        } else {
+            brief.push_str(&format!("\nYou are done when: {done}, and your files meet the design spec and the quality bars.\n"));
+        }
         let agent = match &split {
             Some(mine) => format!("page:{}/{}", page.id, mine.id),
             None => format!("page:{}", page.id),
@@ -2419,6 +2436,9 @@ fn agent_lines(plan: &Plan) -> String {
             clip(agent.task.lines().next().unwrap_or_default(), 160),
             clip(agent.done.lines().next().unwrap_or_default(), 160)
         ));
+    }
+    if !plan.design.trim().is_empty() {
+        out.push_str(&format!("  design: {}\n", clip(&plan.design.split_whitespace().collect::<Vec<_>>().join(" "), 240)));
     }
     out
 }

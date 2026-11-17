@@ -164,6 +164,7 @@ mod tests {
                 units: vec![],
             }],
             estimate: Estimate { tokens: 1, usd: 0.0 },
+            design: String::new(),
         }
     }
 
@@ -214,7 +215,7 @@ mod tests {
         assert!(errors.contains("different content"), "{errors}");
         assert!(errors.contains("negative"), "{errors}");
 
-        let empty = Plan { contracts: vec![], pages: vec![], estimate: Estimate { tokens: 0, usd: 0.0 } };
+        let empty = Plan { contracts: vec![], pages: vec![], estimate: Estimate { tokens: 0, usd: 0.0 }, design: String::new() };
         assert!(check_plan(&empty, &[], &BTreeMap::new()).unwrap_err().join(" ").contains("no pages"));
     }
 }

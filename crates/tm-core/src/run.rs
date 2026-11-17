@@ -399,6 +399,7 @@ mod tests {
                 })
                 .collect(),
             estimate: Estimate { tokens: 0, usd: 0.0 },
+            design: String::new(),
         }
     }
 

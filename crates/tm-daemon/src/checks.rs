@@ -150,6 +150,101 @@ pub fn html_sanity(tree: &Path, files: &[String]) -> Vec<(String, String)> {
     out
 }
 
+/// Quality bars a static page must meet, checked from its files: a viewport meta tag, some
+/// CSS applied, and a label or aria-label on every form control, including controls the
+/// page's scripts create. Returns the problem per file, like [`html_sanity`].
+pub fn html_quality(tree: &Path, files: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for file in files.iter().filter(|f| f.ends_with(".html") || f.ends_with(".htm")) {
+        let Ok(text) = std::fs::read_to_string(tree.join(file)) else { continue };
+        let lower = text.to_ascii_lowercase();
+        if lower.trim().is_empty() {
+            continue;
+        }
+        if !["name=\"viewport\"", "name='viewport'", "name=viewport"].iter().any(|v| lower.contains(v)) {
+            out.push((file.clone(), format!("{file}:1 no viewport meta tag: add <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> to <head>")));
+        }
+        let linked = lower.contains("<style") || (lower.contains("<link") && lower.contains("stylesheet"));
+        if !linked && !lower.contains("style=") {
+            out.push((file.clone(), format!("{file}:1 the page is unstyled: no stylesheet is linked and no <style> is present")));
+        }
+        for (line, control) in unlabeled_controls(&text) {
+            out.push((file.clone(), format!("{file}:{line} {control} has no label: give it a <label for> or aria-label")));
+        }
+    }
+    for file in files.iter().filter(|f| f.ends_with(".js") || f.ends_with(".mjs")) {
+        let Ok(text) = std::fs::read_to_string(tree.join(file)) else { continue };
+        let creates = text.contains("createElement(\"input\")") || text.contains("createElement('input')") || text.contains("createElement(`input`)");
+        let templated = text.contains("<input");
+        let labelled = text.contains("aria-label") || text.contains("ariaLabel") || text.contains("createElement(\"label\")") || text.contains("createElement('label')") || text.contains("<label") || text.contains("aria-labelledby") || text.contains("labels");
+        if (creates || templated) && !labelled {
+            let line = text.lines().position(|l| l.contains("createElement") && l.contains("input") || l.contains("<input")).map_or(1, |i| i + 1);
+            out.push((file.clone(), format!("{file}:{line} an input made in script has no label: set aria-label or wrap it in a <label>")));
+        }
+    }
+    out
+}
+
+/// Form controls in an HTML document with no label: not inside a `<label>`, no `aria-label`
+/// or `aria-labelledby`, and no `<label for>` naming their id. Hidden and button inputs are
+/// skipped. Returns the 1-based line and a short name for each.
+fn unlabeled_controls(html: &str) -> Vec<(usize, String)> {
+    let lower = html.to_ascii_lowercase();
+    let label_for: Vec<String> = lower
+        .match_indices("<label")
+        .filter_map(|(at, _)| {
+            let tag = &lower[at..at + lower[at..].find('>').unwrap_or(0)];
+            attr(tag, "for")
+        })
+        .collect();
+    let mut out = Vec::new();
+    for name in ["<input", "<select", "<textarea"] {
+        for (at, _) in lower.match_indices(name) {
+            let end = lower[at..].find('>').map_or(lower.len(), |e| at + e);
+            let tag = &lower[at..end];
+            let kind = attr(tag, "type").unwrap_or_default();
+            if name == "<input" && matches!(kind.as_str(), "hidden" | "submit" | "button" | "reset" | "image") {
+                continue;
+            }
+            if tag.contains("aria-label") || tag.contains("aria-labelledby") || tag.contains("title=") {
+                continue;
+            }
+            if attr(tag, "id").is_some_and(|id| label_for.contains(&id)) {
+                continue;
+            }
+            let before = &lower[..at];
+            if before.matches("<label").count() > before.matches("</label").count() {
+                continue;
+            }
+            let line = html[..at].matches('\n').count() + 1;
+            let what = if kind.is_empty() { name[1..].to_string() } else { format!("{} type={kind}", &name[1..]) };
+            out.push((line, format!("<{what}>")));
+        }
+    }
+    out
+}
+
+/// The value of `name` in an opening tag (already lowercased), quoted or not.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        let boundary = at == 0 || tag.as_bytes()[at - 1].is_ascii_whitespace();
+        let rest = tag[at + name.len()..].trim_start();
+        if !boundary || !rest.starts_with('=') {
+            continue;
+        }
+        let rest = rest[1..].trim_start();
+        let value = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => rest[1..].split(q).next().unwrap_or_default(),
+            _ => rest.split(|c: char| c.is_ascii_whitespace() || c == '/').next().unwrap_or_default(),
+        };
+        return Some(value.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +307,33 @@ mod tests {
         let files: Vec<String> = ["a.html", "b.html", "c.html"].map(String::from).to_vec();
         let found = html_sanity(&tree, &files);
         assert_eq!(found.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["b.html", "c.html"]);
+        let _ = std::fs::remove_dir_all(tree);
+    }
+
+    #[test]
+    fn quality_bars_catch_a_bare_page_and_pass_a_finished_one() {
+        let tree = dir("quality");
+        std::fs::write(
+            tree.join("bare.html"),
+            "<!doctype html><html><body><form><input id=\"t\" type=\"text\"><button>Add</button></form><script src=\"a.js\"></script></body></html>",
+        )
+        .unwrap();
+        std::fs::write(tree.join("a.js"), "const c = document.createElement('input'); c.type = 'checkbox';").unwrap();
+        std::fs::write(
+            tree.join("good.html"),
+            "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width\"><link rel=\"stylesheet\" href=\"s.css\"></head>\
+             <body><label for=\"t\">New todo</label><input id=\"t\" type=\"text\"><label><input type=\"checkbox\"> Done</label>\
+             <input type=\"search\" aria-label=\"Filter\"><input type=\"hidden\" name=\"x\"></body></html>",
+        )
+        .unwrap();
+        std::fs::write(tree.join("b.js"), "const c = document.createElement('input'); c.setAttribute('aria-label', 'Done');").unwrap();
+        let bare = html_quality(&tree, &["bare.html".into(), "a.js".into()]);
+        let text: Vec<&str> = bare.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(text.iter().any(|l| l.contains("viewport")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("unstyled")), "{text:?}");
+        assert!(text.iter().any(|l| l.starts_with("bare.html:1 <input type=text> has no label")), "{text:?}");
+        assert!(text.iter().any(|l| l.starts_with("a.js:1 an input made in script")), "{text:?}");
+        assert!(html_quality(&tree, &["good.html".into(), "b.js".into()]).is_empty());
         let _ = std::fs::remove_dir_all(tree);
     }
 }

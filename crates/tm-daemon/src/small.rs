@@ -19,6 +19,24 @@ pub fn is_small_prompt(prompt: &str, existing_files: usize) -> bool {
 /// Reasoning effort for the small planning pass: one short JSON reply needs little thought.
 pub const SMALL_EFFORT: &str = "low";
 
+/// What the planner must say about the look and the accessibility of anything shown in a
+/// browser. Workers run at low effort: the precision has to come from the plan.
+pub const DESIGN_RULE: &str = "`design` is the one design spec every agent follows, written for a finished, polished product: \
+palette (hex for background, surface, border, text, muted text, accent, danger; text contrast at least 4.5:1), \
+type (font stack, base size, heading and small sizes), spacing scale, radius and shadow, component look \
+(buttons, inputs, list rows, checkbox, hover, `:focus-visible` ring, done and disabled states), the empty-state copy, \
+and responsive layout (max width, phone breakpoint, tap targets of 44px). Accessibility rules: \
+`<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">`, a `<label>` or `aria-label` on every input \
+and checkbox (also ones made in script), `aria-label` on icon-only buttons, a visible focus ring, \
+`prefers-reduced-motion` respected. Robustness: storage and JSON parsing wrapped in try/catch. \
+Every `done` repeats the quality bars that apply to that agent's files. Use \"\" when nothing is shown in a browser.\n";
+
+/// Fixed quality bars every agent of a plan with a design spec is held to; the free checks
+/// test the first three.
+pub const QUALITY_BARS: &str = "Quality bars: every HTML page has the viewport meta tag and links its stylesheet; \
+every input, checkbox and icon-only button has a label or aria-label, including ones created in script; \
+focus is visible (`:focus-visible`); layout works at 360px wide; storage and JSON parsing never throw uncaught.\n";
+
 /// The short planning brief. `entries` lists stored Dictionary entries, one per item, already
 /// formatted; they are given in full here, so the master needs no tools at all.
 /// How a plan may split a page into work units, given the run's `slots` parallel workers.
@@ -60,11 +78,12 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
          `contracts` are shared source files, only for interfaces used by more than one file or worker; otherwise `[]`. \
          Each page or unit is one agent: `brief` is its whole task in a few lines, `done` one line saying when it is finished. \
          Keep contracts short. Leave `estimate` at zero.\n\
-         {\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\",\"done\":\"...\"}],\
+         {\"design\":\"...\",\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\",\"done\":\"...\"}],\
          \"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n\
          Rules: at least one page; ids use letters, digits, `_` and `-`; globs and contract paths are relative, no `..`; \
          cited keys are listed above or in `dictionary`; briefs are non-empty.\n",
     );
+    brief.push_str(DESIGN_RULE);
     brief.push_str(&units_rule(slots));
     if slots >= 2 {
         brief.push_str(
@@ -95,7 +114,8 @@ mod tests {
         assert!(brief.contains("Dictionary is empty"));
         assert!(brief.contains("Do not call any tools"));
         assert!(!brief.contains("Search the Dictionary"));
-        assert!(brief.len() < 1700, "{}", brief.len());
+        assert!(brief.len() < 2900, "{}", brief.len());
+        assert!(brief.contains("`design`") && brief.contains("viewport"));
         let listed = small_brief("tiny todo", &["- `todo-dom` (commons, component_api): ids\nul#todo-list\n".into()], "", 3);
         assert!(!listed.contains("Dictionary is empty"));
         assert!(listed.contains("`todo-dom`"));

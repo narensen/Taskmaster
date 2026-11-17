@@ -557,6 +557,7 @@ mod tests {
             contracts: vec![],
             pages: vec![page("book", "app/books/**"), page("cart", "app/cart/**")],
             estimate: Estimate { tokens: 0, usd: 0.0 },
+            design: String::new(),
         })
         .unwrap()
     }

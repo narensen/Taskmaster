@@ -55,6 +55,7 @@ pub(crate) fn test_plan(pages: &[(&str, &str)]) -> Plan {
             })
             .collect(),
         estimate: Estimate { tokens: 0, usd: 0.0 },
+        design: String::new(),
     }
 }
 

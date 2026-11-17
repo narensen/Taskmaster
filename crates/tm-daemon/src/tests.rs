@@ -326,6 +326,7 @@ fn plan(pages: &[(&str, &[&str])]) -> Plan {
             })
             .collect(),
         estimate: Estimate { tokens: 10, usd: 0.01 },
+        design: String::new(),
     }
 }
 

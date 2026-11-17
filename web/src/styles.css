@@ -1,35 +1,36 @@
-/* Taskmaster design system: "bronze and stone".
-   Warm stone surfaces and bone ink (paper and ink in the light theme), taken from the
-   marble-and-bronze of the Taskmaster bust. One signature colour, verdigris, the patina on
-   old bronze, used sparingly: focus, live work, the current selection. Status colours keep
-   their own lanes (laurel green, brick red, ochre) so live never reads as done. Flat fills
-   and hairline rules; no glows, washes or gradients. Inter for chrome, a mono for code.
-   Scale: 4px spacing, 11/12/13/14/16/20/24/30 type, 6/8/12/16 radius, three elevations. */
+/* Taskmaster design system.
+   Dark is near-black graphite. Light is paper and ink, and its tokens stay as they are.
+   One signature colour in each theme, used sparingly for focus, live work and selection:
+   rhodochrosite on graphite, verdigris on paper. Status colours keep their own lanes
+   (laurel green, brick red, ochre) so live never reads as done. Flat fills and hairline
+   rules, a crisp focus ring, and no accent halo on dark cards. Inter for chrome, a mono
+   for code. Scale: 4px spacing, 11/12/13/14/16/20/24/30 type, 6/8/12/16 radius, three
+   elevations. No blue anywhere. */
 
 :root {
-  --bg: #0f0f0e;
-  --bg-side: #121211;
-  --bg-elev: #171715;
-  --bg-elev-2: #1d1c1a;
-  --bg-sunken: #0c0c0b;
-  --bg-hover: #1f1e1b;
-  --bg-active: #282723;
-  --ink: #ece8df;
-  --ink-2: #c8c3b7;
-  --muted: #9a9488;
-  --faint: #fff4e014;
-  --line: #fff4e010;
-  --line-strong: #fff4e01f;
-  --rule: #fff4e014;
+  --bg: #09090a;
+  --bg-side: #0c0c0d;
+  --bg-elev: #131315;
+  --bg-elev-2: #19191c;
+  --bg-sunken: #0b0b0c;
+  --bg-hover: #1a1a1d;
+  --bg-active: #232327;
+  --ink: #ededf0;
+  --ink-2: #c4c4cb;
+  --muted: #8e8e98;
+  --faint: #ffffff12;
+  --line: #ffffff0e;
+  --line-strong: #ffffff1c;
+  --rule: #ffffff12;
   --paper: var(--bg);
   --soft: var(--bg-elev);
-  --link: #e2ddd2;
-  --accent: #5cbcb0;
-  --accent-ink: #04201d;
+  --link: #dcdce2;
+  --accent: #e0a0b4;
+  --accent-ink: #35141f;
   --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
   --accent-line: color-mix(in srgb, var(--accent) 38%, transparent);
   --accent-glow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--accent);
-  --tint: #fff4e009;
+  --tint: #ffffff08;
   --good: #86cf78;
   --bad: #f06b62;
   --ask: #e3b955;
@@ -1338,7 +1339,7 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
 }
 .page-pill .dot { box-shadow: none; }
 .review-card { flex-direction: column; gap: 12px; }
-.review-card.is-running { border-color: var(--accent-line); }
+.theme-light .review-card.is-running { border-color: var(--accent-line); }
 .review-card-head { display: flex; align-items: center; gap: 12px; width: 100%; flex-wrap: wrap; }
 .review-ico {
   flex: none;
@@ -1377,7 +1378,7 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
 }
 .agent.state-waiting { border-style: dashed; background: var(--tint); box-shadow: none; }
 .agent.state-waiting .agent-head { opacity: 0.75; }
-.agent.state-working { border-color: var(--accent-line); box-shadow: inset 2px 0 0 var(--accent), var(--shadow-2); }
+.theme-light .agent.state-working { border-color: var(--accent-line); box-shadow: inset 2px 0 0 var(--accent), var(--shadow-2); }
 .agent.state-failed { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
 .agent.compact { max-height: none; }
 .agent.compact .agent-head { border-bottom: 0; padding: 10px 14px; opacity: 1; }
@@ -1385,7 +1386,8 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
 .agent.compact .agent-facts, .agent.compact .meter, .agent.compact .transcript, .agent.compact .attempts { display: none; }
 .agent.compact .agent-state { visibility: hidden; position: relative; }
 .agent.compact .agent-state::after { content: "on demand"; visibility: visible; position: absolute; inset: 0; display: grid; place-items: center; text-transform: none; }
-.agent.focused { outline: none; box-shadow: var(--accent-glow); border-color: var(--line-strong); }
+.agent.focused { outline: none; border-color: var(--line-strong); }
+.theme-light .agent.focused { box-shadow: var(--accent-glow); border-color: var(--line-strong); }
 .agent-head { padding: 12px 14px 10px; border-bottom: 1px solid var(--line); }
 .agent-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .agent-avatar {
@@ -2238,7 +2240,7 @@ mark.current { outline: 1px solid var(--ask); }
   color: var(--bg);
 }
 .code-view tr.hl td { background: var(--accent-soft); }
-.tok-kw { color: #7fcbc0; font-weight: 500; }
+.tok-kw { color: var(--accent); font-weight: 500; }
 .tok-str { color: #d9bd84; }
 .tok-com { color: #8a8478; font-style: italic; }
 .tok-num { color: #e59c80; }
@@ -2443,7 +2445,7 @@ mark.current { outline: 1px solid var(--ask); }
 
 /* Scrollbars */
 
-* { scrollbar-width: thin; scrollbar-color: #fff4e024 transparent; }
+* { scrollbar-width: thin; scrollbar-color: #ffffff22 transparent; }
 .theme-light * { scrollbar-color: #2a200e26 transparent; }
 
 /* Phone */

@@ -331,7 +331,7 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Theme" note="Dark is the default. A verdigris accent marks focus and live work; the stone stays neutral.">
+      <Section title="Theme" note="Dark is the default. A rhodochrosite accent marks focus and live work on graphite; light keeps verdigris.">
         <div className="seg" role="radiogroup" aria-label="Theme">
           {(["dark", "light"] as const).map((t) => (
             <button key={t} role="radio" aria-checked={p.theme === t} className={p.theme === t ? "on" : ""} onClick={() => setPrefs({ theme: t })}>

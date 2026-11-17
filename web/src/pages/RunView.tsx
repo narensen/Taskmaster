@@ -9,7 +9,7 @@ import { CircleCheck, CircleX, Coins, GitBranch, GitCompare, GitMerge, Loader2, 
 import { api, type ReviewJob, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
-import { isUnpriced, pageTone, phaseLabel, phaseTone, spendLabel, tokens, usd } from "../format";
+import { isUnpriced, pageTone, phaseLabel, spendLabel, tokens, usd } from "../format";
 import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
@@ -95,7 +95,7 @@ function ReviewCard({ id }: { id: string }) {
           <>
             <span className="sr-only" data-testid="review-running">Review in progress…</span>
             <span className="badge busy" aria-hidden>
-              <Dot tone="busy" /> Reviewing
+              Reviewing
             </span>
             <button className="ghost small" data-testid="review-cancel" onClick={() => void api.cancelReview(job.id).then(() => load(job.id))}>
               Cancel review
@@ -517,7 +517,6 @@ export function RunView({ id }: { id: string }) {
             <div className="run-title">
               <h1 className="break">{id}</h1>
               <span className={`phase phase-${phase}`}>
-                <Dot tone={detail.cancelled ? "quiet" : detail.active && phase !== "awaiting_approval" ? "busy" : phaseTone(detail.phase)} />
                 {phaseLabel(detail)}
               </span>
             </div>

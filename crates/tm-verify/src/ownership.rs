@@ -50,6 +50,7 @@ pub(crate) fn test_plan(pages: &[(&str, &str)]) -> Plan {
                 owned_glob: glob.to_string(),
                 cites: vec![],
                 brief: String::new(),
+                units: vec![],
             })
             .collect(),
         estimate: Estimate { tokens: 0, usd: 0.0 },

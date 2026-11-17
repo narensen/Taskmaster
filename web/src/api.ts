@@ -53,6 +53,7 @@ export interface PagePlan {
   owned_glob: string;
   cites: string[];
   brief: string;
+  units?: { id: string; owned_glob: string; brief: string }[];
 }
 
 export interface Plan {

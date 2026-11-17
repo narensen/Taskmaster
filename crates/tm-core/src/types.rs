@@ -68,6 +68,90 @@ pub struct PagePlan {
     pub owned_glob: String,
     pub cites: Vec<DictKey>,
     pub brief: String,
+    /// Optional split of this page into parallel work units with disjoint files. Empty
+    /// means one worker owns the whole page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<WorkUnit>,
+}
+
+/// One worker's share of a page: a disjoint set of files and what to build in them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkUnit {
+    pub id: String,
+    /// Files this unit may change. Braces list several: `{app/index.html,app/styles.css}`.
+    pub owned_glob: String,
+    pub brief: String,
+}
+
+/// The most units a page is split into.
+pub const MAX_UNITS: usize = 4;
+
+impl PagePlan {
+    /// The units to run. The declared split when it is safe (2 to [`MAX_UNITS`] units, unique
+    /// ids, no overlapping files); otherwise a single unit owning the whole page.
+    pub fn work_units(&self) -> Vec<WorkUnit> {
+        if units_disjoint(&self.units) {
+            return self.units.clone();
+        }
+        vec![WorkUnit { id: self.id.clone(), owned_glob: self.owned_glob.clone(), brief: self.brief.clone() }]
+    }
+}
+
+/// Whether a declared split can be trusted: 2..=MAX_UNITS units, valid unique ids, relative
+/// globs, and no two units whose globs could match the same file.
+pub fn units_disjoint(units: &[WorkUnit]) -> bool {
+    if units.len() < 2 || units.len() > MAX_UNITS {
+        return false;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if !units.iter().all(|u| valid_key(&u.id) && ids.insert(u.id.as_str()) && !u.owned_glob.trim().is_empty() && !u.brief.trim().is_empty()) {
+        return false;
+    }
+    let alts: Vec<Vec<String>> = units.iter().map(|u| glob_alternatives(&u.owned_glob)).collect();
+    if alts.iter().flatten().any(|g| g.starts_with('/') || g.split('/').any(|c| c == "..")) {
+        return false;
+    }
+    for (i, a) in alts.iter().enumerate() {
+        for b in &alts[i + 1..] {
+            if a.iter().any(|x| b.iter().any(|y| globs_may_overlap(x, y))) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Split one top-level `{a,b}` group into its alternatives; any other glob is its own.
+fn glob_alternatives(glob: &str) -> Vec<String> {
+    let glob = glob.trim();
+    if let Some(inner) = glob.strip_prefix('{').and_then(|g| g.strip_suffix('}'))
+        && !inner.contains(['{', '}'])
+    {
+        return inner.split(',').map(|g| g.trim().to_string()).collect();
+    }
+    vec![glob.to_string()]
+}
+
+/// Conservative: true unless the two globs are provably disjoint by literal prefix, or by
+/// being two different literal paths.
+fn globs_may_overlap(a: &str, b: &str) -> bool {
+    let meta = |g: &str| g.find(['*', '?', '[', '{']);
+    match (meta(a), meta(b)) {
+        (None, None) => a == b,
+        (None, Some(_)) => !literal_cannot_match(a, b),
+        (Some(_), None) => !literal_cannot_match(b, a),
+        (Some(i), Some(j)) => {
+            let (pa, pb) = (&a[..i], &b[..j]);
+            pa.starts_with(pb) || pb.starts_with(pa)
+        }
+    }
+}
+
+/// A literal path against a glob: only a prefix mismatch is treated as proof.
+fn literal_cannot_match(path: &str, glob: &str) -> bool {
+    let at = glob.find(['*', '?', '[', '{']).unwrap_or(glob.len());
+    let prefix = &glob[..at];
+    !(path.starts_with(prefix) || prefix.starts_with(path))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,4 +240,53 @@ pub struct ChangeEntry {
     /// Dictionary keys the change touches or depends on.
     pub keys: Vec<DictKey>,
     pub summary: String,
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn unit(id: &str, glob: &str) -> WorkUnit {
+        WorkUnit { id: id.into(), owned_glob: glob.into(), brief: "x".into() }
+    }
+
+    fn page(units: Vec<WorkUnit>) -> PagePlan {
+        PagePlan {
+            id: "todo".into(),
+            route: "/".into(),
+            owned_glob: "{app/**,README.md}".into(),
+            cites: vec![],
+            brief: "b".into(),
+            units,
+        }
+    }
+
+    #[test]
+    fn disjoint_units_are_kept() {
+        let units = vec![unit("ui", "{app/index.html,app/styles.css}"), unit("js", "app/main.js"), unit("docs", "README.md")];
+        assert_eq!(page(units.clone()).work_units(), units);
+    }
+
+    #[test]
+    fn overlapping_units_fall_back_to_one() {
+        for units in [
+            vec![unit("a", "app/**"), unit("b", "app/main.js")],
+            vec![unit("a", "app/**"), unit("b", "app/x/**")],
+            vec![unit("a", "app/main.js"), unit("b", "{app/main.js,README.md}")],
+        ] {
+            let got = page(units).work_units();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].owned_glob, "{app/**,README.md}");
+        }
+    }
+
+    #[test]
+    fn bad_splits_fall_back_to_one() {
+        assert_eq!(page(vec![]).work_units().len(), 1);
+        assert_eq!(page(vec![unit("a", "app/a.js")]).work_units().len(), 1);
+        assert_eq!(page(vec![unit("a", "a.js"), unit("a", "b.js")]).work_units().len(), 1);
+        assert_eq!(page(vec![unit("a", "a.js"), unit("b", "../b.js")]).work_units().len(), 1);
+        let five: Vec<_> = (0..5).map(|i| unit(&format!("u{i}"), &format!("f{i}.js"))).collect();
+        assert_eq!(page(five).work_units().len(), 1);
+    }
 }

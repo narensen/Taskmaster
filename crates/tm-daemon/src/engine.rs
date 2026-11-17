@@ -163,7 +163,11 @@ struct Driver {
     changes: Vec<ChangeEntry>,
     pending: VecDeque<Command>,
     running: Vec<Command>,
-    jobs: JoinSet<(PageId, anyhow::Result<Product>)>,
+    jobs: JoinSet<(PageId, usize, anyhow::Result<Product>)>,
+    /// Finished units of pages that still have units running.
+    batches: HashMap<PageId, Vec<(usize, Product)>>,
+    /// Caps concurrent worker calls at `parallel`, counting every unit of every page.
+    slots: Arc<Semaphore>,
     harnesses: Harnesses,
     url: String,
     mcp: Arc<McpState>,
@@ -270,6 +274,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         pending: VecDeque::from(pending),
         running: Vec::new(),
         jobs: JoinSet::new(),
+        batches: HashMap::new(),
+        slots: Arc::new(Semaphore::new(parallel)),
         harnesses,
         url,
         mcp,
@@ -382,7 +388,7 @@ impl Driver {
             if self.small_pass(prompt) {
                 request.dictionary = None;
             }
-            self.tag(&mut request, "master", "planner", None);
+            self.tag(&mut request, "master", "planner", None, None);
             let bill = request.bill(Role::Planner, None);
             let asked = ask(request).await;
             if scratch {
@@ -496,7 +502,7 @@ impl Driver {
              \nRules: at least one page; page ids use letters, digits, `_` and `-`; \
              owned_glob and contract paths are relative and do not contain `..`; \
              every cited key is an existing entry or one of the dictionary items; \
-             briefs and contents are non-empty.\n",
+             briefs and contents are non-empty. Optionally give a page `units`: 2-4 work units, each {\"id\",\"owned_glob\",\"brief\"}, built by parallel workers. Split by file or concern (for example markup+styles, scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and inside the page glob (braces list files: `{app/index.html,app/styles.css}`); the page owned_glob must cover them all. Omit `units` when splitting is unsafe.\n",
         );
         if !errors.is_empty() {
             brief.push_str("\nThe last plan was rejected:\n");
@@ -643,60 +649,83 @@ impl Driver {
             self.push_event(Event::PageFresh { page })?;
             return Ok(());
         }
-        let created = self.fresh_worktree(&format!("page-{page}"));
-        let worktree = match created {
-            Ok(path) => path,
-            Err(err) => {
-                self.pending.push_front(Command::SpawnWorker { page, tier, errors });
-                let _ = self.persist();
-                return Err(err);
+        let units = self.page(&page)?.work_units();
+        let mut prepared: Vec<(AgentRequest, PathBuf)> = Vec::new();
+        let mut failure = None;
+        for (index, unit) in units.iter().enumerate() {
+            let label = if units.len() == 1 { format!("page-{page}") } else { format!("page-{page}-{}", unit.id) };
+            let step = self.fresh_worktree(&label).and_then(|worktree| {
+                let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
+                if built.is_err() {
+                    self.drop_worktree(&worktree);
+                }
+                built.map(|request| (request, worktree))
+            });
+            match step {
+                Ok(done) => prepared.push(done),
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
             }
-        };
-        let built = {
-            let text = errors.as_deref();
-            self.worker_request(&page, tier, text, worktree.clone())
-        };
-        let mut request = match built {
-            Ok(request) => request,
-            Err(err) => {
-                self.pending.push_front(Command::SpawnWorker { page, tier, errors });
-                let _ = self.persist();
-                return Err(err);
+        }
+        if let Some(err) = failure {
+            for (_, worktree) in &prepared {
+                self.drop_worktree(worktree);
             }
-        };
-        eprintln!("taskmaster: building {page} ({})", tier_name(tier));
-        self.tag(&mut request, &format!("page:{page}"), tier_name(tier), Some(&page));
+            self.pending.push_front(Command::SpawnWorker { page, tier, errors });
+            let _ = self.persist();
+            return Err(err);
+        }
+        if units.len() == 1 {
+            eprintln!("taskmaster: building {page} ({})", tier_name(tier));
+        } else {
+            eprintln!("taskmaster: building {page} ({} workers, {})", units.len(), tier_name(tier));
+        }
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
-        let bill = request.bill(Role::builder(tier), Some(&page));
-        self.jobs.spawn(async move {
-            let result = ask(request).await.map(|answer| Product { answer, bill, worktree });
-            (page, result)
-        });
+        self.batches.remove(&page);
+        for (index, (mut request, worktree)) in prepared.into_iter().enumerate() {
+            self.tag(&mut request, &format!("page:{page}"), tier_name(tier), Some(&page), Some(&units[index].owned_glob));
+            let bill = request.bill(Role::builder(tier), Some(&page));
+            let (page, slots) = (page.clone(), self.slots.clone());
+            self.jobs.spawn(async move {
+                let _permit = slots.acquire_owned().await.ok();
+                let result = ask(request).await.map(|answer| Product { answer, bill, worktree });
+                (page, index, result)
+            });
+        }
         self.persist()?;
         Ok(())
     }
 
     async fn join_one(&mut self) -> anyhow::Result<()> {
-        let (page, result) = self
+        let (page, index, result) = self
             .jobs
             .join_next()
             .await
             .context("a worker disappeared")?
             .context("a worker task panicked")?;
-        let cmd = self.take_running(&page);
         let product = match result {
             Ok(product) => product,
             Err(err) => {
-                if let Some(cmd) = cmd {
-                    self.running.push(cmd);
-                }
                 self.persist()?;
                 return Err(err);
             }
         };
         self.charge(&product.bill, &product.answer)?;
+        let wanted = self.page(&page).map(|p| p.work_units().len()).unwrap_or(1);
+        let batch = self.batches.entry(page.clone()).or_default();
+        batch.push((index, product));
+        if batch.len() < wanted {
+            return Ok(());
+        }
+        let mut products = self.batches.remove(&page).unwrap_or_default();
+        products.sort_by_key(|(index, _)| *index);
+        let cmd = self.take_running(&page);
         if self.is_stale(&page) {
-            self.drop_worktree(&product.worktree);
+            for (_, product) in &products {
+                self.drop_worktree(&product.worktree);
+            }
             self.records.clear_merged(&self.id, &page);
             eprintln!("taskmaster: {page} was built against an amended entry; discarding it");
             self.push_event(Event::WorkerFinished { page, outcome: WorkerOutcome::Passed })?;
@@ -706,8 +735,8 @@ impl Driver {
             Some(Command::SpawnWorker { tier, errors, .. }) => (*tier, errors.clone()),
             _ => (Tier::Worker, None),
         };
-        let text = product.answer.text.clone();
-        let outcome = match self.judge(&page, tier, &errors, product) {
+        let text = products.iter().map(|(_, p)| p.answer.text.as_str()).collect::<Vec<_>>().join("\n");
+        let outcome = match self.judge(&page, tier, &errors, products) {
             Ok(outcome) => outcome,
             Err(err) => {
                 if let Some(cmd) = cmd {
@@ -737,12 +766,16 @@ impl Driver {
         Ok(())
     }
 
-    fn judge(&mut self, page: &str, tier: Tier, errors: &Option<String>, product: Product) -> anyhow::Result<WorkerOutcome> {
-        let outcome = self.judge_inner(page, tier, errors, &product);
+    fn judge(&mut self, page: &str, tier: Tier, errors: &Option<String>, products: Vec<(usize, Product)>) -> anyhow::Result<WorkerOutcome> {
+        let outcome = self.judge_inner(page, tier, errors, &products);
         if let Ok(outcome) = &outcome {
-            self.note_attempt(page, tier, errors.as_deref(), &product, outcome);
+            for (_, product) in &products {
+                self.note_attempt(page, tier, errors.as_deref(), product, outcome);
+            }
         }
-        self.drop_worktree(&product.worktree);
+        for (_, product) in &products {
+            self.drop_worktree(&product.worktree);
+        }
         outcome
     }
 
@@ -780,37 +813,60 @@ impl Driver {
         page: &str,
         tier: Tier,
         errors: &Option<String>,
-        product: &Product,
+        products: &[(usize, Product)],
     ) -> anyhow::Result<WorkerOutcome> {
-        if let Some((key, issue)) = reply::parse_flag(&product.answer.text) {
-            return Ok(WorkerOutcome::Flagged(Flag { page: page.to_string(), key, issue }));
-        }
-        let changes = git::worktree_changes(&product.worktree)?;
-        for change in &changes {
-            if !git::safe_rel(&change.path) {
-                return Ok(failed(format!("refusing to merge `{}`", change.path)));
-            }
-            if change.status != 'D' {
-                let src = product.worktree.join(&change.path);
-                let meta = fs::symlink_metadata(&src).with_context(|| format!("cannot read {}", change.path))?;
-                if meta.file_type().is_symlink() {
-                    return Ok(failed(format!("refusing to merge symlink `{}`", change.path)));
-                }
+        for (_, product) in products {
+            if let Some((key, issue)) = reply::parse_flag(&product.answer.text) {
+                return Ok(WorkerOutcome::Flagged(Flag { page: page.to_string(), key, issue }));
             }
         }
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
-        let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
-        let outside = outside_owned(&owners, page, &paths);
-        if !outside.is_empty() {
-            let glob = self.page(page)?.owned_glob.clone();
-            return Ok(failed(format!(
-                "these files are outside `{glob}` and were not merged: {}",
-                outside.join(", ")
-            )));
+        let units = self.page(page)?.work_units();
+        let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (index, product) in products {
+            let changes = git::worktree_changes(&product.worktree)?;
+            for change in &changes {
+                if !git::safe_rel(&change.path) {
+                    return Ok(failed(format!("refusing to merge `{}`", change.path)));
+                }
+                if change.status != 'D' {
+                    let src = product.worktree.join(&change.path);
+                    let meta = fs::symlink_metadata(&src).with_context(|| format!("cannot read {}", change.path))?;
+                    if meta.file_type().is_symlink() {
+                        return Ok(failed(format!("refusing to merge symlink `{}`", change.path)));
+                    }
+                }
+            }
+            let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+            let mut outside: Vec<&str> = outside_owned(&owners, page, &paths);
+            let unit_glob = units.get(*index).map(|u| u.owned_glob.clone()).unwrap_or_default();
+            if units.len() > 1 {
+                let matcher = globset::Glob::new(&unit_glob)
+                    .with_context(|| format!("unit glob `{unit_glob}` is invalid"))?
+                    .compile_matcher();
+                outside.extend(paths.iter().filter(|p| !matcher.is_match(p.as_str())).map(String::as_str));
+                outside.sort_unstable();
+                outside.dedup();
+            }
+            if !outside.is_empty() {
+                let glob = if units.len() > 1 { unit_glob } else { self.page(page)?.owned_glob.clone() };
+                return Ok(failed(format!(
+                    "these files are outside `{glob}` and were not merged: {}",
+                    outside.join(", ")
+                )));
+            }
+            for change in changes {
+                if !seen.insert(change.path.clone()) {
+                    return Ok(failed(format!("`{}` was changed by two parallel workers and was not merged", change.path)));
+                }
+                all.push((product.worktree.clone(), change));
+            }
         }
-        if changes.is_empty() {
-            let why = if product.answer.ok {
+        if all.is_empty() {
+            let ok = products.iter().any(|(_, p)| p.answer.ok);
+            let why = if ok {
                 "worker produced no changes under its owned files"
             } else {
                 "harness failed and produced no changes"
@@ -818,7 +874,7 @@ impl Driver {
             return Ok(failed(why));
         }
         let mut files = Vec::new();
-        for change in &changes {
+        for (worktree, change) in &all {
             let dest = self.tree.join(&change.path);
             if change.status == 'D' {
                 if dest.is_file() {
@@ -828,7 +884,7 @@ impl Driver {
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::copy(product.worktree.join(&change.path), &dest)
+                fs::copy(worktree.join(&change.path), &dest)
                     .with_context(|| format!("cannot copy {}", change.path))?;
             }
             files.push(change.path.clone());
@@ -929,7 +985,7 @@ impl Driver {
             self.config.models.master.clone(),
             &self.master_token.clone(),
         )?;
-        self.tag(&mut request, "master", "arbiter", Some(&flag.page));
+        self.tag(&mut request, "master", "arbiter", Some(&flag.page), None);
         let bill = request.bill(Role::Arbiter, Some(&flag.page));
         let asked = ask(request).await;
         self.drop_worktree(&worktree);
@@ -982,7 +1038,7 @@ impl Driver {
                 self.config.models.reviewer.clone(),
                 &self.reviewer_token.clone(),
             )?;
-            self.tag(&mut request, "reviewer", "reviewer", None);
+            self.tag(&mut request, "reviewer", "reviewer", None, None);
             let permit = sem.clone();
             let bill = request.bill(Role::Reviewer, None);
             set.spawn(async move {
@@ -999,7 +1055,7 @@ impl Driver {
                 self.config.models.reviewer.clone(),
                 &self.reviewer_token.clone(),
             )?;
-            self.tag(&mut request, "reviewer", "security", None);
+            self.tag(&mut request, "reviewer", "security", None, None);
             let permit = sem.clone();
             let bill = request.bill(Role::Security, None);
             set.spawn(async move {
@@ -1041,7 +1097,7 @@ impl Driver {
                 self.config.models.verifier.clone(),
                 &self.verifier_token.clone(),
             )?;
-            self.tag(&mut request, "verifier", "verifier", Some(&finding.page));
+            self.tag(&mut request, "verifier", "verifier", Some(&finding.page), None);
             let permit = sem.clone();
             let bill = request.bill(Role::Verifier, Some(&finding.page));
             set.spawn(async move {
@@ -1326,7 +1382,7 @@ impl Driver {
             read_only: false,
             feed: None,
         };
-        self.tag(&mut request, "master", "master", None);
+        self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
         let asked = ask(request).await;
         let merged = match asked {
@@ -1464,13 +1520,13 @@ impl Driver {
         Ok(Some(text))
     }
 
-    fn worker_request(&mut self, page: &str, tier: Tier, errors: Option<&str>, cwd: PathBuf) -> anyhow::Result<AgentRequest> {
+    fn worker_request(&mut self, page: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, cwd: PathBuf) -> anyhow::Result<AgentRequest> {
         // A note queued to this page is fix text: it rides on the next repair, and only
         // then. A note to every worker goes into each brief.
         let target = format!("page:{page}");
         let wanted: Vec<&str> = if errors.is_some() { vec![target.as_str(), "workers"] } else { vec!["workers"] };
         let notes = self.live.take_notes(&self.id, &wanted);
-        let brief = self.with_notes(self.worker_brief(page, tier, errors)?, &notes);
+        let brief = self.with_notes(self.worker_brief(page, unit, units, tier, errors)?, &notes);
         let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
         Ok(AgentRequest {
             harness: self.harness_for(tier),
@@ -1484,7 +1540,7 @@ impl Driver {
         })
     }
 
-    fn worker_brief(&self, page_id: &str, tier: Tier, errors: Option<&str>) -> anyhow::Result<String> {
+    fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>) -> anyhow::Result<String> {
         let page = self.page(page_id)?.clone();
         let contracts: Vec<String> = self.plan()?.contracts.iter().map(|c| c.path.clone()).collect();
         let cites = if page.cites.is_empty() { "none".to_string() } else { page.cites.join(", ") };
@@ -1493,6 +1549,7 @@ impl Driver {
         } else {
             contracts.iter().map(|path| format!("- `{path}`\n")).collect()
         };
+        let split = if units > 1 { page.work_units().get(unit).cloned() } else { None };
         let mut brief = format!(
             "Build page `{id}` for route `{route}`.\n\
              You may create or edit only files matching `{glob}`. Files outside it are discarded and the page fails its check.\n\
@@ -1502,9 +1559,19 @@ impl Driver {
              If a Dictionary entry is wrong, stop and reply with {{\"flag\":{{\"key\":\"...\",\"issue\":\"...\"}}}} and do not edit other pages.\n",
             id = page.id,
             route = page.route,
-            glob = page.owned_glob,
+            glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
             body = page.brief,
         );
+        if let Some(mine) = &split {
+            brief.push_str(&format!(
+                "\nThis page is split across {units} parallel workers who each own different files. You are unit `{}`: build only {}. {}\n",
+                mine.id, mine.owned_glob, mine.brief
+            ));
+            for other in page.work_units().iter().filter(|u| u.id != mine.id) {
+                brief.push_str(&format!("Unit `{}` (another worker) owns `{}`: {}\n", other.id, other.owned_glob, other.brief));
+            }
+            brief.push_str("Rely only on the locked contracts and Dictionary entries to line up with them; do not write their files.\n");
+        }
         if let Some(errors) = errors {
             brief.push_str("\nChecks failed last time. Fix these and leave every other page alone:\n");
             brief.push_str(errors);
@@ -1629,8 +1696,8 @@ impl Driver {
     }
 
     /// Send this call's events to the run's agent transcript, under `agent`.
-    fn tag(&self, request: &mut AgentRequest, agent: &str, role: &str, page: Option<&str>) {
-        let owned_glob = page.and_then(|id| self.page(id).ok()).map(|page| page.owned_glob.clone());
+    fn tag(&self, request: &mut AgentRequest, agent: &str, role: &str, page: Option<&str>, glob: Option<&str>) {
+        let owned_glob = glob.map(str::to_string).or_else(|| page.and_then(|id| self.page(id).ok()).map(|page| page.owned_glob.clone()));
         let tag = serde_json::json!({
             "id": agent,
             "role": role,

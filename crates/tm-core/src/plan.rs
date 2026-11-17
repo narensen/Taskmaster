@@ -160,6 +160,7 @@ mod tests {
                 owned_glob: "app/home/**".into(),
                 cites: cites.iter().map(|cite| (*cite).to_string()).collect(),
                 brief: "Implement home.".into(),
+                units: vec![],
             }],
             estimate: Estimate { tokens: 1, usd: 0.0 },
         }
@@ -188,6 +189,7 @@ mod tests {
             owned_glob: "../secret/**".into(),
             cites: vec!["../x".into(), "theme".into(), "theme".into()],
             brief: "  ".into(),
+            units: vec![],
         });
         broken.contracts.push(ContractFile { path: "contracts/types.ts".into(), content: " \n".into() });
         broken.estimate.usd = -1.0;

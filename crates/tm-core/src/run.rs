@@ -394,6 +394,7 @@ mod tests {
                     owned_glob: format!("app/{id}/**"),
                     cites: cites.iter().map(|c| c.to_string()).collect(),
                     brief: String::new(),
+                    units: vec![],
                 })
                 .collect(),
             estimate: Estimate { tokens: 0, usd: 0.0 },

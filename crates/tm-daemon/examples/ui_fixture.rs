@@ -53,7 +53,7 @@ async fn tool(events: &mpsc::Sender<HarnessEvent>, name: &str, input: serde_json
 const PLAN: &str = r##"{"contracts":[{"path":"contracts/types.ts","content":"export type Book = { id: string; title: string; price: number };\n"}],
 "pages":[
  {"id":"home","route":"/","owned_glob":"app/home/**","cites":["shop-theme"],"brief":"The front page: a hero and three featured books."},
- {"id":"books","route":"/books","owned_glob":"app/books/**","cites":["shop-theme"],"brief":"A searchable list of books."},
+ {"id":"books","route":"/books","owned_glob":"app/books/**","cites":["shop-theme"],"brief":"A searchable list of books.","units":[{"id":"list","owned_glob":"app/books/page.tsx","brief":"The list component."},{"id":"styles","owned_glob":"app/books/styles.css","brief":"Its styles."}]},
  {"id":"cart","route":"/cart","owned_glob":"app/cart/**","cites":["shop-theme"],"brief":"The cart with a total and a checkout button."}],
 "estimate":{"tokens":0,"usd":0},
 "dictionary":[{"key":"shop-theme","kind":"hint","summary":"black and white theme","content":"export const theme = { ink: \"#000\", paper: \"#fff\" };\n","stack":"next"}]}"##;
@@ -85,7 +85,7 @@ impl Harness for Scripted {
                 say(&events, text(chunk)).await;
             }
             let plan = if ASK_FLAG.iter().any(|f| std::fs::remove_file(f).is_ok()) {
-                PLAN.replace(r#"{"id":"books","route":"/books","owned_glob":"app/books/**""#, r#"{"id":"shelf","route":"/shelf","owned_glob":"app/shelf/**""#).replace("A searchable list of books.", "A shelf of books (asks the person).")
+                PLAN.replace(r#"{"id":"books","route":"/books","owned_glob":"app/books/**""#, r#"{"id":"shelf","route":"/shelf","owned_glob":"app/shelf/**""#).replace("app/books/", "app/shelf/").replace("A searchable list of books.", "A shelf of books (asks the person).")
             } else {
                 PLAN.to_string()
             };
@@ -98,7 +98,7 @@ impl Harness for Scripted {
             tool(&events, "Read", json!({ "file_path": "contracts/types.ts" }), true).await;
             tool(&events, "Bash", json!({ "command": "npm test" }), false).await;
             // A page whose brief says it asks the person waits on two risky calls (see the plan).
-            if brief.contains("(asks the person)") {
+            if brief.contains("(asks the person)") && !brief.contains("You are unit `styles`") {
                 let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("npm install left-pad".into()) };
                 let outside = PermissionRequest { tool: "Write".into(), kind: ToolKind::Edit, paths: vec!["/etc/hosts".into()], command: None };
                 for request in [shell, outside] {
@@ -107,10 +107,11 @@ impl Harness for Scripted {
                 }
             }
             let first_cart = id == "cart" && self.cart.fetch_add(1, Ordering::SeqCst) == 0;
-            let file = format!("app/{id}/page.tsx");
-            let body = format!(
+            let styles = brief.contains("You are unit `styles`");
+            let file = if styles { format!("app/{id}/styles.css") } else { format!("app/{id}/page.tsx") };
+            let body = if styles { "main { padding: 1rem; }\n".to_string() } else { format!(
                 "import type {{ Book }} from \"../../contracts/types\";\n\nexport default function Page() {{\n  const books: Book[] = [];\n  return <main>{id}: {{books.length}} books</main>;\n}}\n"
-            );
+            ) };
             std::fs::create_dir_all(task.cwd.join(format!("app/{id}")))?;
             std::fs::write(task.cwd.join(&file), body)?;
             tool(&events, "Write", json!({ "file_path": file, "content": "…" }), true).await;

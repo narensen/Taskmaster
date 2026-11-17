@@ -1054,6 +1054,7 @@ mod tests {
                 owned_glob: "app/home/**".into(),
                 cites: vec!["theme".into()],
                 brief: "b".into(),
+                units: vec![],
             }],
             estimate: tm_core::Estimate { tokens: 1000, usd: 0.5 },
         };

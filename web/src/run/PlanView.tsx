@@ -44,7 +44,10 @@ export function PlanView({ plan, arrived, compact, unpriced }: { plan: Plan; arr
           <tbody>
             {plan.pages.map((page) => (
               <tr key={page.id}>
-                <td className="strong">{page.id}</td>
+                <td className="strong">
+                  {page.id}
+                  {(page.units?.length ?? 0) > 1 && <span className="muted"> ({page.units!.length} workers)</span>}
+                </td>
                 <td>{page.route}</td>
                 <td>{page.owned_glob}</td>
                 <td>{page.cites.length ? page.cites.join(", ") : "none"}</td>

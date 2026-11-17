@@ -107,6 +107,7 @@ export function AgentSurface({
   const { harness, model } = byline(s, detail);
   const glob = s.tag?.owned_glob ?? detail?.plan?.pages.find((p) => p.id === s.page)?.owned_glob ?? null;
   const route = detail?.plan?.pages.find((p) => p.id === s.page)?.route;
+  const units = detail?.plan?.pages.find((p) => p.id === s.page)?.units?.length;
   const [showBrief, setShowBrief] = useState(false);
   const on = motionOn();
   return (
@@ -142,6 +143,7 @@ export function AgentSurface({
               <dd>
                 {s.page}
                 {route ? ` ${route}` : ""}
+                {(units ?? 0) > 1 ? ` (${units} workers)` : ""}
               </dd>
             </>
           )}

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
-use tm_core::{
+use tm_core::{WorkUnit, 
     Book, ContractFile, DictTier, EntryKind, EntryStats, Estimate, Event, Mistake, PagePlan, Plan, Run, RunPhase,
     PROMOTE_AT,
 };
@@ -28,6 +28,8 @@ enum Mode {
     /// `Some` waits until that many workers are inside the build at once.
     Parallel(Option<Arc<Barrier>>),
     Cancel(watch::Sender<bool>),
+    /// Page `a` is split in two units that must be inside the build together.
+    Units(Arc<Barrier>),
     Boom,
     /// Every attempt produces no files, so the page fails.
     Nothing,
@@ -143,6 +145,15 @@ impl World {
         self.calls.lock().unwrap().push(brief.clone());
         if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             return Ok(Script::text(&self.plan_reply()));
+        }
+        if let Mode::Units(barrier) = &self.mode
+            && let Some(unit) = brief.split("You are unit `").nth(1).and_then(|rest| rest.split('`').next())
+        {
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_inflight.fetch_max(now, Ordering::SeqCst);
+            barrier.wait().await;
+            let (path, body) = if unit == "markup" { ("app/a/index.html", "<h1>a</h1>\n") } else { ("app/a/main.js", "console.log(1);\n") };
+            return Ok(Script { text: "done".into(), files: vec![(path.into(), Some(body.into()))] });
         }
         if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
             return self.build(id).await;
@@ -301,6 +312,7 @@ fn plan(pages: &[(&str, &[&str])]) -> Plan {
                 owned_glob: format!("app/{id}/**"),
                 cites: cites.iter().map(|c| (*c).to_string()).collect(),
                 brief: format!("Implement {id}."),
+                units: vec![],
             })
             .collect(),
         estimate: Estimate { tokens: 10, usd: 0.01 },
@@ -486,6 +498,23 @@ async fn parallel_workers_overlap_and_a_limit_of_one_does_not() {
     let outcome = run(config(&narrow.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     assert_eq!(world.max_inflight.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
+    let tmp = repo("units");
+    let world = World::new(Mode::Units(Arc::new(Barrier::new(2))));
+    let mut split = plan(&[("a", &[])]);
+    split.pages[0].units = vec![
+        WorkUnit { id: "markup".into(), owned_glob: "app/a/index.html".into(), brief: "The markup.".into() },
+        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into() },
+    ];
+    let outcome = run(config(&tmp.0, split, true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(world.max_inflight.load(Ordering::SeqCst) >= 2);
+    assert!(read(&tmp.0.join("app/a/index.html")).contains("<h1>"));
+    assert!(read(&tmp.0.join("app/a/main.js")).contains("console.log"));
+    assert_eq!(log(&tmp.0).matches("taskmaster: built page a").count(), 1);
 }
 
 #[tokio::test]

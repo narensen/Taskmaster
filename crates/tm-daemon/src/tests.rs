@@ -112,7 +112,7 @@ impl Harness for Fake {
         }
         let _ = events.send(HarnessEvent::Text { text: script.text }).await;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0 })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: Some(tm_harness::Freed { processes: 1, lingering: 0 }) })
     }
 }
 
@@ -157,7 +157,7 @@ impl World {
             self.max_inflight.fetch_max(now, Ordering::SeqCst);
             barrier.wait().await;
             let (path, body) = if unit == "markup" { ("app/a/index.html", "<h1>a</h1>\n") } else { ("app/a/main.js", "console.log(1);\n") };
-            return Ok(Script { text: "done".into(), files: vec![(path.into(), Some(body.into()))] });
+            return Ok(Script { text: format!("done\nRELEASE page:a/{unit}"), files: vec![(path.into(), Some(body.into()))] });
         }
         if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
             if matches!(self.mode, Mode::Stall) && id == "a" && self.a.load(Ordering::SeqCst) == 0 {
@@ -542,6 +542,7 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     assert!(logic.contains("Unit `markup` (another worker) owns `app/a/index.html`.") && !logic.contains("The markup."), "{logic}");
     assert!(logic.contains("None of your files exist yet") && logic.contains("do not list, search or read other files"), "{logic}");
     assert!(!logic.contains("Search the Commons"), "{logic}");
+    assert!(logic.contains("end your reply with the line `RELEASE page:a/logic`"), "{logic}");
     assert!(world.max_inflight.load(Ordering::SeqCst) >= 2);
     assert!(read(&tmp.0.join("app/a/index.html")).contains("<h1>"));
     assert!(read(&tmp.0.join("app/a/main.js")).contains("console.log"));
@@ -558,6 +559,14 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     assert_eq!(ids, ["page:a/logic", "page:a/markup"], "{said}");
     let markup = starts.iter().find(|e| e["agent"]["unit"] == "markup").unwrap();
     assert_eq!(markup["agent"]["owned_glob"], "app/a/index.html");
+    // Each unit reported done, asked to be released, and was freed with nothing left running.
+    let released: Vec<serde_json::Value> = said
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|e| e["kind"] == "released" && e["agent"]["page"] == "a")
+        .collect();
+    assert_eq!(released.len(), 2, "{said}");
+    assert!(released.iter().all(|e| e["asked"] == true && e["lingering"] == 0), "{said}");
 }
 
 #[tokio::test]

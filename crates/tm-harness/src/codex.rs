@@ -64,7 +64,7 @@ impl Harness for Codex {
                 .arg(format!("mcp_servers.{}.bearer_token_env_var={TOKEN_ENV:?}", dict.name));
             cmd.env(TOKEN_ENV, &dict.bearer_token);
         }
-        let (mut child, _group) = crate::spawn_grouped(
+        let (mut child, group) = crate::spawn_grouped(
             cmd.arg(task.framed_brief()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
         )
         .with_context(|| format!("failed to start `{}`", self.binary))?;
@@ -82,7 +82,7 @@ impl Harness for Codex {
                     }
                     Some("turn.completed") => {
                         let usage = read_usage(&msg["usage"]);
-                        return Ok(RunSummary { ok: true, usage, cost_usd: None, denied: 0 });
+                        return Ok(RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None });
                     }
                     Some("turn.failed") => bail!("codex: {}", error_message(&msg["error"])),
                     Some("error") => bail!("codex: {}", error_message(&msg)),
@@ -91,10 +91,11 @@ impl Harness for Codex {
             }
             bail!("codex exited without completing its turn")
         };
-        match tokio::time::timeout(task.timeout, read).await {
+        let result = match tokio::time::timeout(task.timeout, read).await {
             Ok(result) => result,
-            Err(_) => bail!("codex timed out after {:?}", task.timeout),
-        }
+            Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", task.timeout)),
+        };
+        crate::released(result, group.release(&mut child).await)
     }
 }
 

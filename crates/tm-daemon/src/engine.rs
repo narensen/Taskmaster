@@ -17,7 +17,7 @@ use tm_core::{
 };
 use tm_dictionary::{Catalog, CommonsRemote, Grant, LocalStore, McpState};
 use tm_harness::{
-    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, PermissionGate, Usage, WorkerTask, WorktreeGate,
+    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, PermissionGate, RunSummary, Usage, WorkerTask, WorktreeGate,
 };
 use crate::checks::{self, Timing};
 use tm_verify::{ImportGraph, Owners, load_sources, outside_owned};
@@ -724,8 +724,10 @@ impl Driver {
             let bill = request.bill(Role::builder(tier), Some(&page));
             let (page, slots) = (page.clone(), self.slots.clone());
             self.jobs.spawn(async move {
-                let _permit = slots.acquire_owned().await.ok();
+                let permit = slots.acquire_owned().await.ok();
                 let result = ask(request).await.map(|answer| Product { answer, bill, worktree });
+                // The agent is released; its slot goes to the next waiting unit at once.
+                drop(permit);
                 (page, index, result)
             });
         }
@@ -1816,6 +1818,14 @@ impl Driver {
         }
         let done = split.as_ref().map_or(page.done.as_str(), |u| u.done.as_str()).trim();
         brief.push_str(&format!("\nYou are done when: {}.\n", if done.is_empty() { tm_core::DEFAULT_DONE } else { done }));
+        let agent = match &split {
+            Some(mine) => format!("page:{}/{}", page.id, mine.id),
+            None => format!("page:{}", page.id),
+        };
+        brief.push_str(&format!(
+            "Then stop: end your reply with the line `{RELEASE} {agent}` to report done and ask Taskmaster to release \
+             you and anything you started. Start no background processes.\n"
+        ));
         brief.push_str(if errors.is_some() {
             "This brief is your whole context. Read only the files you own that you are fixing; do not list or search the directory.\n"
         } else if inline || contracts.is_empty() {
@@ -2417,6 +2427,9 @@ fn failed(errors: impl Into<String>) -> WorkerOutcome {
     WorkerOutcome::CheckFailed { errors: errors.into() }
 }
 
+/// The line a worker ends with to report done and ask to be released.
+const RELEASE: &str = "RELEASE";
+
 /// Contracts up to this many bytes in total are given in full in each worker's brief.
 const CONTRACTS_INLINE: usize = 12_000;
 
@@ -2528,6 +2541,16 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             }
         }
         feed.live.push(&feed.run, &feed.agent, "end", end);
+        if let Ok(RunSummary { freed: Some(freed), .. }) = &run {
+            let id = feed.agent["id"].as_str().unwrap_or("agent");
+            let asked = text.lines().any(|line| line.trim().trim_matches('`') == format!("{RELEASE} {id}"));
+            feed.live.push(&feed.run, &feed.agent, "released", serde_json::json!({ "asked": asked, "processes": freed.processes, "lingering": freed.lingering }));
+            if id.starts_with("page:") {
+                let how = if asked { "it reported done" } else { "its turn ended" };
+                let left = if freed.lingering == 0 { "nothing left running".to_string() } else { format!("{} still running", freed.lingering) };
+                eprintln!("taskmaster: released {id} ({how}; freed {} process{}, {left})", freed.processes, if freed.processes == 1 { "" } else { "es" });
+            }
+        }
     }
     let summary = run?;
     Ok(Answer {

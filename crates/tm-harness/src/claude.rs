@@ -66,7 +66,7 @@ impl Harness for ClaudeCode {
             cmd.args(["--mcp-config", &config.to_string()]);
             cmd.args(["--allowedTools", &format!("mcp__{}", dict.name)]);
         }
-        let (mut child, _group) = crate::spawn_grouped(
+        let (mut child, group) = crate::spawn_grouped(
             cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
         )
         .with_context(|| format!("failed to start `{}`", self.binary))?;
@@ -88,10 +88,11 @@ impl Harness for ClaudeCode {
             }
             bail!("claude exited without a result event")
         };
-        match tokio::time::timeout(task.timeout, read).await {
+        let result = match tokio::time::timeout(task.timeout, read).await {
             Ok(result) => result,
-            Err(_) => bail!("claude timed out after {:?}", task.timeout),
-        }
+            Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", task.timeout)),
+        };
+        crate::released(result, group.release(&mut child).await)
     }
 }
 
@@ -129,6 +130,7 @@ fn summary(result: &Value) -> RunSummary {
         },
         cost_usd: result["total_cost_usd"].as_f64(),
         denied,
+        freed: None,
     }
 }
 

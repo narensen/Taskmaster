@@ -201,6 +201,10 @@ export function AgentSurface({
             {call.items.map((item, i) =>
               item.t === "tool" ? (
                 <ToolRow key={i} item={item} />
+              ) : item.t === "life" ? (
+                <div key={i} className="muted small" data-testid="agent-life">
+                  {item.text}
+                </div>
               ) : item.t === "thought" ? (
                 <div key={i} className="thought">
                   <Rich text={item.text} />

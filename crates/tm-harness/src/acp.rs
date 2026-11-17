@@ -110,7 +110,7 @@ impl Harness for AcpHarness {
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let mut command = self.command(&task)?;
-        let (mut child, _group) = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
+        let (mut child, group) = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
             .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary))?;
         let mut session = Session {
             stdin: child.stdin.take().context("agent stdin was not captured")?,
@@ -128,11 +128,13 @@ impl Harness for AcpHarness {
             tools: BTreeSet::new(),
         };
         let timeout = task.timeout;
-        match tokio::time::timeout(timeout, session.drive(task)).await {
+        let result = match tokio::time::timeout(timeout, session.drive(task)).await {
             Ok(result) => result,
-            Err(_) => bail!("{} timed out after {timeout:?}", self.id),
-        }
-        // `child` is dropped here, which kills the agent process.
+            Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
+        };
+        // The turn is over, finished or not: free the agent and everything it started.
+        drop(session);
+        crate::released(result, group.release(&mut child).await)
     }
 }
 
@@ -213,6 +215,7 @@ impl Session {
             usage: read_usage(&result),
             cost_usd: None,
             denied: self.denied,
+            freed: None,
         })
     }
 

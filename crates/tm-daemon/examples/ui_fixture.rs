@@ -150,7 +150,7 @@ impl Harness for Scripted {
         // agy reports no usage; grok reports tokens but no price (subscription CLI).
         let usage = if self.id == "agy" { Usage::default() } else { Usage { input: 1800, output: 420, cache_read: 900, cache_write: 0 } };
         let cost = if self.id == "agy" || self.id == "grok" { None } else { Some(0.012) };
-        Ok(RunSummary { ok: true, usage, cost_usd: cost, denied: 1 })
+        Ok(RunSummary { ok: true, usage, cost_usd: cost, denied: 1, freed: None })
     }
 }
 

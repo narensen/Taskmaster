@@ -34,6 +34,59 @@ impl Drop for GroupGuard {
     }
 }
 
+/// What releasing a finished agent freed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Freed {
+    /// Live processes in the agent's group when it was released: the agent and anything it started.
+    pub processes: usize,
+    /// Processes of the group still running after the kill. Zero means nothing lingers.
+    pub lingering: usize,
+}
+
+impl GroupGuard {
+    /// Free the agent and everything it started: kill the whole group, reap the leader, and
+    /// check that no process of the group is still running.
+    pub async fn release(mut self, child: &mut tokio::process::Child) -> Freed {
+        let pgid = std::mem::take(&mut self.0);
+        let processes = group_members(pgid);
+        kill_group(pgid);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        let mut lingering = group_members(pgid);
+        for _ in 0..20 {
+            if lingering == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            lingering = group_members(pgid);
+        }
+        Freed { processes, lingering }
+    }
+}
+
+/// A finished turn's summary with what releasing its agent freed.
+pub fn released(result: anyhow::Result<RunSummary>, freed: Freed) -> anyhow::Result<RunSummary> {
+    result.map(|summary| RunSummary { freed: Some(freed), ..summary })
+}
+
+/// Running (not zombie) processes whose process group is `pgid`, read from `/proc`.
+pub fn group_members(pgid: u32) -> usize {
+    if pgid <= 1 {
+        return 0;
+    }
+    let Ok(dir) = std::fs::read_dir("/proc") else { return 0 };
+    dir.flatten()
+        .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter(|stat| {
+            // `pid (comm) state ppid pgrp ...`; comm may hold spaces, so split after the last `)`.
+            let rest = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            fields.len() > 2 && fields[0] != "Z" && fields[2].parse::<u32>().ok() == Some(pgid)
+        })
+        .count()
+}
+
 /// Send SIGKILL to every process in the group led by `pgid`.
 pub fn kill_group(pgid: u32) {
     if pgid > 1 {
@@ -161,6 +214,8 @@ pub struct RunSummary {
     pub cost_usd: Option<f64>,
     /// Tool calls the gate refused.
     pub denied: u32,
+    /// What was freed when the agent was released after its turn. `None` before release.
+    pub freed: Option<Freed>,
 }
 
 #[async_trait]
@@ -204,5 +259,17 @@ mod group_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("the grandchild survived the group kill");
+    }
+
+    #[tokio::test]
+    async fn release_frees_the_agent_and_what_it_started() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 300 & sleep 300 & echo go; wait"]).stdout(std::process::Stdio::piped());
+        let (mut child, guard) = spawn_grouped(&mut cmd).unwrap();
+        let mut line = String::new();
+        let out = child.stdout.take().unwrap();
+        tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(out), &mut line).await.unwrap();
+        let freed = guard.release(&mut child).await;
+        assert_eq!(freed, Freed { processes: 3, lingering: 0 });
     }
 }

@@ -333,7 +333,7 @@ export interface AgentTag {
 export interface AgentEntry {
   at: string;
   agent: AgentTag;
-  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved";
+  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved" | "stalled" | "released";
   text?: string;
   brief?: string;
   name?: string;
@@ -352,6 +352,12 @@ export interface AgentEntry {
   code?: number | null;
   step?: string;
   routes?: { page: string; route: string }[];
+  /** `released`: the agent asked for it, and what was freed. */
+  asked?: boolean;
+  processes?: number;
+  lingering?: number;
+  /** `stalled`: which fresh agent this is. */
+  restart?: number;
 }
 
 export interface Note {

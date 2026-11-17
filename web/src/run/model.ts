@@ -21,7 +21,8 @@ export interface ToolItem {
   allowed?: boolean;
   input?: unknown;
 }
-export type Item = { t: "text"; text: string } | { t: "thought"; text: string } | ToolItem;
+/** A lifecycle line: the agent stalled and was replaced, or was released when done. */
+export type Item = { t: "text"; text: string } | { t: "thought"; text: string } | { t: "life"; text: string } | ToolItem;
 
 export interface Call {
   call: number;
@@ -111,6 +112,15 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
         const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.allowed === undefined && i.name === e.tool);
         if (open) open.allowed = e.allowed;
         else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed });
+        break;
+      }
+      case "stalled":
+        call.items.push({ t: "life", text: `Stalled waiting on its model; fresh agent ${e.restart ?? 1} started.` });
+        break;
+      case "released": {
+        const left = e.lingering ? `${e.lingering} still running` : "nothing left running";
+        const n = e.processes ?? 0;
+        call.items.push({ t: "life", text: `${e.asked ? "Reported done and asked to be released" : "Turn ended"}; released ${n} process${n === 1 ? "" : "es"}, ${left}.` });
         break;
       }
       case "end":

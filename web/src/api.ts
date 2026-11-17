@@ -78,6 +78,8 @@ export interface RunSummary {
   spent: Totals;
   review_rounds: number;
   amendments: number;
+  /** Risky tool calls waiting for a person. */
+  pending_approvals?: number;
 }
 
 export interface RunDetail extends RunSummary {
@@ -294,7 +296,7 @@ export interface AgentTag {
 export interface AgentEntry {
   at: string;
   agent: AgentTag;
-  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview";
+  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved";
   text?: string;
   brief?: string;
   name?: string;
@@ -333,6 +335,34 @@ export interface DaemonSettings {
   store: string;
   roles: Roles;
   version: string;
+  approvals?: { mode: ApprovalMode; timeout_secs: number };
+}
+
+export type ApprovalMode = "always" | "risky" | "never";
+
+/** One risky tool call an agent is waiting on. */
+export interface ToolApproval {
+  id: string;
+  run: string;
+  agent: unknown;
+  tool: string;
+  kind: "read" | "edit" | "execute" | "fetch" | "dictionary" | "other";
+  command: string | null;
+  paths: string[];
+  reason: string;
+  at: string;
+  timeout_secs: number;
+}
+
+export interface PreviewView {
+  available: boolean;
+  state: "none" | "starting" | "running" | "stopped" | "failed";
+  url?: string | null;
+  port?: number | null;
+  command?: string | null;
+  reason?: string | null;
+  output?: string | null;
+  started?: string | null;
 }
 
 export interface EditorInfo {
@@ -484,6 +514,14 @@ export const api = {
       `/api/runs/${enc(id)}/diff?scope=${scope}${page ? `&page=${enc(page)}` : ""}`,
     ),
   draftPr: (id: string) => call<{ url: string }>("POST", `/api/runs/${enc(id)}/pr`, {}),
+  approvals: (run: string) =>
+    call<{ approvals: ToolApproval[]; mode: ApprovalMode; timeout_secs: number }>("GET", `/api/approvals?run=${enc(run)}`),
+  approveTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/approve`, {}),
+  denyTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/deny`, {}),
+  setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
+  preview: (id: string) => call<PreviewView>("GET", `/api/runs/${enc(id)}/preview`),
+  startPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview`, {}),
+  stopPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview/stop`, {}),
   settings: () => call<DaemonSettings>("GET", "/api/settings"),
   editors: () => call<{ editors: EditorInfo[]; default: string }>("GET", "/api/editors"),
   open: (body: { path: string; line?: number; column?: number; editor?: string; reveal?: boolean }) =>

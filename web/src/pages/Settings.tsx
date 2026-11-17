@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, server, setServer, setToken, DEFAULT_ROLES, type RoleName } from "../api";
+import { api, server, type ApprovalMode, setServer, setToken, DEFAULT_ROLES, type RoleName } from "../api";
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
 import { ROLES, RolePicker } from "../roles";
@@ -39,6 +39,20 @@ export function Settings() {
   const [address, setAddress] = useState(server());
   const [other, setOther] = useState({ url: "", token: "" });
   const [endpoint, setEndpoint] = useState(p.searchEndpoint);
+  const [policy, setPolicy] = useState<{ mode: ApprovalMode; timeout: string } | null>(null);
+  useEffect(() => {
+    const a = daemon.data?.approvals;
+    if (a && !policy) setPolicy({ mode: a.mode, timeout: String(a.timeout_secs) });
+  }, [daemon.data, policy]);
+  const savePolicy = (next: { mode: ApprovalMode; timeout: string }) => {
+    setPolicy(next);
+    const secs = Number(next.timeout);
+    if (!Number.isInteger(secs) || secs < 1 || secs > 86400) return;
+    api.setApprovals({ approvals: next.mode, approval_timeout_secs: secs }).then(
+      () => toast("Tool approvals saved", `${next.mode}, ${secs}s`),
+      (err) => toast("Tool approvals were not saved", err instanceof Error ? err.message : String(err)),
+    );
+  };
 
   useEffect(() => {
     if (window.location.hash) document.querySelector(window.location.hash)?.scrollIntoView();
@@ -169,6 +183,37 @@ export function Settings() {
           ))}
         </ul>
       </Section>
+
+      {policy && (
+        <Section
+          title="Tool approvals"
+          note="Risky tool calls (a shell command, a write outside the worktree) wait for you on the run page; no answer in time is a denial. Always asks before every call; never keeps the automatic gate only."
+        >
+          <div className="row gap wrap" data-testid="approval-policy">
+            <div className="seg" role="radiogroup" aria-label="Approval mode">
+              {(["always", "risky", "never"] as const).map((m) => (
+                <button key={m} role="radio" aria-checked={policy.mode === m} className={policy.mode === m ? "on" : ""} onClick={() => savePolicy({ ...policy, mode: m })}>
+                  {m}
+                </button>
+              ))}
+            </div>
+            <label className="row gap small">
+              <span className="muted">Deny after</span>
+              <input
+                type="number"
+                min={1}
+                max={86400}
+                style={{ width: 90 }}
+                aria-label="Approval timeout in seconds"
+                value={policy.timeout}
+                onChange={(e) => setPolicy({ ...policy, timeout: e.target.value })}
+                onBlur={() => savePolicy(policy)}
+              />
+              <span className="muted">seconds</span>
+            </label>
+          </div>
+        </Section>
+      )}
 
       <Section id="search" title="Search endpoint" note="The Web search tab sends your query here. Use {q} for the query, or it is added as ?q=. Kept in this browser.">
         <form

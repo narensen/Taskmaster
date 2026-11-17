@@ -20,6 +20,8 @@ import { takeAttachments } from "../App";
 import { AgentSurface } from "../run/AgentSurface";
 import { DiffTab, type Scope } from "../run/Diff";
 import { PlanView } from "../run/PlanView";
+import { LivePreview } from "../run/LivePreview";
+import { ToolApprovals, useToolApprovals } from "../run/ToolApprovals";
 import { BrowserTab, PreviewTab, SearchTab, TerminalTab } from "../run/Tabs";
 import { surfaces, useRun } from "../run/model";
 
@@ -105,6 +107,8 @@ export function RunView({ id }: { id: string }) {
   const narrow = useNarrow();
   const composer = useRef<ComposerHandle>(null);
   const settings = useLoad(api.settings, []);
+  const reloadRun = data.reload;
+  const toolApprovals = useToolApprovals(id, detail?.pending_approvals, data.entries, () => void reloadRun());
   const gh = useLoad(api.gh, []);
   const [focus, setFocus] = useState<string | null>(null);
   const [to, setTo] = useState("master");
@@ -418,6 +422,9 @@ export function RunView({ id }: { id: string }) {
           </div>
         )}
         {detail.plan && <PlanView plan={detail.plan} arrived={data.planArrived} compact />}
+
+        <ToolApprovals list={toolApprovals.list} answer={toolApprovals.answer} />
+        <LivePreview id={id} detail={detail} />
 
         <div className="agents">
           {master && (

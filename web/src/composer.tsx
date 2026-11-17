@@ -5,6 +5,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import { navigate } from "./router";
 import { api, type Skill } from "./api";
 import { commands, type Command } from "./commands";
 import { bezier, dur } from "./motion";
@@ -67,6 +68,10 @@ function keys() {
 }
 export function skills() {
   return (skillCache ??= api.skills().catch(() => ((skillCache = null), [])));
+}
+/** Read the skills again next time: one was installed, removed or switched. */
+export function forgetSkills() {
+  skillCache = null;
 }
 
 interface Option {
@@ -153,7 +158,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const ref = useRef<HTMLDivElement>(null);
   const [attachments, setAttachments] = useState<Chip[]>([]);
   const [empty, setEmpty] = useState(true);
-  const [popup, setPopup] = useState<{ mode: "@" | "#" | "/"; query: string } | null>(null);
+  const [popup, setPopup] = useState<{ mode: "@" | "#" | "/" | "$"; query: string } | null>(null);
   const [options, setOptions] = useState<Option[]>([]);
   const [active, setActive] = useState(0);
   const [drag, setDrag] = useState(false);
@@ -283,6 +288,25 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         for (const k of ks.filter((k) => k.toLowerCase().includes(q)).slice(0, 6)) {
           list.push({ id: `k:${k}`, label: k, group: "Dictionary", pick: () => insert({ kind: "key", label: `@${k}`, value: k }, len) });
         }
+      } else if (popup.mode === "$") {
+        const all = (await skills()).filter((s) => s.place === "store" && s.enabled);
+        for (const s of all.filter((s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q))) {
+          list.push({
+            id: `$:${s.name}`,
+            label: s.name,
+            group: s.description ? s.description.slice(0, 48) + (s.description.length > 48 ? "…" : "") : "Skill",
+            pick: () => insert({ kind: "skill", label: `$${s.name}`, value: s.name, to: "master" }, len),
+          });
+        }
+        list.push({
+          id: "$:find",
+          label: popup.query ? `Find skills for “${popup.query}”` : all.length ? "Find more skills" : "No skills yet: find some",
+          group: "Skills",
+          pick: () => {
+            setPopup(null);
+            navigate(popup.query ? `/skills?q=${encodeURIComponent(popup.query)}` : "/skills");
+          },
+        });
       } else if (popup.mode === "#") {
         if (/^\d+$/.test(popup.query)) {
           const n = Number(popup.query);
@@ -341,8 +365,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     const whole = serialize(ref.current).text;
     const slash = /^\/([\w-]*)$/.exec(whole.trimStart());
     if (slash && before.endsWith(`/${slash[1]}`)) return setPopup({ mode: "/", query: slash[1]! });
-    const m = /(?:^|[\s\u00a0(])([@#])([\w./:-]*)$/.exec(before);
-    if (m) return setPopup({ mode: m[1] as "@" | "#", query: m[2]! });
+    const m = /(?:^|[\s\u00a0(])([@#$])([\w./:-]*)$/.exec(before);
+    // `$5` is money, not a skill.
+    if (m && !(m[1] === "$" && /^[^A-Za-z]/.test(m[2]!))) return setPopup({ mode: m[1] as "@" | "#" | "$", query: m[2]! });
     setPopup(null);
   };
 

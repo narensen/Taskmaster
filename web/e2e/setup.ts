@@ -1,6 +1,6 @@
 // Start tm-daemon on a fresh git project and pair once; tests read the address and token.
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,9 +18,19 @@ export default async function setup() {
   const base = mkdtempSync(join(tmpdir(), "tm-e2e-"));
   const project = join(base, "project");
   execFileSync("sh", ["-c", `mkdir -p "${project}" && cd "${project}" && git init -q && git config user.email e2e@example.invalid && git config user.name e2e && echo '# e2e' > README.md && git add . && git commit -qm init`]);
+  // A skills store of its own, with one skill in it, and (except for screenshots, which
+  // show the real providers) a home with nothing in it.
+  const skills = join(base, "skills");
+  mkdirSync(join(skills, "tidy-css"), { recursive: true });
+  writeFileSync(join(skills, "tidy-css/SKILL.md"), "---\nname: tidy-css\ndescription: Keep stylesheets ordered and small.\n---\n# Tidy CSS\n");
+  writeFileSync(
+    join(skills, "skills.json"),
+    JSON.stringify({ skills: [{ name: "tidy-css", source: { repo: "acme/kit", path: "skills/tidy-css", tree: "v1" }, enabled: true, installed: "2026-11-17T10:00:00Z" }] }),
+  );
+  mkdirSync(join(base, "home"), { recursive: true });
   const child = spawn(daemon, ["serve", project, "--bind", "127.0.0.1:0", "--web", dist, "--commons", join(base, "commons"), "--dictionary", join(base, "dictionary")], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, XDG_DATA_HOME: join(base, "data") },
+    env: { ...process.env, XDG_DATA_HOME: join(base, "data"), TASKMASTER_SKILLS: skills, ...(process.env.SHOTS ? {} : { HOME: join(base, "home") }) },
   });
   const line = await new Promise<string>((ok, fail) => {
     let said = "";

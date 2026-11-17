@@ -56,6 +56,8 @@ export interface PagePlan {
   /** How the page's agent knows it is finished. */
   done?: string;
   units?: { id: string; owned_glob: string; brief: string; done?: string }[];
+  /** Skills from the store the planner attached; the page's agents read each SKILL.md. */
+  skills?: string[];
 }
 
 /** One agent a plan starts. Mirrors `Plan::agents` in tm-core. */
@@ -480,7 +482,23 @@ export interface EditorInfo {
 
 export interface Skill {
   name: string;
+  description: string;
+  /** store: in Taskmaster's store. project / home: found on disk, can be copied in. */
+  place: "store" | "project" | "home";
   path: string;
+  enabled: boolean;
+  source: { repo: string; path: string; tree: string } | null;
+  installed: string | null;
+  updated: string | null;
+}
+
+export interface SkillHit {
+  id: string;
+  name: string;
+  repo: string;
+  skill: string;
+  installs: number;
+  installed: boolean;
 }
 
 export interface GhStatus {
@@ -659,6 +677,13 @@ export const api = {
     call<{ path: string; full: string; content: string; truncated: boolean }>("GET", `/api/file?path=${enc(path)}`),
   files: () => call<{ files: string[] }>("GET", "/api/files").then((r) => r.files),
   skills: () => call<{ skills: Skill[] }>("GET", "/api/skills").then((r) => r.skills),
+  searchSkills: (q: string) => call<{ hits: SkillHit[] }>("GET", `/api/skills/search?q=${enc(q)}`).then((r) => r.hits),
+  skillUpdates: () => call<{ updates: Record<string, string> }>("GET", "/api/skills/updates").then((r) => r.updates),
+  installSkill: (repo: string, skill: string) => call<Skill>("POST", "/api/skills/install", { repo, skill }),
+  enableSkill: (name: string, enabled: boolean) => call<Skill>("POST", `/api/skills/${enc(name)}/enable`, { enabled }),
+  updateSkill: (name: string) => call<Skill>("POST", `/api/skills/${enc(name)}/update`, {}),
+  removeSkill: (name: string) => call<{ removed: string }>("POST", `/api/skills/${enc(name)}/remove`, {}),
+  importSkill: (name: string) => call<Skill>("POST", `/api/skills/${enc(name)}/import`, {}),
   gh: () => call<GhStatus>("GET", "/api/gh"),
   ghPr: (n: number) => call<{ number: number; title: string; url: string; state: string }>("GET", `/api/gh/pr/${n}`),
 

@@ -19,6 +19,7 @@ import {
   Pin,
   PinOff,
   Plus,
+  Puzzle,
   Search,
   Settings,
   SquarePen,
@@ -33,6 +34,7 @@ import { ReviewView, Reviews } from "./pages/Reviews";
 import { RunView } from "./pages/RunView";
 import { Gallery } from "./pages/Gallery";
 import { Providers } from "./pages/Providers";
+import { Skills } from "./pages/Skills";
 import { Settings as SettingsPage } from "./pages/Settings";
 import { SignIn } from "./pages/SignIn";
 import { ContextMenu, Toasts, openMenu, undoLatest, type Chip } from "./overlay";
@@ -50,6 +52,7 @@ const NAV: { to: string; label: string; icon: LucideIcon; active?: (p: string) =
   { to: "/dictionary", label: "Dictionary", icon: BookOpen },
   { to: "/errorography", label: "Errorography", icon: Bug },
   { to: "/reviews", label: "Reviews", icon: GitPullRequest },
+  { to: "/skills", label: "Skills", icon: Puzzle },
   { to: "/providers", label: "Providers", icon: Cpu },
   { to: "/settings", label: "Settings", icon: Settings },
 ];
@@ -100,6 +103,7 @@ function Page({ path }: { path: string }) {
   if (path === "/reviews") return <Reviews />;
   if ((params = match(path, "/reviews/:id"))) return <ReviewView id={params.id!} />;
   if (path === "/providers") return <Providers />;
+  if (path === "/skills") return <Skills />;
   if (path === "/settings") return <SettingsPage />;
   return (
     <div className="page">
@@ -131,6 +135,7 @@ function hereLabel(path: string): string {
   if (path === "/reviews") return "Reviews";
   if (path.startsWith("/reviews/")) return "Review";
   if (path === "/providers") return "Providers";
+  if (path === "/skills") return "Skills";
   if (path === "/settings") return "Settings";
   return "Taskmaster";
 }

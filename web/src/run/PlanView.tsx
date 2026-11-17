@@ -102,6 +102,11 @@ export function PlanView({
             <span className="mono muted clip plan-owns">{page.owned_glob}</span>
             <span className="plan-cites">
               {page.cites.length ? page.cites.map((c) => <span key={c} className="cite-tag">{c}</span>) : <span className="muted">no cites</span>}
+              {page.skills?.map((s) => (
+                <span key={`skill-${s}`} className="cite-tag skill-tag" title={`Skill: the agent reads ${s}/SKILL.md first`}>
+                  ${s}
+                </span>
+              ))}
             </span>
           </li>
         ))}

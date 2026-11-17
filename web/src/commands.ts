@@ -47,6 +47,7 @@ export function commands(ctx: RunContext | null = runContext): Command[] {
     go("dictionary", "Dictionary", "/dictionary"),
     go("errorography", "Errorography", "/errorography"),
     go("reviews", "Reviews", "/reviews"),
+    go("skills", "Skills", "/skills"),
     go("providers", "Providers", "/providers"),
     go("settings", "Settings", "/settings"),
   ];

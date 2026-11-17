@@ -17,14 +17,35 @@ async function anonymous(page: import("@playwright/test").Page) {
   });
 }
 
+async function themed(page: import("@playwright/test").Page, theme: string) {
+  await page.addInitScript((t) => {
+    const saved = JSON.parse(localStorage.getItem("taskmaster.prefs") ?? "{}");
+    localStorage.setItem("taskmaster.prefs", JSON.stringify({ ...saved, theme: t }));
+  }, theme);
+}
+
 for (const theme of ["dark", "light"] as const) {
+  test(`skills picker and page, ${theme}`, async ({ open, page }) => {
+    test.skip(!shots, "set SHOTS=1");
+    await themed(page, theme);
+    await page.route("**/api/skills/search?*", async (route) => route.fulfill({ response: await route.fetch() }));
+    await open("/");
+    const box = page.getByRole("textbox", { name: /Tell the master/ });
+    await box.click();
+    await page.keyboard.type("A recipe box with tags and search. Follow $");
+    await page.getByRole("listbox").waitFor();
+    await page.waitForTimeout(300);
+    await page.screenshot({ path: `${out}/31-skills-picker-${theme}.png` });
+    await open("/skills?q=accessibility");
+    await page.getByTestId("skill").first().waitFor();
+    await page.getByTestId("skill-hit").first().waitFor({ timeout: 20_000 }).catch(() => undefined);
+    await page.screenshot({ path: `${out}/32-skills-${theme}.png`, fullPage: true });
+  });
+
   test(`providers page, ${theme}`, async ({ open, page }) => {
     test.skip(!shots, "set SHOTS=1");
     test.setTimeout(90_000);
-    await page.addInitScript((t) => {
-      const saved = JSON.parse(localStorage.getItem("taskmaster.prefs") ?? "{}");
-      localStorage.setItem("taskmaster.prefs", JSON.stringify({ ...saved, theme: t }));
-    }, theme);
+    await themed(page, theme);
     await anonymous(page);
     await open("/providers");
     await page.getByTestId("provider").first().waitFor();

@@ -333,7 +333,7 @@ pub async fn diff(
 }
 
 /// What to compare against: the run branch while it exists, else the commit it ended on.
-fn run_head(app: &App, id: &str, branch: &str) -> Option<String> {
+pub fn run_head(app: &App, id: &str, branch: &str) -> Option<String> {
     if git(&app.project, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_ok() {
         return Some(branch.to_string());
     }

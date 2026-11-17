@@ -24,6 +24,35 @@ use tokio::sync::mpsc;
 pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate};
 pub use providers::{ModelChoice, ProviderReport, provider_report, provider_reports, require_model};
 
+/// Kills a spawned agent's whole process group when dropped, so a cancelled, timed-out or
+/// finished run leaves no grandchildren (language servers, shells, browsers) behind.
+pub struct GroupGuard(u32);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.0);
+    }
+}
+
+/// Send SIGKILL to every process in the group led by `pgid`.
+pub fn kill_group(pgid: u32) {
+    if pgid > 1 {
+        // SAFETY: killpg only sends a signal; a stale group id fails with ESRCH.
+        unsafe {
+            libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Spawn `cmd` as the leader of its own process group. Keep the guard as long as the child
+/// should live: dropping it kills the whole group.
+pub fn spawn_grouped(cmd: &mut tokio::process::Command) -> std::io::Result<(tokio::process::Child, GroupGuard)> {
+    cmd.process_group(0).kill_on_drop(true);
+    let child = cmd.spawn()?;
+    let guard = GroupGuard(child.id().unwrap_or(0));
+    Ok((child, guard))
+}
+
 /// Every harness Taskmaster can drive, by the name used on the command line.
 pub const HARNESSES: [&str; 5] = ["claude", "agy", "grok", "codex", "opencode"];
 
@@ -127,4 +156,35 @@ pub trait Harness: Send + Sync {
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary>;
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_guard_kills_a_grandchild() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 300 & echo $!; wait"]).stdout(std::process::Stdio::piped());
+        let (mut child, guard) = spawn_grouped(&mut cmd).unwrap();
+        let mut line = String::new();
+        let out = child.stdout.take().unwrap();
+        tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(out), &mut line).await.unwrap();
+        let sleeper: i32 = line.trim().parse().unwrap();
+        assert!(alive(sleeper));
+        drop(guard);
+        let _ = child.wait().await;
+        for _ in 0..50 {
+            if !alive(sleeper) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the grandchild survived the group kill");
+    }
 }

@@ -365,37 +365,12 @@ impl Run {
         }
     }
 
-    /// Every page passed its own checks: review the connections that changed, then verify.
+    /// Every page passed its own checks: go straight to the deterministic checks. Review is
+    /// not part of a run; a person asks for it afterwards (`POST /api/runs/{id}/review`).
     fn after_build(&mut self, out: &mut Vec<Command>) {
-        let review = self.review_rounds < MAX_REVIEW_ROUNDS;
-        let scopes = if review { self.review_scopes() } else { Vec::new() };
-        let security: Vec<PageId> =
-            if review { self.dirty.iter().cloned().collect() } else { Vec::new() };
         self.dirty.clear();
-        if scopes.is_empty() && security.is_empty() {
-            self.phase = RunPhase::Verifying;
-            out.push(Command::RunVerify);
-        } else {
-            self.review_rounds += 1;
-            self.phase = RunPhase::Reviewing;
-            out.push(Command::RunReview { scopes, security });
-        }
-    }
-
-    /// One scope per Dictionary entry that a rebuilt page consumes.
-    fn review_scopes(&self) -> Vec<ReviewScope> {
-        let Some(plan) = &self.plan else { return Vec::new() };
-        let mut by_key: BTreeMap<&DictKey, Vec<PageId>> = BTreeMap::new();
-        for page in &plan.pages {
-            for key in &page.cites {
-                by_key.entry(key).or_default().push(page.id.clone());
-            }
-        }
-        by_key
-            .into_iter()
-            .filter(|(_, consumers)| consumers.iter().any(|c| self.dirty.contains(c)))
-            .map(|(key, consumers)| ReviewScope { key: key.clone(), consumers })
-            .collect()
+        self.phase = RunPhase::Verifying;
+        out.push(Command::RunVerify);
     }
 
     fn count(&self, state: PageState) -> usize {
@@ -440,21 +415,6 @@ mod tests {
         Event::WorkerFinished { page: page.into(), outcome }
     }
 
-    fn review(scopes: Vec<ReviewScope>, security: &[&str]) -> Command {
-        Command::RunReview { scopes, security: security.iter().map(|p| p.to_string()).collect() }
-    }
-
-    fn clean_review(run: &mut Run) -> Vec<Command> {
-        run.step(Event::ReviewFinished { findings: vec![] })
-    }
-
-    /// Report findings and have the verifier confirm all of them.
-    fn confirmed_review(run: &mut Run, findings: Vec<Finding>) -> Vec<Command> {
-        let cmds = run.step(Event::ReviewFinished { findings: findings.clone() });
-        assert_eq!(cmds, vec![Command::VerifyFindings { findings: findings.clone() }]);
-        run.step(Event::FindingsVerified { confirmed: findings })
-    }
-
     fn check_failed(msg: &str) -> WorkerOutcome {
         WorkerOutcome::CheckFailed { errors: msg.into() }
     }
@@ -471,9 +431,9 @@ mod tests {
             ]
         );
         assert!(run.step(finished("a", WorkerOutcome::Passed)).is_empty());
-        // No connections to review, but the security pass still covers both pages.
-        assert_eq!(run.step(finished("b", WorkerOutcome::Passed)), vec![review(vec![], &["a", "b"])]);
-        assert_eq!(clean_review(&mut run), vec![Command::RunVerify]);
+        // No review phase: the run goes straight to the deterministic checks.
+        assert_eq!(run.step(finished("b", WorkerOutcome::Passed)), vec![Command::RunVerify]);
+        assert_eq!(run.phase, RunPhase::Verifying);
         let done = run.step(Event::VerifyFinished { ok: true, failing: BTreeMap::new() });
         assert_eq!(done, vec![Command::Finish { ok: true }]);
         assert_eq!(run.phase, RunPhase::Done);
@@ -555,13 +515,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_page_is_not_reviewed() {
+    fn an_unchanged_page_is_not_rebuilt_and_the_run_verifies() {
         let (mut run, _) = started(&[("a", &["auth"]), ("b", &["nav"])], 4);
         run.step(Event::PageFresh { page: "a".into() });
         assert_eq!(run.pages["a"].state, PageState::Passed);
         let cmds = run.step(finished("b", WorkerOutcome::Passed));
-        assert_eq!(cmds, vec![review(vec![scope("nav", &["b"])], &["b"])]);
-        assert!(!run.dirty.contains("a"));
+        assert_eq!(cmds, vec![Command::RunVerify]);
     }
 
     #[test]
@@ -569,7 +528,6 @@ mod tests {
         let (mut run, _) = started(&[("a", &[]), ("b", &[])], 4);
         run.step(finished("a", WorkerOutcome::Passed));
         run.step(finished("b", WorkerOutcome::Passed));
-        clean_review(&mut run);
         let failing = BTreeMap::from([("b".to_string(), "route /b returned 500".to_string())]);
         let cmds = run.step(Event::VerifyFinished { ok: false, failing });
         assert_eq!(cmds, vec![spawn("b", Tier::Worker, Some("route /b returned 500"))]);
@@ -590,92 +548,7 @@ mod tests {
             live.step(e);
         }
         assert_eq!(Run::replay(2, events), live);
-        assert_eq!(live.phase, RunPhase::Reviewing);
-    }
-
-    fn finding(page: &str, file: &str, line: u32, failure: &str) -> Finding {
-        Finding { page: page.into(), key: None, file: file.into(), line, failure: failure.into() }
-    }
-
-    fn scope(key: &str, consumers: &[&str]) -> ReviewScope {
-        ReviewScope { key: key.into(), consumers: consumers.iter().map(|c| c.to_string()).collect() }
-    }
-
-    fn built(pages: &[(&str, &[&str])]) -> (Run, Vec<Command>) {
-        let (mut run, _) = started(pages, 8);
-        let mut last = Vec::new();
-        for (id, _) in pages {
-            last = run.step(finished(id, WorkerOutcome::Passed));
-        }
-        (run, last)
-    }
-
-    #[test]
-    fn review_covers_each_connection_and_a_clean_one_proceeds_to_verify() {
-        let pages: &[(&str, &[&str])] = &[("a", &["auth", "nav"]), ("b", &["auth"]), ("c", &[])];
-        let (mut run, cmds) = built(pages);
-        let scopes = vec![scope("auth", &["a", "b"]), scope("nav", &["a"])];
-        assert_eq!(cmds, vec![review(scopes, &["a", "b", "c"])]);
-        assert_eq!(run.phase, RunPhase::Reviewing);
-        assert_eq!(clean_review(&mut run), vec![Command::RunVerify]);
-    }
-
-    #[test]
-    fn finding_repairs_the_page_then_only_its_connections_are_reviewed_again() {
-        let pages: &[(&str, &[&str])] = &[("a", &["auth"]), ("b", &["auth"]), ("c", &["nav"])];
-        let (mut run, _) = built(pages);
-        let f = finding("c", "app/c/page.tsx", 12, "links to /settings, which is not a route");
-        let cmds = confirmed_review(&mut run, vec![f]);
-        let errors = "review: app/c/page.tsx:12 links to /settings, which is not a route";
-        assert_eq!(cmds, vec![spawn("c", Tier::Worker, Some(errors))]);
-        assert_eq!(run.pages["c"].repairs, 1, "a finding counts against the repair cap");
-
-        // Only `nav` is re-reviewed: `auth` and its consumers were not rebuilt.
-        let cmds = run.step(finished("c", WorkerOutcome::Passed));
-        assert_eq!(cmds, vec![review(vec![scope("nav", &["c"])], &["c"])]);
-
-        // The second round is the last: after its repair the run goes straight to verify.
-        let f = finding("c", "app/c/page.tsx", 3, "still links to /settings");
-        confirmed_review(&mut run, vec![f]);
-        assert_eq!(run.step(finished("c", WorkerOutcome::Passed)), vec![Command::RunVerify]);
-    }
-
-    #[test]
-    fn findings_without_evidence_are_dropped() {
-        let (mut run, _) = built(&[("a", &["auth"])]);
-        let vague = vec![
-            finding("a", "", 4, "something looks off in this page"),
-            finding("a", "app/a/page.tsx", 0, "something looks off in this page"),
-            finding("a", "app/a/page.tsx", 4, "bad"),
-            finding("ghost", "app/x.tsx", 4, "unknown page reported by reviewer"),
-        ];
-        assert_eq!(run.step(Event::ReviewFinished { findings: vague }), vec![Command::RunVerify]);
-        assert_eq!(run.pages["a"].repairs, 0);
-    }
-
-    #[test]
-    fn only_findings_the_verifier_confirms_become_repairs() {
-        let (mut run, _) = built(&[("a", &["auth"]), ("b", &["auth"])]);
-        let real = finding("a", "app/a/page.tsx", 9, "reads user.role, which the schema lacks");
-        let wrong = finding("b", "app/b/page.tsx", 2, "claims a missing null check that exists");
-        let cmds = run.step(Event::ReviewFinished { findings: vec![real.clone(), wrong.clone()] });
-        assert_eq!(cmds, vec![Command::VerifyFindings { findings: vec![real.clone(), wrong] }]);
-
-        // The verifier confirms one, and also returns a finding it was never given.
-        let invented = finding("b", "app/b/page.tsx", 5, "invented by the verifier itself");
-        let cmds = run.step(Event::FindingsVerified { confirmed: vec![real, invented] });
-        assert!(matches!(cmds.as_slice(), [Command::SpawnWorker { page, .. }] if page == "a"));
-        assert_eq!(run.pages["b"].state, PageState::Passed);
-        assert_eq!(run.pages["b"].repairs, 0);
-    }
-
-    #[test]
-    fn a_review_where_nothing_is_confirmed_proceeds_to_verify() {
-        let (mut run, _) = built(&[("a", &["auth"])]);
-        let f = finding("a", "app/a/page.tsx", 9, "plausible but wrong claim about the page");
-        run.step(Event::ReviewFinished { findings: vec![f] });
-        let cmds = run.step(Event::FindingsVerified { confirmed: vec![] });
-        assert_eq!(cmds, vec![Command::RunVerify]);
+        assert_eq!(live.phase, RunPhase::Verifying);
     }
 
     #[test]

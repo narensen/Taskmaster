@@ -61,14 +61,10 @@ impl Harness for Codex {
                 .arg(format!("mcp_servers.{}.bearer_token_env_var={TOKEN_ENV:?}", dict.name));
             cmd.env(TOKEN_ENV, &dict.bearer_token);
         }
-        let mut child = cmd
-            .arg(task.framed_brief())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("failed to start `{}`", self.binary))?;
+        let (mut child, _group) = crate::spawn_grouped(
+            cmd.arg(task.framed_brief()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
+        )
+        .with_context(|| format!("failed to start `{}`", self.binary))?;
         let stdout = child.stdout.take().context("codex stdout was not captured")?;
 
         let read = async {

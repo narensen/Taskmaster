@@ -237,6 +237,7 @@ export interface ReviewSummary {
   at: string;
   target: string;
   confirmed: number | null;
+  run?: string | null;
 }
 
 export interface ReviewJob {
@@ -246,6 +247,7 @@ export interface ReviewJob {
   target: string;
   reviewer: string;
   verifier: string;
+  run?: string | null;
   text?: string;
   report?: ReviewReport;
   error?: string;
@@ -550,6 +552,8 @@ export const api = {
 
   reviews: () => call<{ reviews: ReviewSummary[] }>("GET", "/api/reviews").then((r) => r.reviews),
   review: (id: string) => call<ReviewJob>("GET", `/api/reviews/${enc(id)}`),
+  reviewRun: (id: string) => call<{ id: string }>("POST", `/api/runs/${enc(id)}/review`, {}),
+  cancelReview: (id: string) => call<{ id: string }>("POST", `/api/reviews/${enc(id)}/cancel`, {}),
   createReview: (body: NewReview) => call<{ id: string }>("POST", "/api/reviews", body),
 };
 

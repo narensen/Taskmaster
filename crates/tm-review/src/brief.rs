@@ -33,7 +33,7 @@ pub fn review(scope: &Scope, diff_file: &str) -> String {
          what changed.\n\n\
          Look for, in this order: a change that breaks a file depending on it; a change that \
          contradicts the architecture; a broken review rule; a logic error in the changed lines; \
-         an obvious performance problem. Ignore style and naming unless a rule covers them.\n\n\
+         an obvious performance problem; and, for anything that handles input, secrets or access, a security problem (state what an attacker sends and what they gain). Ignore style and naming unless a rule covers them.\n\n\
          {REPLY_FORMAT}",
         files = list(&scope.files),
         dependents = list(&scope.dependents),

@@ -63,13 +63,10 @@ impl Harness for ClaudeCode {
             cmd.args(["--mcp-config", &config.to_string()]);
             cmd.args(["--allowedTools", &format!("mcp__{}", dict.name)]);
         }
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("failed to start `{}`", self.binary))?;
+        let (mut child, _group) = crate::spawn_grouped(
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
+        )
+        .with_context(|| format!("failed to start `{}`", self.binary))?;
         let stdout = child.stdout.take().context("claude stdout was not captured")?;
 
         let read = async {

@@ -23,7 +23,6 @@ enum Mode {
     Outside,
     Conform,
     Amend,
-    RejectFinding,
     ConfirmFinding,
     CrossImport,
     /// `Some` waits until that many workers are inside the build at once.
@@ -273,7 +272,7 @@ impl World {
             return Script::text("[]");
         }
         let n = self.reviews.fetch_add(1, Ordering::SeqCst);
-        let finding = matches!(self.mode, Mode::RejectFinding | Mode::ConfirmFinding) && n == 0;
+        let finding = matches!(self.mode, Mode::ConfirmFinding) && n == 0;
         if finding {
             Script::text(
                 "[{\"page\":\"a\",\"file\":\"\",\"line\":0,\"failure\":\"no\"},\
@@ -453,30 +452,6 @@ async fn an_amendment_publishes_a_successor_and_rebuilds_the_other_citer() {
     assert_eq!(world.a.load(Ordering::SeqCst), 2);
     assert_eq!(world.b.load(Ordering::SeqCst), 2);
     assert!(read(&run_directory(&tmp.0, "current").join("changes.jsonl")).contains("entry_amended"));
-}
-
-#[tokio::test]
-async fn a_rejected_finding_does_not_repair_the_page() {
-    let tmp = repo("reject");
-    let world = World::new(Mode::RejectFinding);
-    let outcome = run(config(&tmp.0, plan(&[("a", &["auth"])]), true, 1), &world).await.unwrap();
-    assert_eq!(outcome, Outcome::Finished { ok: true });
-    assert_eq!(world.a.load(Ordering::SeqCst), 1);
-    assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));
-    let calls = world.calls.lock().unwrap().clone();
-    assert_eq!(calls.iter().filter(|c| c.contains("Decide whether it is real")).count(), 1);
-}
-
-#[tokio::test]
-async fn a_confirmed_finding_is_repaired() {
-    let tmp = repo("confirm");
-    let world = World::new(Mode::ConfirmFinding);
-    let outcome = run(config(&tmp.0, plan(&[("a", &["auth"])]), true, 1), &world).await.unwrap();
-    assert_eq!(outcome, Outcome::Finished { ok: true });
-    assert_eq!(world.a.load(Ordering::SeqCst), 2);
-    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 2;\n");
-    assert!(world.calls.lock().unwrap().iter().any(|c| c.contains("review: app/a/page.ts:1")));
-    assert!(read(&tmp.0.join(".taskmaster/CHANGES.md")).contains("review finding"));
 }
 
 #[tokio::test]
@@ -811,16 +786,15 @@ async fn every_agent_call_is_charged_to_the_run() {
     let entries = records.ledger("current").unwrap();
     assert_eq!(entries.len(), world.calls.lock().unwrap().len());
     let roles: Vec<&str> = entries.iter().map(|entry| entry.role.name()).collect();
-    for role in ["worker", "reviewer", "security", "verifier"] {
-        assert!(roles.contains(&role), "{role} missing from {roles:?}");
-    }
+    assert!(roles.contains(&"worker"), "worker missing from {roles:?}");
+    assert!(!roles.contains(&"reviewer"), "a run does not review itself: {roles:?}");
     assert!(entries.iter().any(|entry| entry.role.name() == "worker" && entry.page.as_deref() == Some("a")));
     let status = records.status("current").unwrap().unwrap();
     assert_eq!(status["spent"]["calls"], entries.len());
     assert_eq!(status["spent"]["tokens"], entries.len() * 120);
     assert_eq!(status["spent"]["unpriced_calls"], 0);
-    // One page and two reviewers, priced from defaults because nothing ran here before.
-    assert_eq!(status["estimate"]["tokens"], 17_000 + 2 * 500);
+    // One page and no review, priced from defaults because nothing ran here before.
+    assert_eq!(status["estimate"]["tokens"], 17_000);
 }
 
 #[tokio::test]
@@ -1097,11 +1071,11 @@ async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
     let mut second = config(&tmp.0, plan(&[("b", &[]), ("c", &[])]), true, 1);
     second.run_id = "two".into();
     assert_eq!(run(second, &world).await.unwrap(), Outcome::Finished { ok: true });
-    // Every fake call is 120 tokens and one cent: two pages and one security reviewer.
+    // Every fake call is 120 tokens and one cent: two pages, and no review.
     let status = Records::files(&tmp.0).status("two").unwrap().unwrap();
-    assert_eq!(status["estimate"]["tokens"], 3 * 120);
-    assert!((status["estimate"]["usd"].as_f64().unwrap() - 0.03).abs() < 1e-9);
-    assert_eq!(status["spent"]["fresh"], 3 * 120);
+    assert_eq!(status["estimate"]["tokens"], 2 * 120);
+    assert!((status["estimate"]["usd"].as_f64().unwrap() - 0.02).abs() < 1e-9);
+    assert_eq!(status["spent"]["fresh"], 2 * 120);
 }
 
 /// A project whose `tsc` is a script: it reports `error` until `fixed_when` holds.
@@ -1251,7 +1225,7 @@ mod http {
 
     #[tokio::test]
     async fn a_device_pairs_starts_a_run_approves_it_and_reads_what_it_cost() {
-        let tmp = repo("api");
+        let tmp = seeded("api");
         LocalStore::open(tmp.0.join(".taskmaster/dictionary"))
             .unwrap()
             .publish("greet", EntryKind::Hint, "greeting", "export const G = 1;\n", "next")
@@ -1284,11 +1258,29 @@ mod http {
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
         assert_eq!(done["cancelled"], false);
-        assert_eq!(done["estimate"]["tokens"], 2 * 17_000 + 2 * 500);
+        assert_eq!(done["estimate"]["tokens"], 2 * 17_000);
         let calls = done["spent"]["calls"].as_u64().unwrap();
-        assert!(calls >= 3 && done["spent"]["tokens"] == calls * 120, "{done}");
+        assert!(calls >= 2 && done["spent"]["tokens"] == calls * 120, "{done}");
         assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);
         assert_eq!(client.post("/api/runs/web/cancel", json!({})).await.0, 409);
+
+        // The run never reviewed itself; review is asked for afterwards, once, for the whole run.
+        let (_, reviews) = client.get("/api/reviews").await;
+        assert!(reviews["reviews"].as_array().unwrap().is_empty());
+        assert_eq!(client.post("/api/runs/nope/review", json!({})).await.0, 404);
+        let (status, made) = client.post("/api/runs/web/review", json!({})).await;
+        assert_eq!(status, 202, "{made}");
+        let review_id = made["id"].as_str().unwrap().to_string();
+        let mut job = Value::Null;
+        for _ in 0..400 {
+            job = client.get(&format!("/api/reviews/{review_id}")).await.1;
+            if job["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(job["status"], "done", "{job}");
+        assert_eq!(job["run"], "web");
 
         let (_, ledger) = client.get("/api/runs/web/ledger").await;
         assert_eq!(ledger["entries"].as_array().unwrap().len() as u64, calls);
@@ -1508,7 +1500,7 @@ mod http {
         assert_eq!(findings[0]["file"], "src/lib.ts");
         assert_eq!(findings[0]["outcome"], "confirmed");
         assert!(job["text"].as_str().unwrap().contains("[bug] src/lib.ts:1"));
-        assert!(job["report"]["usage"]["input"].as_u64().unwrap() >= 300);
+        assert!(job["report"]["usage"]["input"].as_u64().unwrap() >= 200);
         let (_, listed) = client.get("/api/reviews").await;
         assert!(listed["reviews"].as_array().unwrap().iter().any(|row| row["id"] == id.as_str() && row["confirmed"] == 1));
         assert!(read(&tmp.0.join(".taskmaster/reviews/history.jsonl")).contains("wrong total"));
@@ -2074,6 +2066,8 @@ mod http {
         assert_eq!(status, 409, "{reply}");
         assert!(reply["error"].as_str().unwrap().contains("done"));
         assert_eq!(client.get("/api/runs/pr1/diff?scope=page").await.0, 409);
+        // Review waits for a finished run.
+        assert_eq!(client.post("/api/runs/pr1/review", json!({})).await.0, 409);
     }
 
     fn have_python() -> bool {

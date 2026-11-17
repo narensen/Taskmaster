@@ -28,6 +28,8 @@
 //! GET  /api/reviews               reviews started here
 //! POST /api/reviews               {target?, base?, head?, pr?, dirty?, reviewer?, verifier?, ...}
 //! GET  /api/reviews/{id}
+//! POST /api/reviews/{id}/cancel
+//! POST /api/runs/{id}/review     one combined review of a finished run's diff; returns {id}
 //! GET  /api/commons/entries       this daemon's Commons, for another daemon to pull
 //! POST /api/commons/entries       an entry another daemon promoted
 //! ```
@@ -180,6 +182,8 @@ struct App {
     /// The editor override; the settings file's value until `POST /api/settings` changes it.
     editor: Mutex<String>,
     previews: crate::preview::Previews,
+    /// Running review jobs, so cancelling one (or its run) can stop the agents.
+    reviews: Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 impl Server {
@@ -216,6 +220,7 @@ impl Server {
             live,
             editor: Mutex::new(options.editor),
             previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
+            reviews: Mutex::new(HashMap::new()),
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -253,6 +258,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/errorography", get(errorography))
         .route("/api/reviews", get(list_reviews).post(create_review))
         .route("/api/reviews/{id}", get(show_review))
+        .route("/api/reviews/{id}/cancel", post(cancel_review))
+        .route("/api/runs/{id}/review", post(review_run))
         .route("/api/commons/entries", get(commons_entries).post(commons_add))
         .route("/api/runs/{id}/agents", get(desk::agents))
         .route("/api/runs/{id}/notes", get(desk::notes).post(desk::add_note))
@@ -818,6 +825,7 @@ async fn resume_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
 
 async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
     let run = app.known(&id)?;
+    app.stop_run_reviews(&id);
     {
         let active = app.active.lock().unwrap();
         if let Some(active) = active.get(&id) {
@@ -961,7 +969,63 @@ impl App {
 }
 
 async fn create_review(State(app): State<Arc<App>>, body: Option<Json<NewReview>>) -> Reply {
-    let body = body.map(|Json(body)| body).unwrap_or_default();
+    start_review(&app, body.map(|Json(body)| body).unwrap_or_default(), None)
+}
+
+/// Review a finished run's whole diff, once, on request. A run never reviews itself.
+async fn review_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    let run = app.known(&id)?;
+    if !matches!(run.phase, RunPhase::Done | RunPhase::Failed) {
+        return Err(fail(StatusCode::CONFLICT, "review a run once it has finished"));
+    }
+    let meta = app.records.meta(&id)?.ok_or_else(|| fail(StatusCode::CONFLICT, "this run has not started building"))?;
+    let (Some(base), Some(branch)) = (meta.base, meta.branch) else {
+        return Err(fail(StatusCode::CONFLICT, "this run built in the project's own working tree, so it has no branch to review"));
+    };
+    let head = desk::run_head(&app, &id, &branch)
+        .ok_or_else(|| fail(StatusCode::CONFLICT, format!("branch `{branch}` is gone and its last commit was not kept")))?;
+    let body = NewReview { base: Some(base), head: Some(head), ..Default::default() };
+    start_review(&app, body, Some(id))
+}
+
+async fn cancel_review(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    if !valid_key(&id) {
+        return Err(fail(StatusCode::NOT_FOUND, "no such review"));
+    }
+    let Some(mut job) = app.records.review(&id)? else { return Err(fail(StatusCode::NOT_FOUND, "no such review")) };
+    if job["status"] != "running" {
+        return Err(fail(StatusCode::CONFLICT, "this review is over"));
+    }
+    app.stop_review(&id);
+    job["status"] = json!("failed");
+    job["error"] = json!("cancelled");
+    app.records.save_review(&id, &job)?;
+    accepted(json!({ "id": id }))
+}
+
+impl App {
+    /// Abort a review job. Its agents die with it: each runs in its own process group that
+    /// is killed when the task's future is dropped.
+    fn stop_run_reviews(&self, run: &str) {
+        for id in self.records.review_ids().unwrap_or_default() {
+            let Ok(Some(mut job)) = self.records.review(&id) else { continue };
+            if job["run"] == run && job["status"] == "running" {
+                self.stop_review(&id);
+                job["status"] = json!("failed");
+                job["error"] = json!("cancelled");
+                let _ = self.records.save_review(&id, &job);
+            }
+        }
+    }
+
+    fn stop_review(&self, id: &str) {
+        if let Some(handle) = self.reviews.lock().unwrap().remove(id) {
+            handle.abort();
+        }
+    }
+}
+
+fn start_review(app: &Arc<App>, body: NewReview, run: Option<String>) -> Reply {
     let defaults = Roles::default();
     let reviewer_name = body.reviewer.unwrap_or(defaults.reviewer);
     let verifier_name = body.verifier.unwrap_or(defaults.verifier);
@@ -986,10 +1050,11 @@ async fn create_review(State(app): State<Arc<App>>, body: Option<Json<NewReview>
         "target": target,
         "reviewer": reviewer_name,
         "verifier": verifier_name,
+        "run": run,
     });
     app.records.save_review(&id, &job)?;
-    let (records, job_id) = (app.records.clone(), id.clone());
-    tokio::spawn(async move {
+    let (records, job_id, tracker) = (app.records.clone(), id.clone(), app.clone());
+    let handle = tokio::spawn(async move {
         match tm_review::run::run(&options, reviewer, verifier).await {
             Ok(report) => {
                 job["status"] = json!("done");
@@ -1004,7 +1069,9 @@ async fn create_review(State(app): State<Arc<App>>, body: Option<Json<NewReview>
         if let Err(err) = records.save_review(&job_id, &job) {
             eprintln!("taskmaster: review {job_id} was not recorded: {err:#}");
         }
+        tracker.reviews.lock().unwrap().remove(&job_id);
     });
+    app.reviews.lock().unwrap().insert(id.clone(), handle.abort_handle());
     accepted(json!({ "id": id }))
 }
 
@@ -1020,6 +1087,7 @@ async fn list_reviews(State(app): State<Arc<App>>) -> Reply {
             "status": job["status"],
             "at": job["at"],
             "target": job["target"],
+            "run": job["run"],
             "confirmed": confirmed,
         }));
     }

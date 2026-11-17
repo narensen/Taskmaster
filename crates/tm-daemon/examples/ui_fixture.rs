@@ -123,6 +123,12 @@ impl Harness for Scripted {
             say(&events, text(&format!("Wrote {file}:3 against contracts/types.ts#L1. "))).await;
             say(&events, text("The key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx was in an env file; it stays masked.\n")).await;
             say(&events, text("Done.")).await;
+        } else if brief.contains("You are reviewing a code change") {
+            // The on-demand review: one combined reviewer, slow enough to see "in progress".
+            say(&events, thought("Reading the whole diff once.")).await;
+            tool(&events, "Read", json!({ "file_path": "app/home/page.tsx" }), true).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            say(&events, text("[{\"file\":\"app/home/page.tsx\",\"line\":5,\"failure\":\"the count is not labelled\"}]")).await;
         } else if brief.contains("reviewing one connection") || brief.contains("security problems") {
             say(&events, thought("Following each import from page to contract.")).await;
             tool(&events, "Read", json!({ "file_path": "app/home/page.tsx" }), true).await;
@@ -136,7 +142,7 @@ impl Harness for Scripted {
         } else if brief.contains("Decide whether it is real") {
             tool(&events, "Read", json!({ "file_path": "app/home/page.tsx" }), true).await;
             say(&events, text("app/home/page.tsx:5 renders a number with a word next to it. ")).await;
-            say(&events, text("{\"real\": false}")).await;
+            say(&events, text("{\"real\": true}")).await;
         } else {
             say(&events, text("Nothing to do.")).await;
         }

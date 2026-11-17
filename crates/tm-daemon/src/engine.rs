@@ -1673,8 +1673,8 @@ impl Driver {
                 history.extend(self.records.ledger(&run)?);
             }
         }
-        let keys: BTreeSet<&String> = plan.pages.iter().flat_map(|page| &page.cites).collect();
-        let (mut estimate, basis) = forecast(&history, plan.pages.len(), keys.len() + 1);
+        // Review is on demand, so a run's own cost is only its builds.
+        let (mut estimate, basis) = forecast(&history, plan.pages.len(), 0);
         let planning = totals(&self.records.ledger(&self.id)?);
         estimate.tokens += planning.fresh;
         estimate.usd += planning.cost_usd;

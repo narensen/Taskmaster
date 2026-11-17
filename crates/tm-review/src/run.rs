@@ -24,6 +24,10 @@ use crate::{CONTEXT_DIR, HISTORY_FILE, ROOT_RULES, brief, forge, git, history, l
 
 const PARALLEL: usize = 4;
 const AGENT_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a whole review may take.
+pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long an agent may go without saying anything before the review is failed.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// What to review and who reviews it.
 #[derive(Debug, Clone)]
@@ -41,6 +45,10 @@ pub struct Options {
     pub head: Option<String>,
     /// Leave the review checkout on disk.
     pub keep: bool,
+    /// The whole review must finish within this.
+    pub timeout: Duration,
+    /// An agent silent for this long fails the review.
+    pub stall: Duration,
 }
 
 impl Options {
@@ -55,6 +63,8 @@ impl Options {
             base: None,
             head: None,
             keep: false,
+            timeout: REVIEW_TIMEOUT,
+            stall: STALL_TIMEOUT,
         }
     }
 }
@@ -161,6 +171,7 @@ struct Target {
     install_lints: bool,
     reviewer_model: Option<String>,
     verifier_model: Option<String>,
+    stall: Duration,
 }
 
 /// What one agent run produced: everything it said, and what it cost.
@@ -175,6 +186,7 @@ async fn ask(
     model: Option<String>,
     worktree: PathBuf,
     brief: String,
+    stall: Duration,
 ) -> anyhow::Result<Reply> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut gate = WorktreeGate::new(&worktree, vec![]).read_only();
@@ -190,16 +202,35 @@ async fn ask(
         read_only: true,
     };
     let (tx, mut rx) = mpsc::channel(256);
-    let collect = tokio::spawn(async move {
-        let mut text = String::new();
-        while let Some(event) = rx.recv().await {
-            if let HarnessEvent::Text { text: chunk } = event {
-                text.push_str(&chunk);
+    let beat = Arc::new(AtomicU64::new(0));
+    let started = std::time::Instant::now();
+    let collect = {
+        let beat = beat.clone();
+        tokio::spawn(async move {
+            let mut text = String::new();
+            while let Some(event) = rx.recv().await {
+                beat.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                if let HarnessEvent::Text { text: chunk } = event {
+                    text.push_str(&chunk);
+                }
+            }
+            text
+        })
+    };
+    // Dropping the run future when the agent stalls kills its whole process group.
+    let watchdog = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1).min(stall)).await;
+            let quiet = started.elapsed().saturating_sub(Duration::from_millis(beat.load(Ordering::Relaxed)));
+            if quiet >= stall {
+                return;
             }
         }
-        text
-    });
-    let summary = harness.run(task, Arc::new(gate), tx).await?;
+    };
+    let summary = tokio::select! {
+        result = harness.run(task, Arc::new(gate), tx) => result?,
+        _ = watchdog => anyhow::bail!("the reviewer stalled: no output for {} seconds", stall.as_secs()),
+    };
     Ok(Reply { text: collect.await?, usage: summary.usage })
 }
 
@@ -273,6 +304,7 @@ pub async fn run(options: &Options, reviewer: Arc<dyn Harness>, verifier: Arc<dy
         install_lints: options.install_lints,
         reviewer_model: options.reviewer_model.clone(),
         verifier_model: options.verifier_model.clone(),
+        stall: options.stall,
     };
     let base = opened.base;
     let head = opened.head;
@@ -294,7 +326,10 @@ pub async fn run(options: &Options, reviewer: Arc<dyn Harness>, verifier: Arc<dy
         if target.dirty {
             git::apply_working_tree(&target.repo, &worktree)?;
         }
-        review(&target, &worktree, &base, &head, reviewer, verifier).await
+        match tokio::time::timeout(options.timeout, review(&target, &worktree, &base, &head, reviewer, verifier)).await {
+            Ok(done) => done,
+            Err(_) => anyhow::bail!("the review timed out after {} seconds", options.timeout.as_secs()),
+        }
     }
     .await;
     if options.keep {
@@ -346,14 +381,20 @@ async fn review(
     };
     std::fs::write(worktree.join(CONTEXT_DIR).join("LINT.md"), lint.markdown())?;
     let all_files: Vec<String> = scopes.iter().flat_map(|(s, _)| s.files.clone()).collect();
-    eprintln!("reviewing {} file(s) with {} reviewer(s) plus a security reviewer", all_files.len(), scopes.len());
+    eprintln!("reviewing {} file(s) in one combined review", all_files.len());
 
-    // One reviewer per scope, plus one that looks only for security problems.
-    let mut briefs: Vec<(String, Kind, String)> = scopes
-        .iter()
-        .map(|(scope, diff)| (scope.name.clone(), Kind::Bug, brief::review(scope, diff)))
-        .collect();
-    briefs.push(("security".into(), Kind::Security, brief::security(&all_files)));
+    // One combined reviewer for the whole change, security included.
+    let whole = Scope {
+        name: "all".into(),
+        files: all_files.clone(),
+        dependents: {
+            let mut all: Vec<String> = scopes.iter().flat_map(|(s, _)| s.dependents.clone()).collect();
+            all.sort();
+            all.dedup();
+            all
+        },
+    };
+    let briefs: Vec<(String, Kind, String)> = vec![("review".into(), Kind::Bug, brief::review(&whole, "DIFF.patch"))];
 
     let limit = Arc::new(Semaphore::new(PARALLEL));
     let mut usage = Usage::default();
@@ -366,10 +407,10 @@ async fn review(
 
     let mut running = JoinSet::new();
     for (name, kind, text) in briefs {
-        let (h, model, tree, limit) = (reviewer.clone(), o.reviewer_model.clone(), worktree.to_path_buf(), limit.clone());
+        let (h, model, tree, limit, stall) = (reviewer.clone(), o.reviewer_model.clone(), worktree.to_path_buf(), limit.clone(), o.stall);
         running.spawn(async move {
             let _permit = limit.acquire_owned().await;
-            (name, kind, ask(h, model, tree, text).await)
+            (name, kind, ask(h, model, tree, text, stall).await)
         });
     }
     let mut found: Vec<Finding> = Vec::new();
@@ -404,10 +445,10 @@ async fn review(
     // Every remaining finding must survive an attempt to disprove it.
     let mut running = JoinSet::new();
     for finding in found {
-        let (h, model, tree, limit) = (verifier.clone(), o.verifier_model.clone(), worktree.to_path_buf(), limit.clone());
+        let (h, model, tree, limit, stall) = (verifier.clone(), o.verifier_model.clone(), worktree.to_path_buf(), limit.clone(), o.stall);
         running.spawn(async move {
             let _permit = limit.acquire_owned().await;
-            let reply = ask(h, model, tree, brief::verify(&finding)).await;
+            let reply = ask(h, model, tree, brief::verify(&finding), stall).await;
             (finding, reply)
         });
     }

@@ -91,13 +91,8 @@ impl Harness for AcpHarness {
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let mut child = self
-            .command(&task)?
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+        let mut command = self.command(&task)?;
+        let (mut child, _group) = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
             .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary))?;
         let mut session = Session {
             stdin: child.stdin.take().context("agent stdin was not captured")?,

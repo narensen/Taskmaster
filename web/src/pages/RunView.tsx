@@ -6,7 +6,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { AnimatePresence, motion } from "framer-motion";
 import gsap from "gsap";
 import { PanelRightClose, PanelRightOpen } from "lucide-react";
-import { api, type RunDetail } from "../api";
+import { api, type ReviewJob, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
 import { phaseLabel, usd } from "../format";
@@ -37,6 +37,76 @@ function useNarrow(): boolean {
     return () => q.removeEventListener("change", on);
   }, []);
   return narrow;
+}
+
+// On-demand code review of a finished run: one combined reviewer over the whole diff.
+function ReviewCard({ id }: { id: string }) {
+  const [job, setJob] = useState<ReviewJob | null>(null);
+  const [busy, setBusy] = useState(false);
+  const jobId = useRef<string | null>(null);
+  const load = useCallback(async (reviewId: string) => {
+    const next = await api.review(reviewId);
+    jobId.current = reviewId;
+    setJob(next);
+    return next;
+  }, []);
+  // Pick up the latest review of this run after a reload.
+  useEffect(() => {
+    void api
+      .reviews()
+      .then((all) => all.find((r) => r.run === id))
+      .then((last) => (last ? load(last.id) : undefined))
+      .catch(() => undefined);
+  }, [id, load]);
+  useEffect(() => {
+    if (job?.status !== "running") return;
+    const t = setInterval(() => void load(job.id).catch(() => undefined), 1500);
+    return () => clearInterval(t);
+  }, [job?.id, job?.status, load]);
+  const start = async () => {
+    setBusy(true);
+    try {
+      const r = await api.reviewRun(id);
+      await load(r.id);
+    } catch (err) {
+      toast("The review did not start", err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const confirmed = job?.report?.findings.filter((f) => f.outcome === "confirmed") ?? [];
+  return (
+    <div className="banner small" data-testid="review-card">
+      <div className="row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <strong>Code review</strong>
+        {job?.status === "running" ? (
+          <>
+            <span data-testid="review-running">Review in progress…</span>
+            <button className="ghost small" data-testid="review-cancel" onClick={() => void api.cancelReview(job.id).then(() => load(job.id))}>
+              Cancel review
+            </button>
+          </>
+        ) : (
+          <button className="ghost small" data-testid="review-button" disabled={busy} onClick={() => void start()}>
+            {job ? "Review again" : "Review"}
+          </button>
+        )}
+      </div>
+      {job?.status === "failed" && <div className="error-line" data-testid="review-error">Review failed: {job.error}</div>}
+      {job?.status === "done" && (
+        <div data-testid="review-result">
+          {confirmed.length === 0 ? "Review finished: no confirmed problems." : `Review finished: ${confirmed.length} confirmed problem(s).`}
+          <ul>
+            {confirmed.map((f, i) => (
+              <li key={i}>
+                {f.file}:{f.line} {f.failure}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: RunDetail; composer: React.RefObject<ComposerHandle | null>; onDone: () => void }) {
@@ -430,6 +500,7 @@ export function RunView({ id }: { id: string }) {
 
         <ToolApprovals list={toolApprovals.list} answer={toolApprovals.answer} />
         <LivePreview id={id} detail={detail} />
+        {["done", "failed"].includes(detail.phase) && detail.branch && <ReviewCard id={id} />}
 
         <div className="agents">
           {master && (

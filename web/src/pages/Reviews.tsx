@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { ClipboardList, GitCompare } from "lucide-react";
+import { ChevronRight, ClipboardList, GitCompare, Plus, X } from "lucide-react";
 import { api, DEFAULT_ROLES, type Judged } from "../api";
 import { ago } from "../format";
 import { Link, navigate } from "../router";
-import { Badge, Code, Empty, Field, Problem, Spinner, useAction, useLoad } from "../ui";
+import { Badge, Code, Empty, Field, Loading, Problem, Spinner, useAction, useLoad } from "../ui";
 
 export function Reviews() {
   const reviews = useLoad(api.reviews, [], 5000);
@@ -12,24 +12,43 @@ export function Reviews() {
   return (
     <div className="page">
       <header className="page-head">
-        <h1>Reviews</h1>
-        <button className="primary" onClick={() => setOpen(!open)}>
+        <div className="grow">
+          <h1>Reviews</h1>
+          <p className="page-lede">
+            Review any repository or pull request: one harness reports problems, a different one checks each report against the code.
+            Lints run first, at no token cost.
+          </p>
+        </div>
+        <button className={open ? "" : "primary"} onClick={() => setOpen(!open)}>
+          {open ? <X size={15} aria-hidden /> : <Plus size={15} aria-hidden />}
           {open ? "Close" : "New review"}
         </button>
       </header>
-      <p className="muted">
-        Review any repository or pull request: one harness reports problems, a different one checks each report against the code.
-        Lints run first, at no token cost.
-      </p>
       {open && <NewReviewForm />}
       <Problem error={reviews.error} onRetry={reviews.reload} />
-      {reviews.loading && !reviews.data && <Spinner />}
-      {reviews.data && reviews.data.length === 0 && !open && <Empty title="No reviews yet" icon={<ClipboardList size={18} strokeWidth={1.5} />} />}
+      {reviews.loading && !reviews.data && <Loading rows={3} tall label="Loading reviews" />}
+      {reviews.data && reviews.data.length === 0 && !open && (
+        <Empty
+          title="No reviews yet"
+          icon={<ClipboardList size={18} strokeWidth={1.5} />}
+          action={
+            <button className="primary" onClick={() => setOpen(true)}>
+              <Plus size={15} aria-hidden /> New review
+            </button>
+          }
+        >
+          Point a reviewer at a repository, a branch or a pull request. A finished run also has a Review button of its own.
+        </Empty>
+      )}
       <div className="cards">
         {(reviews.data ?? []).map((review) => (
-          <Link key={review.id} to={`/reviews/${encodeURIComponent(review.id)}`} className="card">
+          <Link key={review.id} to={`/reviews/${encodeURIComponent(review.id)}`} className="card review-row">
+            <span className="review-ico" aria-hidden>
+              <GitCompare size={15} />
+            </span>
+            <div className="grow">
             <div className="row between gap">
-              <span className="mono clip">{review.target}</span>
+              <span className="mono clip strong">{review.target}</span>
               <StatusBadge status={review.status} />
             </div>
             <div className="row gap muted small">
@@ -40,6 +59,8 @@ export function Reviews() {
                 </span>
               )}
             </div>
+            </div>
+            <ChevronRight size={16} className="row-chev" aria-hidden />
           </Link>
         ))}
       </div>
@@ -84,7 +105,8 @@ function NewReviewForm() {
   };
 
   return (
-    <form className="card stack" onSubmit={submit}>
+    <form className="card stack review-form" onSubmit={submit}>
+      <h2>New review</h2>
       <Field label="What to review" hint="A path, a repository URL or a pull request URL. Empty: this project.">
         <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="https://github.com/owner/repo/pull/12" spellCheck={false} />
       </Field>
@@ -131,7 +153,7 @@ function NewReviewForm() {
 export function ReviewView({ id }: { id: string }) {
   const job = useLoad(() => api.review(id), [id], 4000);
   const [showRejected, setShowRejected] = useState(false);
-  if (!job.data) return <div className="page">{job.error ? <Problem error={job.error} onRetry={job.reload} /> : <Spinner />}</div>;
+  if (!job.data) return <div className="page">{job.error ? <Problem error={job.error} onRetry={job.reload} /> : <Loading rows={3} label="Opening the review" />}</div>;
   const j = job.data;
   const findings = j.report?.findings ?? [];
   const confirmed = findings.filter((f) => f.outcome === "confirmed");
@@ -139,8 +161,10 @@ export function ReviewView({ id }: { id: string }) {
 
   return (
     <div className="page">
-      <nav className="crumbs">
-        <Link to="/reviews">Reviews</Link> / <span className="mono">{j.id}</span>
+      <nav className="crumbs back-crumbs" aria-label="Breadcrumb">
+        <Link to="/reviews">Reviews</Link>
+        <span className="crumb-sep">/</span>
+        <span className="mono crumb-here">{j.id}</span>
       </nav>
       <header className="run-head">
         <div className="row between wrap gap">
@@ -159,7 +183,11 @@ export function ReviewView({ id }: { id: string }) {
           )}
         </div>
       </header>
-      {j.status === "running" && <Spinner label="Reviewing. This takes a few minutes." />}
+      {j.status === "running" && (
+        <div className="banner status-strip" role="status">
+          <Spinner label="Reviewing. This takes a few minutes." />
+        </div>
+      )}
       {j.error && <p className="error-line">{j.error}</p>}
       {j.report && !j.report.reviewed && <Empty title="Nothing changed, so nothing was reviewed" icon={<GitCompare size={18} strokeWidth={1.5} />} />}
       {j.report?.reviewed && (

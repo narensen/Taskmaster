@@ -13,3 +13,15 @@ export const bezier = {
   out: [0.22, 1, 0.36, 1] as [number, number, number, number],
   inOut: [0.4, 0, 0.2, 1] as [number, number, number, number],
 };
+
+/** Shared enter: a short rise, no overshoot. */
+export const fadeUp = {
+  initial: { opacity: 0, y: 6 },
+  animate: { opacity: 1, y: 0 },
+  transition: { duration: 0.22, ease: bezier.out },
+};
+
+/** Stagger delay in seconds. Caps so a long list does not drag. */
+export function stagger(i: number): number {
+  return Math.min(i * 0.03, 0.18);
+}

@@ -7,7 +7,7 @@ import { ShieldAlert } from "lucide-react";
 import { api, type AgentEntry, type ToolApproval } from "../api";
 import { toast } from "../overlay";
 import { motionOn } from "../prefs";
-import { bezier } from "../motion";
+import { bezier, fadeUp } from "../motion";
 
 /** Pending approvals for a run, kept in step with the run payload count and the live stream. */
 export function useToolApprovals(run: string, pending: number | undefined, entries: AgentEntry[], onAnswered: () => void) {
@@ -81,10 +81,10 @@ export function ToolApprovals({ list, answer }: { list: ToolApproval[]; answer: 
               layout="position"
               className={`tool-approval kind-${a.kind}`}
               data-testid="tool-approval"
-              initial={motionOn() ? { opacity: 0, y: 6 } : false}
-              animate={{ opacity: 1, y: 0 }}
-              exit={motionOn() ? { opacity: 0, y: -4 } : { opacity: 0, transition: { duration: 0 } }}
-              transition={{ duration: motionOn() ? 0.16 : 0, ease: bezier.out }}
+              initial={motionOn() ? { ...fadeUp.initial, scale: 0.98 } : false}
+              animate={{ ...fadeUp.animate, scale: 1 }}
+              exit={{ opacity: 0, transition: { duration: 0 } }}
+              transition={{ duration: motionOn() ? fadeUp.transition.duration : 0, ease: bezier.out }}
             >
               <div className="row between gap wrap">
                 <div className="row gap tool-approval-head">

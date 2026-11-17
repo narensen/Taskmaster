@@ -14,7 +14,7 @@ import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, label, resolvedPath } from "../paths";
 import { navigate } from "../router";
 import { motionOn, prefs, setPrefs } from "../prefs";
-import { bezier, dur, ease } from "../motion";
+import { bezier, dur, ease, fadeUp } from "../motion";
 import { Problem, Spinner, useLoad } from "../ui";
 import { takeAttachments } from "../App";
 import { AgentSurface } from "../run/AgentSurface";
@@ -75,9 +75,9 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
     <motion.div
       className="approval"
       data-testid="approval"
-      initial={motionOn() ? { opacity: 0, y: 8 } : false}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.18, ease: bezier.out }}
+      initial={motionOn() ? { ...fadeUp.initial, scale: 0.98 } : false}
+      animate={{ ...fadeUp.animate, scale: 1 }}
+      transition={{ duration: motionOn() ? fadeUp.transition.duration : 0, ease: bezier.out }}
     >
       <div className="strong">The master asks to build this plan</div>
       <div className="small muted">
@@ -240,11 +240,11 @@ export function RunView({ id }: { id: string }) {
   }, [tab, closed, closeTab, setTab]);
 
   useLayoutEffect(() => {
-    if (!panelBody.current || !motionOn()) return;
-    const tween = gsap.fromTo(panelBody.current, { opacity: 0, y: 4 }, { opacity: 1, y: 0, duration: dur.fast, ease: ease.out, clearProps: "opacity,transform" });
-    return () => {
-      tween.kill();
-    };
+    const el = panelBody.current;
+    if (!el || !motionOn()) return;
+    el.classList.remove("tm-fade");
+    void el.offsetWidth;
+    el.classList.add("tm-fade");
   }, [tab]);
 
   const panelWidth = () => Math.min(window.innerWidth * 0.4, 520);
@@ -277,14 +277,17 @@ export function RunView({ id }: { id: string }) {
       return;
     }
     const root = runRef.current;
-    const el = panelRef.current;
     if (!root || !motionOn()) return;
     gsap.set(root, { "--panel-w": "0px" });
     const slide = gsap.to(root, { "--panel-w": `${panelWidth()}px`, duration: dur.base, ease: ease.out, clearProps: "--panel-w" });
-    const fade = el ? gsap.fromTo(el, { opacity: 0 }, { opacity: 1, duration: dur.base, ease: ease.out, clearProps: "opacity" }) : null;
+    const body = panelBody.current;
+    if (body) {
+      body.classList.remove("tm-fade");
+      void body.offsetWidth;
+      body.classList.add("tm-fade");
+    }
     return () => {
       slide.kill();
-      fade?.kill();
     };
   }, [panelOpen, narrow]);
 
@@ -428,7 +431,7 @@ export function RunView({ id }: { id: string }) {
 
         <div className="agents">
           {master && (
-            <AgentSurface surface={master} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === "master"}>
+            <AgentSurface index={0} surface={master} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === "master"}>
               {phase === "awaiting_approval" && (
                 <ApprovalCard
                   id={id}
@@ -444,14 +447,14 @@ export function RunView({ id }: { id: string }) {
           )}
           {workers.length > 0 && (
             <div className="workers">
-              {workers.map((s) => (
-                <AgentSurface key={s.id} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
+              {workers.map((s, i) => (
+                <AgentSurface key={s.id} index={i + 1} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
               ))}
             </div>
           )}
           <div className="workers">
-            {rest.map((s) => (
-              <AgentSurface key={s.id} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
+            {rest.map((s, i) => (
+              <AgentSurface key={s.id} index={workers.length + 1 + i} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
             ))}
           </div>
         </div>

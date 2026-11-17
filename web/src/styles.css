@@ -411,7 +411,7 @@ button.group-head:hover { background: transparent; border-color: transparent; co
   margin-top: 2px;
   color: var(--muted);
 }
-.run-ico.working { color: var(--ink); }
+.run-ico.working { color: var(--ink); animation: tm-pulse 1.6s ease-in-out infinite; }
 .run-ico.ask { color: var(--ask); }
 .spin-ico { animation: spin 0.7s linear infinite; }
 .run-copy {
@@ -542,13 +542,28 @@ button.group-head:hover { background: transparent; border-color: transparent; co
   padding: var(--s4);
 }
 .empty {
+  padding: var(--s6) var(--s5);
   border: 1px dashed var(--line-strong);
   border-radius: var(--r-lg);
-  padding: 28px 16px;
+  background: radial-gradient(120% 80% at 50% 0%, var(--accent-soft), transparent 70%);
+  color: var(--muted);
   text-align: center;
+  display: grid;
+  gap: var(--s2);
+  justify-items: center;
+}
+.empty strong { color: var(--ink); font-size: 14px; font-weight: 600; }
+.empty p { margin: 0; }
+.empty-ico {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r);
+  background: var(--bg-hover);
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
   color: var(--muted);
 }
-.empty strong { color: var(--ink); display: block; margin-bottom: 4px; }
 .problem, .error-line {
   border-left: 2px solid var(--bad);
   padding: 4px 8px;
@@ -589,7 +604,25 @@ button.group-head:hover { background: transparent; border-color: transparent; co
 .dot.good { background: var(--good); }
 .dot.bad { background: var(--bad); }
 .dot.ask { background: var(--ask); }
-.dot.busy { background: var(--ink); }
+.dot.busy { background: var(--ink); animation: tm-pulse 1.6s ease-in-out infinite; }
+@keyframes tm-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+.skeleton {
+  display: inline-block;
+  min-width: 6ch;
+  border-radius: var(--r-sm);
+  color: transparent;
+  background-image: linear-gradient(90deg, var(--bg-hover) 0%, var(--bg-active) 50%, var(--bg-hover) 100%);
+  background-size: 200% 100%;
+  animation: tm-shimmer 1.4s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes tm-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
 .chip {
   display: inline-flex;
   align-items: center;
@@ -669,12 +702,12 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
   box-shadow: var(--shadow-1);
   padding: 0;
   transition:
-    transform var(--t-fast) var(--ease),
+    translate var(--t-fast) var(--ease),
     box-shadow var(--t-fast) var(--ease),
     border-color var(--t-fast) var(--ease);
 }
 .gallery-card:hover {
-  transform: translateY(-1px);
+  translate: 0 -1px;
   box-shadow: var(--shadow-2);
   border-color: var(--line-strong);
 }
@@ -1217,6 +1250,11 @@ button.menu-item:hover:not(:disabled) { background: var(--bg-active); border-col
 .panel-tab .chip-x { padding: 0 8px 0 4px; }
 button.panel-tab-name:hover { background: transparent; border-color: transparent; color: var(--ink); }
 .panel-body { flex: 1; overflow: auto; min-height: 0; }
+.panel-body.tm-fade { animation: tm-fade-in 140ms var(--ease); }
+@keyframes tm-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 .panel-body .plan { border: 0; background: transparent; border-radius: 0; box-shadow: none; }
 .toolbar {
   display: flex;

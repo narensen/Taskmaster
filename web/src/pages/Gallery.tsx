@@ -4,16 +4,16 @@
 
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Inbox } from "lucide-react";
+import { Archive, ArchiveRestore, Folder, Inbox, Pin, PinOff, Plus } from "lucide-react";
 import { api, callAt, type RunSummary } from "../api";
 import { Link } from "../router";
 import { ExternalLink } from "../paths";
-import { isUnpriced, phaseLabel, tokens, usd } from "../format";
+import { isUnpriced, phaseLabel, phaseTone, tokens, usd } from "../format";
 import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, setPrefs, usePrefs } from "../prefs";
 import { ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
-import { Empty, useLoad } from "../ui";
+import { Dot, Empty, useLoad } from "../ui";
 
 const shots = new Map<string, string | null>();
 const prompts = new Map<string, string | null>();
@@ -82,23 +82,38 @@ function RunCard({ run, group, index }: { run: RunSummary; group: string; index:
         ) : (
           <div className="frame typed" data-testid="typed-frame">
             <div className="typed-line">{prompt ?? (prompt === null ? "A run from a plan file" : " ")}</div>
-            <div className="typed-phase">{phaseLabel(run)}</div>
+            <div className="typed-phase">
+              <Dot tone={run.cancelled ? "quiet" : group === "Working" ? "busy" : phaseTone(run.phase)} />
+              {phaseLabel(run)}
+            </div>
           </div>
+        )}
+        {shot && (
+          <span className={`frame-badge tone-${run.cancelled ? "quiet" : phaseTone(run.phase)}`}>
+            <Dot tone={run.cancelled ? "quiet" : group === "Working" ? "busy" : phaseTone(run.phase)} />
+            {phaseLabel(run)}
+          </span>
         )}
       </Link>
       <div className="card-foot">
         <div className="grow">
-          <div className="strong clip">{run.id}</div>
-          <div className="muted small">
+          <Link to={`/runs/${encodeURIComponent(run.id)}`} className="card-title clip">
+            {run.id}
+          </Link>
+          <div className="card-meta clip">
             {group.toLowerCase()} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {isUnpriced(run.spent) ? `${tokens(run.spent.tokens)} tokens` : usd(run.spent.cost_usd)}
           </div>
         </div>
-        <button className="icon" onClick={() => toggleFlag(run.id, "pinned")}>
-          {flags.pinned ? "unpin" : "pin"}
-        </button>
-        <button className="icon" onClick={() => toggleFlag(run.id, "archived")}>
-          {flags.archived ? "unarchive" : "archive"}
-        </button>
+        <div className="card-actions">
+          <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
+            {flags.pinned ? <PinOff size={14} aria-hidden /> : <Pin size={14} aria-hidden />}
+            <span className="sr-only">{flags.pinned ? "unpin" : "pin"}</span>
+          </button>
+          <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
+            {flags.archived ? <ArchiveRestore size={14} aria-hidden /> : <Archive size={14} aria-hidden />}
+            <span className="sr-only">{flags.archived ? "unarchive" : "archive"}</span>
+          </button>
+        </div>
       </div>
     </motion.article>
   );
@@ -134,7 +149,8 @@ function DaemonCard({ url, token, pinned, index }: { url: string; token: string 
           className="icon"
           onClick={() => setPrefs((p) => ({ daemons: p.daemons.map((d) => (d.url === url ? { ...d, pinned: !d.pinned } : d)) }))}
         >
-          {pinned ? "unpin" : "pin"}
+          {pinned ? <PinOff size={14} aria-hidden /> : <Pin size={14} aria-hidden />}
+          <span className="sr-only">{pinned ? "unpin" : "pin"}</span>
         </button>
       </div>
     </motion.article>
@@ -149,20 +165,48 @@ export function Gallery() {
   const archived = ordered(runs, true).filter((x) => x.group === "Archived").length;
   const daemons = [...p.daemons].sort((a, b) => Number(b.pinned) - Number(a.pinned));
 
+  const waiting = list.filter((x) => x.group === "Needs approval").length;
+  const working = list.filter((x) => x.group === "Working").length;
+  const project = settings.data?.project;
+  const name = project ? project.split(/[/\\]/).filter(Boolean).pop() ?? project : null;
+
   return (
-    <div className="page wide">
+    <div className="page wide gallery-page">
       <header className="page-head">
         <div className="grow">
           <div className="eyebrow">Project</div>
-          <h1 className="break">{settings.data?.project ?? <span className="skeleton">…</span>}</h1>
+          <h1 className="break">{name ?? <span className="skeleton">…</span>}</h1>
+          <div className="page-sub">
+            <Folder size={13} aria-hidden />
+            <span className="mono clip" data-testid="project-path">{project ?? "…"}</span>
+          </div>
         </div>
-        <Link to="/runs/new" className="button primary">
-          New run
-        </Link>
+        <div className="page-head-actions">
+          {runs.length > 0 && (
+            <div className="head-stats" aria-label="Run summary">
+              <span><strong>{runs.length}</strong> run{runs.length === 1 ? "" : "s"}</span>
+              {working > 0 && <span className="stat-busy"><Dot tone="busy" /> {working} working</span>}
+              {waiting > 0 && <span className="stat-ask"><Dot tone="ask" /> {waiting} need{waiting === 1 ? "s" : ""} approval</span>}
+            </div>
+          )}
+          <Link to="/runs/new" className="button primary">
+            <Plus size={15} aria-hidden />
+            New run
+          </Link>
+        </div>
       </header>
       {runs.length === 0 && (
-        <Empty title="No runs yet" icon={<Inbox size={18} strokeWidth={1.5} />}>
-          Start one with New run. Each run gets a card here.
+        <Empty
+          title="No runs yet"
+          icon={<Inbox size={18} strokeWidth={1.5} />}
+          action={
+            <Link to="/runs/new" className="button primary">
+              <Plus size={15} aria-hidden />
+              Start a run
+            </Link>
+          }
+        >
+          Describe what to build. Taskmaster plans it, splits it across agents, and each run gets a card here with a live screenshot.
         </Empty>
       )}
       <div className="gallery">
@@ -172,12 +216,14 @@ export function Gallery() {
           ))}
         </AnimatePresence>
       </div>
-      <div className="row gap wrap small">
-        <label className="check">
-          <input type="checkbox" checked={p.showArchived} onChange={(e) => setPrefs({ showArchived: e.target.checked })} />
-          Show archived ({archived})
-        </label>
-      </div>
+      {archived > 0 || p.showArchived ? (
+        <div className="row gap wrap small gallery-foot">
+          <label className="check">
+            <input type="checkbox" checked={p.showArchived} onChange={(e) => setPrefs({ showArchived: e.target.checked })} />
+            Show archived ({archived})
+          </label>
+        </div>
+      ) : null}
       {daemons.length > 0 && (
         <>
           <h2 className="section-title">Other daemons</h2>

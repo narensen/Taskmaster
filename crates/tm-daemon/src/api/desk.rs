@@ -257,7 +257,7 @@ pub async fn terminal(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
     let child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
-        .current_dir(&app.project())
+        .current_dir(app.project())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

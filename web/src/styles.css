@@ -1382,6 +1382,12 @@ button.chip-x:hover { color: var(--ink); background: transparent; border-color: 
 .agent.state-waiting .agent-head { opacity: 0.75; }
 .agent.state-working { border-color: var(--accent-line); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent), var(--shadow-2); }
 .agent.state-failed { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+.agent.compact { max-height: none; }
+.agent.compact .agent-head { border-bottom: 0; padding: 10px 14px; opacity: 1; }
+.agent.compact .agent-byline { margin: 2px 0 0 36px; }
+.agent.compact .agent-facts, .agent.compact .meter, .agent.compact .transcript, .agent.compact .attempts { display: none; }
+.agent.compact .agent-state { visibility: hidden; position: relative; }
+.agent.compact .agent-state::after { content: "on demand"; visibility: visible; position: absolute; inset: 0; display: grid; place-items: center; text-transform: none; }
 .agent.focused { outline: none; box-shadow: var(--accent-glow); border-color: var(--line-strong); }
 .agent-head { padding: 12px 14px 10px; border-bottom: 1px solid var(--line); }
 .agent-title { display: flex; align-items: center; gap: 10px; min-width: 0; }

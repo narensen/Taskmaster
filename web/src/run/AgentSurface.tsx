@@ -95,6 +95,7 @@ export function AgentSurface({
   focused,
   index = 0,
   children,
+  compact = false,
 }: {
   surface: Surface;
   detail: RunDetail | null;
@@ -103,6 +104,8 @@ export function AgentSurface({
   focused: boolean;
   index?: number;
   children?: React.ReactNode;
+  /** An idle agent shown as one line: name, harness and state. */
+  compact?: boolean;
 }) {
   const s = surface;
   const { harness, model } = byline(s, detail);
@@ -122,7 +125,7 @@ export function AgentSurface({
         delay: on ? stagger(index) : 0,
         layout: { duration: on ? 0.18 : 0, ease: bezier.out },
       }}
-      className={`agent state-${s.state} ${focused ? "focused" : ""}`}
+      className={`agent state-${s.state} ${focused ? "focused" : ""} ${compact ? "compact" : ""}`}
       id={`agent-${s.id}`}
       data-agent={s.id}
       tabIndex={-1}

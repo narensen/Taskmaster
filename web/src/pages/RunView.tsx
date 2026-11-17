@@ -638,7 +638,16 @@ export function RunView({ id }: { id: string }) {
           )}
           <div className="workers">
             {rest.map((s, i) => (
-              <AgentSurface key={s.id} index={workers.length + 1 + i} surface={s} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === s.id} />
+              <AgentSurface
+                key={s.id}
+                index={workers.length + 1 + i}
+                surface={s}
+                detail={detail}
+                maxTokens={maxTokens}
+                events={data.events.length}
+                focused={focus === s.id}
+                compact={s.state === "waiting" && s.calls.length === 0 && !detail.active}
+              />
             ))}
           </div>
         </div>

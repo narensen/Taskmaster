@@ -1,0 +1,14 @@
+[Unit]
+Description=SearXNG (localhost-only metasearch for Taskmaster)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=ENGINE=podman
+ExecStartPre=-/usr/bin/env ${ENGINE} rm -f searxng
+ExecStart=/usr/bin/env ${ENGINE} run --rm --name searxng -p 127.0.0.1:8888:8080 -v /etc/searxng:/etc/searxng:Z -e SEARXNG_BASE_URL=http://127.0.0.1:8888/ docker.io/searxng/searxng:latest
+ExecStop=/usr/bin/env ${ENGINE} stop searxng
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

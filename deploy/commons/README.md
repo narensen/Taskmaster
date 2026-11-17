@@ -129,3 +129,13 @@ What you can do with them:
 - **`TM_COMMONS_SIGNING_KEY`** signs every sign-in token, so keep it secret. If it changes, every Taskmaster has to sign in again; they pick up the new public key within the hour.
 - **`TM_COMMONS_SESSION_SECRET`** signs browser sessions. If it changes, every browser has to sign in again.
 - **Taskmaster tokens** (`tmc_…`) are stored only as hashes. You can revoke one from the account page.
+
+## Web search (SearXNG)
+
+The deploy also installs a self-hosted [SearXNG](https://github.com/searxng/searxng), a free metasearch engine that needs no API keys. Skip it with `deploy.sh --no-searxng`.
+
+- It runs as the `searxng` systemd unit (podman or docker, whichever the VM has) and listens only on `http://127.0.0.1:8888`. It is not behind Caddy and not public.
+- JSON output is enabled. The engines are duckduckgo, brave, bing, google and wikipedia.
+- `settings.yml` in this repo holds a placeholder. The real `secret_key` is generated on the VM with `openssl rand -hex 32` and never leaves it.
+- To use it from a laptop: `ssh -L 8888:127.0.0.1:8888 opc@130.210.90.199`, then open http://127.0.0.1:8888.
+- Taskmaster's default search endpoint is `http://127.0.0.1:8888/search?format=json&q={q}`.

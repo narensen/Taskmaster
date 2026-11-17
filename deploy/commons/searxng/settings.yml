@@ -1,0 +1,25 @@
+# SearXNG settings for the Commons VM.
+# secret_key below is a placeholder: it is replaced ON THE VM at deploy time
+# with `openssl rand -hex 32`. Never commit a real key.
+# The container is published only on 127.0.0.1:8888, so the limiter is off
+# because the instance is not public.
+use_default_settings:
+  engines:
+    keep_only: [duckduckgo, brave, bing, google, wikipedia]
+general:
+  instance_name: "Taskmaster search"
+search:
+  formats: [html, json]
+  safe_search: 0
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "__SECRET_KEY__"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 6.0
+  pool_connections: 20
+  pool_maxsize: 10

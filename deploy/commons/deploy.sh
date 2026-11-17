@@ -11,15 +11,17 @@ ENV_FILE=/workspace/taskmaster/secrets.env
 COMMONS_ENV=/workspace/taskmaster/commons.env
 BINARY=target/release/tm-commons
 DUCKDNS=0
+SEARXNG=1
 
 usage() {
   cat <<USAGE
-Usage: $0 [--dry-run] [--env-file PATH] [--commons-env PATH] [--binary PATH] [--duckdns]
+Usage: $0 [--dry-run] [--env-file PATH] [--commons-env PATH] [--binary PATH] [--duckdns] [--no-searxng]
   --dry-run          print the commands without running them
   --env-file PATH    secrets file (default $ENV_FILE)
   --commons-env PATH overrides, loaded after --env-file (default $COMMONS_ENV)
   --binary PATH      tm-commons binary (default $BINARY)
   --duckdns          also update DuckDNS (needs DUCKDNS_TOKEN)
+  --no-searxng       skip installing the localhost-only SearXNG
 USAGE
 }
 
@@ -30,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --commons-env) COMMONS_ENV=${2:?}; shift ;;
     --binary) BINARY=${2:?}; shift ;;
     --duckdns) DUCKDNS=1 ;;
+    --no-searxng) SEARXNG=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -70,7 +73,7 @@ if ((DRY)); then
   echo "# commons.env would contain variables:"
   cut -d= -f1 "$CENV" | sed 's/^/#   /'
 fi
-sed "s/^commons\.example\.invalid /$DOMAIN /" "$HERE/Caddyfile" >"$CADDY"
+sed "s/^taskmaster-commons\.duckdns\.org /$DOMAIN /" "$HERE/Caddyfile" >"$CADDY"
 
 # 2) upload
 run scp "${SSH_OPTS[@]}" "$BINARY" "$REMOTE:/tmp/tm-commons"
@@ -92,6 +95,26 @@ rssh 'sudo install -m 644 /tmp/tm-commons.service /etc/systemd/system/tm-commons
 
 # 6) caddy
 rssh 'sudo install -m 644 /tmp/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy'
+
+# 6b) SearXNG, localhost only (secret key is generated on the VM, never here)
+if ((SEARXNG)); then
+  run scp "${SSH_OPTS[@]}" "$HERE/searxng/settings.yml" "$REMOTE:/tmp/settings.yml"
+  run scp "${SSH_OPTS[@]}" "$HERE/searxng/searxng.service" "$REMOTE:/tmp/searxng.service"
+  rssh 'set -e
+ENGINE=$(command -v podman || command -v docker || true)
+if [ -z "$ENGINE" ]; then sudo dnf install -y podman || sudo apt-get install -y docker.io; ENGINE=$(command -v podman || command -v docker); fi
+ENGINE=$(basename "$ENGINE")
+sudo install -d -m 755 /etc/searxng
+sudo install -m 644 /tmp/settings.yml /etc/searxng/settings.yml
+sudo sed -i "s/__SECRET_KEY__/$(openssl rand -hex 32)/" /etc/searxng/settings.yml
+sudo install -m 644 /tmp/searxng.service /etc/systemd/system/searxng.service
+sudo install -d -m 755 /etc/systemd/system/searxng.service.d
+printf "[Service]\nEnvironment=ENGINE=%s\n" "$ENGINE" | sudo tee /etc/systemd/system/searxng.service.d/engine.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now searxng
+sleep 5
+curl -fsS "http://127.0.0.1:8888/search?q=test&format=json" >/dev/null && echo searxng ok'
+fi
 
 # 7) optional DuckDNS (token is never regenerated)
 if ((DUCKDNS)) && [[ -n ${DUCKDNS_TOKEN:-} ]]; then

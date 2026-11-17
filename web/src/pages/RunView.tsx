@@ -694,7 +694,7 @@ export function RunView({ id }: { id: string }) {
                 </option>
               ))}
             </select>
-            <span className="muted">Delivered with the next approval or repair. It does not interrupt a reply.</span>
+            <span className="muted note-hint">Delivered with the next approval or repair. It does not interrupt a reply.</span>
           </div>
           <Composer
             ref={composer}

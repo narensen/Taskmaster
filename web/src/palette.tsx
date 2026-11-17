@@ -3,6 +3,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { Search } from "lucide-react";
 import gsap from "gsap";
 import { commands, useRunContext } from "./commands";
 import { skills } from "./composer";
@@ -115,9 +116,12 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
         exit={on ? { opacity: 0, y: 6 } : { opacity: 1, transition: { duration: 0 } }}
         transition={{ duration: on ? dur.base : 0, ease: bezier.out }}
       >
+        <div className="palette-search">
+        <Search size={16} aria-hidden className="palette-ico" />
         <input
           ref={input}
           className="palette-input"
+          aria-label="Search runs, pages and commands"
           value={q}
           placeholder="Runs, pages and commands · > for commands only"
           onChange={(e) => setQ(e.target.value)}
@@ -135,8 +139,10 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
             }
           }}
         />
+        <kbd>esc</kbd>
+        </div>
         <div className="palette-list" role="listbox">
-          {items.length === 0 && <div className="muted pad">Nothing matches.</div>}
+          {items.length === 0 && <div className="palette-empty">Nothing matches “{q}”.</div>}
           {items.map((item, i) => (
             <button
               key={item.id}
@@ -147,12 +153,17 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
               onClick={() => pick(item)}
             >
               <span className="clip">{item.label}</span>
-              <span className="muted small">
-                {item.group}
-                {item.hint ? ` · ${item.hint}` : ""}
+              <span className="palette-meta">
+                {item.hint && <span className="muted small">{item.hint}</span>}
+                <span className="palette-group">{item.group}</span>
               </span>
             </button>
           ))}
+        </div>
+        <div className="palette-foot" aria-hidden>
+          <span><kbd>↑</kbd><kbd>↓</kbd> move</span>
+          <span><kbd>↵</kbd> open</span>
+          <span><kbd>&gt;</kbd> commands only</span>
         </div>
       </motion.div>
     </motion.div>

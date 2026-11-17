@@ -88,7 +88,7 @@ export function Toasts() {
             </div>
             {t.undo && (
               <button
-                className="ghost small"
+                className="ghost small toast-undo"
                 onClick={() => {
                   t.undo!();
                   dismiss(t.id);
@@ -97,7 +97,7 @@ export function Toasts() {
                 Undo
               </button>
             )}
-            <button className="ghost small" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
+            <button className="icon toast-x" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
               ×
             </button>
           </motion.div>
@@ -266,13 +266,16 @@ export function Sheet({ open, onClose, children }: { open: boolean; onClose: () 
         >
           <motion.div
             className="sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Panel"
             onClick={(e) => e.stopPropagation()}
             initial={on ? { y: 28 } : false}
             animate={{ y: 0 }}
             exit={on ? { y: 20 } : undefined}
             transition={{ duration: on ? 0.18 : 0, ease: bezier.out }}
           >
-            <div className="sheet-grip" onClick={onClose} />
+            <button type="button" className="sheet-grip" aria-label="Close panel" onClick={onClose} />
             {children}
           </motion.div>
         </motion.div>

@@ -216,6 +216,50 @@ export interface Provider {
   error: string | null;
 }
 
+export interface ProviderStatus {
+  id: string;
+  name: string;
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  /** null when the CLI cannot say without starting a session. */
+  signed_in: boolean | null;
+  account: string | null;
+  latest: string | null;
+  update_available: boolean | null;
+  missing_runtimes: string[];
+  notes: string[];
+}
+
+export interface RuntimeStatus {
+  id: string;
+  name: string;
+  installed: boolean;
+  version: string | null;
+  used_for: string;
+}
+
+export type SetupAction = "install" | "update" | "login";
+export type JobState = "running" | "done" | "failed" | "cancelled";
+
+export interface SetupJob {
+  id: string;
+  kind: "provider" | "runtime";
+  target: string;
+  action: SetupAction;
+  state: JobState;
+  steps: { label: string; command: string; state: "waiting" | "running" | "done" | "failed" }[];
+  output: string;
+  prompt: { url: string | null; code: string | null };
+  accepts_input: boolean;
+  exit_code: number | null;
+  error: string | null;
+  started: string;
+  finished: string | null;
+}
+
+export type TerminalKey = "enter" | "up" | "down" | "left" | "right" | "tab" | "escape" | "backspace" | "interrupt";
+
 export interface EntryStats {
   reuses: number;
   pass_rate: number;
@@ -570,6 +614,12 @@ export const api = {
     call<{ providers: Provider[] }>("GET", `/api/providers${harness ? `?harness=${enc(harness)}` : ""}`).then(
       (r) => r.providers,
     ),
+  setup: () => call<{ providers: ProviderStatus[]; runtimes: RuntimeStatus[]; jobs: SetupJob[] }>("GET", "/api/setup"),
+  startProviderJob: (id: string, action: SetupAction) => call<SetupJob>("POST", `/api/setup/providers/${enc(id)}/${action}`, {}),
+  installRuntime: (id: string) => call<SetupJob>("POST", `/api/setup/runtimes/${enc(id)}/install`, {}),
+  job: (id: string) => call<SetupJob>("GET", `/api/setup/jobs/${enc(id)}`),
+  jobInput: (id: string, body: { text?: string; key?: TerminalKey }) => call("POST", `/api/setup/jobs/${enc(id)}/input`, body),
+  cancelJob: (id: string) => call<SetupJob>("POST", `/api/setup/jobs/${enc(id)}/cancel`, {}),
   templates: () => call<{ templates: string[] }>("GET", "/api/templates").then((r) => r.templates),
   dictionary: (q: string) =>
     call<{ entries: DictionaryEntry[] }>("GET", `/api/dictionary?q=${enc(q)}`).then((r) => r.entries),
@@ -653,6 +703,23 @@ export function follow(
   });
   source.onerror = () => {
     if (source.readyState === EventSource.CLOSED) on.lost();
+  };
+  return () => source.close();
+}
+
+/** Follow a setup job until it finishes. Each message is the whole job as it is now. */
+export function followJob(id: string, on: (job: SetupJob) => void, lost: () => void): () => void {
+  const params = new URLSearchParams();
+  const bearer = token();
+  if (bearer) params.set("token", bearer);
+  const source = new EventSource(`${server()}/api/setup/jobs/${enc(id)}/stream?${params}`);
+  source.addEventListener("job", (message) => {
+    const job = JSON.parse((message as MessageEvent<string>).data) as SetupJob;
+    on(job);
+    if (job.state !== "running") source.close();
+  });
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) lost();
   };
   return () => source.close();
 }

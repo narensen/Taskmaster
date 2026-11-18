@@ -1,0 +1,4 @@
+{"name": "tipjar", "label": "checker-off", "seconds": 835.2, "ok": true, "calls": 3, "input": 310684, "output": 126909, "cache_read": 3088358, "cache_write": 0, "cost_usd": 0}
+{"name": "tipjar", "label": "checker-on", "seconds": 527.3, "ok": true, "calls": 3, "input": 250506, "output": 98237, "cache_read": 2105062, "cache_write": 0, "cost_usd": 0}
+{"cache_read": 542467, "cache_write": 0, "calls": 1, "input": 74586, "ok": true, "output": 37291, "seconds": 323.9, "name": "tipjar", "label": "single agent (agy)", "files": 5}
+{"name": "tipjar", "label": "code-mode", "seconds": 404.1, "ok": true, "calls": 2, "input": 143950, "output": 97404, "cache_read": 1077324, "cache_write": 0, "cost_usd": 0}

@@ -1,0 +1,2 @@
+A static tip calculator site with no build step: plain HTML, CSS and JavaScript in app/.
+Two pages. app/index.html: enter a bill, pick a tip (10, 15, 20 percent or custom) and a number of people, and see the tip, the total and each person's share update as you type. app/history.html: the last ten calculations, kept in localStorage, with a button to clear them. A shared header links the two pages.

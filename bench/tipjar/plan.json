@@ -1,0 +1,26 @@
+{
+  "contracts": [],
+  "pages": [
+    {
+      "id": "calculator",
+      "route": "/",
+      "owned_glob": "app/index.html",
+      "cites": [],
+      "brief": "Build the tip calculator page in app/index.html with a shared header containing navigation links to index.html and history.html. Provide inputs for bill amount, tip selection (10%, 15%, 20% preset buttons plus a custom percentage field), and number of people (minimum 1). Calculate and display tip amount, total bill, and per-person split in real-time as inputs update. Validate inputs against negative numbers and non-numeric values. Save valid completed calculations ({id, timestamp, bill, tipPercent, numPeople, tipAmount, totalAmount, perPerson}) to localStorage under key 'tip_calculator_history', capping history at the latest 10 items. Wrap all localStorage and JSON operations in try/catch. Follow the design spec for layout, 44px tap targets, 4.5:1 contrast, explicit labels, visible focus rings, and prefers-reduced-motion.",
+      "done": "app/index.html is complete with shared header navigation, responsive real-time tip/total/share calculation, tip preset selection and custom percentage, accessible labeled inputs with 44px tap targets, 4.5:1 text contrast, visible focus rings, prefers-reduced-motion support, and try/catch wrapped localStorage saving for the last 10 calculations."
+    },
+    {
+      "id": "history",
+      "route": "/history",
+      "owned_glob": "app/history.html",
+      "cites": [],
+      "brief": "Build the calculation history page in app/history.html with a shared header containing navigation links to index.html and history.html. Read and display up to the last 10 calculations from localStorage key 'tip_calculator_history' formatted in styled list rows showing date, bill, tip percentage, tip amount, total amount, and per-person share. When no calculations exist, show the exact empty-state copy: 'No calculation history yet. Calculate a tip on the calculator page to see it here.'. Provide a 'Clear History' danger button that empties the localStorage key and updates the UI immediately. Wrap all localStorage and JSON parsing operations in try/catch. Follow the design spec for layout, 44px tap targets, 4.5:1 contrast, explicit labels, visible focus rings, and prefers-reduced-motion.",
+      "done": "app/history.html is complete with shared header navigation, styled list of the last 10 calculations from localStorage, exact empty-state copy when storage is empty, functional clear history button, accessible controls with 44px tap targets, 4.5:1 text contrast, visible focus rings, prefers-reduced-motion support, and try/catch wrapped localStorage access."
+    }
+  ],
+  "estimate": {
+    "tokens": 0,
+    "usd": 0.0
+  },
+  "design": "Palette: background #f8fafc, surface #ffffff, border #e2e8f0, text #0f172a, muted text #64748b, accent #2563eb, accent-hover #1d4ed8, danger #dc2626, danger-hover #b91c1c, focus-ring #3b82f6 (all text contrast >= 4.5:1 against background/surface). Typography: font stack system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; base size 16px (line-height 1.5); heading sizes h1 28px (weight 700), h2 20px (weight 600); small size 13px (weight 500). Spacing scale: 4px, 8px, 12px, 16px, 20px, 24px, 32px, 40px. Radius: sm 6px, md 10px, lg 16px, pill 9999px. Shadow: sm 0 1px 3px rgba(0,0,0,0.08), md 0 4px 6px -1px rgba(0,0,0,0.08), lg 0 10px 15px -3px rgba(0,0,0,0.08). Component look: buttons min 44px height/width, radius 10px, padding 10px 18px, font-weight 600, cursor pointer, hover transition 0.15s ease; preset tip buttons neutral surface with active state in accent #2563eb with #ffffff text; danger button transparent with danger border/text hovering to filled danger; inputs min 44px height, padding 10px 14px, radius 10px, 16px font size to prevent mobile zoom; list rows on surface with border #e2e8f0, radius 10px, padding 14px 18px; checkboxes 20px with 44px touch padding; :focus-visible ring outline 2px solid #3b82f6 with 2px offset; disabled state opacity 0.5, cursor not-allowed. Empty-state copy: 'No calculation history yet. Calculate a tip on the calculator page to see it here.'. Responsive layout: max container width 560px centered, mobile breakpoint 640px (full-width stacked controls, 2-column tip grid), all interactive tap targets at least 44px. Accessibility: <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> on all pages, explicit <label> or aria-label on every input and control (including script-generated), aria-label on icon-only buttons, visible focus ring on all focusable elements, @media (prefers-reduced-motion: reduce) disables all animations and transitions. Robustness: all localStorage reads, writes, and JSON parse/stringify calls wrapped in try/catch."
+}

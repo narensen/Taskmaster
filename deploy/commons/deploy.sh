@@ -68,7 +68,7 @@ CENV="$TMP/commons.env"
 CADDY="$TMP/Caddyfile"
 
 # 1) commons.env
-write_commons_env "$CENV"
+write_commons_env "$CENV" || exit 1
 if ((DRY)); then
   echo "# commons.env would contain variables:"
   cut -d= -f1 "$CENV" | sed 's/^/#   /'
@@ -81,17 +81,26 @@ run scp "${SSH_OPTS[@]}" "$CENV" "$REMOTE:/tmp/commons.env"
 run scp "${SSH_OPTS[@]}" "$HERE/tm-commons.service" "$REMOTE:/tmp/tm-commons.service"
 run scp "${SSH_OPTS[@]}" "$CADDY" "$REMOTE:/tmp/Caddyfile"
 
-# 3) user, binary, env
+# 3) check first, with the uploaded binary and env, before anything on the server changes.
+# It reads the settings, reaches Neon and creates the tables (over DATABASE_URL_DIRECT when
+# set). A failure stops here and leaves the running service and its files as they were.
+if ! rssh "chmod 600 /tmp/commons.env && bash -c 'set -a; . /tmp/commons.env; set +a; chmod 755 /tmp/tm-commons; /tmp/tm-commons check'"; then
+  rssh 'rm -f /tmp/commons.env' || true
+  echo "error: tm-commons check failed; nothing on $HOST was changed" >&2
+  exit 1
+fi
+
+# 4) user, binary, env (640 root:tm-commons: the service's group reads it)
 rssh 'id tm-commons >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin tm-commons'
 rssh 'sudo install -m 755 /tmp/tm-commons /usr/local/bin/tm-commons && sudo install -d -m 750 -o root -g tm-commons /etc/tm-commons'
-rssh 'sudo install -m 600 -o root -g tm-commons /tmp/commons.env /etc/tm-commons/commons.env && rm -f /tmp/commons.env'
+rssh 'sudo install -m 640 -o root -g tm-commons /tmp/commons.env /etc/tm-commons/commons.env && rm -f /tmp/commons.env'
 
-# 4) migrations: tm-commons migrates over DATABASE_URL_DIRECT on start (if set);
-# the runtime DATABASE_URL stays the Neon pooled string.
-rssh "sudo -u tm-commons bash -c 'set -a; . /etc/tm-commons/commons.env; tm-commons check'"
-
-# 5) service
-rssh 'sudo install -m 644 /tmp/tm-commons.service /etc/systemd/system/tm-commons.service && sudo systemctl daemon-reload && sudo systemctl enable --now tm-commons'
+# 5) service: restart, so a unit that is already running picks up the new binary and env.
+rssh 'sudo install -m 644 /tmp/tm-commons.service /etc/systemd/system/tm-commons.service && sudo systemctl daemon-reload && sudo systemctl enable tm-commons && sudo systemctl restart tm-commons'
+if ! rssh 'for i in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active --quiet tm-commons && exit 0; sleep 1; done; sudo journalctl -u tm-commons -n 30 --no-pager; exit 1'; then
+  echo "error: tm-commons did not stay up after the restart (its log is above)" >&2
+  exit 1
+fi
 
 # 6) caddy
 rssh 'sudo install -m 644 /tmp/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy'

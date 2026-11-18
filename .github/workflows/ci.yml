@@ -33,6 +33,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: bash deploy/commons/lib/test-load-env.sh
 
   web:
     runs-on: ubuntu-latest

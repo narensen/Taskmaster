@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "framer-motion";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Archive,
   ArchiveRestore,
@@ -10,12 +11,11 @@ import {
   CircleAlert,
   CircleCheck,
   Cpu,
-  Folder,
+  FolderTree,
   GitBranch,
   GitPullRequest,
   LayoutGrid,
   Loader2,
-  Menu,
   Pin,
   PinOff,
   Plus,
@@ -25,8 +25,8 @@ import {
   SquarePen,
   type LucideIcon,
 } from "lucide-react";
-import { api, setToken, token, tokenFromRedirect, type DaemonSettings, type RunSummary } from "./api";
-import { Link, match, navigate, usePath } from "./router";
+import { api, setToken, token, tokenFromRedirect, type RunSummary } from "./api";
+import { Link, isMorph, match, navigate, usePath } from "./router";
 import { Dictionary } from "./pages/Dictionary";
 import { Errorography } from "./pages/Errorography";
 import { NewRun } from "./pages/NewRun";
@@ -37,18 +37,30 @@ import { Providers } from "./pages/Providers";
 import { Skills } from "./pages/Skills";
 import { Settings as SettingsPage } from "./pages/Settings";
 import { SignIn } from "./pages/SignIn";
-import { ContextMenu, Toasts, openMenu, undoLatest, type Chip } from "./overlay";
-import { Palette, type PaletteState } from "./palette";
+import { Files } from "./pages/Files";
+import { ContextMenu, Toasts, emit, openMenu, undoLatest, useOn, type Chip } from "./overlay";
+import { Palette, openProject, type PaletteState } from "./palette";
 import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan } from "./format";
 import { readFile } from "./composer";
 import { bezier, dur } from "./motion";
 import { useLoad } from "./ui";
+import { typing } from "./keys";
+import { TitleBar, type Crumb } from "./shell/TitleBar";
+import { Shortcuts } from "./shell/Shortcuts";
+import { QuickTerminal } from "./lazy";
+import { TipProvider } from "./components/Tip";
+import { prefetchRun, useSettings } from "./query";
+import { watchRuns } from "./notify";
+import { MOD, isDesktop, isMac } from "./desktop";
+
+export { typing };
 
 const NAV: { to: string; label: string; icon: LucideIcon; active?: (p: string) => boolean }[] = [
   { to: "/", label: "Gallery", icon: LayoutGrid, active: (p) => p === "/" || p === "/runs" },
   { to: "/runs/new", label: "New run", icon: Plus },
+  { to: "/files", label: "Files", icon: FolderTree },
   { to: "/dictionary", label: "Dictionary", icon: BookOpen },
   { to: "/errorography", label: "Errorography", icon: Bug },
   { to: "/reviews", label: "Reviews", icon: GitPullRequest },
@@ -97,6 +109,7 @@ function Page({ path }: { path: string }) {
   let params: Record<string, string> | null;
   if (path === "/" || path === "/runs") return <Gallery />;
   if (path === "/runs/new") return <NewRun />;
+  if (path === "/files") return <Files />;
   if ((params = match(path, "/runs/:id"))) return <RunView key={params.id} id={params.id!} />;
   if (path === "/dictionary") return <Dictionary />;
   if (path === "/errorography") return <Errorography />;
@@ -115,40 +128,31 @@ function Page({ path }: { path: string }) {
   );
 }
 
-export function typing(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
-}
-
 function projectName(project: string | undefined): string {
   if (!project) return "Project";
   const parts = project.split(/[/\\]/).filter(Boolean);
   return parts[parts.length - 1] || project;
 }
 
-function hereLabel(path: string): string {
-  if (path === "/" || path === "/runs") return "Gallery";
-  if (path === "/runs/new") return "New run";
-  if (path.startsWith("/runs/")) return decodeURIComponent(path.slice("/runs/".length));
-  if (path === "/dictionary") return "Dictionary";
-  if (path === "/errorography") return "Errorography";
-  if (path === "/reviews") return "Reviews";
-  if (path.startsWith("/reviews/")) return "Review";
-  if (path === "/providers") return "Providers";
-  if (path === "/skills") return "Skills";
-  if (path === "/settings") return "Settings";
-  return "Taskmaster";
-}
+const PAGE_NAMES: Record<string, string> = {
+  "/runs/new": "New run",
+  "/files": "Files",
+  "/dictionary": "Dictionary",
+  "/errorography": "Errorography",
+  "/reviews": "Reviews",
+  "/providers": "Providers",
+  "/skills": "Skills",
+  "/settings": "Settings",
+};
 
-function Crumbs({ project, here }: { project: string; here: string }) {
-  return (
-    <div className="crumbs">
-      <Folder size={14} className="crumb-ico" aria-hidden />
-      <span className="clip">{project}</span>
-      <span className="crumb-sep">/</span>
-      <span className="clip crumb-here">{here}</span>
-    </div>
-  );
+/** Project, then the run or page: parents dimmed, the current one in full ink. */
+function crumbsFor(path: string, project: string): Crumb[] {
+  const home: Crumb = { label: project, to: "/" };
+  if (path === "/" || path === "/runs") return [home, { label: "Gallery" }];
+  if (PAGE_NAMES[path]) return [home, { label: PAGE_NAMES[path]! }];
+  if (path.startsWith("/runs/")) return [home, { label: "Runs", to: "/" }, { label: decodeURIComponent(path.slice("/runs/".length)) }];
+  if (path.startsWith("/reviews/")) return [home, { label: "Reviews", to: "/reviews" }, { label: decodeURIComponent(path.slice("/reviews/".length)) }];
+  return [home, { label: "Not found" }];
 }
 
 /** First and last ledger timestamps, so Working can show elapsed time and Settled a relative time. */
@@ -182,13 +186,76 @@ function RunMark({ group }: { group: Group }) {
   return <Circle size={13} />;
 }
 
+/** A long run list is drawn a screenful at a time; a short one keeps its layout animation. */
+const VIRTUAL_AFTER = 60;
+
+function RunRow({ run, group, i, on, stamp, onPick }: { run: RunSummary; group: Group; i: number; on: boolean; stamp: string; onPick: () => void }) {
+  const p = usePrefs();
+  const flags = p.runFlags[run.id] ?? {};
+  const menu = (x: number, y: number) =>
+    openMenu(x, y, [
+      { label: flags.pinned ? "Unpin" : "Pin", run: () => toggleFlag(run.id, "pinned") },
+      { label: flags.settled ? "Unsettle" : "Settle", run: () => toggleFlag(run.id, "settled") },
+      { label: flags.archived ? "Unarchive" : "Archive", run: () => toggleFlag(run.id, "archived") },
+    ]);
+  return (
+    <div
+      className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}
+      onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
+      onDrop={(e) => {
+        if (e.dataTransfer.files.length) {
+          e.preventDefault();
+          void dropOnRun(run.id, e.dataTransfer.files);
+        }
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        menu(e.clientX, e.clientY);
+      }}
+      onMouseEnter={() => prefetchRun(run.id)}
+      onFocus={() => prefetchRun(run.id)}
+    >
+      <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick} aria-current={on ? "page" : undefined}>
+        <span className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs approval" ? "ask" : ""}`} aria-hidden>
+          <RunMark group={group} />
+        </span>
+        <span className="run-copy">
+          <span className="clip run-title">{run.id}</span>
+          {run.branch && !(run.merged && run.merge_commit) && (
+            <span className="run-branch clip">
+              <GitBranch size={11} />
+              {run.branch}
+            </span>
+          )}
+        </span>
+        <span className={`runrow-phase ${group === "Working" ? "elapsed" : ""}`}>
+          {i < 9 && <kbd>{i + 1}</kbd>}
+          <span>{stamp}</span>
+        </span>
+      </Link>
+      <span className="runrow-actions">
+        <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
+          {flags.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+        </button>
+        <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
+          {flags.settled ? <CircleCheck size={13} /> : <Circle size={13} />}
+        </button>
+        <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
+          {flags.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+        </button>
+      </span>
+    </div>
+  );
+}
+
 function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onPick: () => void }) {
   const p = usePrefs();
   const list = ordered(runs, p.showArchived);
-  const clocks = useClocks(list.map((x) => x.run.id));
+  const clocks = useClocks(list.length > VIRTUAL_AFTER ? [] : list.map((x) => x.run.id));
   const working = list.some((x) => x.group === "Working");
   const [now, setNow] = useState(() => Date.now());
   const [folded, setFolded] = useState<Partial<Record<Group, boolean>>>({});
+  const scroller = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!working) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -196,115 +263,101 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
   }, [working]);
   const counts = new Map<Group, number>();
   for (const item of list) counts.set(item.group, (counts.get(item.group) ?? 0) + 1);
+
+  // Rows and group heads in one flat list, folded groups left out.
+  type Item = { kind: "head"; group: Group } | { kind: "run"; run: RunSummary; group: Group; i: number };
+  const items: Item[] = [];
   let last: Group | null = null;
+  list.forEach(({ run, group }, i) => {
+    if (group !== last) items.push({ kind: "head", group });
+    last = group;
+    if (!folded[group]) items.push({ kind: "run", run, group, i });
+  });
+  const stampOf = (run: RunSummary, group: Group) => {
+    const clock = clocks[run.id];
+    const when = group === "Working" && clock ? shortSpan(now - clock.start) : group !== "Working" && clock ? shortSpan(now - clock.end) : null;
+    return group === "Working" ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase());
+  };
+  const isOn = (run: RunSummary) => path === `/runs/${encodeURIComponent(run.id)}` || path === `/runs/${run.id}`;
+  const head = (group: Group) => (
+    <button type="button" className="group-head" aria-expanded={!folded[group]} onClick={() => setFolded((f) => ({ ...f, [group]: !f[group] }))}>
+      <span>{group}</span>
+      <span className="group-count">
+        {counts.get(group)}
+        <ChevronDown size={12} className={folded[group] ? "chev closed" : "chev"} />
+      </span>
+    </button>
+  );
+
+  const virtual = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => scroller.current,
+    estimateSize: (i) => (items[i]?.kind === "head" ? 30 : 40),
+    overscan: 10,
+    enabled: list.length > VIRTUAL_AFTER,
+  });
+
   return (
-    <div className="runlist">
-      <LayoutGroup>
-        <ul>
-          <AnimatePresence initial={false}>
-            {list.map(({ run, group }, i) => {
-              const head = group !== last ? group : null;
-              last = group;
-              const shut = !!folded[group];
-              if (shut && !head) return null;
-              const on = path === `/runs/${encodeURIComponent(run.id)}` || path === `/runs/${run.id}`;
-              const flags = p.runFlags[run.id] ?? {};
-              const clock = clocks[run.id];
-              const menu = (x: number, y: number) =>
-                openMenu(x, y, [
-                  { label: flags.pinned ? "Unpin" : "Pin", run: () => toggleFlag(run.id, "pinned") },
-                  { label: flags.settled ? "Unsettle" : "Settle", run: () => toggleFlag(run.id, "settled") },
-                  { label: flags.archived ? "Unarchive" : "Archive", run: () => toggleFlag(run.id, "archived") },
-                ]);
-              const when =
-                group === "Working" && clock
-                  ? shortSpan(now - clock.start)
-                  : group !== "Working" && clock
-                    ? shortSpan(now - clock.end)
-                    : null;
-              const stamp =
-                group === "Working" ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase());
-              return (
+    <div className="runlist" ref={scroller}>
+      {list.length === 0 ? (
+        <div className="runlist-empty">Runs you start show up here.</div>
+      ) : list.length > VIRTUAL_AFTER ? (
+        <div style={{ height: virtual.getTotalSize(), position: "relative" }}>
+          {virtual.getVirtualItems().map((v) => {
+            const item = items[v.index]!;
+            return (
+              <div key={item.kind === "head" ? `h:${item.group}` : item.run.id} ref={virtual.measureElement} data-index={v.index} className="vrow" style={{ transform: `translateY(${v.start}px)` }}>
+                {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} stamp={stampOf(item.run, item.group)} onPick={onPick} />}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <LayoutGroup>
+          <ul>
+            <AnimatePresence initial={false}>
+              {items.map((item) => (
                 <motion.li
-                  key={run.id}
+                  key={item.kind === "head" ? `h:${item.group}` : item.run.id}
                   layout="position"
                   initial={{ opacity: 0, y: 4 }}
                   animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -4 }}
+                  exit={{ opacity: 0 }}
                   transition={{ duration: 0.16, ease: bezier.out, layout: { duration: dur.base, ease: bezier.out } }}
                 >
-                  {head && (
-                    <button
-                      type="button"
-                      className="group-head"
-                      aria-expanded={!shut}
-                      onClick={() => setFolded((f) => ({ ...f, [group]: !f[group] }))}
-                    >
-                      <span>{head}</span>
-                      <span className="group-count">
-                        {counts.get(head)}
-                        <ChevronDown size={12} className={shut ? "chev closed" : "chev"} />
-                      </span>
-                    </button>
-                  )}
-                  {!shut && (
-                    <div
-                      className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}
-                      onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
-                      onDrop={(e) => {
-                        if (e.dataTransfer.files.length) {
-                          e.preventDefault();
-                          void dropOnRun(run.id, e.dataTransfer.files);
-                        }
-                      }}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        menu(e.clientX, e.clientY);
-                      }}
-                    >
-                      <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick}>
-                        <span className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs approval" ? "ask" : ""}`} aria-hidden>
-                          <RunMark group={group} />
-                        </span>
-                        <span className="run-copy">
-                          <span className="clip run-title">{run.id}</span>
-                          {run.branch && !(run.merged && run.merge_commit) && (
-                            <span className="run-branch clip">
-                              <GitBranch size={11} />
-                              {run.branch}
-                            </span>
-                          )}
-                        </span>
-                        <span className={`runrow-phase ${group === "Working" ? "elapsed" : ""}`}>
-                          {i < 9 && <kbd>{i + 1}</kbd>}
-                          <span>{stamp}</span>
-                        </span>
-                      </Link>
-                      <span className="runrow-actions">
-                        <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
-                          {flags.pinned ? <PinOff size={13} /> : <Pin size={13} />}
-                        </button>
-                        <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
-                          {flags.settled ? <CircleCheck size={13} /> : <Circle size={13} />}
-                        </button>
-                        <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
-                          {flags.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
-                        </button>
-                      </span>
-                    </div>
-                  )}
+                  {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} stamp={stampOf(item.run, item.group)} onPick={onPick} />}
                 </motion.li>
-              );
-            })}
-          </AnimatePresence>
-        </ul>
-      </LayoutGroup>
+              ))}
+            </AnimatePresence>
+          </ul>
+        </LayoutGroup>
+      )}
       <label className="check small">
         <input type="checkbox" checked={p.showArchived} onChange={(e) => setPrefs({ showArchived: e.target.checked })} />
         Show archived
       </label>
     </div>
   );
+}
+
+/** Open the project this browser had open last, once, if the daemon started on another. */
+function useLastProject(project: string | undefined) {
+  const done = useRef(false);
+  useEffect(() => {
+    if (!project || done.current) return;
+    done.current = true;
+    const last = prefs().lastProject;
+    if (last && last !== project) {
+      void api
+        .projects()
+        .then((r) => {
+          const hit = r.projects.find((x) => x.path === last);
+          if (hit) openProject(hit.path, hit.name);
+          else setPrefs({ lastProject: project });
+        })
+        .catch(() => undefined);
+    } else setPrefs({ lastProject: project });
+  }, [project]);
 }
 
 export function App() {
@@ -314,17 +367,34 @@ export function App() {
   const motionOn = useMotion();
   const [palette, setPalette] = useState<PaletteState | null>(null);
   const [drawer, setDrawer] = useState(false);
+  const [term, setTerm] = useState(false);
+  const [termMounted, setTermMounted] = useState(false);
+  const [keys, setKeys] = useState(false);
   const runs = useLoad(() => (signedIn ? api.runs() : Promise.resolve([] as RunSummary[])), [signedIn], 3000);
-  const settings = useLoad(() => (signedIn ? api.settings() : Promise.resolve(null as DaemonSettings | null)), [signedIn]);
+  const settings = useSettings();
 
   useEffect(() => {
     if (signedIn && path === "/signed-in") navigate("/", true);
   }, [signedIn, path]);
 
   useEffect(() => {
+    if (runs.data) watchRuns(runs.data);
+  }, [runs.data]);
+
+  useLastProject(signedIn ? settings.data?.project : undefined);
+
+  const toggleTerm = useCallback(() => {
+    setTermMounted(true);
+    setTerm((t) => !t);
+  }, []);
+  useOn("terminal-toggle", toggleTerm);
+  useOn("shortcuts", () => setKeys(true));
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && !e.shiftKey && e.key.toLowerCase() === "z") {
+      const k = e.key.toLowerCase();
+      if (mod && !e.shiftKey && k === "z") {
         // An Undo on screen wins, even inside the composer.
         if (undoLatest()) {
           e.preventDefault();
@@ -332,9 +402,26 @@ export function App() {
         }
         return;
       }
-      if (mod && e.key.toLowerCase() === "k") {
+      if (mod && k === "k") {
         e.preventDefault();
         setPalette((s) => (s ? null : { open: true, mode: "all" }));
+        return;
+      }
+      // Command-J on a Mac, Ctrl-J elsewhere; it works from inside the terminal too.
+      if (mod && !e.shiftKey && k === "j") {
+        e.preventDefault();
+        toggleTerm();
+        return;
+      }
+      if (mod && k === ",") {
+        e.preventDefault();
+        navigate("/settings");
+        return;
+      }
+      if (mod && e.shiftKey && k === "e") {
+        e.preventDefault();
+        if (path.startsWith("/runs/") && path !== "/runs/new") emit("files-toggle", null);
+        else navigate("/files");
         return;
       }
       if (typing(e.target)) return;
@@ -343,8 +430,27 @@ export function App() {
         setPalette({ open: true, mode: "slash" });
         return;
       }
+      if (e.key === "?" && !mod) {
+        e.preventDefault();
+        setKeys(true);
+        return;
+      }
+      if (k === "n" && !mod && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        navigate("/runs/new");
+        return;
+      }
+      const list = ordered(runs.data ?? [], prefs().showArchived);
+      if (e.altKey && !mod && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+        const here = list.findIndex((x) => path === `/runs/${encodeURIComponent(x.run.id)}`);
+        const next = list[here < 0 ? 0 : Math.max(0, Math.min(list.length - 1, here + (e.key === "ArrowDown" ? 1 : -1)))]?.run;
+        if (next) {
+          e.preventDefault();
+          navigate(`/runs/${encodeURIComponent(next.id)}`);
+        }
+        return;
+      }
       if (mod && /^[1-9]$/.test(e.key)) {
-        const list = ordered(runs.data ?? [], prefs().showArchived);
         const run = list[Number(e.key) - 1]?.run;
         if (run) {
           e.preventDefault();
@@ -354,81 +460,75 @@ export function App() {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [runs.data]);
+  }, [runs.data, path, toggleTerm]);
 
   const runsState = useMemo(() => ({ runs: runs.data ?? [], reload: () => void runs.reload() }), [runs.data, runs.reload]);
   const project = projectName(settings.data?.project);
-  const here = hereLabel(path);
+  const crumbs = crumbsFor(path, project);
 
   if (!signedIn) return <SignIn />;
 
   return (
     <MotionConfig reducedMotion={motionOn ? "never" : "always"}>
-      <RunsContext.Provider value={runsState}>
-        <div className={`shell theme-${p.theme} density-${p.density} ${motionOn ? "" : "no-motion"}`}>
-          <header className="topbar">
-            <button className="ghost small" onClick={() => setDrawer(!drawer)} aria-label="Menu">
-              <Menu size={16} />
-            </button>
-            <Crumbs project={project} here={here} />
-            <button className="ghost small" aria-label="Search" onClick={() => setPalette({ open: true, mode: "all" })}>
-              <Search size={16} />
-            </button>
-          </header>
-          <aside className={`side ${drawer ? "open" : ""}`} aria-label="Main">
-            <Link to="/" className="brand side-brand" onClick={() => setDrawer(false)}>
-              <img src="/icon.png" alt="" width={16} height={16} />
-              <span>Taskmaster</span>
-            </Link>
-            <div className="side-search">
-              <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
-                <Search size={14} />
-                <span>Search</span>
-                <kbd>⌘K</kbd>
-              </button>
-              <Link to="/runs/new" className="side-new" aria-label="New run" title="New run" onClick={() => setDrawer(false)}>
-                <SquarePen size={14} />
+      <TipProvider>
+        <RunsContext.Provider value={runsState}>
+          <div className={`shell theme-${p.theme} density-${p.density} ${motionOn ? "" : "no-motion"} ${term ? "term-open" : ""} ${isDesktop() && isMac ? "desktop-mac" : ""}`}>
+            <TitleBar
+              crumbs={crumbs}
+              onPalette={() => setPalette({ open: true, mode: "all" })}
+              onTerminal={toggleTerm}
+              onMenu={() => setDrawer(!drawer)}
+              terminalOpen={term}
+            />
+            <aside className={`side ${drawer ? "open" : ""}`} aria-label="Main">
+              <Link to="/" className="brand side-brand" onClick={() => setDrawer(false)}>
+                <img src="/icon.png" alt="" width={16} height={16} />
+                <span>Taskmaster</span>
               </Link>
-            </div>
-            <nav className="nav">
-              {NAV.map((item) => {
-                const on = item.active ? item.active(path) : path === item.to || path.startsWith(item.to + "/");
-                const Icon = item.icon;
-                return (
-                  <Link key={item.to} to={item.to} className={on ? "on" : ""} aria-current={on ? "page" : undefined} onClick={() => setDrawer(false)}>
-                    <Icon size={15} strokeWidth={1.75} />
-                    <span>{item.label}</span>
-                  </Link>
-                );
-              })}
-            </nav>
-            <RunList runs={runs.data ?? []} path={path} onPick={() => setDrawer(false)} />
-          </aside>
-          {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
-          <main className="main">
-            <div className="crumbbar">
-              <Crumbs project={project} here={here} />
-            </div>
-            <AnimatePresence mode="wait" initial={false}>
+              <div className="side-search">
+                <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
+                  <Search size={14} />
+                  <span>Search</span>
+                  <kbd>{MOD} K</kbd>
+                </button>
+                <Link to="/runs/new" className="side-new" aria-label="New run" title="New run (N)" onClick={() => setDrawer(false)}>
+                  <SquarePen size={14} />
+                </Link>
+              </div>
+              <nav className="nav">
+                {NAV.map((item) => {
+                  const on = item.active ? item.active(path) : path === item.to || path.startsWith(item.to + "/");
+                  const Icon = item.icon;
+                  return (
+                    <Link key={item.to} to={item.to} className={on ? "on" : ""} aria-current={on ? "page" : undefined} onClick={() => setDrawer(false)}>
+                      <Icon size={15} strokeWidth={1.75} />
+                      <span>{item.label}</span>
+                    </Link>
+                  );
+                })}
+              </nav>
+              <RunList runs={runs.data ?? []} path={path} onPick={() => setDrawer(false)} />
+            </aside>
+            {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
+            <main className="main">
               <motion.div
                 key={path}
                 className="route"
-                initial={motionOn ? { opacity: 0, y: 4 } : false}
-                animate={{ opacity: 1, y: 0 }}
-                exit={motionOn ? { opacity: 0 } : undefined}
-                transition={{ duration: 0.16, ease: bezier.out }}
+                initial={motionOn && !isMorph() ? { opacity: 0 } : false}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.15, ease: bezier.out }}
               >
                 <Page path={path} />
               </motion.div>
-            </AnimatePresence>
-          </main>
-          <AnimatePresence>
-            {palette && <Palette key="palette" state={palette} onClose={() => setPalette(null)} />}
-          </AnimatePresence>
-          <ContextMenu />
-          <Toasts />
-        </div>
-      </RunsContext.Provider>
+            </main>
+            {termMounted && <QuickTerminal open={term} onClose={() => setTerm(false)} />}
+            {palette && <Palette state={palette} onClose={() => setPalette(null)} />}
+            <Shortcuts open={keys} onOpenChange={setKeys} />
+            <ContextMenu />
+            <Toasts theme={p.theme} />
+          </div>
+        </RunsContext.Provider>
+      </TipProvider>
     </MotionConfig>
   );
 }

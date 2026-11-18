@@ -15,13 +15,16 @@
 //! POST /api/runs/{id}/preview/stop
 //! GET  /api/approvals             ?run=<id> risky tool calls waiting for a person
 //! POST /api/approvals/{id}/{approve|deny}   answer one
-//! GET  /api/settings              where this daemon keeps things, and the approval policy
-//! POST /api/settings              {approvals?: always|risky|never, approval_timeout_secs?, editor?}
+//! GET  /api/settings              where this daemon keeps things, the roles the person chose,
+//!                                 and what this machine can run at once (`machine.max_parallel`)
+//! POST /api/settings              {approvals?: always|risky|never, approval_timeout_secs?, editor?,
+//!                                 roles?: {role: harness | ""}, models?, checker?, code_mode?}
 //! GET  /api/editors               the editors this machine can launch, and the default
 //! POST /api/open                  {path, line?, column?, editor?, reveal?}
 //! POST /api/paths                 {paths: [..]} -> {paths: {raw: full path or null}}
 //! GET  /api/file                  ?path=<p> a file's text, for a read-only preview
 //! GET  /api/files                 files git knows in the project
+//! GET  /api/grep                  ?q=<text> lines in the project's files that contain it
 //! GET  /api/gh                    whether gh is installed and signed in, and as whom
 //! GET  /api/gh/pr/{number}        one pull request of the project's repository
 //! ```
@@ -791,6 +794,49 @@ pub async fn files(State(app): State<Arc<App>>) -> Reply {
     ok(json!({ "files": list }))
 }
 
+/// Search the text of the project's files: tracked and untracked, ignoring what git
+/// ignores, binary files and anything `sensitive` would hide.
+pub async fn grep(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
+    let q = query.get("q").map(|q| q.trim()).unwrap_or("");
+    if q.is_empty() {
+        return ok(json!({ "hits": [], "truncated": false }));
+    }
+    if q.len() > 200 {
+        return Err(fail(StatusCode::BAD_REQUEST, "search for at most 200 characters"));
+    }
+    let project = app.project();
+    let q = q.to_string();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["grep", "--untracked", "--exclude-standard", "-I", "-n", "--column", "-i", "-F", "--no-color", "-e"])
+            .arg(&q)
+            .output()
+    })
+    .await
+    .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}")))?
+    .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot run git: {err}")))?;
+    const LIMIT: usize = 400;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    for line in text.lines() {
+        let mut parts = line.splitn(4, ':');
+        let (Some(path), Some(n), Some(col), Some(body)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+        if sensitive(Path::new(path)) {
+            continue;
+        }
+        if hits.len() == LIMIT {
+            truncated = true;
+            break;
+        }
+        let body: String = body.chars().take(240).collect();
+        hits.push(json!({ "path": path, "line": n.parse::<u32>().unwrap_or(0), "column": col.parse::<u32>().unwrap_or(0), "text": redact(&body) }));
+    }
+    ok(json!({ "hits": hits, "truncated": truncated }))
+}
+
 // The live preview.
 
 fn preview_view(app: &App, id: &str) -> Value {
@@ -870,8 +916,9 @@ pub struct SettingsBody {
     approval_timeout_secs: Option<u64>,
     /// An editor id, a program name or path, or empty to go back to `$VISUAL`, `$EDITOR` and what is installed.
     editor: Option<String>,
-    /// Role defaults for new runs: `{worker, mid, master, reviewer, verifier}`, each a harness id.
-    roles: Option<crate::Roles>,
+    /// Role choices for new runs: any of `{worker, mid, master, reviewer, verifier}`, each a
+    /// harness id. Roles left out keep what was saved; an empty string forgets a choice.
+    roles: Option<serde_json::Map<String, Value>>,
     /// Model per role; `null` is the provider's default.
     models: Option<crate::Models>,
     /// The mid-tier checker on or off.
@@ -907,20 +954,29 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
     }
     if body.roles.is_some() || body.models.is_some() {
         let mut saved = crate::settings::Settings::load(&app.project()).unwrap_or_default();
-        if let Some(roles) = body.roles {
-            for id in [&roles.worker, &roles.mid, &roles.master, &roles.reviewer, &roles.verifier] {
+        let mut roles = crate::settings::Settings::saved_roles(&app.project());
+        if let Some(chosen) = body.roles {
+            for (role, value) in chosen {
+                if !crate::Roles::NAMES.contains(&role.as_str()) {
+                    return Err(fail(StatusCode::BAD_REQUEST, format!("`{role}` is not a role: use one of {}", crate::Roles::NAMES.join(", "))));
+                }
+                let id = value.as_str().unwrap_or("").trim().to_string();
+                if id.is_empty() {
+                    roles.remove(&role);
+                    continue;
+                }
                 if !tm_harness::HARNESSES.contains(&id.as_str()) {
                     return Err(fail(StatusCode::BAD_REQUEST, format!("unknown harness `{id}`: use one of {}", tm_harness::HARNESSES.join(", "))));
                 }
+                roles.insert(role, json!(id));
             }
-            saved.roles = roles;
         }
         if let Some(models) = body.models {
             saved.models = models;
         }
-        let save = |key: &str, value: Value| save_setting(&app.project(), key, value);
-        save("roles", json!(saved.roles))
-            .and_then(|()| save("models", json!(saved.models)))
+        // The roles object is written whole, so a forgotten choice is gone from the file.
+        set_setting(&app.project(), "roles", Value::Object(roles))
+            .and_then(|()| save_setting(&app.project(), "models", json!(saved.models)))
             .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if let Some(on) = body.code_mode {
@@ -947,8 +1003,17 @@ fn settings_file(project: &Path) -> PathBuf {
         .unwrap_or(project_file)
 }
 
+/// Put `value` at `key` of the settings file, replacing what was there.
+fn set_setting(project: &Path, key: &str, value: Value) -> anyhow::Result<()> {
+    write_setting(project, key, value, false)
+}
+
 /// Merge `values` into the object at `key` of the settings file.
 fn save_setting(project: &Path, key: &str, values: Value) -> anyhow::Result<()> {
+    write_setting(project, key, values, true)
+}
+
+fn write_setting(project: &Path, key: &str, values: Value, merge: bool) -> anyhow::Result<()> {
     use anyhow::Context;
     let file = settings_file(project);
     let mut root: Value = match std::fs::read_to_string(&file) {
@@ -957,7 +1022,7 @@ fn save_setting(project: &Path, key: &str, values: Value) -> anyhow::Result<()> 
     };
     let object = root.as_object_mut().with_context(|| format!("{} is not a settings file", file.display()))?;
     match (object.get_mut(key), values) {
-        (Some(Value::Object(existing)), Value::Object(new)) => existing.extend(new),
+        (Some(Value::Object(existing)), Value::Object(new)) if merge => existing.extend(new),
         (_, values) => {
             object.insert(key.into(), values);
         }
@@ -990,14 +1055,34 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "config": config,
         "config_default": project_config.display().to_string(),
         "store": if app.store.is_some() { "sqlite" } else { "files" },
-        "roles": role_defaults.roles,
+        // Only what the person chose. A role missing here has no provider yet.
+        "roles": crate::settings::Settings::saved_roles(&app.project()),
         "models": role_defaults.models,
         "checker": { "enabled": role_defaults.checker.enabled },
         "code_mode": { "enabled": role_defaults.code_mode.enabled },
         "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
+        "machine": machine(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// What this machine can run at once. Every worker is a local agent CLI with its own
+/// process tree, so the ceiling is the smaller of the cores and the free memory, at about
+/// one gigabyte a worker.
+pub fn machine() -> Value {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let free_gb = free_memory_bytes().map(|bytes| bytes / (1 << 30));
+    let by_memory = free_gb.map(|gb| gb as usize).unwrap_or(cpus);
+    let max_parallel = cpus.min(by_memory).clamp(1, 32);
+    json!({ "cpus": cpus, "free_memory_gb": free_gb, "max_parallel": max_parallel })
+}
+
+fn free_memory_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|line| line.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 #[cfg(test)]

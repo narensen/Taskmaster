@@ -19,7 +19,7 @@ SSH_USER="${SSH_USER:-${VPS_SSH_USER:-opc}}"
 SSH_KEY="${SSH_KEY:-${VPS_SSH_KEY:-/workspace/taskmaster/vps_key}}"
 run() { if ((DRY)); then printf '+ %s\n' "$*"; else "$@"; fi; }
 
-(cd "$ROOT/site" && node build.mjs)
+(cd "$ROOT/site" && npm ci --silent && node build.mjs)
 run ssh -i "$SSH_KEY" "$SSH_USER@$HOST" 'sudo install -d -m 755 -o '"$SSH_USER"' /srv/taskmaster-site'
 run rsync -az --delete -e "ssh -i $SSH_KEY" "$ROOT/site/dist/" "$SSH_USER@$HOST:/srv/taskmaster-site/"
 echo "site: copied to $HOST:/srv/taskmaster-site$( ((DRY)) && echo ' (dry-run)')"

@@ -1,9 +1,9 @@
-// The right panel's tabs other than the diff: the browser preview and screenshots, web
-// search, the terminal transcript, and the read-only file preview.
+// The side panel's tabs other than the diff and the files: the browser preview and
+// screenshots, web search, and the terminal transcript.
 
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { api, searchWeb, type AgentEntry, type RunDetail } from "../api";
-import { ExternalLink, Rich, label } from "../paths";
+import { ExternalLink, Rich } from "../paths";
 import { emit, openMenu, toast } from "../overlay";
 import { usePrefs } from "../prefs";
 
@@ -262,79 +262,4 @@ export function TerminalTab({ run, entries, project, onRan }: { run: string; ent
       </form>
     </div>
   );
-}
-
-// Preview.
-
-const KEYWORDS = new Set(
-  (
-    "as async await break case catch class const continue crate default def do dyn else enum export extends false fn for from func " +
-    "function if impl import in interface let loop match mod module mut new nil None null package pub return self Self static " +
-    "struct super switch this throw trait true try type typeof use var void where while with yield"
-  ).split(" "),
-);
-
-function tokenize(line: string): { t: string; k: "kw" | "str" | "com" | "num" | "plain" }[] {
-  const out: { t: string; k: "kw" | "str" | "com" | "num" | "plain" }[] = [];
-  const re = /(\/\/.*$|#(?![[!]).*$|--.*$)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_.]*\b)|([A-Za-z_][\w]*)|(\s+|.)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(line))) {
-    if (m[1]) out.push({ t: m[1], k: "com" });
-    else if (m[2]) out.push({ t: m[2], k: "str" });
-    else if (m[3]) out.push({ t: m[3], k: "num" });
-    else if (m[4]) out.push({ t: m[4], k: KEYWORDS.has(m[4]) ? "kw" : "plain" });
-    else out.push({ t: m[0], k: "plain" });
-  }
-  return out;
-}
-
-export function PreviewTab({ path, line }: { path: string; line?: number }) {
-  const [file, setFile] = useState<{ content: string; full: string; truncated: boolean } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const target = useRef<HTMLTableRowElement>(null);
-  useEffect(() => {
-    setFile(null);
-    setError(null);
-    api
-      .file(path)
-      .then(setFile)
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [path]);
-  useEffect(() => {
-    target.current?.scrollIntoView({ block: "center" });
-  }, [file, line]);
-  if (error) return <div className="pad error-line">{error}</div>;
-  if (!file) return <div className="pad muted">Loading {path}…</div>;
-  const lines = file.content.split("\n");
-  return (
-    <div className="preview-tab">
-      <div className="muted small pad-x break" title={file.full}>
-        {file.full} · read-only{file.truncated ? " · first 512 KiB" : ""}
-      </div>
-      <table className="code-view" data-testid="preview">
-        <tbody>
-          {lines.map((l, i) => (
-            <tr key={i} ref={i + 1 === line ? target : undefined} className={i + 1 === line ? "hl" : ""}>
-              <td className="gutter">{i + 1}</td>
-              <td className="code-cell">
-                {tokenize(l).map((t, j) =>
-                  t.k === "plain" ? (
-                    <Fragment key={j}>{t.t}</Fragment>
-                  ) : (
-                    <span key={j} className={`tok-${t.k}`}>
-                      {t.t}
-                    </span>
-                  ),
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-export function previewTitle(path: string): string {
-  return label(path);
 }

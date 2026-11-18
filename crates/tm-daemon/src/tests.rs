@@ -1431,7 +1431,19 @@ mod http {
         }
     }
 
+    /// The person's saved choice of a harness for every role; nothing is chosen for them.
+    fn choose_roles(project: &std::path::Path) {
+        let file = project.join(".taskmaster/config.json");
+        let mut root: Value = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
+        if root.get("roles").is_none() {
+            root["roles"] = json!({ "worker": "grok", "mid": "grok", "master": "grok", "reviewer": "grok", "verifier": "grok" });
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+        }
+    }
+
     async fn server(tmp: &Tmp, world: &Arc<World>) -> (Server, Client, String) {
+        choose_roles(&tmp.0);
         let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
         let code = auth.code().to_string();
         let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
@@ -1454,6 +1466,7 @@ mod http {
         canned.set("https://skills.sh/api/search?q=tidy", r#"{"skills":[{"source":"acme/kit","skillId":"tidy-css","name":"tidy-css","installs":7}]}"#);
         options.skills = tmp.0.join(".skills-store");
         options.skills_fetch = canned.clone();
+        choose_roles(&options.project);
         let server = Server::serve(options).await.unwrap();
         let mut client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
         let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
@@ -1507,6 +1520,7 @@ mod http {
             (crate::jobs::Target::Provider("codex"), tm_harness::setup::Action::Install) => Some(vec![install.clone()]),
             _ => None,
         }));
+        choose_roles(&options.project);
         let server = Server::serve(options).await.unwrap();
         let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
         let mut client = Client { addr, token: None };
@@ -1574,16 +1588,27 @@ mod http {
 
         // Nothing is built until the plan is approved.
         let planned = serde_json::to_value(plan(&[("a", &["greet"]), ("b", &["greet"])])).unwrap();
-        let (status, made) = client.post("/api/runs", json!({ "id": "web", "plan": planned, "parallel": 2 })).await;
+        // Forget every choice: an empty name removes it.
+        let forget = json!({ "worker": "", "mid": "", "master": "", "reviewer": "", "verifier": "" });
+        assert_eq!(client.post("/api/settings", json!({ "roles": forget })).await.0, 200);
+        // Nobody has chosen a provider now, so a run that names none is refused, and says which roles.
+        let (_, defaults) = client.get("/api/settings").await;
+        assert_eq!(defaults["roles"], json!({}));
+        assert!(defaults["machine"]["max_parallel"].as_u64().unwrap() >= 1);
+        let (status, refused) = client.post("/api/runs", json!({ "id": "web", "plan": planned })).await;
+        assert_eq!(status, 400, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("choose a provider"), "{refused}");
+
+        let every = json!({ "worker": "grok", "mid": "grok", "master": "grok", "reviewer": "grok", "verifier": "grok" });
+        let (status, made) = client.post("/api/runs", json!({ "id": "web", "plan": planned, "parallel": 2, "roles": every })).await;
         assert_eq!(status, 202, "{made}");
         let waiting = client.settled("web", "awaiting_approval").await;
         assert_eq!(waiting["plan"]["pages"].as_array().unwrap().len(), 2);
         assert_eq!(waiting["roles"]["worker"], "grok");
 
-        // Role defaults are Grok, are kept in the settings file, and apply to runs that name no roles.
-        let (_, defaults) = client.get("/api/settings").await;
-        assert_eq!(defaults["roles"], json!({ "worker": "grok", "mid": "grok", "master": "grok", "reviewer": "grok", "verifier": "grok" }));
+        // Saved choices are kept in the settings file and apply to runs that name no roles.
         assert_eq!(client.post("/api/settings", json!({ "roles": { "worker": "nope" } })).await.0, 400);
+        assert_eq!(client.post("/api/settings", json!({ "roles": every, "models": {} })).await.0, 200);
         let (status, saved) = client.post("/api/settings", json!({ "roles": { "worker": "claude" }, "models": { "worker": null } })).await;
         assert_eq!(status, 200, "{saved}");
         assert_eq!((saved["roles"]["worker"].as_str(), saved["roles"]["master"].as_str(), saved["models"]["worker"].as_str()), (Some("claude"), Some("grok"), None));
@@ -2007,6 +2032,7 @@ mod http {
         let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
         let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
         options.web = Some(web);
+        choose_roles(&options.project);
         let server = Server::serve(options).await.unwrap();
         let client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
 
@@ -2089,6 +2115,7 @@ mod http {
         let (w, a) = (world.clone(), asked.clone());
         options.harness = Arc::new(move |_| Ok(Arc::new(Asking { inner: Fake(w.clone()), asked: a.clone() }) as Arc<dyn Harness>));
         options.approvals = crate::approvals::Policy { mode: crate::approvals::Mode::Risky, timeout: Duration::from_secs(30) };
+        choose_roles(&options.project);
         let server = Server::serve(options).await.unwrap();
         let mut client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
         assert_eq!(client.get("/api/approvals").await.0, 401);
@@ -2138,7 +2165,7 @@ mod http {
 
         // The policy changes at once and survives in the settings file; nothing else in it is lost.
         std::fs::create_dir_all(tmp.0.join(".taskmaster")).unwrap();
-        std::fs::write(tmp.0.join(".taskmaster/config.json"), r#"{"commons":{"report":false},"approvals":{"mode":"risky","timeout_secs":30}}"#).unwrap();
+        std::fs::write(tmp.0.join(".taskmaster/config.json"), r#"{"commons":{"report":false},"approvals":{"mode":"risky","timeout_secs":30},"roles":{"worker":"grok","mid":"grok","master":"grok","reviewer":"grok","verifier":"grok"}}"#).unwrap();
         assert_eq!(client.post("/api/settings", json!({ "approvals": "sometimes" })).await.0, 400);
         assert_eq!(client.post("/api/settings", json!({ "approval_timeout_secs": 0 })).await.0, 400);
         let (status, changed) = client.post("/api/settings", json!({ "approvals": "never" })).await;
@@ -2432,9 +2459,10 @@ mod http {
         assert_eq!(client.get("/api/file?path=bin.dat").await.0, 415);
 
         // Settings: bad values change nothing.
+        let before = std::fs::read_to_string(project.join(".taskmaster/config.json")).unwrap();
         assert_eq!(client.post("/api/settings", json!({ "approval_timeout_secs": 999999 })).await.0, 400);
         assert_eq!(client.post("/api/settings", json!({ "editor": "x\nrm -rf" })).await.0, 400);
-        assert!(!project.join(".taskmaster/config.json").exists(), "a refused change writes nothing");
+        assert_eq!(std::fs::read_to_string(project.join(".taskmaster/config.json")).unwrap(), before, "a refused change writes nothing");
         // The PR draft needs a finished run; the pull request lookup needs a number.
         assert_eq!(client.get("/api/gh/pr/99999999999999999999").await.0, 400);
         assert_eq!(client.get("/api/approvals?run=..").await.0, 400);
@@ -2505,6 +2533,7 @@ mod http {
         let w = world.clone();
         options.harness = Arc::new(move |_| Ok(Arc::new(Fake(w.clone())) as Arc<dyn Harness>));
         options.preview_command = STUB.into();
+        choose_roles(&options.project);
         let server = Server::serve(options).await.unwrap();
         let mut client = Client { addr: server.url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
         client.token = Some(client.post("/api/pair", json!({ "code": code })).await.1["token"].as_str().unwrap().to_string());
@@ -2810,14 +2839,23 @@ mod commons_service {
 
 #[cfg(test)]
 mod role_defaults {
+    use serde_json::json;
+
     #[test]
-    fn every_role_defaults_to_grok_and_survives_a_save_and_load() {
+    fn no_role_has_a_built_in_harness() {
         let roles = crate::Roles::default();
-        for id in [&roles.worker, &roles.mid, &roles.master, &roles.reviewer, &roles.verifier] {
-            assert_eq!(id, "grok");
-        }
+        assert_eq!(roles.missing().len(), 5);
         let settings: crate::settings::Settings = serde_json::from_str(r#"{"roles":{"master":"claude"}}"#).unwrap();
-        assert_eq!((settings.roles.master.as_str(), settings.roles.worker.as_str()), ("claude", "grok"));
-        assert_eq!(crate::settings::Settings::default().roles, roles);
+        assert_eq!((settings.roles.master.as_str(), settings.roles.worker.as_str()), ("claude", ""));
+    }
+
+    #[test]
+    fn a_run_takes_the_request_over_the_saved_choice_and_names_what_is_missing() {
+        let saved = json!({ "master": "claude", "worker": "grok" });
+        let chosen = json!({ "worker": "codex", "mid": "opencode", "reviewer": "agy", "verifier": "agy" });
+        let roles = crate::Roles::resolve(saved.as_object().unwrap(), chosen.as_object().unwrap()).unwrap();
+        assert_eq!((roles.master.as_str(), roles.worker.as_str(), roles.mid.as_str()), ("claude", "codex", "opencode"));
+        let err = crate::Roles::resolve(saved.as_object().unwrap(), &Default::default()).unwrap_err().to_string();
+        assert!(err.contains("mid, reviewer, verifier"), "{err}");
     }
 }

@@ -2,7 +2,8 @@
 // call with the gate's answer. A worker that has not started stays on screen as waiting.
 
 import { useEffect, useState } from "react";
-import { motion } from "framer-motion";
+import { ProviderLogo } from "../providers/logos";
+import { motion } from "motion/react";
 import { api, type Attempt, type RunDetail } from "../api";
 import { KnownPath, Rich, looksLikePath, masked } from "../paths";
 import { emit, toast } from "../overlay";
@@ -142,7 +143,7 @@ export function AgentSurface({
           </span>
         </div>
         <div className="agent-byline muted small">
-          {harness} · {model}
+          <ProviderLogo id={harness} size={12} title={harness} /> {harness} · {model}
           {s.cost > 0 && ` · ${usd(s.cost)}`}
           {s.calls_billed > 0 && ` · ${s.calls_billed} call${s.calls_billed === 1 ? "" : "s"}`}
         </div>

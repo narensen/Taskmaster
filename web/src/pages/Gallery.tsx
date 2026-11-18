@@ -3,19 +3,32 @@
 // Nothing here scans the disk.
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
-import { motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Folder, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
-import { api, callAt, DEFAULT_ROLES, type ApprovalMode, type RunSummary } from "../api";
-import { RoleMark } from "../marks";
+import { api, callAt, type ApprovalMode, type RunSummary } from "../api";
+import { RoleDeck } from "../components/RoleDeck";
+import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
+import { modelLabel } from "../components/ProviderPicker";
+import { ProviderLogo, providerName } from "../providers/logos";
+import { afterStart, problemWith, SEATS, seatChoice, toRequest, useChoice } from "../rolechoice";
+import { prefetchRun, useProviders, useSettings } from "../query";
+import { runStarted } from "../notify";
+import { EmptyRuns } from "../lazy";
+import { Loading } from "../ui";
 import { Link, navigate } from "../router";
 import { ExternalLink } from "../paths";
 import { isUnpriced, phaseLabel, tokens, usd } from "../format";
 import { bezier, dur, fadeUp, stagger } from "../motion";
-import { motionOn, setPrefs, usePrefs } from "../prefs";
+import { motionOn, prefs, setPrefs, usePrefs } from "../prefs";
 import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
 import { Problem, useAction, useLoad } from "../ui";
+
+/** A name the View Transitions API accepts for a run, shared by its card and its page. */
+export function morphName(id: string): string {
+  return `run-${id.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+}
 
 const shots = new Map<string, string | null>();
 const prompts = new Map<string, string | null>();
@@ -70,6 +83,8 @@ function RunCard({ run, index }: { run: RunSummary; group?: string; index: numbe
         layout: { duration: on ? dur.base : 0, ease: bezier.out },
       }}
       className="card gallery-card"
+      onMouseEnter={() => prefetchRun(run.id)}
+      onFocus={() => prefetchRun(run.id)}
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
       onDrop={(e) => {
         if (e.dataTransfer.files.length) {
@@ -78,7 +93,7 @@ function RunCard({ run, index }: { run: RunSummary; group?: string; index: numbe
         }
       }}
     >
-      <Link to={`/runs/${encodeURIComponent(run.id)}`} className="frame-link" aria-label={`Open ${run.id}`}>
+      <Link morph to={`/runs/${encodeURIComponent(run.id)}`} className="frame-link" aria-label={`Open ${run.id}`} style={{ viewTransitionName: morphName(run.id) } as React.CSSProperties}>
         {shot ? (
           <img className="frame shot" src={shot} alt={`Latest page of ${run.id}`} />
         ) : (
@@ -90,7 +105,7 @@ function RunCard({ run, index }: { run: RunSummary; group?: string; index: numbe
       </Link>
       <div className="card-foot">
         <div className="grow">
-          <Link to={`/runs/${encodeURIComponent(run.id)}`} className="card-title clip">
+          <Link morph to={`/runs/${encodeURIComponent(run.id)}`} className="card-title clip">
             {run.id}
           </Link>
           <div className="card-meta clip">
@@ -296,8 +311,8 @@ function accessLabel(mode?: ApprovalMode) {
 export function Gallery() {
   const { runs } = useRuns();
   const p = usePrefs();
-  const settings = useLoad(api.settings, []);
-  const providers = useLoad(() => api.providers(), []);
+  const settings = useSettings();
+  const providers = useProviders();
   const list = byRecent(ordered(runs, p.showArchived));
   const archived = ordered(runs, true).filter((x) => x.group === "Archived").length;
   const daemons = [...p.daemons].sort((a, b) => Number(b.pinned) - Number(a.pinned));
@@ -308,13 +323,21 @@ export function Gallery() {
   const projectLabel = name ?? null;
   const branch = settings.data?.branch ?? null;
   const access = accessLabel(settings.data?.approvals?.mode);
-  const roles = { ...DEFAULT_ROLES, ...(settings.data?.roles ?? {}) };
-  const masterId = roles.master;
-  const master = (providers.data ?? []).find((item) => item.id === masterId);
-  const masterModel = settings.data?.models?.master;
-  const chosen = master?.models.find((m) => m.id === masterModel) ?? master?.models.find((m) => m.default) ?? master?.models[0];
-  const modelPill = `${master?.name ?? masterId} · ${chosen?.name ?? masterModel ?? "default"}`;
-
+  const { choice, setSeat, missing, fresh } = useChoice(settings.data);
+  const [remember, setRemember] = useState(false);
+  const [rolesOpen, setRolesOpen] = useState(false);
+  const max = settings.data?.machine?.max_parallel ?? null;
+  const [pages, setPagesState] = useState<Pages>(() => prefs().parallel ?? 3);
+  const setPages = (v: Pages) => {
+    setPagesState(v);
+    setPrefs({ parallel: v });
+  };
+  const masterPick = seatChoice(choice, "master");
+  const providerList = providers.data ?? [];
+  const modelPill = masterPick ? `${providerList.find((x) => x.id === masterPick.harness)?.name ?? providerName(masterPick.harness)} · ${modelLabel(providerList, masterPick)}` : "Choose providers";
+  useEffect(() => {
+    if (settings.data && missing.length) setRolesOpen(true);
+  }, [settings.data, missing.length]);
 
   const strip = useRef<HTMLDivElement>(null);
   const showAllBtn = useRef<HTMLButtonElement>(null);
@@ -346,19 +369,33 @@ export function Gallery() {
     const prompt = messageText(m);
     void action.run("create", async () => {
       if (!prompt) throw new Error("Write what to build first.");
-      const roles = { ...DEFAULT_ROLES, ...(settings.data?.roles ?? {}) };
-      const models = settings.data?.models ?? {};
-      const chosen = Object.fromEntries(Object.entries(models).filter(([, model]) => model));
+      if (missing.length) {
+        setRolesOpen(true);
+        throw new Error(`Choose a provider for ${missing.map((x) => SEATS.find((y) => y.id === x)!.label.toLowerCase()).join(", ")}.`);
+      }
+      for (const seat of SEATS) {
+        const problem = problemWith(providerList, seatChoice(choice, seat.id));
+        if (problem) {
+          setRolesOpen(true);
+          throw new Error(`${seat.label}: ${problem}`);
+        }
+      }
+      const { roles, models: chosen } = toRequest(choice);
+      const parallel = resolvePages(pages, max ?? 32);
       if (mode === "new") {
         const name = newName.trim() || slugify(prompt);
         if (!name) throw new Error("Name the project first.");
-        const created = await api.createProject({ name, prompt, roles, models: chosen });
+        const created = await api.createProject({ name, prompt, roles, models: chosen, parallel });
         if (!created.id) throw new Error("The project was created, but the first run did not start.");
+        void afterStart(choice, settings.data, true);
+        runStarted(created.id);
         composer.current?.clear();
         navigate(`/runs/${encodeURIComponent(created.id)}`);
         return;
       }
-      const { id } = await api.createRun({ prompt, roles, models: chosen });
+      const { id } = await api.createRun({ prompt, roles, models: chosen, parallel });
+      void afterStart(choice, settings.data, remember);
+      runStarted(id);
       composer.current?.clear();
       navigate(`/runs/${encodeURIComponent(id)}`);
     });
@@ -467,10 +504,10 @@ export function Gallery() {
                 </button>
               </div>
               <div className="composer-end">
-                <Link to="/runs/new" className="model-pill" title="Harnesses and models">
-                  <RoleMark role="master" size={14} />
+                <button type="button" className={`model-pill ${rolesOpen ? "on" : ""}`} aria-expanded={rolesOpen} title="Roles and pages" onClick={() => setRolesOpen((v) => !v)}>
+                  <ProviderLogo id={masterPick?.harness} size={14} />
                   <span className="clip">{modelPill}</span>
-                </Link>
+                </button>
                 <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
                   {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
                 </button>
@@ -495,6 +532,37 @@ export function Gallery() {
           </span>
         </div>
         <Problem error={action.error} />
+        <AnimatePresence initial={false}>
+          {rolesOpen && (
+            <motion.div
+              key="roles"
+              className="home-roles"
+              initial={motionOn() ? { opacity: 0, y: -6 } : false}
+              animate={{ opacity: 1, y: 0 }}
+              exit={motionOn() ? { opacity: 0, y: -4 } : undefined}
+              transition={{ duration: dur.base, ease: bezier.out }}
+            >
+              <RoleDeck
+                choice={choice}
+                providers={providerList}
+                loading={providers.isLoading}
+                onSeat={setSeat}
+                remember={remember}
+                onRemember={setRemember}
+                fresh={fresh}
+                missing={missing}
+              />
+              <PagesPicker value={pages} onChange={setPages} max={max} />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      {!settings.data && runs.length === 0 && <Loading rows={2} tall label="Loading the gallery" />}
+      {settings.data && list.length === 0 && (
+        <section className="home-empty" aria-label="No runs yet">
+          <EmptyRuns />
+          <p>No runs yet. Describe one above and the master plans it with you.</p>
+        </section>
+      )}
       {list.length > 0 && (
         <section className="home-recent" aria-label="Recent runs">
           <div className="home-recent-head">

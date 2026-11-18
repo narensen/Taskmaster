@@ -40,6 +40,24 @@ export interface Prefs {
   showArchived: boolean;
   /** When this browser last opened a run, for the home strip. */
   recentRuns: Record<string, number>;
+  /** The provider and model last used for each role, per project path. */
+  lastRoles: Record<string, Partial<Record<RoleName, RoleDefault>>>;
+  /** Pages at once last chosen: a number, or "max" for what this machine can run. */
+  parallel: number | "max" | null;
+  /** A soft tick when a run finishes. */
+  sound: boolean;
+  /** Desktop notifications when a run finishes, fails or waits on the person. */
+  notify: boolean;
+  /** The quick terminal's height in pixels, and whether it was open. */
+  termHeight: number;
+  /** The project this browser had open, opened again on the next launch. */
+  lastProject: string | null;
+  /** Files open in the files panel, per project, and the active one. */
+  openFiles: Record<string, { tabs: string[]; active: string | null }>;
+  /** Whether the files panel shows a run's change to the file instead of the file. */
+  fileDiff: boolean;
+  /** Whether a run's side panel is open. */
+  runPanel: boolean;
 }
 
 const KEY = "taskmaster.prefs";
@@ -58,6 +76,15 @@ const DEFAULTS: Prefs = {
   viewed: {},
   showArchived: false,
   recentRuns: {},
+  lastRoles: {},
+  parallel: null,
+  sound: false,
+  notify: true,
+  termHeight: 280,
+  lastProject: null,
+  openFiles: {},
+  fileDiff: false,
+  runPanel: true,
 };
 
 function load(): Prefs {

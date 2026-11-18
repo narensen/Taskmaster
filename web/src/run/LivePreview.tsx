@@ -2,7 +2,7 @@
 // Not the file preview tab (a code table); this is the running app.
 
 import { useCallback, useEffect, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { MonitorPlay, Play, Square, ExternalLink as Out } from "lucide-react";
 import { api, type PreviewView, type RunDetail } from "../api";
 import { toast } from "../overlay";

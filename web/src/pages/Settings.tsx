@@ -1,22 +1,24 @@
 import { useEffect, useState } from "react";
-import { api, server, type ApprovalMode, setServer, setToken, DEFAULT_ROLES, type RoleName, type Roles, type Models } from "../api";
+import { api, server, type ApprovalMode, setServer, setToken, type RoleName } from "../api";
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
-import { ROLES, RolePicker } from "../roles";
+import { ROLES } from "../roles";
+import { RoleMark } from "../marks";
+import { ProviderPicker } from "../components/ProviderPicker";
+import { ALL_ROLES, rememberChoice, savedChoice } from "../rolechoice";
+import { useProviders, useSettings, queryClient, keys as qk } from "../query";
+import { allowNotifications, tick } from "../notify";
+import { SHORTCUTS } from "../shell/Shortcuts";
+import type { RoleDefault } from "../prefs";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { appVersion, checkForUpdate, installUpdate, isDesktop, type AvailableUpdate } from "../desktop";
 
 const KEYS: [string, string][] = [
-  ["⌘K / Ctrl-K", "Command palette: runs, pages, commands. Start with > for commands only"],
-  ["/", "Commands and skills, outside a text field or at the start of the composer"],
-  ["⌘1–⌘9 / Ctrl-1–9", "Jump to the first nine runs, when no text field is focused"],
-  ["⌘Z / Ctrl-Z", "Undo the last pin, settle or archive while its Undo shows, even from the composer"],
-  ["⌘W / Ctrl-W", "Close the focused tab of a run's right panel (where the browser lets a page have it)"],
-  ["⌘⇧T / Ctrl-Shift-T", "Reopen the last closed tab"],
-  ["Enter / Shift+Enter", "Send / break the line, in the composer"],
+  ...SHORTCUTS.flatMap((g) => g.items.map(([label, combo]) => [combo.join(" "), label] as [string, string])),
+  ["Enter / Shift+Enter", "Send, or break the line, in the composer"],
   ["↑ / ↓", "Recall earlier prompts in an empty composer"],
-  ["⌘-click / Ctrl-click", "Preview a path word in the right panel"],
+  ["⌘-click / Ctrl-click", "Preview a path word in the side panel"],
   ["Right-click or long-press", "Open, Open with, Reveal in folder, Copy path, Copy path with line"],
 ];
 
@@ -107,9 +109,10 @@ function Section({ id, title, children, note }: { id?: string; title: string; ch
 
 const TOC: { group: string; items: [string, string][] }[] = [
   { group: "Connection", items: [["account", "Account"], ["daemon-address", "Daemon address"], ["project-path", "Project path"], ["commons", "Commons"]] },
-  { group: "Agents", items: [["default-harness-and-model", "Harness and model"], ["tool-approvals", "Tool approvals"]] },
+  { group: "Agents", items: [["providers-for-each-role", "Providers for each role"], ["tool-approvals", "Tool approvals"]] },
   { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"]] },
   { group: "Appearance", items: [["motion", "Motion"], ["density", "Density"], ["theme", "Theme"]] },
+  { group: "Alerts", items: [["notifications", "Notifications"], ["sound", "Sound"]] },
   { group: "Help", items: [["keybindings", "Keybindings"]] },
 ];
 
@@ -131,7 +134,6 @@ export function Settings() {
   const p = usePrefs();
   const health = useLoad(api.health, []);
   const daemon = useLoad(api.settings, []);
-  const providers = useLoad(() => api.providers(), []);
   const gh = useLoad(api.gh, []);
   const { list: editorList, fallback } = useEditors();
   const [address, setAddress] = useState(server());
@@ -156,21 +158,32 @@ export function Settings() {
     if (window.location.hash) document.querySelector(window.location.hash)?.scrollIntoView();
   }, []);
 
-  // Role defaults live in the daemon's settings file; this browser keeps no copy of its own.
-  const [saved, setSaved] = useState<{ roles: Roles; models: Models } | null>(null);
-  useEffect(() => {
-    if (daemon.data && !saved) setSaved({ roles: { ...DEFAULT_ROLES, ...daemon.data.roles }, models: daemon.data.models ?? {} });
-  }, [daemon.data, saved]);
-  const roleDefault = (role: RoleName) => ({
-    harness: saved?.roles[role] ?? daemon.data?.roles[role] ?? DEFAULT_ROLES[role],
-    model: saved?.models[role] ?? null,
-  });
-  const saveRole = (role: RoleName, harness: string, model: string | null) => {
-    const next = { roles: { ...(saved?.roles ?? DEFAULT_ROLES), [role]: harness }, models: { ...(saved?.models ?? {}), [role]: model } };
-    setSaved(next);
-    api.setRoleDefaults(next).then(
-      () => toast("Role defaults saved", `${role}: ${harness}${model ? ` · ${model}` : ""}`),
-      (err) => toast("Role defaults were not saved", err instanceof Error ? err.message : String(err)),
+  // Role choices live in the daemon's settings file. A change shows at once and is saved behind it.
+  const roleSettings = useSettings();
+  const roleProviders = useProviders();
+  const saved = savedChoice(roleSettings.data);
+  const saveRole = (role: RoleName, pick: RoleDefault | null) => {
+    const before = roleSettings.data;
+    const next = { ...saved };
+    if (pick) next[role] = pick;
+    else delete next[role];
+    if (before) {
+      queryClient.setQueryData(qk.settings, {
+        ...before,
+        roles: { ...before.roles, [role]: pick?.harness },
+        models: { ...(before.models ?? {}), [role]: pick?.model ?? null },
+      });
+    }
+    const request = pick ? rememberChoice(next) : api.setRoleDefaults({ roles: { [role]: "" } });
+    request.then(
+      (settings) => {
+        queryClient.setQueryData(qk.settings, settings);
+        toast(pick ? "Saved for this project" : "Choice forgotten", `${ROLES.find((r) => r.id === role)?.label}: ${pick ? pick.harness + (pick.model ? ` · ${pick.model}` : "") : "no provider"}`, 2500);
+      },
+      (err) => {
+        if (before) queryClient.setQueryData(qk.settings, before);
+        toast("The choice was not saved", err instanceof Error ? err.message : String(err));
+      },
     );
   };
 
@@ -280,20 +293,23 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Default harness and model" note="Kept by the daemon and used by every New Run, in any browser. Only harnesses and models the providers list returned can be chosen.">
-        <Problem error={providers.error} onRetry={providers.reload} />
-        <div className="roles">
-          {ROLES.map((role) => {
-            const d = roleDefault(role.id);
+      <Section title="Providers for each role" note="Kept for this project by the daemon. New Run starts from these, and you can change any of them there for one run. Nothing is chosen for you.">
+        <Problem error={roleProviders.error} onRetry={() => void roleProviders.refetch()} />
+        <div className="role-table">
+          {ALL_ROLES.map((role) => {
+            const meta = ROLES.find((r) => r.id === role)!;
             return (
-              <RolePicker
-                key={role.id}
-                role={role}
-                providers={providers.data ?? []}
-                harness={d.harness}
-                model={d.model}
-                onChange={(harness, model) => saveRole(role.id, harness, model)}
-              />
+              <div key={role} className="role-line">
+                <span className="role-line-name">
+                  <RoleMark role={role} size={13} />
+                  {meta.label}
+                </span>
+                <span className="role-line-hint">{meta.hint}</span>
+                <ProviderPicker label={`${meta.label} provider`} providers={roleProviders.data ?? []} loading={roleProviders.isLoading} value={saved[role] ?? null} onChange={(pick) => saveRole(role, pick)} />
+                <button type="button" className="ghost small" disabled={!saved[role]} onClick={() => saveRole(role, null)}>
+                  Forget
+                </button>
+              </div>
             );
           })}
         </div>
@@ -460,6 +476,32 @@ export function Settings() {
               {t}
             </button>
           ))}
+        </div>
+      </Section>
+
+      <Section title="Notifications" note="When a run finishes, fails, or waits on you, and the window is not in front. Clicking one opens the run.">
+        <div className="row between gap">
+          <span>Desktop notifications</span>
+          <Switch
+            on={p.notify}
+            label="Desktop notifications"
+            onChange={(on) => {
+              setPrefs({ notify: on });
+              if (on) void allowNotifications().then((ok) => !ok && toast("Notifications are blocked", "Allow them for this app in your system settings."));
+            }}
+          />
+        </div>
+      </Section>
+
+      <Section title="Sound" note="A very soft tick when a run finishes. Off unless you turn it on.">
+        <div className="row between gap">
+          <span>Completion tick</span>
+          <span className="row gap">
+            <button type="button" className="ghost small" onClick={tick}>
+              Play it
+            </button>
+            <Switch on={p.sound} label="Completion tick" onChange={(on) => (setPrefs({ sound: on }), on && tick())} />
+          </span>
         </div>
       </Section>
 

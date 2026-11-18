@@ -31,7 +31,7 @@ pub struct Settings {
     /// program on this machine. Empty means `$VISUAL`, then `$EDITOR`, then whatever is
     /// installed.
     pub editor: String,
-    /// The harness for each role when a run does not say. Grok for every role by default.
+    /// The harness for each role when a run does not say. Empty until the person chooses.
     pub roles: crate::Roles,
     /// The model for each role when a run does not say; none means the provider's default.
     pub models: crate::Models,
@@ -161,6 +161,22 @@ impl Settings {
             return serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", path.display()));
         }
         Ok(Settings::default())
+    }
+
+    /// The role choices the person saved, and only those: no role is filled in for them.
+    pub fn saved_roles(project: &Path) -> serde_json::Map<String, serde_json::Value> {
+        let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".taskmaster/config.json"));
+        for path in [Some(project.join(".taskmaster/config.json")), home].into_iter().flatten() {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(serde_json::Value::Object(root)) = serde_json::from_str::<serde_json::Value>(&text) else { return Default::default() };
+            let Some(serde_json::Value::Object(roles)) = root.get("roles") else { return Default::default() };
+            return roles
+                .iter()
+                .filter(|(role, value)| crate::Roles::NAMES.contains(&role.as_str()) && value.as_str().is_some_and(|v| !v.trim().is_empty()))
+                .map(|(role, value)| (role.clone(), value.clone()))
+                .collect();
+        }
+        Default::default()
     }
 
     pub fn approval_policy(&self) -> anyhow::Result<crate::approvals::Policy> {

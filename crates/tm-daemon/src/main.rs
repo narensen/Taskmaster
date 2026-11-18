@@ -14,9 +14,9 @@
 //!           [--no-runtime-checks]
 //! ```
 //!
-//! Harnesses are `claude`, `agy`, `grok`, `codex` and `opencode`. The worker defaults
-//! to `agy`, the reviewer and the Taskmaster to `claude`, and the verifier to `agy`.
-//! `--master` chooses the Taskmaster harness. `providers` asks every harness for the
+//! Harnesses are `claude`, `agy`, `grok`, `codex` and `opencode`. There is no built-in
+//! choice: a role left off the command line takes the harness saved in the settings
+//! file, and the run stops if neither names one. `--master` chooses the Taskmaster harness. `providers` asks every harness for the
 //! models it offers right now and prints JSON the UI can use to install one and sign in.
 //! A model flag must name an id from that list. Leaving the flag off keeps the
 //! provider's own default and does not ask for the list.
@@ -97,6 +97,19 @@ async fn run() -> anyhow::Result<Outcome> {
         }
         Invocation::Drive(args) => *args,
     };
+    let mut args = args;
+    {
+        let project = args.project.canonicalize().unwrap_or_else(|_| args.project.clone());
+        let chosen = match serde_json::to_value(&args.roles)? {
+            serde_json::Value::Object(map) => map,
+            _ => Default::default(),
+        };
+        args.roles = Roles::resolve(&Settings::saved_roles(&project), &chosen)
+            .context("pass --master, --mid, --worker, --reviewer and --verifier, or save them in Settings")?;
+        if args.baseline.is_empty() {
+            args.baseline = args.roles.master.clone();
+        }
+    }
     check_models(&args.roles, &args.models).await?;
     let mut config = Config::new(&args.project);
     config.skills = Some(tm_daemon::skills::default_root());

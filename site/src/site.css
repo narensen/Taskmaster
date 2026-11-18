@@ -172,3 +172,8 @@ footer .wrap { display: flex; gap: 18px; flex-wrap: wrap; }
 @media (prefers-reduced-motion: no-preference) {
   .button, .top nav a, .downloads a { transition: background 120ms ease, filter 120ms ease; }
 }
+
+/* Lenis drives the scroll on the landing page; the browser's own smoothing stays out of its way. */
+html.lenis, html.lenis body { height: auto; }
+.lenis.lenis-smooth { scroll-behavior: auto !important; }
+.lenis.lenis-smooth [data-lenis-prevent] { overscroll-behavior: contain; }

@@ -46,10 +46,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            site/package-lock.json
       - run: npm ci
       - run: npm run build
-      - run: cd ../site && npm test && node build.mjs --offline
+      - run: cd ../site && npm ci && npm test && node build.mjs --offline
 
   e2e:
     runs-on: ubuntu-latest
@@ -72,6 +74,8 @@ jobs:
       # The e2e setup needs the daemon binary and the built app.
       - run: cargo build -p tm-daemon --locked
       - run: cd web && npm run build
+      # The site's landing page loads Lenis and GSAP from its own node_modules.
+      - run: cd site && npm ci
       # The runner's own Chrome; Playwright downloads no browser.
       - run: cd web && TASKMASTER_CHROME=$(command -v google-chrome) npm run e2e
 
@@ -80,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libdbus-1-dev pkg-config patchelf
       - uses: actions/setup-node@v4
         with:
           node-version: 24

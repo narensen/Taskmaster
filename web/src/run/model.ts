@@ -13,6 +13,8 @@ import {
   type RunEvent,
   type Totals,
 } from "../api";
+import { keys, queryClient } from "../query";
+import { checksFailed, pageDone } from "../notify";
 
 export interface ToolItem {
   t: "tool";
@@ -182,10 +184,20 @@ export interface RunData {
   reloadNotes: () => void;
   /** Fetch transcript entries written since the last one, e.g. after a typed command. */
   catchUp: () => Promise<void>;
+  /** Show a change at once, before the daemon confirms it; the next load reconciles. */
+  patch: (change: Partial<RunDetail>) => void;
 }
 
 export function useRun(id: string): RunData {
-  const [detail, setDetail] = useState<RunDetail | null>(null);
+  // A run prefetched on hover opens with what was fetched, then catches up.
+  const [detail, setDetailState] = useState<RunDetail | null>(() => queryClient.getQueryData<RunDetail>(keys.run(id)) ?? null);
+  const setDetail = useCallback(
+    (d: RunDetail) => {
+      queryClient.setQueryData(keys.run(id), d);
+      setDetailState(d);
+    },
+    [id],
+  );
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [entries, setEntries] = useState<AgentEntry[]>([]);
   const [ledger, setLedger] = useState<RunData["ledger"]>(null);
@@ -210,7 +222,22 @@ export function useRun(id: string): RunData {
       setError(err);
     }
     reloadNotes();
-  }, [id, reloadNotes]);
+  }, [id, reloadNotes, setDetail]);
+
+  // Streamed entries are added once a frame, however fast they arrive.
+  const pending = useRef<AgentEntry[]>([]);
+  const frame = useRef(0);
+  const push = useCallback((entry: AgentEntry) => {
+    pending.current.push(entry);
+    if (frame.current) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = 0;
+      const batch = pending.current;
+      pending.current = [];
+      setEntries((all) => all.concat(batch));
+    });
+  }, []);
+  useEffect(() => () => cancelAnimationFrame(frame.current), []);
 
   const catchUp = useCallback(async () => {
     // While the stream is open it delivers the entries itself.
@@ -236,11 +263,16 @@ export function useRun(id: string): RunData {
           counts.current.events = index;
           setEvents((all) => [...all, event]);
           if (typeof event === "object" && "plan_ready" in event && loaded.current) setPlanArrived(true);
+          if (typeof event === "object" && "worker_finished" in event && loaded.current) {
+            const { page, outcome } = event.worker_finished;
+            if (outcome === "passed") pageDone(id, page);
+            else if (typeof outcome === "object" && "check_failed" in outcome) checksFailed(id, page, outcome.check_failed.errors);
+          }
           void reload();
         },
         agent: (entry) => {
           counts.current.entries += 1;
-          setEntries((all) => [...all, entry]);
+          push(entry);
           // A finished call is in the ledger now: refresh the token split.
           if (entry.kind === "end") api.ledger(id).then(setLedger, () => undefined);
         },
@@ -254,7 +286,7 @@ export function useRun(id: string): RunData {
       },
       counts.current.entries,
     );
-  }, [id, reload]);
+  }, [id, reload, push]);
 
   useEffect(() => {
     let stale = false;
@@ -309,9 +341,11 @@ export function useRun(id: string): RunData {
       }
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [id, refollow, reload]);
+  }, [id, refollow, reload, setDetail]);
 
-  return { detail, events, entries, ledger, notes, error, planArrived, reload, refollow, reloadNotes, catchUp };
+  const patch = useCallback((change: Partial<RunDetail>) => setDetailState((d) => (d ? { ...d, ...change } : d)), []);
+
+  return { detail, events, entries, ledger, notes, error, planArrived, reload, refollow, reloadNotes, catchUp, patch };
 }
 
 /** A glob as the daemon's owners read it: `**` any depth, `*` within a segment. */

@@ -74,6 +74,17 @@ impl PtyWriter {
         file.write_all(bytes)?;
         file.flush()
     }
+
+    /// Change the terminal's size. The kernel tells the program with SIGWINCH.
+    pub fn resize(&self, rows: u16, cols: u16) -> std::io::Result<()> {
+        let file = self.0.lock().unwrap();
+        let size = libc::winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: TIOCSWINSZ reads one winsize from the pointer; the descriptor is the open master.
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCSWINSZ as _, &size) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// A running program on a terminal. Dropping it kills the program's whole group.
@@ -197,6 +208,16 @@ mod tests {
         child.writer.write(Key::Enter.bytes()).unwrap();
         let text = collect(child).await;
         assert!(text.contains("got:hello"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_can_be_resized() {
+        let child = spawn(Path::new("/bin/sh"), &["-c", "read line; stty size"], Path::new("/"), [("TERM", "dumb")], 24, 80).unwrap();
+        child.writer.resize(40, 120).unwrap();
+        child.writer.write(b"go").unwrap();
+        child.writer.write(Key::Enter.bytes()).unwrap();
+        let text = collect(child).await;
+        assert!(text.contains("40 120"), "{text:?}");
     }
 
     #[test]

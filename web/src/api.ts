@@ -446,8 +446,11 @@ export interface DaemonSettings {
   config: string | null;
   config_default: string;
   store: string;
-  roles: Roles;
+  /** Only the roles the person chose. A role missing here has no provider yet. */
+  roles: Partial<Roles>;
   models?: Models;
+  /** What this machine can run at once. Workers always run here. */
+  machine?: { cpus: number; free_memory_gb: number | null; max_parallel: number };
   version: string;
   approvals?: { mode: ApprovalMode; timeout_secs: number };
   checker?: { enabled: boolean };
@@ -515,13 +518,27 @@ export interface GhStatus {
   error?: string;
 }
 
-export const DEFAULT_ROLES: Roles = {
-  worker: "grok",
-  mid: "grok",
-  master: "grok",
-  reviewer: "grok",
-  verifier: "grok",
-};
+export interface GrepHit {
+  path: string;
+  line: number;
+  column: number;
+  text: string;
+}
+
+export interface ProjectEntry {
+  name: string;
+  path: string;
+  current: boolean;
+}
+
+export interface TerminalInfo {
+  id: string;
+  cwd: string;
+  shell: string;
+  started: string;
+  alive: boolean;
+  code: number | null;
+}
 
 // Where the daemon is, and the token it gave this device. Kept in localStorage so a
 // phone that paired once stays paired.
@@ -670,7 +687,8 @@ export const api = {
     call<{ approvals: ToolApproval[]; mode: ApprovalMode; timeout_secs: number }>("GET", `/api/approvals?run=${enc(run)}`),
   approveTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/approve`, {}),
   denyTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/deny`, {}),
-  setRoleDefaults: (body: { roles: Roles; models: Models }) => call<DaemonSettings>("POST", "/api/settings", body),
+  /** Save role choices. Roles left out keep what was saved; an empty string forgets one. */
+  setRoleDefaults: (body: { roles: Partial<Roles>; models?: Models }) => call<DaemonSettings>("POST", "/api/settings", body),
   setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
   setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
   setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
@@ -686,6 +704,14 @@ export const api = {
   file: (path: string) =>
     call<{ path: string; full: string; content: string; truncated: boolean }>("GET", `/api/file?path=${enc(path)}`),
   files: () => call<{ files: string[] }>("GET", "/api/files").then((r) => r.files),
+  grep: (q: string) => call<{ hits: GrepHit[]; truncated: boolean }>("GET", `/api/grep?q=${enc(q)}`),
+  projects: () => call<{ projects: ProjectEntry[]; workspace: string }>("GET", "/api/projects"),
+  openProject: (path: string) => call<{ project: string }>("POST", "/api/projects/open", { path }),
+  terminals: () => call<{ terminals: TerminalInfo[] }>("GET", "/api/terminals").then((r) => r.terminals),
+  openTerminal: (cols: number, rows: number) => call<TerminalInfo>("POST", "/api/terminals", { cols, rows }),
+  terminalInput: (id: string, data: string) => call("POST", `/api/terminals/${enc(id)}/input`, { data }),
+  resizeTerminal: (id: string, cols: number, rows: number) => call("POST", `/api/terminals/${enc(id)}/resize`, { cols, rows }),
+  closeTerminal: (id: string) => call("POST", `/api/terminals/${enc(id)}/close`, {}),
   skills: () => call<{ skills: Skill[] }>("GET", "/api/skills").then((r) => r.skills),
   searchSkills: (q: string) => call<{ hits: SkillHit[] }>("GET", `/api/skills/search?q=${enc(q)}`).then((r) => r.hits),
   skillUpdates: () => call<{ updates: Record<string, string> }>("GET", "/api/skills/updates").then((r) => r.updates),
@@ -755,6 +781,33 @@ export function followJob(id: string, on: (job: SetupJob) => void, lost: () => v
   });
   source.onerror = () => {
     if (source.readyState === EventSource.CLOSED) lost();
+  };
+  return () => source.close();
+}
+
+/** Follow a terminal's output from byte `from`. Bytes arrive decoded; `exit` ends it. */
+export function followTerminal(
+  id: string,
+  from: number,
+  on: { data: (bytes: Uint8Array, end: number) => void; exit: (code: number | null) => void; lost: () => void },
+): () => void {
+  const params = new URLSearchParams({ from: String(from) });
+  const bearer = token();
+  if (bearer) params.set("token", bearer);
+  const source = new EventSource(`${server()}/api/terminals/${enc(id)}/stream?${params}`);
+  source.addEventListener("data", (message) => {
+    const { at, b64 } = JSON.parse((message as MessageEvent<string>).data) as { at: number; b64: string };
+    const raw = atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    on.data(bytes, at + bytes.length);
+  });
+  source.addEventListener("exit", (message) => {
+    source.close();
+    on.exit((JSON.parse((message as MessageEvent<string>).data) as { code: number | null }).code);
+  });
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) on.lost();
   };
   return () => source.close();
 }

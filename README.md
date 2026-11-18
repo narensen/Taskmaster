@@ -131,7 +131,7 @@ Taskmaster does not run `npm install`. Once the packages are there, later runs t
 
 ## Who does the work
 
-`--master` chooses the Taskmaster harness. The default is `claude`. The worker defaults to `agy`, the mid tier to `grok`, the reviewer to `claude`, and the verifier to `agy`.
+Taskmaster picks no provider for you. Each role (`--master`, `--mid`, `--worker`, `--reviewer`, `--verifier`) takes the harness you name on the command line, or the one saved for the project in `.taskmaster/config.json` under `roles`; a run with a role left unchosen stops and says which. In the app, New Run and the gallery show a provider and model picker for each role. The first time every role is chosen, the answer is saved for the project; after that a choice in New Run applies to that run only, unless you tick "Remember for this project". Settings changes the saved choice.
 
 ```bash
 tm-daemon providers

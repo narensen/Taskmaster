@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronRight, ClipboardList, GitCompare, Plus, X } from "lucide-react";
-import { api, DEFAULT_ROLES, type Judged } from "../api";
+import { api, type Judged } from "../api";
+import { useProviders, useSettings } from "../query";
+import { ProviderPicker } from "../components/ProviderPicker";
 import { ago } from "../format";
 import { Link, navigate } from "../router";
 import { Badge, Code, Empty, Field, Loading, Problem, Spinner, useAction, useLoad } from "../ui";
@@ -83,10 +85,25 @@ function NewReviewForm() {
   const [head, setHead] = useState("");
   const [pr, setPr] = useState("");
   const [dirty, setDirty] = useState(false);
-  const [reviewer, setReviewer] = useState(DEFAULT_ROLES.reviewer);
-  const [verifier, setVerifier] = useState(DEFAULT_ROLES.verifier);
+  const settings = useSettings();
+  const [reviewer, setReviewer] = useState("");
+  const [verifier, setVerifier] = useState("");
+  const [reviewerModel, setReviewerModel] = useState<string | null>(null);
+  const [verifierModel, setVerifierModel] = useState<string | null>(null);
+  const providers = useProviders();
+  // The checker the person chose for the project, once it is known; nothing otherwise.
+  useEffect(() => {
+    if (!reviewer && settings.data?.roles.reviewer) {
+      setReviewer(settings.data.roles.reviewer);
+      setReviewerModel(settings.data.models?.reviewer ?? null);
+    }
+    if (!verifier && settings.data?.roles.verifier) {
+      setVerifier(settings.data.roles.verifier);
+      setVerifierModel(settings.data.models?.verifier ?? null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.data]);
   const action = useAction();
-  const harnesses = ["claude", "agy", "grok", "opencode", "codex"];
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -97,8 +114,10 @@ function NewReviewForm() {
         head: head.trim() || undefined,
         pr: pr.trim() ? Number(pr) : undefined,
         dirty,
-        reviewer,
-        verifier,
+        reviewer: reviewer || undefined,
+        verifier: verifier || undefined,
+        reviewer_model: reviewerModel ?? undefined,
+        verifier_model: verifierModel ?? undefined,
       });
       navigate(`/reviews/${encodeURIComponent(id)}`);
     });
@@ -123,18 +142,22 @@ function NewReviewForm() {
       </div>
       <div className="grid two">
         <Field label="Reviewer">
-          <select value={reviewer} onChange={(e) => setReviewer(e.target.value)}>
-            {harnesses.map((h) => (
-              <option key={h}>{h}</option>
-            ))}
-          </select>
+          <ProviderPicker
+            label="Reviewer provider"
+            providers={providers.data ?? []}
+            loading={providers.isLoading}
+            value={reviewer ? { harness: reviewer, model: reviewerModel } : null}
+            onChange={(pick) => (setReviewer(pick.harness), setReviewerModel(pick.model))}
+          />
         </Field>
         <Field label="Verifier">
-          <select value={verifier} onChange={(e) => setVerifier(e.target.value)}>
-            {harnesses.map((h) => (
-              <option key={h}>{h}</option>
-            ))}
-          </select>
+          <ProviderPicker
+            label="Verifier provider"
+            providers={providers.data ?? []}
+            loading={providers.isLoading}
+            value={verifier ? { harness: verifier, model: verifierModel } : null}
+            onChange={(pick) => (setVerifier(pick.harness), setVerifierModel(pick.model))}
+          />
         </Field>
       </div>
       <label className="check">

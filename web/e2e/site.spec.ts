@@ -1,4 +1,5 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { lowContrast } from "./fixtures";
 import { createServer, type Server } from "node:http";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -28,37 +29,6 @@ test.beforeAll(async () => {
 });
 test.afterAll(() => server.close());
 
-/** WCAG contrast of each text style on the page against the background it sits on. */
-async function lowContrast(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
-    const lum = (rgb: number[]) => {
-      const [r, g, b] = rgb.map((v) => {
-        const c = v / 255;
-        return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-      });
-      return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
-    };
-    const parse = (s: string) => (s.match(/[\d.]+/g) ?? []).map(Number);
-    const bgOf = (el: Element | null): number[] => {
-      while (el) {
-        const c = parse(getComputedStyle(el).backgroundColor);
-        if (c.length >= 3 && (c.length < 4 || c[3]! > 0.5)) return c.slice(0, 3);
-        el = el.parentElement;
-      }
-      return parse(getComputedStyle(document.body).backgroundColor).slice(0, 3);
-    };
-    const bad: string[] = [];
-    for (const el of Array.from(document.querySelectorAll("h1, h2, h3, p, li, a, span, th, td, dt, dd, summary, button, code, figcaption"))) {
-      if (!el.textContent?.trim() || (el as HTMLElement).offsetParent === null) continue;
-      const fg = parse(getComputedStyle(el).color);
-      const bg = bgOf(el);
-      const [a, b] = [lum(fg), lum(bg)].sort((x, y) => y - x);
-      const ratio = (a! + 0.05) / (b! + 0.05);
-      if (ratio < 4.5) bad.push(`${el.tagName.toLowerCase()}.${(el as HTMLElement).className} "${el.textContent.trim().slice(0, 30)}" ${ratio.toFixed(2)}`);
-    }
-    return bad;
-  });
-}
 
 for (const theme of ["dark", "light"] as const) {
   test(`landing page, ${theme}: content, contrast, and the theme switch`, async ({ page }) => {
@@ -72,7 +42,9 @@ for (const theme of ["dark", "light"] as const) {
     await expect(page.getByRole("button", { name: theme === "dark" ? "Use the light theme" : "Use the dark theme" })).toBeVisible();
     const toggle = page.locator("[data-theme]");
     await toggle.click();
-    await expect(page.locator("html")).toHaveClass(theme === "dark" ? "light" : "");
+    // Only the theme class is ours to check; the scroll library adds its own.
+    if (theme === "dark") await expect(page.locator("html")).toHaveClass(/(^|\s)light(\s|$)/);
+    else await expect(page.locator("html")).not.toHaveClass(/(^|\s)light(\s|$)/);
     await toggle.click();
     if (process.env.SHOTS) await page.screenshot({ path: `${shots}/40-site-${theme}.png`, fullPage: true });
   });

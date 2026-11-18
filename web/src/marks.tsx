@@ -24,7 +24,7 @@ const paths: Record<MarkRole, ReactElement> = {
   verifier: <path d="M2.25 1.75v12h12v-3h-9v-9zM8.25 5.25l1.5 1.5 3-3.25" />,
 };
 
-export function RoleMark({ role, size = 14, ...rest }: { role: MarkRole; size?: number } & SVGProps<SVGSVGElement>) {
+export function RoleMark({ role, size = 14, className, ...rest }: { role: MarkRole; size?: number } & SVGProps<SVGSVGElement>) {
   return (
     <svg
       width={size}
@@ -37,7 +37,7 @@ export function RoleMark({ role, size = 14, ...rest }: { role: MarkRole; size?: 
       strokeLinejoin="round"
       aria-hidden
       focusable="false"
-      className="role-mark"
+      className={className ? `role-mark ${className}` : "role-mark"}
       data-role={role}
       {...rest}
     >

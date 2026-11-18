@@ -1,40 +1,50 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowUp, GitMerge, ListChecks, Settings2, Users, X } from "lucide-react";
 import { RoleMark } from "../marks";
-import { api, DEFAULT_ROLES, type RoleName, type Roles } from "../api";
+import { api } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
 import { Field, Problem, useAction, useLoad } from "../ui";
-import { ROLES, RolePicker, allowed } from "../roles";
+import { RoleDeck } from "../components/RoleDeck";
+import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
+import { ProviderLogo, providerName } from "../providers/logos";
+import { modelLabel } from "../components/ProviderPicker";
+import { afterStart, problemWith, SEATS, seatChoice, toRequest, useChoice } from "../rolechoice";
+import { prefs, setPrefs } from "../prefs";
+import { useProviders, useSettings } from "../query";
+import { runStarted } from "../notify";
 
 export function NewRun() {
-  const providers = useLoad(() => api.providers(), []);
+  const providers = useProviders();
   const templates = useLoad(api.templates, []);
   const [template, setTemplate] = useState("");
-  const [parallel, setParallel] = useState(3);
+  const settings = useSettings();
+  const max = settings.data?.machine?.max_parallel ?? null;
+  const [pages, setPagesState] = useState<Pages>(() => prefs().parallel ?? 3);
+  const setPages = (v: Pages) => {
+    setPagesState(v);
+    setPrefs({ parallel: v });
+  };
   const [yes, setYes] = useState(false);
-  const defaults = useLoad(api.settings, []);
-  const [roles, setRoles] = useState<Roles>({ ...DEFAULT_ROLES });
-  const [models, setModels] = useState<Partial<Record<RoleName, string | null>>>({});
-  const [touched, setTouched] = useState(false);
-  useEffect(() => {
-    if (!defaults.data || touched) return;
-    setRoles({ ...DEFAULT_ROLES, ...defaults.data.roles });
-    setModels(defaults.data.models ?? {});
-  }, [defaults.data, touched]);
+  const [remember, setRemember] = useState(false);
+  const { choice, setSeat, missing, fresh } = useChoice(settings.data);
   const composer = useRef<ComposerHandle>(null);
   const action = useAction();
   const [advanced, setAdvanced] = useState(false);
   const list = providers.data ?? [];
-  const master = list.find((p) => p.id === roles.master);
-  const chosen = master?.models.find((m) => m.id === models.master) ?? master?.models.find((m) => m.default) ?? master?.models[0];
-  const modelName = chosen?.name ?? models.master ?? "default";
-  const pill = `${master?.name ?? roles.master} · ${modelName}`;
-  const project = defaults.data?.project?.split(/[/\\]/).filter(Boolean).pop();
+  const master = seatChoice(choice, "master");
+  const pill = master ? `${list.find((p) => p.id === master.harness)?.name ?? providerName(master.harness)} · ${modelLabel(list, master)}` : "Choose providers";
+  const project = settings.data?.project?.split(/[/\\]/).filter(Boolean).pop();
+  const parallel = resolvePages(pages, max ?? 32);
 
   useEffect(() => {
     composer.current?.focus();
   }, []);
+
+  // A role with no provider opens the options, so the question is asked where it is answered.
+  useEffect(() => {
+    if (settings.data && missing.length) setAdvanced(true);
+  }, [settings.data, missing.length]);
 
   const submit = (message?: Message) => {
     const m = message ?? composer.current?.read();
@@ -42,13 +52,18 @@ export function NewRun() {
     const prompt = messageText(m);
     void action.run("create", async () => {
       if (!prompt) throw new Error("Write what to build first.");
-      // Only what the providers list returned. An omitted model keeps the default.
-      for (const role of ROLES) {
-        const problem = allowed(list, roles[role.id], models[role.id] ?? null);
-        if (problem) throw new Error(`${role.label}: ${problem}`);
+      if (missing.length) {
+        setAdvanced(true);
+        throw new Error(`Choose a provider for ${missing.map((s) => SEATS.find((x) => x.id === s)!.label.toLowerCase()).join(", ")}.`);
       }
-      const chosen = Object.fromEntries(Object.entries(models).filter(([, model]) => model));
-      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models: chosen });
+      for (const seat of SEATS) {
+        const problem = problemWith(list, seatChoice(choice, seat.id));
+        if (problem) throw new Error(`${seat.label}: ${problem}`);
+      }
+      const { roles, models } = toRequest(choice);
+      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models });
+      void afterStart(choice, settings.data, remember);
+      runStarted(id);
       composer.current?.clear();
       navigate(`/runs/${encodeURIComponent(id)}`);
     });
@@ -77,14 +92,14 @@ export function NewRun() {
                   className={`model-pill ${advanced ? "on" : ""}`}
                   aria-expanded={advanced}
                   onClick={() => setAdvanced((v) => !v)}
-                  title="Harnesses and models"
+                  title="Roles and pages"
                 >
-                  <RoleMark role="master" size={14} />
+                  <ProviderLogo id={master?.harness} size={14} />
                   <span className="clip">{pill}</span>
                 </button>
                 <span className="foot-sep" aria-hidden />
                 <span className="foot-note">
-                  <Users size={13} aria-hidden /> {parallel} at once
+                  <Users size={13} aria-hidden /> {pages === "max" ? `Max (${parallel})` : parallel} at once
                 </span>
               </div>
               <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
@@ -107,42 +122,33 @@ export function NewRun() {
         </div>
         <Problem error={action.error} />
         {advanced && (
-          <section className="ask-advanced" aria-label="Harnesses and models">
+          <section className="ask-advanced" aria-label="Roles and pages">
             <div className="row between">
-              <h2 className="section-title">Harnesses and models</h2>
+              <h2 className="section-title">Roles and pages</h2>
               <button type="button" className="icon" aria-label="Close options" onClick={() => setAdvanced(false)}>
                 <X size={15} />
               </button>
             </div>
-            <Problem error={providers.error} onRetry={providers.reload} />
-            {providers.loading && <div className="muted small">Asking each harness for its models…</div>}
-            <div className="roles">
-              {ROLES.map((role) => (
-                <RolePicker
-                  key={role.id}
-                  role={role}
-                  providers={list}
-                  harness={roles[role.id]}
-                  model={models[role.id] ?? null}
-                  onChange={(harness, model) => {
-                    setTouched(true);
-                    setRoles({ ...roles, [role.id]: harness });
-                    setModels({ ...models, [role.id]: model });
-                  }}
-                />
-              ))}
-            </div>
+            <Problem error={providers.error} onRetry={() => void providers.refetch()} />
+            <RoleDeck
+              choice={choice}
+              providers={list}
+              loading={providers.isLoading}
+              onSeat={setSeat}
+              remember={remember}
+              onRemember={setRemember}
+              fresh={fresh}
+              missing={missing}
+            />
+            <PagesPicker value={pages} onChange={setPages} max={max} />
             <div className="grid two">
-              <Field label="Start from" hint="For a new project. A path to a template directory works too.">
+              <Field label="Start from" hint="For a new project. A folder with a template works too.">
                 <input list="templates" value={template} onChange={(e) => setTemplate(e.target.value)} placeholder="the project as it is" spellCheck={false} />
                 <datalist id="templates">
                   {(templates.data ?? []).map((name) => (
                     <option key={name} value={name} />
                   ))}
                 </datalist>
-              </Field>
-              <Field label="Pages at once">
-                <input type="number" min={1} max={16} value={parallel} onChange={(e) => setParallel(Number(e.target.value) || 1)} />
               </Field>
             </div>
             <div>

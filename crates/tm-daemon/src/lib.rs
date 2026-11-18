@@ -95,8 +95,10 @@ impl Harnesses {
     }
 }
 
-/// The harness name for each role.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The harness for each role. There is no built-in choice: an empty name means nobody
+/// has chosen one yet, and a run cannot start until every role has a harness, either from
+/// the request or from what the person saved in the settings file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Roles {
     pub worker: String,
@@ -106,11 +108,43 @@ pub struct Roles {
     pub verifier: String,
 }
 
-impl Default for Roles {
-    /// Every role is Grok Build until the settings file or the request says otherwise.
-    fn default() -> Self {
-        let grok = || "grok".to_string();
-        Roles { worker: grok(), mid: grok(), master: grok(), reviewer: grok(), verifier: grok() }
+impl Roles {
+    pub const NAMES: [&'static str; 5] = ["master", "mid", "worker", "reviewer", "verifier"];
+
+    pub fn get(&self, role: &str) -> &str {
+        match role {
+            "worker" => &self.worker,
+            "mid" => &self.mid,
+            "master" => &self.master,
+            "reviewer" => &self.reviewer,
+            "verifier" => &self.verifier,
+            _ => "",
+        }
+    }
+
+    /// Roles nobody has chosen a harness for.
+    pub fn missing(&self) -> Vec<&'static str> {
+        Self::NAMES.into_iter().filter(|role| self.get(role).trim().is_empty()).collect()
+    }
+
+    /// The request's choices over the saved ones. Fails, naming the roles, when any is
+    /// still unchosen, because nothing here picks a provider for the person.
+    pub fn resolve(
+        saved: &serde_json::Map<String, serde_json::Value>,
+        chosen: &serde_json::Map<String, serde_json::Value>,
+    ) -> anyhow::Result<Roles> {
+        let mut merged = serde_json::Map::new();
+        for (role, value) in saved.iter().chain(chosen.iter()) {
+            if value.as_str().is_some_and(|name| !name.trim().is_empty()) {
+                merged.insert(role.clone(), value.clone());
+            }
+        }
+        let roles: Roles = serde_json::from_value(serde_json::Value::Object(merged))?;
+        let missing = roles.missing();
+        if !missing.is_empty() {
+            bail!("choose a provider for the {} role{}", missing.join(", "), if missing.len() == 1 { "" } else { "s" });
+        }
+        Ok(roles)
     }
 }
 

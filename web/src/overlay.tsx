@@ -1,9 +1,12 @@
-// What floats above the page: toasts (some with Undo), the right-click menu, and a small
+// What floats above the page: toasts (some with Undo), the right-click menu, the bottom
+// sheet, and a small
 // bus that lets any part of a run hand a chip to the composer or a file to the preview.
 
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { AnimatePresence, motion } from "framer-motion";
-import { bezier, dur } from "./motion";
+import { useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import * as Menu from "@radix-ui/react-dropdown-menu";
+import { Toaster, toast as sonner } from "sonner";
+import { bezier } from "./motion";
 import { useMotion } from "./prefs";
 
 // A tiny store helper.
@@ -27,87 +30,90 @@ function store<T>(initial: T) {
   };
 }
 
-// Toasts.
+// Toasts, on Sonner. Calm and short: a line, an optional detail, and Undo where a change
+// can be taken back.
 
-export interface Toast {
-  id: number;
-  text: string;
-  detail?: string;
-  undo?: () => void;
+export interface ToastOptions {
+  action?: { label: string; run: () => void };
+}
+
+export function toast(text: string, detail?: string, ms = 6000, options: ToastOptions = {}) {
+  sonner(text, {
+    description: detail,
+    duration: ms,
+    action: options.action ? { label: options.action.label, onClick: options.action.run } : undefined,
+  });
+}
+
+interface Undo {
+  id: string | number;
+  run: () => void;
   until: number;
 }
+let undos: Undo[] = [];
 
-const toasts = store<Toast[]>([]);
-let nextToast = 1;
-
-export function toast(text: string, detail?: string, ms = 6000) {
-  const t: Toast = { id: nextToast++, text, detail, until: Date.now() + ms };
-  toasts.set([...toasts.get(), t]);
-  window.setTimeout(() => dismiss(t.id), ms);
+/**
+ * A change that can be taken back for five seconds, by the button or Command-Z. This is
+ * used instead of a confirm dialog: the change happens at once and Undo reverses it.
+ */
+export function undoable(text: string, undo: () => void, ms = 5000, detail?: string) {
+  const entry: Undo = { id: 0, run: undo, until: Date.now() + ms };
+  entry.id = sonner(text, {
+    description: detail,
+    duration: ms,
+    action: {
+      label: "Undo",
+      onClick: () => {
+        undos = undos.filter((u) => u !== entry);
+        undo();
+      },
+    },
+    onDismiss: () => (undos = undos.filter((u) => u !== entry)),
+    onAutoClose: () => (undos = undos.filter((u) => u !== entry)),
+  });
+  undos.push(entry);
 }
 
-/** A change that can be taken back for five seconds, by the button or Command-Z. */
-export function undoable(text: string, undo: () => void) {
-  const t: Toast = { id: nextToast++, text, undo, until: Date.now() + 5000 };
-  toasts.set([...toasts.get().filter((x) => !x.undo), t]);
-  window.setTimeout(() => dismiss(t.id), 5000);
-}
-
-export function dismiss(id: number) {
-  toasts.set(toasts.get().filter((t) => t.id !== id));
+export function dismiss(id: string | number) {
+  sonner.dismiss(id);
 }
 
 /** Run the newest Undo still on screen. True when there was one. */
 export function undoLatest(): boolean {
-  const live = toasts.get().filter((t) => t.undo && t.until > Date.now());
+  const live = undos.filter((u) => u.until > Date.now());
   const last = live[live.length - 1];
   if (!last) return false;
-  last.undo!();
-  dismiss(last.id);
+  undos = undos.filter((u) => u !== last);
+  last.run();
+  sonner.dismiss(last.id);
   return true;
 }
 
-export function Toasts() {
-  const list = toasts.use();
-  const on = useMotion();
+export function Toasts({ theme }: { theme: "dark" | "light" }) {
   return (
-    <div className="toasts" role="status" aria-live="polite">
-      <AnimatePresence initial={false}>
-        {list.map((t) => (
-          <motion.div
-            key={t.id}
-            className="toast"
-            initial={on ? { opacity: 0, y: 8 } : false}
-            animate={{ opacity: 1, y: 0 }}
-            exit={on ? { opacity: 0, y: 6 } : { opacity: 1, transition: { duration: 0 } }}
-            transition={{ duration: on ? dur.base : 0, ease: bezier.out }}
-          >
-            <div className="grow">
-              <div>{t.text}</div>
-              {t.detail && <div className="muted small break">{t.detail}</div>}
-            </div>
-            {t.undo && (
-              <button
-                className="ghost small toast-undo"
-                onClick={() => {
-                  t.undo!();
-                  dismiss(t.id);
-                }}
-              >
-                Undo
-              </button>
-            )}
-            <button className="icon toast-x" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
-              ×
-            </button>
-          </motion.div>
-        ))}
-      </AnimatePresence>
-    </div>
+    <Toaster
+      theme={theme}
+      position="bottom-right"
+      visibleToasts={4}
+      gap={8}
+      offset={16}
+      toastOptions={{
+        unstyled: true,
+        classNames: {
+          toast: "toast",
+          title: "toast-title",
+          description: "toast-detail",
+          actionButton: "toast-action",
+          cancelButton: "toast-action",
+          closeButton: "toast-x",
+        },
+      }}
+    />
   );
 }
 
-// The right-click menu.
+// The right-click menu, on Radix: a menu opened at the pointer, with submenus, typeahead
+// and arrow keys.
 
 export interface MenuItem {
   label: string;
@@ -121,88 +127,60 @@ interface MenuState {
   x: number;
   y: number;
   items: MenuItem[];
+  n: number;
 }
 
 const menu = store<MenuState | null>(null);
+let menuN = 0;
 
 export function openMenu(x: number, y: number, items: MenuItem[]) {
-  menu.set({ x, y, items });
+  menu.set({ x, y, items, n: ++menuN });
 }
 
 export function closeMenu() {
   menu.set(null);
 }
 
-function MenuList({ items, onDone }: { items: MenuItem[]; onDone: () => void }) {
-  const [open, setOpen] = useState<number | null>(null);
+function MenuItems({ items }: { items: MenuItem[] }) {
   return (
-    <ul className="menu-list" role="menu">
-      {items.map((item, i) => (
-        <li key={item.label} className="menu-li" onMouseEnter={() => setOpen(item.items ? i : null)}>
-          <button
-            role="menuitem"
-            className="menu-item"
-            disabled={item.disabled}
-            onClick={() => {
-              if (item.items) {
-                setOpen(open === i ? null : i);
-                return;
-              }
-              item.run?.();
-              onDone();
-            }}
-          >
+    <>
+      {items.map((item) =>
+        item.items ? (
+          <Menu.Sub key={item.label}>
+            <Menu.SubTrigger className="menu-item" disabled={item.disabled}>
+              <span>{item.label}</span>
+              <span className="muted">›</span>
+            </Menu.SubTrigger>
+            <Menu.Portal>
+              <Menu.SubContent className="menu" sideOffset={4} collisionPadding={8}>
+                <MenuItems items={item.items} />
+              </Menu.SubContent>
+            </Menu.Portal>
+          </Menu.Sub>
+        ) : (
+          <Menu.Item key={item.label} className="menu-item" disabled={item.disabled} onSelect={() => item.run?.()}>
             <span>{item.label}</span>
-            {item.items ? <span className="muted">›</span> : item.hint ? <span className="muted small">{item.hint}</span> : null}
-          </button>
-          {item.items && open === i && (
-            <div className="submenu">
-              <MenuList items={item.items} onDone={onDone} />
-            </div>
-          )}
-        </li>
-      ))}
-    </ul>
+            {item.hint && <span className="muted small">{item.hint}</span>}
+          </Menu.Item>
+        ),
+      )}
+    </>
   );
 }
 
 export function ContextMenu() {
   const state = menu.use();
-  const on = useMotion();
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!state) return;
-    const close = (event: Event) => {
-      if (ref.current && event.target instanceof Node && ref.current.contains(event.target)) return;
-      closeMenu();
-    };
-    const key = (event: KeyboardEvent) => event.key === "Escape" && closeMenu();
-    window.addEventListener("pointerdown", close, true);
-    window.addEventListener("keydown", key);
-    window.addEventListener("resize", closeMenu);
-    return () => {
-      window.removeEventListener("pointerdown", close, true);
-      window.removeEventListener("keydown", key);
-      window.removeEventListener("resize", closeMenu);
-    };
-  }, [state]);
   return (
-    <AnimatePresence>
-      {state && (
-        <motion.div
-          key="menu"
-          ref={ref}
-          className="menu"
-          style={{ left: Math.max(4, Math.min(state.x, window.innerWidth - 240)), top: Math.max(4, Math.min(state.y, window.innerHeight - 40 * state.items.length - 16)) }}
-          initial={on ? { opacity: 0, y: 4 } : false}
-          animate={{ opacity: 1, y: 0 }}
-          exit={on ? { opacity: 0, y: 4 } : { opacity: 1, transition: { duration: 0 } }}
-          transition={{ duration: on ? dur.fast : 0, ease: bezier.out }}
-        >
-          <MenuList items={state.items} onDone={closeMenu} />
-        </motion.div>
-      )}
-    </AnimatePresence>
+    <Menu.Root key={state?.n ?? 0} open={!!state} onOpenChange={(open) => !open && closeMenu()} modal={false}>
+      <Menu.Trigger asChild>
+        <span aria-hidden className="menu-anchor" style={{ left: state?.x ?? 0, top: state?.y ?? 0 }} />
+      </Menu.Trigger>
+      <Menu.Portal>
+        <Menu.Content className="menu" align="start" sideOffset={2} collisionPadding={8} loop>
+          {state && <MenuItems items={state.items} />}
+        </Menu.Content>
+      </Menu.Portal>
+    </Menu.Root>
   );
 }
 

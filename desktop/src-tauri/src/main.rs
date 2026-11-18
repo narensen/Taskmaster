@@ -1,6 +1,10 @@
 //! Taskmaster for the desktop: start tm-daemon (the bundled sidecar) on this machine, open
 //! its app in a window already signed in, and stop the daemon when the window closes.
 //!
+//! The window has no system title bar (macOS keeps its traffic lights): the web app draws
+//! its own, with its own window controls, and sends desktop notifications through the
+//! notification plugin.
+//!
 //! Updates come from GitHub Releases through the Tauri updater: `check_update` reads
 //! `latest.json`, and `install_update` downloads the installer, checks its signature
 //! against the public key built into the app, installs it, stops the daemon and restarts.
@@ -71,6 +75,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![check_update, install_update, app_version])
         .setup(|app| {
@@ -89,12 +94,18 @@ fn main() {
                 serde_json::to_string(&daemon.token)?
             );
             let url = format!("{}/", daemon.url).parse()?;
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("Taskmaster")
                 .inner_size(1360.0, 860.0)
                 .min_inner_size(880.0, 600.0)
-                .initialization_script(&script)
-                .build()?;
+                .initialization_script(&script);
+            // The app draws its own title bar on the same surface as everything else. macOS
+            // keeps its traffic lights, over the app; elsewhere the app draws the controls.
+            #[cfg(target_os = "macos")]
+            let window = window.title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true);
+            #[cfg(not(target_os = "macos"))]
+            let window = window.decorations(false);
+            window.build()?;
             *app.state::<AppState>().daemon.lock().unwrap() = Some(daemon);
             Ok(())
         })

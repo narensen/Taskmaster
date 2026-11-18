@@ -38,3 +38,34 @@ export async function installUpdate(): Promise<void> {
   if (!t) throw new Error("updates are installed by the desktop app");
   await t.core.invoke("install_update");
 }
+
+interface TauriWindow {
+  minimize: () => Promise<void>;
+  toggleMaximize: () => Promise<void>;
+  close: () => Promise<void>;
+  isMaximized: () => Promise<boolean>;
+  onResized: (cb: () => void) => Promise<() => void>;
+}
+
+function currentWindow(): TauriWindow | null {
+  const w = (window as unknown as { __TAURI__?: { window?: { getCurrentWindow: () => TauriWindow } } }).__TAURI__?.window;
+  return w ? w.getCurrentWindow() : null;
+}
+
+export const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
+/** The desktop window draws its own title bar; on macOS the system keeps its traffic lights. */
+export function ownTitleBar(): boolean {
+  return isDesktop() && !isMac;
+}
+
+export const windowControls = {
+  minimize: () => void currentWindow()?.minimize(),
+  toggleMaximize: () => void currentWindow()?.toggleMaximize(),
+  close: () => void currentWindow()?.close(),
+  isMaximized: async () => (await currentWindow()?.isMaximized()) ?? false,
+  onResized: (cb: () => void) => currentWindow()?.onResized(cb) ?? Promise.resolve(() => {}),
+};
+
+/** ⌘ on a Mac, Ctrl elsewhere, for labels. */
+export const MOD = isMac ? "⌘" : "Ctrl";

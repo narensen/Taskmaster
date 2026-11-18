@@ -2,16 +2,16 @@
 // surfaces, the live plan, approvals, the notes waiting for the next brief, and a right
 // panel with the plan, the diff, the browser, web search, the terminal and file previews.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import gsap from "gsap";
 import { CircleCheck, CircleX, Coins, GitBranch, GitCompare, GitMerge, Loader2, PanelRightClose, PanelRightOpen, ShieldAlert } from "lucide-react";
 import { api, type ReviewJob, type RunDetail } from "../api";
 import { setRunContext } from "../commands";
 import { Composer, messageText, type ComposerHandle } from "../composer";
 import { isUnpriced, pageTone, phaseLabel, spendLabel, tokens, usd } from "../format";
-import { emit, Sheet, toast, useOn, type Chip } from "../overlay";
-import { ExternalLink, Rich, label, resolvedPath } from "../paths";
+import { emit, Sheet, toast, undoable, useOn, type Chip } from "../overlay";
+import { ExternalLink, Rich, resolvedPath } from "../paths";
 import { navigate } from "../router";
 import { motionOn, prefs, rememberRun, setPrefs } from "../prefs";
 import { RoleMark } from "../marks";
@@ -24,11 +24,36 @@ import { PlanView } from "../run/PlanView";
 import { LivePreview } from "../run/LivePreview";
 import { TokenLedger } from "../run/Tokens";
 import { ToolApprovals, useToolApprovals } from "../run/ToolApprovals";
-import { BrowserTab, PreviewTab, SearchTab, TerminalTab } from "../run/Tabs";
-import { surfaces, useRun } from "../run/model";
+import { BrowserTab, SearchTab, TerminalTab } from "../run/Tabs";
+import { surfaces, useRun, type Surface } from "../run/model";
+import { Lanes } from "../run/Lanes";
+import { Timeline } from "../run/Timeline";
+import { FilesPanel, Transcript } from "../lazy";
 
-const FIXED = ["plan", "diff", "browser", "search", "terminal"] as const;
-const TAB_LABEL: Record<string, string> = { plan: "Plan", diff: "Diff", browser: "Browser", search: "Web search", terminal: "Terminal" };
+import { morphName } from "./Gallery";
+import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
+
+const FIXED = ["plan", "files", "diff", "browser", "search", "terminal"] as const;
+const TAB_LABEL: Record<string, string> = { plan: "Plan", files: "Files", diff: "Diff", browser: "Browser", search: "Web search", terminal: "Terminal" };
+
+/** An agent's transcript as terminal text: what it said, its tool calls, and how each turn ended. */
+function logText(s: Surface | undefined): string {
+  if (!s) return "";
+  const dim = (t: string) => `\x1b[2m${t}\x1b[0m`;
+  const bold = (t: string) => `\x1b[1m${t}\x1b[0m`;
+  const out: string[] = [];
+  for (const call of s.calls) {
+    out.push(dim(`── turn ${call.call + 1}${call.tag.model ? ` · ${call.tag.harness ?? ""} ${call.tag.model}` : ""} · ${call.at}`));
+    for (const item of call.items) {
+      if (item.t === "text") out.push(item.text.trimEnd());
+      else if (item.t === "thought") out.push(dim(item.text.trim()));
+      else if (item.t === "life") out.push(dim(`· ${item.text}`));
+      else out.push(`${bold(`$ ${item.name}`)}${item.target ? ` ${item.target}` : ""}${item.allowed === false ? dim("  (refused)") : ""}`);
+    }
+    if (call.end) out.push(call.end.ok === false ? bold(`✕ ${call.end.error ?? "the turn failed"}`) : dim("✓ turn ended"));
+  }
+  return out.join("\n") + "\n";
+}
 
 function useNarrow(): boolean {
   const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 900px)").matches);
@@ -172,7 +197,19 @@ function DoneSummary({ detail, onDiff }: { detail: RunDetail; onDiff: () => void
   );
 }
 
-function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: RunDetail; composer: React.RefObject<ComposerHandle | null>; onDone: () => void }) {
+function ApprovalCard({
+  id,
+  detail,
+  composer,
+  onDone,
+  onOptimistic,
+}: {
+  id: string;
+  detail: RunDetail;
+  composer: React.RefObject<ComposerHandle | null>;
+  onDone: () => void;
+  onOptimistic: (change: Partial<RunDetail>) => void;
+}) {
   const [reply, setReply] = useState("");
   const [busy, setBusy] = useState(false);
   const plan = detail.plan;
@@ -181,7 +218,12 @@ function ApprovalCard({ id, detail, composer, onDone }: { id: string; detail: Ru
     try {
       // A draft in the composer rides along as the note on this approval.
       const draft = composer.current && !composer.current.isEmpty() ? messageText(composer.current.read()) : undefined;
-      await api.approve(id, draft);
+      // The card goes and the run reads as building at once; a refusal puts it back.
+      onOptimistic({ phase: "building", active: true });
+      await api.approve(id, draft).catch((err) => {
+        onOptimistic({ phase: detail.phase, active: detail.active });
+        throw err;
+      });
       composer.current?.clear();
       onDone();
     } catch (err) {
@@ -259,14 +301,42 @@ export function RunView({ id }: { id: string }) {
   const panelBody = useRef<HTMLDivElement>(null);
   const runRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
-  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelOpen, setPanelOpenState] = useState(() => prefs().runPanel);
+  const setPanelOpen = useCallback((open: boolean) => {
+    setPanelOpenState(open);
+    setPrefs({ runPanel: open });
+  }, []);
+  const [removed, setRemoved] = useState<Set<string>>(() => new Set());
   const skipPanelEnter = useRef(true);
 
   // The right panel: fixed tabs plus file previews; the active one is kept per run.
   const [tabs, setTabs] = useState<string[]>([...FIXED]);
   const [closed, setClosed] = useState<string[]>([]);
   const [tab, setTabState] = useState<string>(() => prefs().panelTab[id] ?? "plan");
-  const [previews, setPreviews] = useState<Record<string, { path: string; line?: number }>>({});
+  const [fileOpen, setFileOpen] = useState<{ path: string; line?: number; n: number } | null>(null);
+  const [at, setAt] = useState<number | null>(null);
+  const progress = useRef<HTMLDivElement>(null);
+  const head = useRef<HTMLElement>(null);
+  const splitPanel = usePanelRef();
+  const tabStrip = useRef<HTMLDivElement>(null);
+  // The first frame draws the header, the lanes and the timeline; what is below them follows
+  // in the next one, as a transition React can interrupt, so opening a run never stalls.
+  const [below, setBelow] = useState(false);
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => startTransition(() => setBelow(true)));
+    return () => cancelAnimationFrame(frame);
+  }, []);
+  // The active tab is kept in view in the strip, sideways only.
+  useLayoutEffect(() => {
+    const strip = tabStrip.current;
+    const on = strip?.querySelector<HTMLElement>(".panel-tab.on");
+    if (!strip || !on) return;
+    const left = on.offsetLeft;
+    const right = left + on.offsetWidth;
+    if (left < strip.scrollLeft) strip.scrollLeft = left - 8;
+    else if (right > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = right - strip.clientWidth + 8;
+  });
+  const split = useDefaultLayout({ id: "taskmaster-run", storage: localStorage });
   const [diffRequest, setDiffRequest] = useState<{ scope: Scope; page?: string; attempt?: number; n: number } | null>(null);
   const setTab = useCallback(
     (t: string) => {
@@ -281,11 +351,14 @@ export function RunView({ id }: { id: string }) {
     rememberRun(id);
   }, [id]);
 
-  const list = useMemo(() => surfaces(detail, entries, ledger?.entries ?? []), [detail, entries, ledger]);
+  // Scrubbing the timeline replays the run: only what had happened by then is shown.
+  const shown = useMemo(() => (at === null ? entries : entries.filter((e) => Date.parse(e.at) <= at)), [entries, at]);
+  const list = useMemo(() => surfaces(detail, shown, ledger?.entries ?? []), [detail, shown, ledger]);
   const master = list.find((s) => s.id === "master");
   const workers = list.filter((s) => s.page);
   const rest = list.filter((s) => s.id !== "master" && !s.page);
   const maxTokens = Math.max(1, ...list.map((s) => s.tokens));
+  const pageStates = useMemo(() => Object.fromEntries((detail?.pages ?? []).map((p) => [p.id, p.state])), [detail?.pages]);
   const pages = detail?.plan?.pages.map((p) => p.id) ?? detail?.pages.map((p) => p.id) ?? [];
   const phase = detail?.phase;
 
@@ -331,11 +404,28 @@ export function RunView({ id }: { id: string }) {
   }, [id]);
 
   useOn<{ path: string; line?: number }>("preview", ({ path, line }) => {
-    const key = `file:${path}`;
-    setPreviews((p) => ({ ...p, [key]: { path, line } }));
-    setTab(key);
+    setFileOpen({ path, line, n: Date.now() });
+    setTab("files");
+    setPanelOpen(true);
     if (narrow) setSheet(true);
   });
+  useOn("files-toggle", () => {
+    if (tab === "files" && panelOpen) togglePanel();
+    else {
+      setTab("files");
+      setPanelOpen(true);
+      if (narrow) setSheet(true);
+    }
+  });
+  const openAgent = useCallback(
+    (agent: string) => {
+      setTab(`agent:${agent}`);
+      setPanelOpen(true);
+      if (narrow) setSheet(true);
+    },
+    [narrow, setTab],
+  );
+  const openPageDiff = useCallback((page: string) => emit("diff", { scope: "page", page }), []);
   useOn<{ scope: Scope; page?: string; attempt?: number }>("diff", (req) => {
     setDiffRequest({ ...req, n: Date.now() });
     openTab("diff");
@@ -367,7 +457,10 @@ export function RunView({ id }: { id: string }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && !e.shiftKey && e.key.toLowerCase() === "w") {
+      if (mod && e.key === "\\") {
+        e.preventDefault();
+        togglePanel();
+      } else if (mod && !e.shiftKey && e.key.toLowerCase() === "w") {
         e.preventDefault();
         closeTab(tab);
       } else if (mod && e.shiftKey && e.key.toLowerCase() === "t") {
@@ -391,49 +484,82 @@ export function RunView({ id }: { id: string }) {
     el.classList.add("tm-fade");
   }, [tab]);
 
-  const panelWidth = () => Math.min(window.innerWidth * 0.4, 520);
-
-  const togglePanel = () => {
-    const root = runRef.current;
-    const el = panelRef.current;
-    if (narrow || !panelOpen || !root || !el || !motionOn()) {
-      setPanelOpen((open) => !open);
+  // The side panel opens and closes on the split: its content fades and slides by
+  // transform while the split itself changes once, so nothing is laid out per frame.
+  function togglePanel() {
+    if (narrow) {
+      setSheet((v) => !v);
       return;
     }
-    const width = el.getBoundingClientRect().width || panelWidth();
-    gsap.set(root, { "--panel-w": `${width}px` });
-    gsap.to(el, { opacity: 0, duration: dur.base, ease: ease.out });
-    gsap.to(root, {
-      "--panel-w": "0px",
-      duration: dur.base,
-      ease: ease.out,
-      onComplete: () => {
-        gsap.set(root, { clearProps: "--panel-w" });
-        setPanelOpen(false);
-      },
-    });
-  };
+    const body = panelRef.current;
+    if (!panelOpen) {
+      setPanelOpen(true);
+      return;
+    }
+    if (!body || !motionOn()) {
+      setPanelOpen(false);
+      return;
+    }
+    gsap.to(body, { opacity: 0, x: 12, duration: dur.fast, ease: ease.out, onComplete: () => setPanelOpen(false) });
+  }
 
   useLayoutEffect(() => {
-    if (!panelOpen || narrow) return;
-    if (skipPanelEnter.current) {
+    if (narrow) return;
+    const panel = splitPanel.current;
+    if (panelOpen) panel?.expand();
+    else panel?.collapse();
+    if (!panelOpen || skipPanelEnter.current) {
       skipPanelEnter.current = false;
       return;
     }
-    const root = runRef.current;
-    if (!root || !motionOn()) return;
-    gsap.set(root, { "--panel-w": "0px" });
-    const slide = gsap.to(root, { "--panel-w": `${panelWidth()}px`, duration: dur.base, ease: ease.out, clearProps: "--panel-w" });
-    const body = panelBody.current;
-    if (body) {
-      body.classList.remove("tm-fade");
-      void body.offsetWidth;
-      body.classList.add("tm-fade");
-    }
-    return () => {
-      slide.kill();
-    };
+    const body = panelRef.current;
+    if (!body || !motionOn()) return;
+    const tween = gsap.fromTo(body, { opacity: 0, x: 12 }, { opacity: 1, x: 0, duration: dur.base, ease: ease.out, clearProps: "opacity,transform" });
+    return () => void tween.progress(1).kill();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelOpen, narrow]);
+
+  // A run starting: the header rises in, line by line.
+  const intro = useRef(false);
+  const introTl = useRef<gsap.core.Timeline | null>(null);
+  useLayoutEffect(() => {
+    if (intro.current || !detail || !head.current) return;
+    intro.current = true;
+    if (!motionOn() || !["planning", "awaiting_approval"].includes(detail.phase)) return;
+    const parts = head.current.querySelectorAll(".eyebrow, .run-title, .run-meta, .prompt");
+    // Not killed when the run updates: it plays out, and a page that closes finishes it.
+    const tl = gsap.timeline();
+    tl.fromTo(parts, { opacity: 0, y: 6 }, { opacity: 1, y: 0, duration: 0.22, ease: ease.out, stagger: 0.04, clearProps: "opacity,transform" });
+    introTl.current = tl;
+  }, [detail]);
+  useEffect(() => () => void introTl.current?.progress(1).kill(), []);
+
+  // Progress: the bar follows the pages that passed; finishing fills it and lifts the result in.
+  const total = detail?.pages.length ?? 0;
+  const passed = detail?.pages.filter((p) => p.state === "passed").length ?? 0;
+  const lastPhase = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const bar = progress.current;
+    if (!bar || !detail) return;
+    const to = detail.phase === "done" ? 1 : total ? passed / total : 0;
+    const was = lastPhase.current;
+    lastPhase.current = detail.phase;
+    const finishing = !!was && was !== "done" && detail.phase === "done";
+    // A run that was already over when opened shows no bar.
+    const settled = !finishing && !detail.active && ["done", "failed"].includes(detail.phase);
+    if (!motionOn() || settled) {
+      gsap.set(bar, { scaleX: to, opacity: settled ? 0 : 1 });
+      return;
+    }
+    const tl = gsap.timeline();
+    tl.to(bar, { scaleX: to, opacity: 1, duration: 0.3, ease: ease.out });
+    if (finishing) {
+      tl.to(bar, { opacity: 0, duration: 0.24, ease: ease.out }, "+=0.2");
+      const card = document.querySelector("[data-testid=done-summary]");
+      if (card) tl.fromTo(card, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.26, ease: ease.out, clearProps: "opacity,transform" }, "<");
+    }
+    return () => void tl.progress(1).kill();
+  }, [detail?.phase, detail?.active, passed, total]);
 
   // Cite: select text in an agent's reply.
   useEffect(() => {
@@ -474,16 +600,16 @@ export function RunView({ id }: { id: string }) {
     );
 
   const recipients = ["master", "workers", ...pages.map((p) => `page:${p}`), "reviewer", "verifier"];
-  const pending = notes.filter((n) => !n.delivered);
+  const pending = notes.filter((n) => !n.delivered && !removed.has(n.id));
   const delivered = notes.filter((n) => n.delivered);
   const panelTabs = tabs;
   const panel = (
     <div className="panel" data-testid="right-panel">
-      <div className="panel-tabs" role="tablist">
+      <div className="panel-tabs" role="tablist" ref={tabStrip}>
         {panelTabs.map((t) => (
           <div key={t} className={`panel-tab ${t === tab ? "on" : ""}`} role="tab" aria-selected={t === tab}>
             <button className="panel-tab-name" onClick={() => setTab(t)}>
-              {t.startsWith("file:") ? label(previews[t]?.path ?? t.slice(5)) : TAB_LABEL[t]}
+              {t.startsWith("agent:") ? `${t.slice(6).replace(/^page:/, "")} log` : TAB_LABEL[t]}
             </button>
             <button className="chip-x" aria-label={`Close ${t}`} onClick={() => closeTab(t)}>
               ×
@@ -502,17 +628,25 @@ export function RunView({ id }: { id: string }) {
         {tab === "browser" && <BrowserTab run={id} detail={detail} entries={entries} />}
         {tab === "search" && <SearchTab />}
         {tab === "terminal" && <TerminalTab run={id} entries={entries} project={settings.data?.project ?? ""} onRan={() => void data.catchUp()} />}
-        {tab.startsWith("file:") && previews[tab] && <PreviewTab path={previews[tab]!.path} line={previews[tab]!.line} />}
+        {tab === "files" && <FilesPanel run={id} open={fileOpen} />}
+        {tab.startsWith("agent:") &&
+          (list.find((x) => x.id === tab.slice(6))?.calls.length ? (
+            <Transcript label={`${tab.slice(6)} log`} text={logText(list.find((x) => x.id === tab.slice(6)))} />
+          ) : (
+            <div className="tab-empty">{tab.slice(6).replace(/^page:/, "")} has nothing in its log for this run.</div>
+          ))}
         {!panelTabs.includes(tab) && <div className="tab-empty">Every tab is closed. <kbd>⌘</kbd><kbd>⇧</kbd><kbd>T</kbd> reopens the last one.</div>}
       </div>
     </div>
   );
 
-  return (
-    <div ref={runRef} className={`run ${narrow ? "narrow" : ""} ${!narrow && !panelOpen ? "panel-shut" : ""}`}>
+  const main = (
       <div className="run-main">
         <div className="run-scroll">
-        <header className="run-head">
+        <header className="run-head" ref={head} style={{ viewTransitionName: morphName(id) } as React.CSSProperties}>
+          <div className="run-progress" aria-hidden>
+            <div className="run-progress-fill" ref={progress} />
+          </div>
           <div className="grow">
             <div className="eyebrow">{settings.data?.project ?? "run"}</div>
             <div className="run-title">
@@ -587,7 +721,7 @@ export function RunView({ id }: { id: string }) {
                 Panel
               </button>
             ) : (
-              <button className="ghost icon" aria-label={panelOpen ? "Hide panel" : "Show panel"} title={panelOpen ? "Hide panel" : "Show panel"} onClick={togglePanel}>
+              <button className="ghost icon" aria-label={panelOpen ? "Hide panel" : "Show panel"} title={panelOpen ? "Hide panel (⌘\\)" : "Show panel (⌘\\)"} onClick={togglePanel}>
                 {panelOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
               </button>
             )}
@@ -619,20 +753,25 @@ export function RunView({ id }: { id: string }) {
             id={id}
             detail={detail}
             composer={composer}
+            onOptimistic={data.patch}
             onDone={() => {
               void data.reload();
               data.refollow();
             }}
           />
         )}
-        {detail.plan && <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} arrived={data.planArrived} compact open={phase === "awaiting_approval"} />}
+        <Lanes workers={workers} pages={pageStates} onOpen={openAgent} onDiff={openPageDiff} />
+        <Timeline detail={detail} entries={entries} at={at} onScrub={setAt} />
 
-        {ledger && <TokenLedger totals={ledger.totals} open={["done", "failed"].includes(detail.phase) && !detail.active} />}
+        {below && detail.plan && <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} arrived={data.planArrived} compact open={phase === "awaiting_approval"} />}
+
+        {below && ledger && <TokenLedger totals={ledger.totals} open={["done", "failed"].includes(detail.phase) && !detail.active} />}
 
         <ToolApprovals list={toolApprovals.list} answer={toolApprovals.answer} />
         <LivePreview id={id} detail={detail} />
 
-        <div className="agents">
+        {!below && <Loading rows={3} tall label="Opening the run" />}
+        {below && <div className="agents">
           {master && (
             <AgentSurface index={0} surface={master} detail={detail} maxTokens={maxTokens} events={data.events.length} focused={focus === "master"} />
           )}
@@ -657,7 +796,7 @@ export function RunView({ id }: { id: string }) {
               />
             ))}
           </div>
-        </div>
+        </div>}
 
         <section className="drafts">
           {pending.map((n) => (
@@ -674,7 +813,18 @@ export function RunView({ id }: { id: string }) {
                   >
                     edit
                   </button>
-                  <button className="link small" onClick={() => void api.editNote(id, n.id).then(data.reloadNotes)}>
+                  <button
+                    className="link small"
+                    onClick={() => {
+                      // Gone at once; Undo puts the same note back for the same agent.
+                      setRemoved((r) => new Set(r).add(n.id));
+                      void api.editNote(id, n.id).then(data.reloadNotes, () => {
+                        setRemoved((r) => (r.delete(n.id), new Set(r)));
+                        toast("The note was not removed");
+                      });
+                      undoable(`Removed the note to ${n.to}`, () => void api.addNote(id, n.to, n.text).then(data.reloadNotes));
+                    }}
+                  >
                     remove
                   </button>
                 </span>
@@ -723,16 +873,29 @@ export function RunView({ id }: { id: string }) {
         </div>
       </div>
 
+  );
+
+  return (
+    <div ref={runRef} className={`run ${narrow ? "narrow" : ""} ${!narrow && !panelOpen ? "panel-shut" : ""}`}>
       {narrow ? (
-        <Sheet open={sheet} onClose={() => setSheet(false)}>
-          {panel}
-        </Sheet>
-      ) : (
-        panelOpen && (
-          <aside ref={panelRef} className="run-panel">
+        <>
+          {main}
+          <Sheet open={sheet} onClose={() => setSheet(false)}>
             {panel}
-          </aside>
-        )
+          </Sheet>
+        </>
+      ) : (
+        <Group orientation="horizontal" id="taskmaster-run" className="run-split" defaultLayout={split.defaultLayout} onLayoutChanged={split.onLayoutChanged}>
+          <Panel id="run-main" minSize="40%" className="run-split-main">
+            {main}
+          </Panel>
+          <Separator className={`split-handle ${panelOpen ? "" : "gone"}`} disabled={!panelOpen} />
+          <Panel id="run-panel" panelRef={splitPanel} defaultSize="38%" minSize="24%" maxSize="60%" collapsible collapsedSize={0} className="run-split-panel">
+            <aside ref={panelRef} className="run-panel" hidden={!panelOpen}>
+              {panel}
+            </aside>
+          </Panel>
+        </Group>
       )}
 
       <AnimatePresence>

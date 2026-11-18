@@ -157,7 +157,7 @@ export function measurements(dir = join(root, "bench")) {
 const n = (v) => (v == null ? "—" : Number(v).toLocaleString("en-US"));
 const mins = (s) => (s == null ? "—" : s >= 90 ? `${(s / 60).toFixed(1)} min` : `${Math.round(s)} s`);
 
-function layout({ title, description, path, body }) {
+function layout({ title, description, path, body, motion = false }) {
   const nav = (href, label, extra = "") => `<a href="${href}"${path === href ? ' aria-current="page"' : ""}${extra}>${label}</a>`;
   return `<!doctype html>
 <html lang="en">
@@ -193,6 +193,10 @@ ${body}
 <a href="${GITHUB}/issues">Issues</a>
 </div></footer>
 <script src="/site.js" defer></script>
+${motion ? `<script src="/vendor/gsap.min.js" defer></script>
+<script src="/vendor/ScrollTrigger.min.js" defer></script>
+<script src="/vendor/lenis.min.js" defer></script>
+<script src="/motion.js" defer></script>` : ""}
 </body>
 </html>
 `;
@@ -213,6 +217,7 @@ ${rows.map((r) => `<tr><th scope="row">${escape(r.title ?? `${r.name}: ${r.label
     title: "Taskmaster: one master plans, workers build, every page is checked",
     description: "Taskmaster is a multi-model coding harness: one master model plans the product, cheaper workers build its pages in parallel, and each page is verified before the run is done.",
     path: "/",
+    motion: true,
     body: `<div class="hero"><div class="wrap">
 <p class="eyebrow">multi-model coding harness</p>
 <h1>One master plans. Workers build. <span>Nothing is done until it is checked.</span></h1>
@@ -314,6 +319,36 @@ ${body}
   });
 }
 
+// The landing page only: Lenis for the scroll, GSAP's ScrollTrigger to bring each band in
+// once as it reaches the view. Short, ease-out, no bounce; with reduced motion, nothing runs
+// and the page is as it was written.
+const MOTION_JS = `(function () {
+  if (!window.gsap || !window.ScrollTrigger || !window.Lenis) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  var gsap = window.gsap;
+  gsap.registerPlugin(window.ScrollTrigger);
+  var lenis = new window.Lenis({ duration: 0.9, easing: function (t) { return 1 - Math.pow(1 - t, 3); }, smoothWheel: true });
+  lenis.on("scroll", window.ScrollTrigger.update);
+  gsap.ticker.add(function (time) { lenis.raf(time * 1000); });
+  gsap.ticker.lagSmoothing(0);
+  document.querySelectorAll('a[href^="#"]').forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      var target = document.querySelector(a.getAttribute("href"));
+      if (target) { e.preventDefault(); lenis.scrollTo(target, { offset: -24 }); }
+    });
+  });
+  // Each band rises once, a little, as it comes into view; lists follow one item at a time.
+  gsap.utils.toArray(".band .wrap").forEach(function (band) {
+    var parts = band.querySelectorAll("h2, .lead, .steps li, .providers li, .table-wrap, .note, .empty, .closing > *");
+    if (!parts.length) return;
+    gsap.from(parts, { opacity: 0, y: 14, duration: 0.3, ease: "power2.out", stagger: 0.05, clearProps: "opacity,transform", scrollTrigger: { trigger: band, start: "top 86%", once: true } });
+  });
+  // The screenshot settles as the hero scrolls away.
+  var shot = document.querySelector(".hero .shot");
+  if (shot) gsap.to(shot, { y: -20, ease: "none", scrollTrigger: { trigger: ".hero", start: "top top", end: "bottom top", scrub: true } });
+})();
+`;
+
 const SITE_JS = `// Theme switch, and the download for this computer first. Nothing else runs here.
 (function () {
   var root = document.documentElement;
@@ -360,6 +395,12 @@ export async function build({ offline = false, out = join(here, "dist") } = {}) 
   writeFileSync(join(out, "releases/index.html"), releasesPage(list));
   writeFileSync(join(out, "releases.json"), JSON.stringify(list, null, 2));
   writeFileSync(join(out, "site.js"), SITE_JS);
+  writeFileSync(join(out, "motion.js"), MOTION_JS);
+  // Lenis and GSAP are served from the site itself, like everything else (see the CSP).
+  mkdirSync(join(out, "vendor"), { recursive: true });
+  for (const [from, to] of [["gsap/dist/gsap.min.js", "gsap.min.js"], ["gsap/dist/ScrollTrigger.min.js", "ScrollTrigger.min.js"], ["lenis/dist/lenis.min.js", "lenis.min.js"]]) {
+    copyFileSync(join(here, "node_modules", from), join(out, "vendor", to));
+  }
   copyFileSync(join(here, "src/site.css"), join(out, "site.css"));
   for (const f of ["icon.png", "favicon.ico", "favicon-32.png", "apple-touch-icon.png"]) copyFileSync(join(root, "assets", f), join(out, f));
   for (const [from, to] of [["33-run-tokens-dark.png", "run-dark.png"], ["33-run-tokens-light.png", "run-light.png"]]) {

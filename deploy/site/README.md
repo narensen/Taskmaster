@@ -2,13 +2,17 @@
 
 `site/` builds the landing page (`/`) and the releases page (`/releases/`) into
 `site/dist/`: plain HTML, one stylesheet, and a few lines of script (the theme switch, and
-putting the download for the visitor's computer first). It is served as static files by
-the Caddy that already runs the Commons on the Oracle VM.
+putting the download for the visitor's computer first). The landing page alone also loads
+Lenis and GSAP's ScrollTrigger, copied into `dist/vendor/` from `site/node_modules` and
+served from the site like everything else, so its sections ease in as they are scrolled to
+(nothing moves with reduced motion). It is served as static files by the Caddy that
+already runs the Commons on the Oracle VM.
 
 ## Build
 
 ```bash
 cd site
+npm ci                    # Lenis and GSAP, for the landing page
 node build.mjs            # reads releases from the GitHub API (cached 30 minutes in .cache/)
 node build.mjs --offline  # the cached list only
 npm test                  # the generator's tests

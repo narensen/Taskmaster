@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { ProviderLogo } from "../providers/logos";
 import { ArrowUp, ArrowDown, Check, CircleAlert, CircleCheck, CircleDashed, CircleArrowUp, Copy, ExternalLink, RefreshCw, Square } from "lucide-react";
 import {
   api,
@@ -265,7 +266,8 @@ function ProviderCard({
   return (
     <section className={`card provider ${installed ? "" : "missing"}`} data-testid="provider" aria-labelledby={`p-${id}`}>
       <header className="provider-head">
-        <span className="grow">
+        <span className="grow provider-title">
+          <ProviderLogo id={id} size={16} />
           <span className="strong" id={`p-${id}`}>
             {name}
           </span>{" "}

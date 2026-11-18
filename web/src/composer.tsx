@@ -4,7 +4,7 @@
 // skill. A big paste or a dropped file becomes an attachment.
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { navigate } from "./router";
 import { api, type Skill } from "./api";
 import { commands, type Command } from "./commands";
@@ -162,6 +162,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const [options, setOptions] = useState<Option[]>([]);
   const [active, setActive] = useState(0);
   const [drag, setDrag] = useState(false);
+  const [focused, setFocused] = useState(false);
   const historyAt = useRef<number | null>(null);
   const saved = useRef<Range | null>(null);
   const motionOk = useMotion();
@@ -462,6 +463,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   return (
     <div
       className={`composer ${drag ? "drag" : ""} ${props.className ?? ""}`}
+      onFocus={() => setFocused(true)}
+      onBlur={(e) => !e.currentTarget.contains(e.relatedTarget as Node | null) && setFocused(false)}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes("Files")) {
           e.preventDefault();
@@ -477,17 +480,45 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         }
       }}
     >
+      <motion.span
+        className="composer-ring"
+        aria-hidden
+        initial={false}
+        animate={{ opacity: focused || drag ? 1 : 0 }}
+        transition={{ duration: motionOk ? 0.18 : 0, ease: [0.22, 1, 0.36, 1] }}
+      />
+      <AnimatePresence>
+        {drag && (
+          <motion.div
+            key="drop"
+            className="composer-drop"
+            initial={motionOk ? { opacity: 0 } : false}
+            animate={{ opacity: 1 }}
+            exit={motionOk ? { opacity: 0 } : undefined}
+            transition={{ duration: 0.15 }}
+          >
+            Drop to attach
+          </motion.div>
+        )}
+      </AnimatePresence>
       {attachments.length > 0 && (
         <div className="attachments">
           {attachments.map((a, i) => (
-            <span key={i} className="chip chip-attachment">
+            <motion.span
+              key={`${a.label}-${i}`}
+              layout="position"
+              initial={motionOk ? { opacity: 0, scale: 0.96 } : false}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+              className="chip chip-attachment"
+            >
               {a.thumb && <img src={a.thumb} alt="" className="thumb" />}
               <span>{a.label}</span>
               {a.bytes !== undefined && <span className="muted">{Math.ceil(a.bytes / 1024)} KiB</span>}
               <button className="chip-x" aria-label={`Remove ${a.label}`} onClick={() => setAttachments((all) => all.filter((_, j) => j !== i))}>
                 ×
               </button>
-            </span>
+            </motion.span>
           ))}
         </div>
       )}

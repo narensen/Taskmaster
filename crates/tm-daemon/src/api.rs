@@ -7,6 +7,7 @@
 //!
 //! GET  /api/runs                  every run, with its phase, pages and spend
 //! POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?, timeout_secs?, template?}
+//!                                 a role left out takes the saved choice; with neither, the run is refused
 //! GET  /api/runs/{id}             one run, with its plan and how it was asked for
 //! GET  /api/runs/{id}/events      ?after=<n> -> {next, events}
 //! GET  /api/runs/{id}/stream      the same events as they happen (server-sent events)
@@ -32,10 +33,14 @@
 //! POST /api/runs/{id}/review     one combined review of a finished run's diff; returns {id}
 //! GET  /api/commons/entries       this daemon's Commons, for another daemon to pull
 //! POST /api/commons/entries       an entry another daemon promoted
+//! GET  /api/projects              the workspace's git repositories, the open one first
+//! POST /api/projects              {name, prompt?, ...} a new project, and its first run
+//! POST /api/projects/open         {path} open another repository of the workspace
 //! ```
 //!
 //! Installing, updating and signing in to harness CLIs is in `api/setup.rs`, and the
-//! skills store in `api/skills.rs`.
+//! skills store in `api/skills.rs`. Terminals a person opens (a shell on a PTY in the
+//! project) are in `api/terms.rs`.
 //!
 //! The control surface's own routes (the agent transcript, notes, the terminal, diffs,
 //! opening files in an editor, completions, gh) are listed in `api/desk.rs`.
@@ -86,6 +91,7 @@ use tokio::sync::{oneshot, watch};
 mod desk;
 mod setup;
 mod skills;
+mod terms;
 
 #[cfg(test)]
 pub(crate) use desk::{Style, choose_editor, redact, sensitive};
@@ -202,6 +208,7 @@ struct App {
     /// Running review jobs, so cancelling one (or its run) can stop the agents.
     reviews: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     jobs: Arc<crate::jobs::Jobs>,
+    terms: terms::Terminals,
     skills_root: PathBuf,
     skills_fetch: Arc<dyn crate::skills::Fetch>,
 }
@@ -246,6 +253,7 @@ impl Server {
             previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
             reviews: Mutex::new(HashMap::new()),
             jobs: Arc::new(crate::jobs::Jobs::new(options.setup_planner.unwrap_or_else(crate::jobs::default_planner))),
+            terms: terms::Terminals::default(),
             skills_root: options.skills,
             skills_fetch: options.skills_fetch,
         });
@@ -280,7 +288,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/search", get(web_search))
         .route("/api/providers", get(providers))
         .route("/api/templates", get(templates))
-        .route("/api/projects", post(create_project))
+        .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/projects/open", post(open_project))
         .route("/api/dictionary", get(search_dictionary))
         .route("/api/dictionary/{key}", get(show_entry))
         .route("/api/errorography", get(errorography))
@@ -305,6 +314,11 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/paths", post(desk::paths))
         .route("/api/file", get(desk::file))
         .route("/api/files", get(desk::files))
+        .route("/api/grep", get(desk::grep))
+        .route("/api/terminals", get(terms::list).post(terms::open))
+        .route("/api/terminals/{id}/input", post(terms::input))
+        .route("/api/terminals/{id}/resize", post(terms::resize))
+        .route("/api/terminals/{id}/close", post(terms::close))
         .route("/api/skills", get(skills::list))
         .route("/api/skills/search", get(skills::search))
         .route("/api/skills/updates", get(skills::updates))
@@ -325,6 +339,7 @@ fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/runs/{id}/stream", get(run_stream))
         .route("/api/setup/jobs/{id}/stream", get(setup::stream_job))
+        .route("/api/terminals/{id}/stream", get(terms::stream))
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
         .merge(private)
@@ -734,7 +749,7 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     let bad_request = |err: anyhow::Error| fail(StatusCode::BAD_REQUEST, format!("{err:#}"));
     // A request that names roles but no models does not inherit the saved models, which belong to the saved harnesses.
     let models: Models = if body.roles.is_empty() { with_defaults(&saved.models, body.models).map_err(bad_request)? } else { with_defaults(&Models::default(), body.models).map_err(bad_request)? };
-    let roles: Roles = with_defaults(&saved.roles, body.roles).map_err(bad_request)?;
+    let roles = Roles::resolve(&crate::settings::Settings::saved_roles(&app.project()), &body.roles).map_err(bad_request)?;
     check_models(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
@@ -997,6 +1012,53 @@ fn workspace_child(workspace: &std::path::Path, name: &str) -> Result<PathBuf, A
     Ok(dest)
 }
 
+/// The projects in the workspace: its folders that are git repositories, the open one first.
+async fn list_projects(State(app): State<Arc<App>>) -> Reply {
+    let current = app.project();
+    let mut list: Vec<Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&app.workspace) {
+        for entry in entries.flatten().take(2000) {
+            let path = entry.path();
+            if !path.is_dir() || !path.join(".git").exists() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = path.canonicalize().unwrap_or(path);
+            list.push(json!({ "name": name, "path": path.display().to_string(), "current": path == current }));
+        }
+    }
+    if !list.iter().any(|p| p["current"] == true) {
+        let name = current.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        list.push(json!({ "name": name, "path": current.display().to_string(), "current": true }));
+    }
+    list.sort_by(|a, b| b["current"].as_bool().cmp(&a["current"].as_bool()).then(a["name"].as_str().cmp(&b["name"].as_str())));
+    ok(json!({ "projects": list, "workspace": app.workspace.display().to_string() }))
+}
+
+#[derive(Deserialize)]
+struct OpenProject {
+    path: String,
+}
+
+/// Open another project of the workspace, or the one open already.
+async fn open_project(State(app): State<Arc<App>>, Json(body): Json<OpenProject>) -> Reply {
+    let path = PathBuf::from(body.path.trim())
+        .canonicalize()
+        .map_err(|_| fail(StatusCode::NOT_FOUND, format!("`{}` is not a folder on this machine", body.path)))?;
+    if path == app.project() {
+        return ok(json!({ "project": path.display().to_string() }));
+    }
+    let workspace = app.workspace.canonicalize().unwrap_or_else(|_| app.workspace.clone());
+    if path.parent() != Some(workspace.as_path()) || !path.join(".git").exists() {
+        return Err(fail(StatusCode::BAD_REQUEST, "open a git repository that sits in the workspace"));
+    }
+    app.use_project(path.clone())?;
+    ok(json!({ "project": path.display().to_string() }))
+}
+
 /// Create a new project folder and repository under the workspace (the current
 /// project's parent). With a prompt or a plan, the daemon opens that project and
 /// starts its first run.
@@ -1030,7 +1092,7 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
     } else {
         with_defaults(&Models::default(), body.models).map_err(bad_request)?
     };
-    let roles: Roles = with_defaults(&saved.roles, body.roles).map_err(bad_request)?;
+    let roles = Roles::resolve(&crate::settings::Settings::saved_roles(&path), &body.roles).map_err(bad_request)?;
     check_models(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
@@ -1221,8 +1283,11 @@ impl App {
 
 fn start_review(app: &Arc<App>, body: NewReview, run: Option<String>) -> Reply {
     let defaults = crate::settings::Settings::load(&app.project()).unwrap_or_default().roles;
-    let reviewer_name = body.reviewer.unwrap_or(defaults.reviewer);
-    let verifier_name = body.verifier.unwrap_or(defaults.verifier);
+    let reviewer_name = body.reviewer.filter(|n| !n.is_empty()).unwrap_or(defaults.reviewer);
+    let verifier_name = body.verifier.filter(|n| !n.is_empty()).unwrap_or(defaults.verifier);
+    if reviewer_name.is_empty() || verifier_name.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "choose a provider for the reviewer and verifier roles first"));
+    }
     let bad = |err: anyhow::Error| fail(StatusCode::BAD_REQUEST, format!("{err:#}"));
     let reviewer = (app.harness)(&reviewer_name).map_err(bad)?;
     let verifier = (app.harness)(&verifier_name).map_err(bad)?;

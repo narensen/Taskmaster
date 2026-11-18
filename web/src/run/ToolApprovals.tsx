@@ -2,7 +2,7 @@
 // card (that one gates the build); these gate one call and time out into a denial.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { ShieldAlert } from "lucide-react";
 import { api, type AgentEntry, type ToolApproval } from "../api";
 import { toast } from "../overlay";

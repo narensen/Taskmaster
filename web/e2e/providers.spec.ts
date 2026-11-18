@@ -143,6 +143,18 @@ test("Sign in shows the device code and the sign-in page, and sends what is type
   await expect.poll(() => posts.filter((p) => p.url.endsWith("/input")).map((p) => p.body)).toEqual([{ text: "y", key: "enter" }, { key: "down" }]);
 });
 
+test("signing in again to a signed-in provider asks first", async ({ open, page }) => {
+  const posts: { url: string; body: unknown }[] = [];
+  await mockSetup(page, {}, posts);
+  await open("/providers");
+  const claude = page.getByTestId("provider").filter({ hasText: "Claude Code" });
+  await claude.getByRole("button", { name: "Sign in again" }).click();
+  await expect(claude.getByRole("alert")).toContainText("signed out until you finish");
+  await claude.getByRole("button", { name: "Keep this sign-in" }).click();
+  await expect(claude.getByRole("alert")).toHaveCount(0);
+  expect(posts.filter((p) => p.url.endsWith("/login"))).toHaveLength(0);
+});
+
 test("the provider actions are reachable from the keyboard with a visible focus ring", async ({ open, page }) => {
   await mockSetup(page, {}, []);
   await open("/providers");

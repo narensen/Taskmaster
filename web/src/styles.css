@@ -2941,3 +2941,5 @@ button.switch:hover:not(:disabled) { border-color: var(--muted); }
 .token-table th[scope="row"], .token-table thead th:first-child { text-align: left; font-weight: 500; color: var(--ink-2); }
 .token-table thead th { color: var(--muted); font-weight: 500; border-top: 0; }
 .token-table tfoot th, .token-table tfoot td { border-top: 1px solid var(--line-strong); color: var(--ink); font-weight: 600; }
+
+.confirm-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--bg-sunken); color: var(--ink-2); }

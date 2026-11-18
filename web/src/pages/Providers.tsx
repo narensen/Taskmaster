@@ -245,6 +245,7 @@ function ProviderCard({
   onChanged: () => void;
 }) {
   const [hidden, setHidden] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const [job, setJob] = useJob(latest, (done) => {
     if (done.state === "done") toast(`${name}: ${ACTION_DONE[done.action].toLowerCase()}`);
     onChanged();
@@ -282,13 +283,30 @@ function ProviderCard({
             </button>
           )}
           {installed && (
-            <button className={status?.signed_in === false ? "primary small" : "small"} disabled={busy} onClick={() => void start("login")}>
+            <button
+              className={status?.signed_in === false ? "primary small" : "small"}
+              disabled={busy || confirming}
+              onClick={() => (status?.signed_in ? setConfirming(true) : void start("login"))}
+            >
               {status?.signed_in ? "Sign in again" : "Sign in"}
             </button>
           )}
         </span>
       </header>
       <StatusRow status={status} />
+      {confirming && (
+        <div className="confirm-line small" role="alert">
+          <span className="grow">
+            Some CLIs drop the current sign-in the moment a new one starts, so stopping half way can leave {name} signed out until you finish.
+          </span>
+          <button className="small primary" onClick={() => (setConfirming(false), void start("login"))}>
+            Sign in again
+          </button>
+          <button className="small ghost" onClick={() => setConfirming(false)} autoFocus>
+            Keep this sign-in
+          </button>
+        </div>
+      )}
       {job && hidden !== job.id && <JobPanel job={job} onClose={() => setHidden(job.id)} />}
       {status?.notes.length ? (
         <ul className="provider-notes small muted">

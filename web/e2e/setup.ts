@@ -1,8 +1,8 @@
 // Start tm-daemon on a fresh git project and pair once; tests read the address and token.
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -60,9 +60,16 @@ export default async function setup() {
   if (existsSync(fixtureBin)) {
     const fixtureProject = join(base, "fixture");
     execFileSync("sh", ["-c", `mkdir -p "${fixtureProject}" && cd "${fixtureProject}" && git init -q && git config user.email e2e@example.invalid && git config user.name e2e && echo '# shop' > README.md && git add . && git commit -qm init`]);
+    // The scripted harnesses do not need a real CLI, but the providers API only offers
+    // what is installed. A stub Grok lets the shell e2e pick it on a bare runner.
+    const bins = join(base, "bin");
+    mkdirSync(bins, { recursive: true });
+    const grok = join(bins, "grok");
+    writeFileSync(grok, "#!/bin/sh\nif [ \"$1\" = models ]; then echo '* grok-4 (default)'; fi\nexit 0\n");
+    chmodSync(grok, 0o755);
     const f = spawn(fixtureBin, [fixtureProject, "0", dist], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, FIXTURE_DELAY_MS: "5", TASKMASTER_SKILLS: skills, HOME: join(base, "home") },
+      env: { ...process.env, FIXTURE_DELAY_MS: "5", TASKMASTER_SKILLS: skills, HOME: join(base, "home"), PATH: `${bins}${delimiter}${process.env.PATH ?? ""}` },
     });
     const said = await new Promise<string>((ok, fail) => {
       let text = "";

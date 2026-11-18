@@ -327,7 +327,7 @@ export function Gallery() {
   const [remember, setRemember] = useState(false);
   const [rolesOpen, setRolesOpen] = useState(false);
   const max = settings.data?.machine?.max_parallel ?? null;
-  const [pages, setPagesState] = useState<Pages>(() => prefs().parallel ?? 3);
+  const [pages, setPagesState] = useState<Pages | null>(() => prefs().parallel);
   const setPages = (v: Pages) => {
     setPagesState(v);
     setPrefs({ parallel: v });
@@ -379,6 +379,10 @@ export function Gallery() {
           setRolesOpen(true);
           throw new Error(`${seat.label}: ${problem}`);
         }
+      }
+      if (pages == null) {
+        setRolesOpen(true);
+        throw new Error("Choose how many pages to run at once.");
       }
       const { roles, models: chosen } = toRequest(choice);
       const parallel = resolvePages(pages, max ?? 32);

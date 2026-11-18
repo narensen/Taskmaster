@@ -20,7 +20,7 @@ export function NewRun() {
   const [template, setTemplate] = useState("");
   const settings = useSettings();
   const max = settings.data?.machine?.max_parallel ?? null;
-  const [pages, setPagesState] = useState<Pages>(() => prefs().parallel ?? 3);
+  const [pages, setPagesState] = useState<Pages | null>(() => prefs().parallel);
   const setPages = (v: Pages) => {
     setPagesState(v);
     setPrefs({ parallel: v });
@@ -35,7 +35,6 @@ export function NewRun() {
   const master = seatChoice(choice, "master");
   const pill = master ? `${list.find((p) => p.id === master.harness)?.name ?? providerName(master.harness)} · ${modelLabel(list, master)}` : "Choose providers";
   const project = settings.data?.project?.split(/[/\\]/).filter(Boolean).pop();
-  const parallel = resolvePages(pages, max ?? 32);
 
   useEffect(() => {
     composer.current?.focus();
@@ -60,7 +59,12 @@ export function NewRun() {
         const problem = problemWith(list, seatChoice(choice, seat.id));
         if (problem) throw new Error(`${seat.label}: ${problem}`);
       }
+      if (pages == null) {
+        setAdvanced(true);
+        throw new Error("Choose how many pages to run at once.");
+      }
       const { roles, models } = toRequest(choice);
+      const parallel = resolvePages(pages, max ?? 32);
       const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models });
       void afterStart(choice, settings.data, remember);
       runStarted(id);
@@ -99,7 +103,7 @@ export function NewRun() {
                 </button>
                 <span className="foot-sep" aria-hidden />
                 <span className="foot-note">
-                  <Users size={13} aria-hidden /> {pages === "max" ? `Max (${parallel})` : parallel} at once
+                  <Users size={13} aria-hidden /> {pages == null ? "Choose pages" : pages === "max" ? `Max (${max ?? "…"})` : `${pages} at once`}
                 </span>
               </div>
               <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>

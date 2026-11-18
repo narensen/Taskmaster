@@ -47,6 +47,7 @@ test("a provider and model are picked in place, and the first run saves them", a
     await pop.getByRole("option", { name: /Provider default/ }).click();
   }
   await expect(page.getByRole("button", { name: /^Master provider: Grok/ })).toBeVisible();
+  await page.getByRole("radiogroup", { name: "Pages at once" }).getByRole("radio", { name: "2" }).click();
   await page.locator(".composer-input").click();
   await page.keyboard.type("A one page site");
   await page.keyboard.press("Enter");

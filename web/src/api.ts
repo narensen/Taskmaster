@@ -450,6 +450,8 @@ export interface DaemonSettings {
   models?: Models;
   version: string;
   approvals?: { mode: ApprovalMode; timeout_secs: number };
+  checker?: { enabled: boolean };
+  code_mode?: { enabled: boolean };
 }
 
 export type ApprovalMode = "always" | "risky" | "never";
@@ -670,6 +672,8 @@ export const api = {
   denyTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/deny`, {}),
   setRoleDefaults: (body: { roles: Roles; models: Models }) => call<DaemonSettings>("POST", "/api/settings", body),
   setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
+  setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
+  setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
   preview: (id: string) => call<PreviewView>("GET", `/api/runs/${enc(id)}/preview`),
   startPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview`, {}),
   stopPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview/stop`, {}),

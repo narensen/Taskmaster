@@ -3,7 +3,7 @@ import { Download, FolderInput, Puzzle, RefreshCw, Search, SearchX, Trash2 } fro
 import { api, type Skill, type SkillHit } from "../api";
 import { forgetSkills } from "../composer";
 import { toast } from "../overlay";
-import { Empty, Loading, Problem, useLoad } from "../ui";
+import { Empty, Loading, Problem, Switch, useLoad } from "../ui";
 
 function why(err: unknown) {
   return err instanceof Error ? err.message : String(err);
@@ -13,14 +13,6 @@ function installs(n: number) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M installs`;
   if (n >= 1000) return `${Math.round(n / 1000)}k installs`;
   return `${n} install${n === 1 ? "" : "s"}`;
-}
-
-function Switch({ on, label, onChange, disabled }: { on: boolean; label: string; onChange: (on: boolean) => void; disabled?: boolean }) {
-  return (
-    <button type="button" role="switch" aria-checked={on} aria-label={label} className={`switch ${on ? "on" : ""}`} disabled={disabled} onClick={() => onChange(!on)}>
-      <span className="switch-knob" aria-hidden />
-    </button>
-  );
 }
 
 function InstalledRow({ skill, update, onChanged }: { skill: Skill; update: boolean; onChanged: () => void }) {

@@ -3,7 +3,7 @@ import { api, server, type ApprovalMode, setServer, setToken, DEFAULT_ROLES, typ
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
 import { ROLES, RolePicker } from "../roles";
-import { Problem, useLoad } from "../ui";
+import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
 
 const KEYS: [string, string][] = [
@@ -251,6 +251,56 @@ export function Settings() {
           ))}
         </ul>
       </Section>
+
+      {daemon.data && (
+        <Section
+          id="checker"
+          title="Mid-tier checker"
+          note="After a page passes its own checks, the mid model reads its diff, its screenshot, its brief and the worker's last words, and answers pass or a short fix list. It runs beside the build, only on pages that change UI files or large ones, and waits at most 20 seconds at the end. Each page is checked once, so it adds at most one repair. Uses the mid role's harness and model."
+        >
+          <label className="row gap" data-testid="checker-setting">
+            <Switch
+              on={daemon.data.checker?.enabled ?? false}
+              label="Check finished pages with the mid model"
+              onChange={(on) =>
+                void api.setChecker(on).then(
+                  (next) => {
+                    daemon.setData(next);
+                    toast(on ? "The checker is on for new runs" : "The checker is off");
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span>{daemon.data.checker?.enabled ? "On: new runs get a second look per page" : "Off"}</span>
+          </label>
+        </Section>
+      )}
+
+      {daemon.data && (
+        <Section
+          id="code-mode"
+          title="Code Mode"
+          note="Workers get run_code: one call runs a short JavaScript program that reads, edits, searches and checks their files, instead of a tool call per step. It runs in Node with no file, process or network access of its own, under the same permissions as the worker's tools. Claude Code workers use Claude Code's own code mode in an interactive session. Off until the benchmark says it is faster for your projects."
+        >
+          <label className="row gap" data-testid="code-mode-setting">
+            <Switch
+              on={daemon.data.code_mode?.enabled ?? false}
+              label="Use Code Mode for workers"
+              onChange={(on) =>
+                void api.setCodeMode(on).then(
+                  (next) => {
+                    daemon.setData(next);
+                    toast(on ? "Code Mode is on for new runs" : "Code Mode is off");
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span>{daemon.data.code_mode?.enabled ? "On for new runs" : "Off"}</span>
+          </label>
+        </Section>
+      )}
 
       {policy && (
         <Section

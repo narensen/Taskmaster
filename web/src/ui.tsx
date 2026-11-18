@@ -164,3 +164,12 @@ export function useAction() {
   }, []);
   return { busy, error, run, clear: () => setError(null) };
 }
+
+/** An on/off switch: a button with role=switch, so Space and Enter toggle it. */
+export function Switch({ on, label, onChange, disabled }: { on: boolean; label: string; onChange: (on: boolean) => void; disabled?: boolean }) {
+  return (
+    <button type="button" role="switch" aria-checked={on} aria-label={label} className={`switch ${on ? "on" : ""}`} disabled={disabled} onClick={() => onChange(!on)}>
+      <span className="switch-knob" aria-hidden />
+    </button>
+  );
+}

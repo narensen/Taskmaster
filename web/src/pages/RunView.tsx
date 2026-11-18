@@ -628,7 +628,7 @@ export function RunView({ id }: { id: string }) {
         {tab === "browser" && <BrowserTab run={id} detail={detail} entries={entries} />}
         {tab === "search" && <SearchTab />}
         {tab === "terminal" && <TerminalTab run={id} entries={entries} project={settings.data?.project ?? ""} onRan={() => void data.catchUp()} />}
-        {tab === "files" && <FilesPanel run={id} open={fileOpen} />}
+        {tab === "files" && <FilesPanel run={id} open={fileOpen} layout="vertical" />}
         {tab.startsWith("agent:") &&
           (list.find((x) => x.id === tab.slice(6))?.calls.length ? (
             <Transcript label={`${tab.slice(6)} log`} text={logText(list.find((x) => x.id === tab.slice(6)))} />

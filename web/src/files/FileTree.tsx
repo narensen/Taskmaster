@@ -89,6 +89,14 @@ export function FileTree({
   }, [tree, open, files, q]);
 
   const virtual = useVirtualizer({ count: rows.length, getScrollElement: () => scroller.current, estimateSize: () => 26, overscan: 16 });
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => virtual.measure());
+    ro.observe(el);
+    virtual.measure();
+    return () => ro.disconnect();
+  }, [virtual]);
 
   // Unfold to a file when it opens elsewhere, and keep it in view.
   useEffect(() => {

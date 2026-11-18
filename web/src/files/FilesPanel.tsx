@@ -41,7 +41,7 @@ function relative(path: string, project: string): string {
   return path.replace(/^\.\//, "");
 }
 
-export function FilesPanel({ run, open: openRequest }: { run?: string; open?: { path: string; line?: number; n: number } | null }) {
+export function FilesPanel({ run, open: openRequest, layout = "horizontal" }: { run?: string; open?: { path: string; line?: number; n: number } | null; layout?: "horizontal" | "vertical" }) {
   const p = usePrefs();
   const on = useMotion();
   const settings = useSettings();
@@ -58,7 +58,9 @@ export function FilesPanel({ run, open: openRequest }: { run?: string; open?: { 
   const [goto, setGoto] = useState<string | null>(null);
   const [reveal, setReveal] = useState<{ path: string; n: number } | null>(null);
   const root = useRef<HTMLDivElement>(null);
-  const layout = useDefaultLayout({ id: "taskmaster-files", storage: localStorage });
+  const layoutId = layout === "vertical" ? "taskmaster-files-run" : "taskmaster-files";
+  const split = useDefaultLayout({ id: layoutId, storage: localStorage });
+
   const findInput = useRef<HTMLInputElement>(null);
   const gotoInput = useRef<HTMLInputElement>(null);
 
@@ -150,8 +152,8 @@ export function FilesPanel({ run, open: openRequest }: { run?: string; open?: { 
 
   return (
     <div className="files" ref={root}>
-      <Group orientation="horizontal" id="taskmaster-files" className="files-split" defaultLayout={layout.defaultLayout} onLayoutChanged={layout.onLayoutChanged}>
-        <Panel id="tree" defaultSize="32%" minSize="16%" maxSize="60%" className="files-side">
+      <Group orientation={layout} id={layoutId} className={`files-split ${layout === "vertical" ? "stacked" : ""}`} defaultLayout={split.defaultLayout} onLayoutChanged={split.onLayoutChanged}>
+        <Panel id="tree" defaultSize={layout === "vertical" ? "36%" : "36%"} minSize={layout === "vertical" ? "22%" : "28%"} maxSize={layout === "vertical" ? "70%" : "55%"} className="files-side">
           <div className="files-side-head">
             <div className="seg mini" role="tablist" aria-label="Browse">
               <button type="button" role="tab" aria-selected={mode === "tree"} className={`seg-item ${mode === "tree" ? "on" : ""}`} onClick={() => setMode("tree")}>
@@ -183,7 +185,7 @@ export function FilesPanel({ run, open: openRequest }: { run?: string; open?: { 
           )}
         </Panel>
         <Separator className="split-handle" />
-        <Panel id="viewer" minSize="30%" className="files-main">
+        <Panel id="viewer" minSize={layout === "vertical" ? "30%" : "40%"} className="files-main">
           {tabs.length > 0 && (
             <div className="ftabs" role="tablist" aria-label="Open files">
               <AnimatePresence initial={false}>

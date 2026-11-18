@@ -5,7 +5,7 @@ import { useMemo } from "react";
 import { DotLottieReact, setWasmUrl } from "@lottiefiles/dotlottie-react";
 import wasm from "dotlottie-player.wasm?url";
 import { useMotion, usePrefs } from "../prefs";
-import { emptyRunsLottie } from "./emptyRuns";
+import { emptyRunsLottie } from "./emptyRunsLottie";
 
 setWasmUrl(wasm);
 

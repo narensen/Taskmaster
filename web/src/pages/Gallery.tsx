@@ -4,7 +4,7 @@
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Folder, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
 import { api, callAt, type ApprovalMode, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
@@ -316,8 +316,6 @@ export function Gallery() {
   const list = byRecent(ordered(runs, p.showArchived));
   const archived = ordered(runs, true).filter((x) => x.group === "Archived").length;
   const daemons = [...p.daemons].sort((a, b) => Number(b.pinned) - Number(a.pinned));
-  const waiting = list.filter((x) => x.group === "Needs approval").length;
-  const working = list.filter((x) => x.group === "Working").length;
   const project = settings.data?.project;
   const name = project ? project.split(/[/\\]/).filter(Boolean).pop() ?? project : null;
   const projectLabel = name ?? null;
@@ -335,9 +333,6 @@ export function Gallery() {
   const masterPick = seatChoice(choice, "master");
   const providerList = providers.data ?? [];
   const modelPill = masterPick ? `${providerList.find((x) => x.id === masterPick.harness)?.name ?? providerName(masterPick.harness)} · ${modelLabel(providerList, masterPick)}` : "Choose providers";
-  useEffect(() => {
-    if (settings.data && missing.length) setRolesOpen(true);
-  }, [settings.data, missing.length]);
 
   const strip = useRef<HTMLDivElement>(null);
   const showAllBtn = useRef<HTMLButtonElement>(null);
@@ -407,27 +402,7 @@ export function Gallery() {
 
   return (
     <div className="page wide gallery-page">
-      <header className="page-head">
-        <div className="grow">
-          <div className="eyebrow">Project</div>
-          <h1 className="break">{name ?? <span className="skeleton">…</span>}</h1>
-          <div className="page-sub">
-            <Folder size={13} aria-hidden />
-            <span className="mono clip" data-testid="project-path">{project ?? "…"}</span>
-          </div>
-        </div>
-        <div className="page-head-actions">
-          {runs.length > 0 && (
-            <div className="head-stats" aria-label="Run summary">
-              <span><strong>{runs.length}</strong> run{runs.length === 1 ? "" : "s"}</span>
-              {working > 0 && <span>{working} working</span>}
-              {waiting > 0 && <span>{waiting} need{waiting === 1 ? "s" : ""} approval</span>}
-            </div>
-          )}
-        </div>
-      </header>
-
-      <div className="home-ask">
+      <div className="home-above">
         <h2 data-testid="home-heading">
           {mode === "new" ? (
             "Start something new"
@@ -480,6 +455,8 @@ export function Gallery() {
         <p className="ask-sub">
           {mode === "new" ? "Name the project, then tell the master what to build." : "A master will plan it; workers take the pages."}
         </p>
+      </div>
+      <div className="home-composer">
         <Composer
           ref={composer}
           bus
@@ -536,6 +513,16 @@ export function Gallery() {
           </span>
         </div>
         <Problem error={action.error} />
+        {!rolesOpen && (missing.length > 0 || pages == null) && (
+          <p className="home-choose">
+            <button type="button" className="link" onClick={() => setRolesOpen(true)}>
+              {missing.length ? "Choose providers" : "Choose pages at once"}
+            </button>
+            {missing.length > 0 && pages == null ? " and how many pages to run at once." : missing.length > 0 ? " for each role, then you only do this once." : "."}
+          </p>
+        )}
+      </div>
+      <div className="home-below">
         <AnimatePresence initial={false}>
           {rolesOpen && (
             <motion.div
@@ -602,8 +589,6 @@ export function Gallery() {
         </section>
       )}
 
-      </div>
-
       {archived > 0 || p.showArchived ? (
         <div className="row gap wrap small gallery-foot">
           <label className="check">
@@ -612,6 +597,7 @@ export function Gallery() {
           </label>
         </div>
       ) : null}
+      </div>
 
       <ShowAll open={allOpen} onClose={() => setAllOpen(false)} list={list} daemons={daemons} archived={archived} />
     </div>

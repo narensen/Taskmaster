@@ -23,12 +23,17 @@ The run is a state machine. The models do the writing. Taskmaster decides the ne
 - **Checks that cost nothing.** `tsc`, eslint, clippy, ruff, the project's own `build` and `test`, and headless-Chrome checks of a Next.js app, run before a run finishes.
 - **Per-tool approval.** `approvals.mode` can ask a person before risky tool calls (shell, network, writes outside the worktree) instead of refusing them.
 - **Live preview.** A run's dev server can be started from the app and is stopped with the run.
-- **Cost ledger.** Every agent call is recorded with tokens, seconds and price when the harness reports one.
+- **Token ledger.** Every agent call is recorded with input, output, cache-read and cache-write tokens, seconds, and price when the harness reports one; the run view splits them per agent.
+- **Providers in the app.** Install, update and sign in to each harness CLI from the Providers page, with the installer's output and the sign-in code shown live. Node, Bun and Python install from there too.
+- **One skills store.** SKILL.md skills are searched, installed, switched and updated in one store every harness shares; the planner attaches them to the pages they fit, and `$` in the composer names one.
+- **A browser for workers.** A worker on a web page can open, click, type into, screenshot and read the console of its own page's preview, and nothing else.
+- **Mid-tier checker (optional).** A second, cheaper look at each finished UI page: the diff, a screenshot, the brief and the done line, answered with pass or a short fix list. Runs beside the build.
+- **Code Mode (optional).** Workers get `run_code`, one sandboxed JavaScript call for many steps; Claude Code workers use its own code mode.
 - **Dictionary and Commons.** An immutable, content-addressed store of contracts, plus a shared Commons you can opt in to.
 - **Errorography.** Each model's repeated mistakes are handed back to it on its next attempt.
 - **Resumable.** `events.jsonl` is the run; replaying it rebuilds the state.
 - **Review any repo.** `tm-review` reviews a diff, a range or a pull request without a Taskmaster plan.
-- **Desktop and phone app.** A React app served by the daemon; pair a phone over Tailscale.
+- **Desktop and phone app.** A desktop app for macOS and Linux that starts and stops tm-daemon and updates itself from GitHub Releases, and the same React app served by the daemon; pair a phone over Tailscale.
 
 ## Screenshots
 
@@ -182,6 +187,16 @@ The project store is `.taskmaster/dictionary`. The Commons defaults to `~/.taskm
 **Citations.** `.taskmaster/citations.json` stores the Dictionary hash each page was built against. A later run skips a page whose cited hashes still match. A page is recorded only once its run is merged, so a run left on its branch does not make the next one skip anything.
 
 **The event log.** `.taskmaster/runs/<id>/events.jsonl` is the run. Replaying it rebuilds the state. The default id is `current`.
+
+## Optional: the checker and Code Mode
+
+Both are off until you switch them on in Settings (or `checker.enabled` and `code_mode.enabled` in the settings file).
+
+The **checker** gives a page that just passed its own checks one read-only call on the mid role's model, but only when the page changes UI files, is large, or needed a stronger tier. It reads `diff.patch`, a screenshot of the page as the worker left it, the brief, the done line and the worker's last words, and answers `pass` or up to five fixes. Those fixes join the verify step's errors, so the page is repaired the usual way. Each page is checked once, the check runs beside the rest of the build, and verification waits at most 20 seconds for a check still running.
+
+**Code Mode** gives each worker `run_code`: an async JavaScript body with `read`, `write`, `edit`, `grep`, `ls`, `sh`, `check` and `browser`, run in Node with its permission model on (no files, processes or workers of its own) and, under bubblewrap, no network. Every call goes to the same permission gate as the worker's own tools. Claude Code workers instead run Claude Code's native code mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`) in an interactive session on a terminal.
+
+`scripts/bench.sh` builds one locked plan under different settings, and runs a single-agent baseline, writing each result to `bench/results.jsonl`.
 
 ## Eval
 
@@ -337,11 +352,17 @@ This builds both binaries and copies them to `~/.local/bin`, or to the directory
 
 To build without installing: `cargo build --release -p tm-daemon -p tm-review`. A harness is found on `PATH`, and also in `~/.local/bin` and `~/.opencode/bin`.
 
+## Releases and the site
+
+A `v*` tag builds the Linux server tarball and the signed desktop installers, with `latest.json` for the in-app updater and `SHA256SUMS.txt`; see [docs/RELEASING.md](docs/RELEASING.md) for the secrets. `site/` builds the public landing page and releases page as static files for Caddy; see [deploy/site/README.md](deploy/site/README.md).
+
 ## Contributing
 
 ```bash
 cargo test --workspace        # Rust
 cd web && npm ci && npm run typecheck && npm run build
+cd web && npm run e2e           # Playwright, the built app on a real tm-daemon (system Chrome)
+cd site && npm test            # the public site's generator
 ```
 
 Run `npm run dev` in `web/` next to `tm-daemon serve .` to work on the app. `tm-core` does no I/O; keep it that way. Commits the daemon makes need `user.name` and `user.email` set on the repository.

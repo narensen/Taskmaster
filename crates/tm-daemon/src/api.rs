@@ -617,7 +617,7 @@ impl App {
         let harnesses = Harnesses::from_roles(&request.roles, &*self.harness)
             .map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
         let (cancel, cancelled) = watch::channel(matches!(decision, Decision::Cancel));
-        let mut config = Config::new(self.project());
+        let mut config = Config::new(&self.project());
         config.skills = Some(self.skills_root.clone());
         let saved = crate::settings::Settings::load(&self.project()).unwrap_or_default();
         config.checker = saved.checker.enabled;

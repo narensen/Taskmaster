@@ -1,4 +1,4 @@
-import { test } from "./fixtures";
+import { test, finishedRun } from "./fixtures";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +25,22 @@ async function themed(page: import("@playwright/test").Page, theme: string) {
 }
 
 for (const theme of ["dark", "light"] as const) {
+  test(`run view with the token split, and home, ${theme}`, async ({ openFixture, page, daemon }) => {
+    test.skip(!shots, "set SHOTS=1");
+    test.setTimeout(120_000);
+    await themed(page, theme);
+    await finishedRun(daemon.fixture!, "bookshop", "A bookshop: a home page with featured books, a searchable list, and a cart with a total.");
+    await openFixture("/runs/bookshop");
+    await page.getByTestId("token-ledger").scrollIntoViewIfNeeded();
+    await page.waitForTimeout(400);
+    await page.screenshot({ path: `${out}/33-run-tokens-${theme}.png` });
+    await page.getByTestId("token-ledger").screenshot({ path: `${out}/34-token-ledger-${theme}.png` });
+    await page.goto(daemon.fixture!.url + "/");
+    await page.getByRole("textbox", { name: /Tell the master/ }).waitFor();
+    await page.waitForTimeout(600);
+    await page.screenshot({ path: `${out}/35-home-${theme}.png` });
+  });
+
   test(`skills picker and page, ${theme}`, async ({ open, page }) => {
     test.skip(!shots, "set SHOTS=1");
     await themed(page, theme);

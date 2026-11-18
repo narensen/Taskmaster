@@ -42,9 +42,18 @@ export interface Surface {
   tag: AgentTag | null;
   state: "waiting" | "working" | "done" | "failed";
   tokens: number;
+  /** The same tokens, split four ways, from each finished call's usage. */
+  split: TokenSplit;
   usage: boolean;
   cost: number;
   calls_billed: number;
+}
+
+export interface TokenSplit {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
 }
 
 export function surfaceOf(entry: LedgerEntry): string {
@@ -71,6 +80,7 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
       tag: null,
       state: "waiting",
       tokens: 0,
+      split: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
       usage: false,
       cost: 0,
       calls_billed: 0,
@@ -128,6 +138,10 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
         if (e.usage) {
           s.usage = true;
           s.tokens += e.usage.input + e.usage.output + e.usage.cache_read + e.usage.cache_write;
+          s.split.input += e.usage.input;
+          s.split.output += e.usage.output;
+          s.split.cache_read += e.usage.cache_read;
+          s.split.cache_write += e.usage.cache_write;
         }
         break;
     }
@@ -227,6 +241,8 @@ export function useRun(id: string): RunData {
         agent: (entry) => {
           counts.current.entries += 1;
           setEntries((all) => [...all, entry]);
+          // A finished call is in the ledger now: refresh the token split.
+          if (entry.kind === "end") api.ledger(id).then(setLedger, () => undefined);
         },
         idle: () => {
           stop.current = null;

@@ -71,7 +71,7 @@ impl Harness for Scripted {
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let brief = task.brief.clone();
-        if brief.contains("Plan this product and lock its contracts.") {
+        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             say(&events, thought("The request names three pages. I will look for a theme in the Dictionary first.")).await;
             tool(&events, "Read", json!({ "file_path": "README.md" }), true).await;
             tool(&events, "dictionary__search", json!({ "query": "theme" }), true).await;
@@ -148,7 +148,14 @@ impl Harness for Scripted {
             say(&events, text("Nothing to do.")).await;
         }
         // agy reports no usage; grok reports tokens but no price (subscription CLI).
-        let usage = if self.id == "agy" { Usage::default() } else { Usage { input: 1800, output: 420, cache_read: 900, cache_write: 0 } };
+        // The rest report all four counts; a plan writes more than a page, a review less.
+        let output = if brief.contains("Plan this") { 1900 } else if brief.contains("Build page") { 640 } else { 180 };
+        let usage = if self.id == "agy" {
+            Usage::default()
+        } else {
+            let claude = self.id == "claude";
+            Usage { input: 600 + brief.len() as u64 / 4, output, cache_read: 4200, cache_write: if claude { 2600 } else { 0 } }
+        };
         let cost = if self.id == "agy" || self.id == "grok" { None } else { Some(0.012) };
         Ok(RunSummary { ok: true, usage, cost_usd: cost, denied: 1, freed: None })
     }

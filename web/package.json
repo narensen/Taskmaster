@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
     "preview": "vite preview",
-    "e2e": "npm run build && cargo build -p tm-daemon --manifest-path ../Cargo.toml && playwright test",
+    "e2e": "npm run build && cargo build -p tm-daemon --example ui_fixture --manifest-path ../Cargo.toml && playwright test",
     "e2e:only": "playwright test"
   },
   "dependencies": {

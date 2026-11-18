@@ -14,9 +14,13 @@ export interface Estimate {
 export interface Spend {
   calls: number;
   tokens: number;
+  input: number;
+  output: number;
   cache_read: number;
+  cache_write: number;
   cost_usd: number;
   unpriced_calls: number;
+  seconds: number;
 }
 
 export interface Totals {
@@ -32,6 +36,8 @@ export interface Totals {
   seconds: number;
   by_role: Record<string, Spend>;
   by_model: Record<string, Spend>;
+  /** `master`, `page:<id>`, or `<role> page:<id>`. */
+  by_agent?: Record<string, Spend>;
 }
 
 export interface PageView {

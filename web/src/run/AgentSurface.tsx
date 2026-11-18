@@ -177,9 +177,14 @@ export function AgentSurface({
           )}
         </dl>
         {s.usage && (
-          <div className="meter" title={`${s.tokens} tokens reported by ${harness}`}>
+          <div
+            className="meter"
+            title={`${harness}: ${s.split.output.toLocaleString()} output, ${s.split.input.toLocaleString()} input, ${s.split.cache_write.toLocaleString()} cache write, ${s.split.cache_read.toLocaleString()} cache read`}
+          >
             <div className="meter-fill" style={{ width: `${Math.max(2, (100 * s.tokens) / Math.max(1, maxTokens))}%` }} />
-            <span className="meter-label small">{tokens(s.tokens)} tok</span>
+            <span className="meter-label small" data-testid="agent-split">
+              {tokens(s.split.output)} out · {tokens(s.split.input)} in{s.split.cache_read ? ` · ${tokens(s.split.cache_read)} cached` : ""}
+            </span>
           </div>
         )}
       </header>

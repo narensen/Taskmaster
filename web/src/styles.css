@@ -2912,3 +2912,32 @@ button.switch.on { background: var(--ink-2); border-color: var(--ink-2); }
 button.switch.on .switch-knob { transform: translateX(14px); background: var(--bg); }
 button.switch:hover:not(:disabled) { border-color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { button.switch .switch-knob { transition: none; } }
+
+/* Token ledger */
+
+.token-ledger { padding: 0; margin: var(--s3) 0; }
+.token-ledger > summary { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 10px var(--s4); cursor: pointer; border-radius: var(--r-lg); }
+.token-ledger > summary:focus-visible { outline: none; box-shadow: var(--accent-glow); }
+.token-body { display: flex; flex-direction: column; gap: 12px; padding: 0 var(--s4) var(--s4); }
+.split-bar { display: flex; gap: 2px; height: 8px; border-radius: 4px; overflow: hidden; }
+.split-seg { min-width: 3px; border-radius: 2px; }
+.seg-output { background: #ededf0; }
+.seg-input { background: #a8a8b2; }
+.seg-cache_write { background: #6e6e78; }
+.seg-cache_read { background: transparent; box-shadow: inset 0 0 0 1px #8e8e98; }
+.theme-light .seg-output { background: #1c1b18; }
+.theme-light .seg-input { background: #5c574d; }
+.theme-light .seg-cache_write { background: #9a9384; }
+.theme-light .seg-cache_read { box-shadow: inset 0 0 0 1px #605b51; }
+.split-key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.token-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 16px; margin: 0; }
+.token-total { display: flex; flex-direction: column; gap: 1px; }
+.token-total dt { color: var(--ink-2); font-size: var(--fs-sm); }
+.token-total dd { margin: 0; }
+.token-total dd.mono { font-size: var(--fs-lg); color: var(--ink); font-variant-numeric: tabular-nums; }
+.token-table-wrap { overflow-x: auto; }
+.token-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+.token-table th, .token-table td { padding: 6px 8px; text-align: right; border-top: 1px solid var(--line); white-space: nowrap; }
+.token-table th[scope="row"], .token-table thead th:first-child { text-align: left; font-weight: 500; color: var(--ink-2); }
+.token-table thead th { color: var(--muted); font-weight: 500; border-top: 0; }
+.token-table tfoot th, .token-table tfoot td { border-top: 1px solid var(--line-strong); color: var(--ink); font-weight: 600; }

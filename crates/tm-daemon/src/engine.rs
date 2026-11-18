@@ -2131,6 +2131,11 @@ impl Driver {
     fn spend_line(&self) -> anyhow::Result<String> {
         let sum = totals(&self.records.ledger(&self.id)?);
         let mut line = format!("{} agent calls, {} tokens", sum.calls, sum.fresh);
+        line.push_str(&format!(" ({} in, {} out", sum.input, sum.output));
+        if sum.cache_write > 0 {
+            line.push_str(&format!(", {} written to cache", sum.cache_write));
+        }
+        line.push(')');
         if sum.cache_read > 0 {
             line.push_str(&format!(" plus {} read from cache", sum.cache_read));
         }

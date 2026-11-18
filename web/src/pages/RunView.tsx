@@ -22,6 +22,7 @@ import { AgentSurface } from "../run/AgentSurface";
 import { DiffTab, type Scope } from "../run/Diff";
 import { PlanView } from "../run/PlanView";
 import { LivePreview } from "../run/LivePreview";
+import { TokenLedger } from "../run/Tokens";
 import { ToolApprovals, useToolApprovals } from "../run/ToolApprovals";
 import { BrowserTab, PreviewTab, SearchTab, TerminalTab } from "../run/Tabs";
 import { surfaces, useRun } from "../run/model";
@@ -625,6 +626,8 @@ export function RunView({ id }: { id: string }) {
           />
         )}
         {detail.plan && <PlanView plan={detail.plan} unpriced={isUnpriced(ledger?.totals ?? detail.spent)} arrived={data.planArrived} compact open={phase === "awaiting_approval"} />}
+
+        {ledger && <TokenLedger totals={ledger.totals} open={["done", "failed"].includes(detail.phase) && !detail.active} />}
 
         <ToolApprovals list={toolApprovals.list} answer={toolApprovals.answer} />
         <LivePreview id={id} detail={detail} />

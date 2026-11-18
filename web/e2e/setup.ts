@@ -51,6 +51,35 @@ export default async function setup() {
   const code = /code (\S+)/.exec(line)![1]!;
   const paired = await fetch(`${url}/api/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
   const { token } = (await paired.json()) as { token: string };
-  writeFileSync(STATE, JSON.stringify({ url, token, pid: child.pid, base, project }));
   child.unref();
+
+  // A second daemon whose agents are scripts (examples/ui_fixture.rs), for runs that go
+  // from plan to done with real ledgers and transcripts, and no model.
+  const fixtureBin = join(root, "target/debug/examples/ui_fixture");
+  let fixture: { url: string; token: string; pid: number } | null = null;
+  if (existsSync(fixtureBin)) {
+    const fixtureProject = join(base, "fixture");
+    execFileSync("sh", ["-c", `mkdir -p "${fixtureProject}" && cd "${fixtureProject}" && git init -q && git config user.email e2e@example.invalid && git config user.name e2e && echo '# shop' > README.md && git add . && git commit -qm init`]);
+    const f = spawn(fixtureBin, [fixtureProject, "0", dist], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, FIXTURE_DELAY_MS: "5", TASKMASTER_SKILLS: skills, HOME: join(base, "home") },
+    });
+    const said = await new Promise<string>((ok, fail) => {
+      let text = "";
+      const timer = setTimeout(() => fail(new Error(`ui_fixture did not start: ${text}`)), 20_000);
+      f.stdout.on("data", (chunk: Buffer) => {
+        text += chunk.toString();
+        if (/api \S+/.test(text) && /code \S+/.test(text)) {
+          clearTimeout(timer);
+          ok(text);
+        }
+      });
+    });
+    const fUrl = /api (\S+)/.exec(said)![1]!.replace(/\/$/, "");
+    const fCode = /code (\S+)/.exec(said)![1]!;
+    const fPaired = await fetch(`${fUrl}/api/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: fCode }) });
+    fixture = { url: fUrl, token: ((await fPaired.json()) as { token: string }).token, pid: f.pid! };
+    f.unref();
+  }
+  writeFileSync(STATE, JSON.stringify({ url, token, pid: child.pid, base, project, fixture }));
 }

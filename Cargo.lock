@@ -1846,6 +1846,7 @@ name = "tm-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1879,6 +1880,7 @@ name = "tm-dictionary"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "http-body-util",
  "serde",

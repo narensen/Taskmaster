@@ -154,12 +154,25 @@ fn read_loop(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
+
+// Apple's openpty takes *mut termios and *mut winsize; Linux takes *const of both.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn call_openpty(master: &mut libc::c_int, slave: &mut libc::c_int, mut size: libc::winsize) -> libc::c_int {
+    unsafe { libc::openpty(master, slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+unsafe fn call_openpty(master: &mut libc::c_int, slave: &mut libc::c_int, size: libc::winsize) -> libc::c_int {
+    unsafe { libc::openpty(master, slave, std::ptr::null_mut(), std::ptr::null(), &size) }
+}
+
 fn open(rows: u16, cols: u16) -> anyhow::Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: openpty writes two descriptors into the pointers given.
-    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &size) };
+    // Apple takes *mut termios and *mut winsize; Linux takes *const of both.
+    let rc = unsafe { call_openpty(&mut master, &mut slave, size) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("could not open a terminal");
     }

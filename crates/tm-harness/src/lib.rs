@@ -94,16 +94,22 @@ pub fn group_members(pgid: u32) -> usize {
 pub fn kill_group(pgid: u32) {
     if pgid > 1 {
         // SAFETY: killpg only sends a signal; a stale group id fails with ESRCH.
+        #[cfg(unix)]
         unsafe {
             libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
         }
+        #[cfg(windows)]
+        let _ = pgid;
     }
 }
 
 /// Spawn `cmd` as the leader of its own process group. Keep the guard as long as the child
 /// should live: dropping it kills the whole group.
 pub fn spawn_grouped(cmd: &mut tokio::process::Command) -> std::io::Result<(tokio::process::Child, GroupGuard)> {
+    #[cfg(unix)]
     cmd.process_group(0).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.kill_on_drop(true);
     for name in parent_session_vars() {
         cmd.env_remove(name);
     }

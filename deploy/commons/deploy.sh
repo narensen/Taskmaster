@@ -74,6 +74,10 @@ if ((DRY)); then
   cut -d= -f1 "$CENV" | sed 's/^/#   /'
 fi
 sed "s/^taskmaster-commons\.duckdns\.org /$DOMAIN /" "$HERE/Caddyfile" >"$CADDY"
+# The public site's block, only when its domain is given (see deploy/site/README.md).
+if [[ -n ${SITE_DOMAIN:-} ]]; then
+  { echo; sed "s/__SITE_DOMAIN__/$SITE_DOMAIN/" "$HERE/../site/Caddyfile"; } >>"$CADDY"
+fi
 
 # 2) upload
 run scp "${SSH_OPTS[@]}" "$BINARY" "$REMOTE:/tmp/tm-commons"

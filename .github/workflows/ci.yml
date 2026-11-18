@@ -49,6 +49,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+      - run: cd ../site && npm test && node build.mjs --offline
 
   e2e:
     runs-on: ubuntu-latest

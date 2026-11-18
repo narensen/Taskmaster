@@ -1,0 +1,21 @@
+# The public site (site/dist): the landing page and /releases/. Static files only.
+# deploy/commons/deploy.sh appends this block to /etc/caddy/Caddyfile when SITE_DOMAIN is
+# set, with that domain in place of __SITE_DOMAIN__. Caddy gets the certificate itself.
+__SITE_DOMAIN__ {
+	root * /srv/taskmaster-site
+	encode zstd gzip
+	file_server
+	try_files {path} {path}/ {path}/index.html
+	@assets path *.css *.js *.png *.ico
+	header @assets Cache-Control "public, max-age=86400"
+	@pages path / /releases/ *.html *.json
+	header @pages Cache-Control "public, max-age=300"
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "default-src 'none'; style-src 'self'; script-src 'self' 'sha256-5nOrOMx/VfG4bNwuSJuzVMCHg/L10fMkR+u22s2uGPI='; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+		-Server
+	}
+}

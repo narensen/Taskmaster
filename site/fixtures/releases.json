@@ -1,0 +1,32 @@
+[
+  {
+    "tag": "v0.2.0",
+    "name": "Taskmaster 0.2.0",
+    "date": "2026-11-20T10:00:00Z",
+    "prerelease": false,
+    "notes": "## What changed\n- Install, update and sign in to every provider from the app.\n- One skills store for every harness, and a `$` picker in the composer.\n- Workers look at their own page in a browser before they report done.\n- A token ledger split into output, input, cache writes and cache reads.",
+    "url": "https://github.com/narensen/Taskmaster/releases/tag/v0.2.0",
+    "sumsUrl": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/SHA256SUMS.txt",
+    "files": [
+      { "name": "Taskmaster_0.2.0_aarch64.dmg", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/Taskmaster_0.2.0_aarch64.dmg", "size": 18874368, "sha256": "3f1c0d2a9b8e7f6a5d4c3b2a1908f7e6d5c4b3a291807f6e5d4c3b2a19087f6e" },
+      { "name": "Taskmaster_0.2.0_x64.dmg", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/Taskmaster_0.2.0_x64.dmg", "size": 19398656, "sha256": "9a8b7c6d5e4f30211f2e3d4c5b6a79881a2b3c4d5e6f708192a3b4c5d6e7f809" },
+      { "name": "Taskmaster_0.2.0_amd64.AppImage", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/Taskmaster_0.2.0_amd64.AppImage", "size": 82837504, "sha256": "0b1c2d3e4f5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" },
+      { "name": "Taskmaster_0.2.0_amd64.AppImage.sig", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/Taskmaster_0.2.0_amd64.AppImage.sig", "size": 420, "sha256": null },
+      { "name": "Taskmaster_0.2.0_amd64.deb", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/Taskmaster_0.2.0_amd64.deb", "size": 17825792, "sha256": "5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f" },
+      { "name": "taskmaster-v0.2.0-x86_64-linux.tar.gz", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/taskmaster-v0.2.0-x86_64-linux.tar.gz", "size": 25165824, "sha256": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00" },
+      { "name": "latest.json", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.2.0/latest.json", "size": 1200, "sha256": null }
+    ]
+  },
+  {
+    "tag": "v0.1.0",
+    "name": "Taskmaster 0.1.0",
+    "date": "2026-11-01T09:00:00Z",
+    "prerelease": false,
+    "notes": "The first release: tm-daemon, tm-review and the app for Linux servers.",
+    "url": "https://github.com/narensen/Taskmaster/releases/tag/v0.1.0",
+    "sumsUrl": null,
+    "files": [
+      { "name": "taskmaster-v0.1.0-x86_64-linux.tar.gz", "url": "https://github.com/narensen/Taskmaster/releases/download/v0.1.0/taskmaster-v0.1.0-x86_64-linux.tar.gz", "size": 23068672, "sha256": null }
+    ]
+  }
+]

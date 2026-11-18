@@ -8,6 +8,32 @@
   <img src="assets/screenshots/01-gallery-desktop.png" alt="The Taskmaster gallery of runs" width="860">
 </p>
 
+<p align="center">
+  <a href="https://github.com/narensen/Taskmaster/actions/workflows/ci.yml"><img src="https://github.com/narensen/Taskmaster/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/narensen/Taskmaster/releases/latest"><img src="https://img.shields.io/github/v/release/narensen/Taskmaster?label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-black" alt="Platforms">
+  <img src="https://img.shields.io/badge/license-MIT-black" alt="MIT license">
+</p>
+
+<p align="center">
+  <a href="https://github.com/narensen/Taskmaster/releases/latest"><b>Download</b></a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#the-app">The app</a> ·
+  <a href="#configuration">Configuration</a>
+</p>
+
+## Download
+
+| Platform | Get it |
+| --- | --- |
+| Ubuntu / Debian | `Taskmaster_<version>_amd64.deb` from [the latest release](https://github.com/narensen/Taskmaster/releases/latest), then `sudo apt install ./Taskmaster_<version>_amd64.deb` |
+| Any Linux | `Taskmaster_<version>_amd64.AppImage`, then `chmod +x` and run it |
+| Linux server (headless) | `taskmaster-<version>-x86_64-linux.tar.gz`: `tm-daemon`, `tm-review`, `tm-commons` and the built app |
+| macOS | Build from source with `scripts/install.sh` (see [Install](#install)) |
+
+Every release ships `SHA256SUMS.txt` and signed updater artifacts. The desktop app updates itself from GitHub Releases.
+
 ## What it is
 
 Taskmaster is a multi-model coding harness. You describe the product once. A planner locks the contracts and the Dictionary. Workers build one page each, in parallel, and cite only those locked entries. A different model reviews the connections, and another confirms the findings before a page is asked to repair them.

@@ -42,8 +42,9 @@ test("a provider and model are picked in place, and the first run saves them", a
   await openFixture("/runs/new");
   for (const seat of ["Master", "Mid", "Worker", "Checker"]) {
     await page.getByRole("button", { name: new RegExp(`^${seat} provider`) }).click();
-    await page.getByRole("option", { name: /Grok/ }).first().click();
-    await page.keyboard.press("Escape");
+    const pop = page.locator(".prov-pop").last();
+    await pop.getByRole("option", { name: /Grok/ }).click();
+    await pop.getByRole("option", { name: /Provider default/ }).click();
   }
   await expect(page.getByRole("button", { name: /^Master provider: Grok/ })).toBeVisible();
   await page.locator(".composer-input").click();

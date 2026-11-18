@@ -3,7 +3,7 @@
 // be picked.
 
 import * as Popover from "@radix-ui/react-popover";
-import { AnimatePresence, motion } from "motion/react";
+import { motion } from "motion/react";
 import { Check, ChevronDown } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Provider } from "../api";
@@ -72,15 +72,13 @@ export function ProviderPicker({
           <ChevronDown size={12} className="prov-chev" aria-hidden />
         </button>
       </Popover.Trigger>
-      <AnimatePresence>
-        {open && (
-          <Popover.Portal forceMount>
-            <Popover.Content asChild sideOffset={6} align="start" collisionPadding={12} forceMount>
+      {open && (
+          <Popover.Portal>
+            <Popover.Content asChild sideOffset={6} align="start" collisionPadding={12}>
               <motion.div
                 className="pop prov-pop"
                 initial={on ? { opacity: 0, y: -4, scale: 0.98 } : false}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={on ? { opacity: 0, y: -4, scale: 0.98 } : { opacity: 0, transition: { duration: 0 } }}
                 transition={{ duration: dur.fast, ease: bezier.out }}
               >
                 <div className="prov-cols">
@@ -160,8 +158,7 @@ export function ProviderPicker({
               </motion.div>
             </Popover.Content>
           </Popover.Portal>
-        )}
-      </AnimatePresence>
+      )}
     </Popover.Root>
   );
 }

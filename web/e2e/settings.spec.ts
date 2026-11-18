@@ -26,3 +26,37 @@ test("Code Mode is off by default and can be switched on", async ({ open, page }
   await toggle.click();
   await expect(toggle).toHaveAttribute("aria-checked", "false");
 });
+
+test("in the desktop app, Settings shows an available update with its notes and installs it", async ({ open, page }) => {
+  // The desktop shell's commands, as the window would have them.
+  await page.addInitScript(() => {
+    const calls: string[] = [];
+    (window as unknown as { __calls: string[] }).__calls = calls;
+    (window as unknown as { __TAURI__: unknown }).__TAURI__ = {
+      core: {
+        invoke: async (command: string) => {
+          calls.push(command);
+          if (command === "app_version") return "0.4.0";
+          if (command === "check_update") return { version: "0.5.0", current: "0.4.0", date: "2026-11-20 10:00:00 +00:00", notes: "Faster plans.\nA token ledger per agent." };
+          if (command === "install_update") return new Promise(() => undefined);
+          throw new Error(`unknown ${command}`);
+        },
+      },
+    };
+  });
+  await open("/settings");
+  const updates = page.getByTestId("updates");
+  await expect(updates).toContainText("This is Taskmaster 0.4.0");
+  await expect(updates).toContainText("Update available: 0.5.0");
+  await expect(updates).toContainText("A token ledger per agent.");
+  await updates.getByRole("button", { name: "Install and restart" }).click();
+  await expect(updates).toContainText("checking the signature");
+  const calls = await page.evaluate(() => (window as unknown as { __calls: string[] }).__calls);
+  expect(calls).toContain("install_update");
+});
+
+test("in a browser there is no Updates section", async ({ open, page }) => {
+  await open("/settings");
+  await expect(page.getByRole("heading", { name: "Mid-tier checker" })).toBeVisible();
+  await expect(page.getByTestId("updates")).toHaveCount(0);
+});

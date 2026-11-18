@@ -5,6 +5,7 @@ import { setPrefs, usePrefs } from "../prefs";
 import { ROLES, RolePicker } from "../roles";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
+import { appVersion, checkForUpdate, installUpdate, isDesktop, type AvailableUpdate } from "../desktop";
 
 const KEYS: [string, string][] = [
   ["⌘K / Ctrl-K", "Command palette: runs, pages, commands. Start with > for commands only"],
@@ -20,6 +21,75 @@ const KEYS: [string, string][] = [
 ];
 
 const slug = (title: string) => title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+function Updates() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [state, setState] = useState<"idle" | "checking" | "latest" | "available" | "installing" | "failed">("idle");
+  const [update, setUpdate] = useState<AvailableUpdate | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const check = async () => {
+    setState("checking");
+    setError(null);
+    try {
+      const found = await checkForUpdate();
+      setUpdate(found);
+      setState(found ? "available" : "latest");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setState("failed");
+    }
+  };
+  useEffect(() => {
+    void appVersion().then(setVersion);
+    void check();
+  }, []);
+  const install = async () => {
+    setState("installing");
+    try {
+      await installUpdate();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setState("failed");
+    }
+  };
+  return (
+    <Section id="updates" title="Updates" note="New versions come from the project's GitHub releases. Each installer is checked against the signing key built into this app before it is installed.">
+      <div className="update-box" data-testid="updates" aria-live="polite">
+        <div className="row gap wrap">
+          <span>
+            This is Taskmaster <span className="mono">{version ?? "…"}</span>.
+          </span>
+          {state === "checking" && (
+            <span className="muted">
+              <span className="spin" aria-hidden /> Checking
+            </span>
+          )}
+          {state === "latest" && <span className="muted">It is the newest release.</span>}
+          {state === "available" && update && <span className="strong">Update available: {update.version}</span>}
+          <span className="grow" />
+          <button className="small" onClick={() => void check()} disabled={state === "checking" || state === "installing"}>
+            Check for updates
+          </button>
+        </div>
+        {state === "available" && update && (
+          <div className="update-notes">
+            {update.date && <div className="muted small">Released {update.date.slice(0, 10)}</div>}
+            {update.notes && <pre className="update-notes-text">{update.notes}</pre>}
+            <button className="primary small" onClick={() => void install()}>
+              Install and restart
+            </button>
+          </div>
+        )}
+        {state === "installing" && (
+          <div className="muted small">
+            <span className="spin" aria-hidden /> Downloading and checking the signature; Taskmaster restarts when it is installed.
+          </div>
+        )}
+        {error && <div className="error-line small">{error}</div>}
+      </div>
+    </Section>
+  );
+}
 
 function Section({ id, title, children, note }: { id?: string; title: string; children: React.ReactNode; note?: string }) {
   return (
@@ -133,6 +203,8 @@ export function Settings() {
         ))}
       </nav>
       <div className="settings-main">
+
+      {isDesktop() && <Updates />}
 
       <Section title="Account">
         <div className="row between gap wrap">

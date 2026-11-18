@@ -202,6 +202,7 @@ async fn ask(
         timeout: AGENT_TIMEOUT,
         stall: None,
         read_only: true,
+        code_mode: false,
     };
     let (tx, mut rx) = mpsc::channel(256);
     let beat = Arc::new(AtomicU64::new(0));

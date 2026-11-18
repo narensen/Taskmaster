@@ -273,6 +273,17 @@ impl PageBrowsers {
         }
     }
 
+    /// A screenshot of `page`'s tab as the worker left it, when it opened one.
+    pub async fn snapshot(&self, page: &str) -> Option<Vec<u8>> {
+        use base64::Engine;
+        let site = self.site(page)?;
+        let session = site.tab.lock().await.as_ref().map(|(_, session)| session.clone())?;
+        let mut slot = self.browser.lock().await;
+        let browser = slot.as_mut()?;
+        let shot = browser.call("Page.captureScreenshot", json!({ "format": "jpeg", "quality": 60 }), Some(&session)).await.ok()?;
+        base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str()?).ok()
+    }
+
     /// Whether `page` has a site now.
     #[cfg(test)]
     pub fn attached(&self, page: &str) -> bool {

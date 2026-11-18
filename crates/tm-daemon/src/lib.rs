@@ -19,6 +19,8 @@ pub mod approvals;
 pub mod auth;
 mod browser;
 pub mod commons;
+mod checker;
+mod code;
 mod checks;
 mod engine;
 mod eval;
@@ -217,6 +219,10 @@ pub struct Config {
     pub skills: Option<PathBuf>,
     /// Give workers on a web page a browser on that page's own preview (needs Chrome).
     pub browser: bool,
+    /// Have the mid model check each finished page that is worth it (see `checker.rs`).
+    pub checker: bool,
+    /// Code Mode: workers get `run_code`, and Claude Code runs its own code mode.
+    pub code_mode: bool,
 }
 
 impl Config {
@@ -246,6 +252,8 @@ impl Config {
             live: None,
             skills: None,
             browser: true,
+            checker: false,
+            code_mode: false,
         }
     }
 }

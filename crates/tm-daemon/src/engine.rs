@@ -55,6 +55,20 @@ struct Bill {
     model: Option<String>,
 }
 
+/// What the checker is given about a page that just passed.
+struct CheckInput {
+    diff: String,
+    files: Vec<String>,
+    /// A screenshot of the page as the worker left it, when it had the page open.
+    shot: Option<Vec<u8>>,
+    /// What the worker said when it finished.
+    said: String,
+}
+
+/// A finished mid-tier check: the page, the answer (or why there is none), what to bill,
+/// and the scratch directory to remove.
+type CheckDone = (PageId, anyhow::Result<Answer>, Bill, PathBuf);
+
 struct Product {
     answer: Answer,
     bill: Bill,
@@ -76,6 +90,8 @@ struct AgentRequest {
     feed: Option<Feed>,
     /// The page's own preview origin, when the agent has the browser tool.
     browser: Option<String>,
+    /// Ask the harness for its native code mode where it has one (Claude Code).
+    code_mode: bool,
 }
 
 struct Feed {
@@ -189,6 +205,12 @@ struct Driver {
     small: bool,
     /// Each page's preview and tab for the browser tool. `None` without Chrome.
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
+    /// `run_code` for each page being built, when Code Mode is on and Node is here.
+    code: Option<Arc<crate::code::CodeTools>>,
+    /// Mid-tier checks running beside the build (see `checker.rs`).
+    checks: JoinSet<CheckDone>,
+    /// Pages already given to the checker: each is checked once.
+    checked: BTreeSet<PageId>,
 }
 
 impl Drop for Driver {
@@ -250,8 +272,17 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     let _server = AbortOnDrop(server);
     // Workers on a web page get a browser on that page's own preview.
     let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
+    // Code Mode: run_code, beside the browser, on the same server.
+    let code = if config.code_mode { crate::code::CodeTools::new(browsers.clone()) } else { None };
+    let mut extensions: Vec<Arc<dyn tm_dictionary::Extension>> = Vec::new();
     if let Some(browsers) = &browsers {
-        mcp.extend(browsers.clone());
+        extensions.push(browsers.clone());
+    }
+    if let Some(code) = &code {
+        extensions.push(code.clone());
+    }
+    if !extensions.is_empty() {
+        mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     }
 
     let reviewer_token = fresh_token()?;
@@ -304,6 +335,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         live,
         small: false,
         browsers,
+        code,
+        checks: JoinSet::new(),
+        checked: BTreeSet::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -676,7 +710,9 @@ impl Driver {
                 Ok(Step::Continue)
             }
             Command::RunVerify => {
-                let (ok, failing) = self.verify_project().await?;
+                let (ok, mut failing) = self.verify_project().await?;
+                let fixes = self.harvest_checks(&mut failing).await?;
+                let ok = ok && !fixes;
                 self.push_event(Event::VerifyFinished { ok, failing })?;
                 Ok(Step::Continue)
             }
@@ -782,7 +818,9 @@ impl Driver {
             self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
             if units.len() == 1 {
                 self.offer_browser(&page, &worktree, &mut request);
+                self.offer_code(&page, &worktree, &mut request);
             }
+            request.code_mode = self.config.code_mode;
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
                 feed.agent["unit"] = serde_json::json!(unit);
             }
@@ -807,8 +845,15 @@ impl Driver {
             .await
             .context("a worker disappeared")?
             .context("a worker task panicked")?;
+        let shot = match (&self.browsers, self.config.checker && !self.checked.contains(&page)) {
+            (Some(browsers), true) => browsers.snapshot(&page).await,
+            _ => None,
+        };
         if let Some(browsers) = &self.browsers {
             browsers.detach(&page);
+        }
+        if let Some(code) = &self.code {
+            code.detach(&page);
         }
         let product = match result {
             Ok(product) => product,
@@ -841,6 +886,15 @@ impl Driver {
             _ => (Tier::Worker, None),
         };
         let text = products.iter().map(|(_, p)| p.answer.text.as_str()).collect::<Vec<_>>().join("\n");
+        // What the checker needs, read before the worktrees go.
+        let review = (self.config.checker && !self.checked.contains(&page)).then(|| {
+            let diff: String = products.iter().filter_map(|(_, p)| git::worktree_diff(&p.worktree).ok()).collect::<Vec<_>>().join("\n");
+            let files: Vec<String> = products
+                .iter()
+                .flat_map(|(_, p)| git::worktree_changes(&p.worktree).unwrap_or_default().into_iter().map(|c| c.path))
+                .collect();
+            (diff, files)
+        });
         let outcome = match self.judge(&page, tier, &errors, products) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -866,9 +920,107 @@ impl Driver {
             }
             WorkerOutcome::Flagged(_) => {}
         }
+        if let (WorkerOutcome::Passed, Some((diff, files))) = (&outcome, review) {
+            self.start_check(&page, tier, wanted, CheckInput { diff, files, shot, said: text });
+        }
         self.push_event(Event::WorkerFinished { page: page.clone(), outcome })?;
         self.records.clear_merged(&self.id, &page);
         Ok(())
+    }
+
+    /// Give a page that just passed to the mid model for a second look, beside the build.
+    fn start_check(&mut self, page: &str, tier: Tier, units: usize, input: CheckInput) {
+        let CheckInput { diff, files, shot, said } = input;
+        let (diff, said) = (diff.as_str(), said.as_str());
+        let Some(why) = crate::checker::worth_checking(&files, diff.lines().count(), tier != Tier::Worker, units) else { return };
+        let Ok(plan_page) = self.page(page).cloned() else { return };
+        self.checked.insert(page.to_string());
+        let dir = std::env::temp_dir().join(format!("tm-check-{}-{page}-{}", self.id, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        if fs::create_dir_all(&dir).is_err() || fs::write(dir.join("diff.patch"), clip(diff, 40_000)).is_err() {
+            return;
+        }
+        let screenshot = shot.is_some_and(|png| fs::write(dir.join("screen.jpg"), png).is_ok());
+        let tail: String = said.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect();
+        let brief = crate::checker::brief(&crate::checker::Inputs {
+            page,
+            route: &plan_page.route,
+            brief: &plan_page.brief,
+            done: &plan_page.done,
+            said: &tail,
+            screenshot,
+        });
+        let mut request = AgentRequest {
+            harness: self.harnesses.mid.clone(),
+            brief,
+            cwd: dir.clone(),
+            model: self.config.models.mid.clone(),
+            effort: Some("low".into()),
+            dictionary: None,
+            timeout: self.config.timeout.min(Duration::from_secs(300)),
+            stall: None,
+            read_only: true,
+            feed: None,
+            browser: None,
+            code_mode: false,
+        };
+        self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
+        let bill = request.bill(Role::Checker, Some(page));
+        eprintln!("taskmaster: checking {page} with the mid model ({why})");
+        let page = page.to_string();
+        self.checks.spawn(async move {
+            let answer = ask(request).await;
+            (page, answer, bill, dir)
+        });
+    }
+
+    /// Collect finished checks, waiting at most `checker::GRACE` for the rest, and add
+    /// their fixes to the pages that verification failed or passed. True when a check
+    /// asked for a fix.
+    async fn harvest_checks(&mut self, failing: &mut BTreeMap<PageId, String>) -> anyhow::Result<bool> {
+        if self.checks.is_empty() {
+            return Ok(false);
+        }
+        let mut fixed = false;
+        let started = Instant::now();
+        let deadline = started + crate::checker::GRACE;
+        let mut lines = Vec::new();
+        while !self.checks.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(Some(joined)) = tokio::time::timeout(left, self.checks.join_next()).await else { break };
+            let Ok((page, answer, bill, dir)) = joined else { continue };
+            let _ = fs::remove_dir_all(&dir);
+            let answer = match answer {
+                Ok(answer) => answer,
+                Err(err) => {
+                    lines.push(format!("{page}: no answer ({err:#})"));
+                    continue;
+                }
+            };
+            self.charge(&bill, &answer)?;
+            match crate::checker::verdict(&answer.text) {
+                crate::checker::Verdict::Pass => lines.push(format!("{page}: pass ({:.1}s)", answer.seconds)),
+                crate::checker::Verdict::Fixes(fixes) => {
+                    lines.push(format!("{page}: {} fix{} ({:.1}s)", fixes.len(), if fixes.len() == 1 { "" } else { "es" }, answer.seconds));
+                    fixed = true;
+                    let entry = failing.entry(page).or_default();
+                    if !entry.is_empty() {
+                        entry.push('\n');
+                    }
+                    entry.push_str(&crate::checker::as_errors(&fixes));
+                }
+            }
+        }
+        let late = self.checks.len();
+        self.checks.abort_all();
+        let waited = started.elapsed().as_secs_f64();
+        let mut text = format!("checker: {}; waited {waited:.1}s after the build", lines.join(", "));
+        if late > 0 {
+            text.push_str(&format!("; {late} still running were dropped"));
+        }
+        eprintln!("taskmaster: {text}");
+        self.terminal("output", serde_json::json!({ "ok": true, "text": text }));
+        Ok(fixed)
     }
 
     fn judge(&mut self, page: &str, tier: Tier, errors: &Option<String>, products: Vec<(usize, Product)>) -> anyhow::Result<WorkerOutcome> {
@@ -1558,6 +1710,7 @@ impl Driver {
             read_only: false,
             feed: None,
             browser: None,
+            code_mode: false,
         };
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
@@ -1761,6 +1914,7 @@ impl Driver {
             read_only: false,
             feed: None,
             browser: None,
+            code_mode: false,
         })
     }
 
@@ -1781,6 +1935,17 @@ impl Driver {
              Fix what is wrong and look again. Use browser_click and browser_type to try what the page does.\n"
         ));
         request.browser = Some(origin);
+    }
+
+    /// Give the agent `run_code` over its worktree, through the gate its own tools face.
+    fn offer_code(&self, page: &str, cwd: &Path, request: &mut AgentRequest) {
+        let Some(code) = &self.code else { return };
+        code.attach(page, cwd, gate_for(request));
+        request.brief.push_str(
+            "\nYou have run_code: one call runs a short async JavaScript program with read, write, edit, grep, ls, check, sh and browser. \
+             Prefer one run_code call that does several steps (read what you need, write your files, then `return await check()`) \
+             over many single tool calls. Keep your replies short: the files are the work.\n",
+        );
     }
 
     /// A project a browser can show: one with a package.json, an HTML start page, or plan
@@ -2031,6 +2196,7 @@ impl Driver {
             read_only: true,
             feed: None,
             browser: None,
+            code_mode: false,
         })
     }
 
@@ -2605,7 +2771,8 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
     unreachable!("the last attempt always returns")
 }
 
-async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
+/// The gate an agent's tool calls (and its run_code calls) are put to.
+fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
     if request.read_only {
@@ -2618,10 +2785,14 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         gate = gate.with_readable(format!("{home}/{dir}"));
     }
     // With a policy that asks, risky calls wait for a person; otherwise the gate stands alone.
-    let gate: Arc<dyn PermissionGate> = match &request.feed {
+    match &request.feed {
         Some(feed) => Arc::new(ApprovalGate::new(gate, feed.live.clone(), feed.run.clone(), feed.agent.clone())),
         None => Arc::new(gate),
-    };
+    }
+}
+
+async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
+    let gate = gate_for(request);
     let task = WorkerTask {
         brief: request.brief.clone(),
         cwd: request.cwd.clone(),
@@ -2631,6 +2802,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         timeout: request.timeout,
         stall: request.stall,
         read_only: request.read_only,
+        code_mode: request.code_mode,
     };
     let feed = &request.feed;
     if let Some(feed) = &feed {

@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         timeout: Duration::from_secs(240),
         stall: None,
         read_only: false,
+        code_mode: false,
     };
 
     let (tx, mut rx) = mpsc::channel(64);

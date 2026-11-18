@@ -425,6 +425,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(1),
             stall: None,
             read_only: true,
+            code_mode: false,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
         task.effort = Some("low".into());
@@ -513,6 +514,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(20),
             stall: Some(std::time::Duration::from_millis(300)),
             read_only: true,
+            code_mode: false,
         };
         let (tx, _rx) = mpsc::channel(8);
         let started = std::time::Instant::now();

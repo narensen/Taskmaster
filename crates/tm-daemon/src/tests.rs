@@ -47,6 +47,8 @@ enum Mode {
     PlanBad,
     /// Page `a`'s first agent stalls waiting on its model.
     Stall,
+    /// Pages are UI files; the checker asks for one fix on page `a` and passes the rest.
+    Checked,
 }
 
 struct World {
@@ -171,6 +173,14 @@ impl World {
         if brief.contains("objected to Dictionary") {
             return self.arbitrate();
         }
+        if brief.contains("Check one page another agent has just built") {
+            assert!(task.read_only && task.cwd.join("diff.patch").is_file(), "the checker reads the diff in its own directory");
+            let first = self.reviews.fetch_add(1, Ordering::SeqCst) == 0;
+            if brief.contains("Page `a`") && first {
+                return Ok(Script::text("One thing.\n- app/a/page.tsx: the total is never shown"));
+            }
+            return Ok(Script::text("pass"));
+        }
         if brief.contains("Decide whether it is real") {
             let real = matches!(self.mode, Mode::ConfirmFinding);
             return Ok(Script::text(if real { "{\"real\": true}" } else { "{\"real\": false}" }));
@@ -275,6 +285,10 @@ impl World {
                 files: vec![("app/a/page.ts".into(), Some("export const a = 1;\n".into()))],
             }),
             Mode::Rebuild => Ok(Script::page(id, &format!("export const rebuilt = \"{id}\";\n"))),
+            Mode::Checked => Ok(Script {
+                text: "done".into(),
+                files: vec![(format!("app/{id}/page.tsx"), Some(format!("export const page = \"{id}\"; // attempt {n}\n")))],
+            }),
             _ => Ok(Script::page(id, &format!("export const page = \"{id}\";\n"))),
         }
     }
@@ -1314,6 +1328,32 @@ async fn workers_on_a_web_project_get_a_browser_on_their_own_preview() {
     let world = World::new(Mode::Write);
     run(config(&plain.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
     assert!(!world.calls.lock().unwrap().iter().any(|c| c.contains("A browser is ready")));
+}
+
+#[tokio::test]
+async fn the_checker_looks_once_at_ui_pages_and_its_fixes_become_one_repair() {
+    let tmp = seeded("checker");
+    let world = World::new(Mode::Checked);
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg.checker = true;
+    cfg.browser = false;
+    let outcome = run(cfg, &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let checks = calls.iter().filter(|c| c.contains("Check one page another agent")).count();
+    assert_eq!(checks, 2, "each page is checked once, the repair is not checked again");
+    let a_builds: Vec<&String> = calls.iter().filter(|c| c.contains("Build page `a`")).collect();
+    assert_eq!(a_builds.len(), 2, "one repair for the checker's fix");
+    assert!(a_builds[1].contains("A second model checked this page") && a_builds[1].contains("the total is never shown"));
+    assert_eq!(calls.iter().filter(|c| c.contains("Build page `b`")).count(), 1);
+    let ledger = Records::files(&tmp.0).ledger("current").unwrap();
+    assert_eq!(ledger.iter().filter(|e| e.role == tm_core::Role::Checker).count(), 2);
+
+    // Off by default: no check at all.
+    let quiet = seeded("checker-off");
+    let world = World::new(Mode::Checked);
+    run(config(&quiet.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert!(!world.calls.lock().unwrap().iter().any(|c| c.contains("Check one page")));
 }
 
 #[tokio::test]

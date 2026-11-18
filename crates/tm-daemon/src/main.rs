@@ -128,6 +128,8 @@ async fn run() -> anyhow::Result<Outcome> {
     config.models = args.models;
     let settings = Settings::load(&args.project.canonicalize().unwrap_or_else(|_| args.project.clone()))?;
     config.store = settings.store(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone()))?;
+    config.checker = settings.checker.enabled;
+    config.code_mode = settings.code_mode.enabled;
     config.remote = settings.remote();
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;

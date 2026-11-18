@@ -619,6 +619,9 @@ impl App {
         let (cancel, cancelled) = watch::channel(matches!(decision, Decision::Cancel));
         let mut config = Config::new(self.project());
         config.skills = Some(self.skills_root.clone());
+        let saved = crate::settings::Settings::load(&self.project()).unwrap_or_default();
+        config.checker = saved.checker.enabled;
+        config.code_mode = saved.code_mode.enabled;
         config.run_id = id.to_string();
         config.plan = request.plan;
         config.prompt = request.prompt;

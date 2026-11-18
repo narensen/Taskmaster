@@ -22,6 +22,8 @@ pub enum Role {
     Reviewer,
     Security,
     Verifier,
+    /// The mid-tier checker's second look at a finished page.
+    Checker,
 }
 
 impl Role {
@@ -44,6 +46,7 @@ impl Role {
             Role::Reviewer => "reviewer",
             Role::Security => "security",
             Role::Verifier => "verifier",
+            Role::Checker => "checker",
         }
     }
 }

@@ -35,6 +35,22 @@ pub struct Settings {
     pub roles: crate::Roles,
     /// The model for each role when a run does not say; none means the provider's default.
     pub models: crate::Models,
+    pub checker: CheckerSettings,
+    pub code_mode: CodeModeSettings,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CodeModeSettings {
+    /// Workers get `run_code`, and Claude Code runs its native code mode (see `code.rs`).
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CheckerSettings {
+    /// Give each finished page a second look from the mid model (see `checker.rs`).
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

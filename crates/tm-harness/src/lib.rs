@@ -104,9 +104,24 @@ pub fn kill_group(pgid: u32) {
 /// should live: dropping it kills the whole group.
 pub fn spawn_grouped(cmd: &mut tokio::process::Command) -> std::io::Result<(tokio::process::Child, GroupGuard)> {
     cmd.process_group(0).kill_on_drop(true);
+    for name in parent_session_vars() {
+        cmd.env_remove(name);
+    }
     let child = cmd.spawn()?;
     let guard = GroupGuard(child.id().unwrap_or(0));
     Ok((child, guard))
+}
+
+/// Whether an environment variable belongs to a Claude Code session this process was
+/// started from. An agent must not inherit them: they tie it to that session (a nested
+/// session keeps no transcript) and carry its messaging token.
+pub fn is_parent_session_var(name: &str) -> bool {
+    name.starts_with("CLAUDE_CODE_") || matches!(name, "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_AGENT_SDK_VERSION" | "CLAUDE_EFFORT")
+}
+
+/// The names to remove from a child's environment, from this process's own.
+pub fn parent_session_vars() -> Vec<String> {
+    std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).filter(|k| is_parent_session_var(k)).collect()
 }
 
 /// Every harness Taskmaster can drive, by the name used on the command line.
@@ -163,6 +178,8 @@ pub struct WorkerTask {
     pub stall: Option<Duration>,
     /// Reviewers and verifiers: the worktree is mounted read-only and edit tools are removed.
     pub read_only: bool,
+    /// Use the harness's native code mode where it has one (Claude Code, interactive).
+    pub code_mode: bool,
 }
 
 impl WorkerTask {

@@ -874,6 +874,10 @@ pub struct SettingsBody {
     roles: Option<crate::Roles>,
     /// Model per role; `null` is the provider's default.
     models: Option<crate::Models>,
+    /// The mid-tier checker on or off.
+    checker: Option<bool>,
+    /// Code Mode on or off.
+    code_mode: Option<bool>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -918,6 +922,12 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         save("roles", json!(saved.roles))
             .and_then(|()| save("models", json!(saved.models)))
             .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(on) = body.code_mode {
+        save_setting(&app.project(), "code_mode", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(on) = body.checker {
+        save_setting(&app.project(), "checker", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if !changes.is_empty() {
         save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -982,6 +992,8 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "store": if app.store.is_some() { "sqlite" } else { "files" },
         "roles": role_defaults.roles,
         "models": role_defaults.models,
+        "checker": { "enabled": role_defaults.checker.enabled },
+        "code_mode": { "enabled": role_defaults.code_mode.enabled },
         "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "version": env!("CARGO_PKG_VERSION"),

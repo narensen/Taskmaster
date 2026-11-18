@@ -94,6 +94,9 @@ where
 {
     let (master, slave) = open(rows, cols)?;
     let mut cmd = tokio::process::Command::new(program);
+    for name in crate::parent_session_vars() {
+        cmd.env_remove(name);
+    }
     cmd.args(args)
         .current_dir(cwd)
         .envs(env)

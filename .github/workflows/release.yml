@@ -1,5 +1,18 @@
 name: release
 
+# A v* tag builds and publishes:
+#   - the Linux tarball for servers and headless use (tm-daemon, tm-review, tm-commons, the app);
+#   - the desktop app, signed, for macOS (.dmg, Apple silicon and Intel), Linux (.AppImage,
+#     .deb) and Windows (.msi, .exe), with the updater manifest latest.json;
+#   - SHA256SUMS.txt for every file in the release.
+#
+# Secrets (Settings > Secrets and variables > Actions). See docs/RELEASING.md.
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD  updater signatures (required)
+#   TAURI_UPDATER_PUBKEY                                           the matching public key (required)
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID                         macOS signing and notarizing (optional)
+#   WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD               Windows code signing (optional)
+
 on:
   push:
     tags: ["v*"]
@@ -8,7 +21,17 @@ permissions:
   contents: write
 
 jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "Taskmaster ${GITHUB_REF_NAME#v}" --generate-notes
+
   linux:
+    needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,4 +54,112 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" taskmaster-*.tar.gz taskmaster-*.sha256 --generate-notes
+        run: gh release upload "$GITHUB_REF_NAME" taskmaster-*.tar.gz taskmaster-*.sha256 --clobber
+
+  desktop:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          # tm-daemon uses POSIX process groups, PTYs and /proc, so it does not build for
+          # Windows yet. The job runs so the gap is visible, and does not fail the release.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            experimental: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    env:
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal --target ${{ matrix.target }} && rustup default 1.93.1
+        shell: bash
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Linux webview libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Build the app
+        run: cd web && npm ci && npm run build
+        shell: bash
+      - name: Build tm-daemon as the sidecar
+        shell: bash
+        run: |
+          cargo build --release --locked -p tm-daemon --target ${{ matrix.target }}
+          ext=""; [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          cp "target/${{ matrix.target }}/release/tm-daemon$ext" "desktop/src-tauri/binaries/tm-daemon-${{ matrix.target }}$ext"
+      - name: Icons from assets/icon.png
+        run: npx --yes @tauri-apps/cli@2 icon assets/icon.png -o desktop/src-tauri/icons
+        shell: bash
+      - name: Version and updater key
+        shell: bash
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = "desktop/src-tauri/tauri.conf.json";
+            const conf = JSON.parse(fs.readFileSync(file, "utf8"));
+            conf.version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (!process.env.TAURI_UPDATER_PUBKEY) { console.error("TAURI_UPDATER_PUBKEY is not set"); process.exit(1); }
+            conf.plugins.updater.pubkey = process.env.TAURI_UPDATER_PUBKEY;
+            fs.writeFileSync(file, JSON.stringify(conf, null, 2));
+          '
+      - name: Windows signing certificate
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          [IO.File]::WriteAllBytes("cert.pfx", $bytes)
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath cert.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item cert.pfx
+          $conf = Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = "sha256"; timestampUrl = "http://timestamp.digicert.com" } -Force
+          $conf | ConvertTo-Json -Depth 20 | Set-Content desktop/src-tauri/tauri.conf.json
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: desktop/src-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: Taskmaster ${{ github.ref_name }}
+          releaseDraft: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --target ${{ matrix.target }}
+
+  checksums:
+    needs: [linux, desktop]
+    if: always() && needs.linux.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: SHA256SUMS.txt for every file in the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir files && cd files
+          gh release download "$GITHUB_REF_NAME" --repo "$REPO" --pattern '*'
+          rm -f SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS.txt --repo "$REPO" --clobber

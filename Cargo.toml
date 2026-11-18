@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# The desktop shell needs the system webview to build; CI builds it on its own.
+exclude = ["desktop"]
 
 [workspace.package]
 edition = "2024"

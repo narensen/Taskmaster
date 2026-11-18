@@ -49,3 +49,40 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci
+      # The runner's own Chrome; Playwright downloads no browser.
+      - run: cd web && TASKMASTER_CHROME=$(command -v google-chrome) npm run e2e
+
+  desktop:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Icons and a stand-in sidecar
+        run: |
+          npx --yes @tauri-apps/cli@2 icon assets/icon.png -o desktop/src-tauri/icons
+          touch "desktop/src-tauri/binaries/tm-daemon-$(rustc -vV | sed -n 's/host: //p')"
+          mkdir -p web/dist && echo '<!doctype html>' > web/dist/index.html
+      - run: cd desktop/src-tauri && cargo check --locked

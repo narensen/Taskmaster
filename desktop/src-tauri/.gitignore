@@ -1,0 +1,4 @@
+binaries/tm-daemon-*
+icons/
+gen/
+target/

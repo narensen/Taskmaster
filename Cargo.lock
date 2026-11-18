@@ -1904,6 +1904,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-launcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "tm-review"
 version = "0.1.0"
 dependencies = [

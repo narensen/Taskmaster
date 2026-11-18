@@ -99,9 +99,10 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
             title="Live preview"
             src={view.url}
             data-testid="live-preview-frame"
-            initial={motionOn() ? { opacity: 0, height: 0 } : false}
-            animate={{ opacity: 1, height: 320 }}
-            exit={motionOn() ? { opacity: 0, height: 0 } : { opacity: 0, transition: { duration: 0 } }}
+            style={{ height: 320, transformOrigin: "top center" }}
+            initial={motionOn() ? { opacity: 0, scaleY: 0.96 } : false}
+            animate={{ opacity: 1, scaleY: 1 }}
+            exit={motionOn() ? { opacity: 0, scaleY: 0.98 } : { opacity: 0, transition: { duration: 0 } }}
             transition={{ duration: motionOn() ? 0.18 : 0, ease: bezier.out }}
           />
         )}

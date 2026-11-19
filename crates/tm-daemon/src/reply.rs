@@ -3,20 +3,58 @@
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, Plan};
+use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, Plan, ProjectKind};
 
 #[derive(Deserialize)]
 struct RawPlan {
     #[serde(default)]
-    contracts: Vec<ContractFile>,
+    kind: Option<String>,
     #[serde(default)]
+    contracts: Vec<ContractFile>,
+    /// Planners now write `units`; `pages` is still read.
+    #[serde(default, alias = "units")]
     pages: Vec<PagePlan>,
     #[serde(default)]
     estimate: Option<Estimate>,
     #[serde(default)]
-    dictionary: Vec<DraftEntry>,
+    dictionary: Vec<RawEntry>,
     #[serde(default)]
     design: Value,
+}
+
+/// A dictionary item as a planner wrote it. An unknown `kind` is read as a hint rather than
+/// throwing the whole plan away.
+#[derive(Deserialize)]
+struct RawEntry {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    kind: Value,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    stack: String,
+}
+
+impl RawEntry {
+    fn entry(self) -> DraftEntry {
+        let kind = serde_json::from_value::<EntryKind>(self.kind).unwrap_or(EntryKind::Hint);
+        DraftEntry { key: self.key, kind, summary: self.summary, content: self.content, stack: self.stack }
+    }
+}
+
+/// The kind a plan names, or, when it names none, the one its units imply: routes, a design
+/// or web files mean web; anything else is a library.
+fn plan_kind(named: Option<&str>, pages: &[PagePlan], contracts: &[ContractFile], design: &str) -> ProjectKind {
+    if let Some(kind) = named.and_then(ProjectKind::parse) {
+        return kind;
+    }
+    const WEB: [&str; 7] = [".html", ".css", ".tsx", ".jsx", ".vue", ".svelte", "app/"];
+    let routed = pages.iter().any(|p| p.route.trim().starts_with('/'));
+    let web_files = contracts.iter().map(|c| c.path.as_str()).chain(pages.iter().map(|p| p.owned_glob.as_str())).any(|t| WEB.iter().any(|w| t.contains(w)));
+    if routed || !design.trim().is_empty() || web_files { ProjectKind::Web } else { ProjectKind::Library }
 }
 
 /// The planner's design spec as text. Models write it as a string or as an object of
@@ -118,7 +156,9 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     let raw: RawPlan = serde_json::from_value(value).context("the plan reply was not a plan")?;
     let estimate = raw.estimate.unwrap_or(Estimate { tokens: 0, usd: 0.0 });
     let design = design_text(&raw.design);
-    Ok((Plan { contracts: raw.contracts, pages: raw.pages, estimate, design }, raw.dictionary))
+    let kind = plan_kind(raw.kind.as_deref(), &raw.pages, &raw.contracts, &design);
+    let dictionary = raw.dictionary.into_iter().map(RawEntry::entry).collect();
+    Ok((Plan { kind, contracts: raw.contracts, pages: raw.pages, estimate, design }, dictionary))
 }
 
 pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {
@@ -380,7 +420,24 @@ mod tests {
         assert_eq!(dictionary[0].key, "greet");
         assert_eq!(dictionary[0].stack, "");
         assert!(parse_plan("no json here").is_err());
-        assert!(parse_plan("{\"dictionary\":[{\"key\":\"greet\",\"kind\":\"nope\",\"summary\":\"x\",\"content\":\"y\"}]}").is_err());
+        // An unknown entry kind is read as a hint, not a reason to lose the plan.
+        let (_, entries) = parse_plan("{\"dictionary\":[{\"key\":\"greet\",\"kind\":\"nope\",\"summary\":\"x\",\"content\":\"y\"}]}").unwrap();
+        assert_eq!(entries[0].kind, EntryKind::Hint);
+    }
+
+    #[test]
+    fn reads_a_plan_of_modules_with_no_routes() {
+        let text = "{\"kind\":\"server\",\"units\":[{\"id\":\"protocol\",\"owned_glob\":\"toyredis/protocol.py\",\"brief\":\"RESP parser.\"},\
+                    {\"id\":\"tests\",\"owned_glob\":\"tests/**\",\"brief\":\"Tests.\",\"parts\":[]}]}";
+        let (plan, _) = parse_plan(text).unwrap();
+        assert_eq!(plan.kind, ProjectKind::Server);
+        assert_eq!(plan.pages.len(), 2);
+        assert!(plan.pages.iter().all(|p| p.route.is_empty() && p.cites.is_empty()));
+        assert!(!plan.has_ui());
+        // No kind named: routes mean web, plain modules mean a library.
+        assert_eq!(parse_plan("{\"pages\":[{\"id\":\"a\",\"route\":\"/a\",\"owned_glob\":\"app/a/**\",\"brief\":\"x\"}]}").unwrap().0.kind, ProjectKind::Web);
+        assert_eq!(parse_plan("{\"units\":[{\"id\":\"db\",\"owned_glob\":\"tinydb/**\",\"brief\":\"x\"}]}").unwrap().0.kind, ProjectKind::Library);
+        assert_eq!(parse_plan("{\"kind\":\"api\",\"units\":[]}").unwrap().0.kind, ProjectKind::Server);
     }
 
     #[test]

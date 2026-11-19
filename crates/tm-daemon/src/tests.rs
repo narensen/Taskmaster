@@ -349,12 +349,14 @@ fn plan_json(cite: &str, entry: &str) -> String {
 
 fn plan(pages: &[(&str, &[&str])]) -> Plan {
     Plan {
+        kind: Default::default(),
         contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into() }],
         pages: pages
             .iter()
             .map(|(id, cites)| PagePlan {
                 id: (*id).into(),
                 route: format!("/{id}"),
+                ui: None,
                 owned_glob: format!("app/{id}/**"),
                 cites: cites.iter().map(|c| (*c).to_string()).collect(),
                 brief: format!("Implement {id}."),
@@ -903,7 +905,7 @@ async fn a_prompt_that_never_plans_fails() {
     let tmp = repo("plan-bad");
     let world = World::new(Mode::PlanBad);
     let err = run(prompt_config(&tmp.0, "Build page a.", true), &world).await.unwrap_err();
-    assert!(err.to_string().contains("no pages"), "{err}");
+    assert!(err.to_string().contains("no units"), "{err}");
     assert_eq!(world.plans.load(Ordering::SeqCst), 2);
     assert!(!tmp.0.join("contracts/types.ts").exists());
 }
@@ -2034,7 +2036,7 @@ mod http {
         let (_, made) = client.post("/api/runs", json!({ "id": "bad", "prompt": "Build page a." })).await;
         assert_eq!(made["id"], "bad");
         let run = client.settled("bad", "planning").await;
-        assert!(run["error"].as_str().unwrap().contains("no pages"), "{run}");
+        assert!(run["error"].as_str().unwrap().contains("no units"), "{run}");
         let (_, listed) = client.get("/api/runs").await;
         assert_eq!(listed["runs"][0]["id"], "bad");
     }

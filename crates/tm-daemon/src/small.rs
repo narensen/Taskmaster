@@ -21,7 +21,8 @@ pub const SMALL_EFFORT: &str = "low";
 
 /// What the planner must say about the look and the accessibility of anything shown in a
 /// browser. Workers run at low effort: the precision has to come from the plan.
-pub const DESIGN_RULE: &str = "`design` is the one design system every agent follows, written for a finished, polished product, \
+pub const DESIGN_RULE: &str = "For a `web` plan, or one with a `\"ui\": true` unit, only: \
+`design` is the one design system every agent follows, written for a finished, polished product, \
 in short lines: palette (hex for background, surface, border, text, muted text, accent, danger; text contrast at least 4.5:1); \
 type scale (font stack, base 16px, h1, h2 and small sizes); spacing scale (for example 4/8/12/16/24/32px); radius and shadow; \
 form controls (inputs and buttons inherit the font and are at least 44px tall; checkboxes and radios 18-20px with `accent-color`, \
@@ -56,16 +57,41 @@ checks catch what they miss. A plan written now beats a perfect plan that is nev
 pub fn units_rule(slots: usize) -> String {
     let most = slots.min(4);
     if most < 2 {
-        return "Do not give pages `units`: this run builds with one worker at a time.\n".into();
+        return "Do not split units into `parts`: this run builds with one worker at a time.\n".into();
     }
     let range = if most == 2 { "2".to_string() } else { format!("2-{most}") };
     format!(
-        "Optionally give a page `units`: {range} work units (never more than {most}, the parallel workers this run has), \
-         each {{\"id\",\"owned_glob\",\"brief\",\"done\"}}, one agent per unit, built in parallel. Split by file or concern (for example markup+styles, \
-         scripts, docs) only when the units' files are independent given the contracts; unit globs must be disjoint and \
-         inside the page glob (braces list files: `{{app/index.html,app/styles.css}}`); the page owned_glob must cover them \
-         all. Omit `units` when splitting is unsafe.\n"
+        "Optionally split a unit into `parts`: {range} work units (never more than {most}, the parallel workers this run has), \
+         each {{\"id\",\"owned_glob\",\"brief\",\"done\"}}, one agent per part, built in parallel. Split by file or concern (for example markup+styles, \
+         scripts, docs, or one module and its tests) only when the parts' files are independent given the contracts; part globs must be disjoint and \
+         inside the unit glob (braces list files: `{{app/index.html,app/styles.css}}`); the unit owned_glob must cover them \
+         all. Omit `parts` when splitting is unsafe.\n"
     )
+}
+
+/// One example plan per kind, so a library or a server is never squeezed into the shape of
+/// a website. Kept short: they show the shape, not a product.
+pub const PLAN_EXAMPLES: &str = concat!(
+    "One example per `kind`:\n",
+    "- web: {\"kind\":\"web\",\"design\":\"...\",\"contracts\":[{\"path\":\"app/types.ts\",\"content\":\"export type Item = { id: string; title: string };\"}],",
+    "\"units\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\",\"done\":\"...\",\"skills\":[]}],",
+    "\"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[{\"key\":\"theme\",\"kind\":\"hint\",\"summary\":\"...\",\"content\":\"...\",\"stack\":\"next\"}]}\n",
+    "- library: {\"kind\":\"library\",\"contracts\":[{\"path\":\"tinydb/contract.py\",\"content\":\"class Table:\\n    def insert(self, doc: dict) -> int: ...\\n\"}],",
+    "\"units\":[{\"id\":\"table\",\"owned_glob\":\"{tinydb/table.py,tests/test_table.py}\",\"brief\":\"...\",\"done\":\"... and `python -m pytest tests/test_table.py` passes\"}],",
+    "\"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n",
+    "- cli: {\"kind\":\"cli\",\"contracts\":[],\"units\":[{\"id\":\"cli\",\"owned_glob\":\"{src/**,tests/**}\",\"brief\":\"...\",\"done\":\"... and the tests pass\"}],\"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n",
+    "- server: {\"kind\":\"server\",\"contracts\":[{\"path\":\"toyredis/contract.py\",\"content\":\"def encode(value) -> bytes: ...\\ndef decode(data: bytes) -> tuple: ...\\n\"}],",
+    "\"units\":[{\"id\":\"protocol\",\"owned_glob\":\"{toyredis/protocol.py,tests/test_protocol.py}\",\"brief\":\"...\",\"done\":\"...\"},",
+    "{\"id\":\"server\",\"owned_glob\":\"{toyredis/server.py,tests/test_server.py}\",\"brief\":\"...\",\"done\":\"...\"}],\"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n",
+    "- migration: {\"kind\":\"migration\",\"contracts\":[],\"units\":[{\"id\":\"upgrade\",\"owned_glob\":\"**\",\"brief\":\"...\",\"done\":\"... and the existing tests pass\"}],\"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n",
+    "Only a `web` unit (or one with `\"ui\": true`) has a `route`, and only such a plan has a `design`. ",
+    "A unit owns its own tests and its `done` names the command that runs them. ",
+    "A Python contract sits inside the package the tests import (for example `tinydb/contract.py`), never loose at the project root.\n",
+);
+
+/// What the plan reply looks like and what it is checked against, for both planning briefs.
+pub fn plan_shape() -> String {
+    format!("{PLAN_EXAMPLES}{}", tm_core::rules_text())
 }
 
 pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usize) -> String {
@@ -86,22 +112,20 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
     }
     brief.push_str(template);
     brief.push_str(
-        "\nReply with one JSON object only and do not edit files. Use as few pages as possible (one if it fits). \
-         `contracts` are shared source files, only for interfaces used by more than one file or worker; otherwise `[]`. \
-         Each page or unit is one agent: `brief` is its whole task in a few lines, `done` one line saying when it is finished. \
-         Keep contracts short. Leave `estimate` at zero.\n\
-         {\"design\":\"...\",\"contracts\":[],\"pages\":[{\"id\":\"home\",\"route\":\"/\",\"owned_glob\":\"**\",\"cites\":[],\"brief\":\"...\",\"done\":\"...\",\"skills\":[]}],\
-         \"estimate\":{\"tokens\":0,\"usd\":0},\"dictionary\":[]}\n\
-         Rules: at least one page; ids use letters, digits, `_` and `-`; globs and contract paths are relative, no `..`; \
-         cited keys are listed above or in `dictionary`; briefs are non-empty.\n",
+        "\nReply with one JSON object only and do not edit files. Use as few units as possible (one if it fits). \
+         `kind` is web, library, cli, server or migration. \
+         `contracts` are shared interface files, only for interfaces used by more than one file or worker; otherwise `[]`. \
+         Each unit (or part) is one agent: `brief` is its whole task in a few lines, `done` one line saying when it is finished. \
+         Keep contracts short. Leave `estimate` at zero.\n",
     );
+    brief.push_str(&plan_shape());
     brief.push_str(DESIGN_RULE);
     brief.push_str(DECIDE_RULE);
     brief.push_str(&units_rule(slots));
     if slots >= 2 {
         brief.push_str(
-            "Parallel units finish sooner: when a page has separate markup and styles, scripts, and docs, split it into units \
-             and pin every id, file name and interface they share in a contract, a cited entry or each unit's brief.\n",
+            "Parallel parts finish sooner: when a unit has separate markup and styles, scripts, docs, or modules and their tests, split it into parts \
+             and pin every id, file name and interface they share in a contract, a cited entry or each part's brief.\n",
         );
     }
     brief
@@ -127,8 +151,9 @@ mod tests {
         assert!(brief.contains("Dictionary is empty"));
         assert!(brief.contains("Do not call any tools"));
         assert!(!brief.contains("Search the Dictionary"));
-        // The design system and the decide rule are most of it; keep it near a thousand tokens.
-        assert!(brief.len() < 3800, "{}", brief.len());
+        // The examples, the rules and the design system are most of it; keep it under two thousand tokens.
+        assert!(brief.len() < 8000, "{}", brief.len());
+        assert!(brief.contains("\"kind\":\"library\"") && brief.contains(tm_core::Rule::ContractNotOwned.text()));
         assert!(brief.contains("`design`") && brief.contains("viewport"));
         let listed = small_brief("tiny todo", &["- `todo-dom` (commons, component_api): ids\nul#todo-list\n".into()], "", 3);
         assert!(!listed.contains("Dictionary is empty"));
@@ -141,7 +166,7 @@ mod tests {
         assert!(units_rule(3).contains("2-3 work units"));
         assert!(units_rule(8).contains("2-4 work units"));
         assert!(units_rule(2).contains(": 2 work units"));
-        assert!(units_rule(1).contains("Do not give pages `units`"));
-        assert!(!small_brief("tiny todo", &[], "", 1).contains("Parallel units finish sooner"));
+        assert!(units_rule(1).contains("Do not split units into `parts`"));
+        assert!(!small_brief("tiny todo", &[], "", 1).contains("Parallel parts finish sooner"));
     }
 }

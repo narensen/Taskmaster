@@ -460,6 +460,7 @@ mod tests {
         let page = |id: &str, glob: &str| PagePlan {
             id: id.into(),
             route: format!("/{id}"),
+            ui: None,
             owned_glob: glob.into(),
             cites: vec![],
             brief: String::new(),
@@ -468,6 +469,7 @@ mod tests {
             skills: vec![],
         };
         Owners::from_plan(&Plan {
+            kind: Default::default(),
             contracts: vec![],
             pages: vec![page("book", "app/books/**"), page("cart", "app/cart/**")],
             estimate: Estimate { tokens: 0, usd: 0.0 },

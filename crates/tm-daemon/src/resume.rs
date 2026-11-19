@@ -194,12 +194,14 @@ mod tests {
 
     fn plan(pages: &[(&str, &[&str])]) -> Plan {
         Plan {
+            kind: Default::default(),
             contracts: vec![],
             pages: pages
                 .iter()
                 .map(|(id, cites)| PagePlan {
                     id: (*id).into(),
                     route: format!("/{id}"),
+                    ui: None,
                     owned_glob: format!("app/{id}/**"),
                     cites: cites.iter().map(|c| (*c).to_string()).collect(),
                     brief: String::new(),

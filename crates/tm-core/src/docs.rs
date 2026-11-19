@@ -153,6 +153,7 @@ mod tests {
         let page = |id: &str, cites: &[&str]| PagePlan {
             id: id.into(),
             route: format!("/{id}"),
+            ui: None,
             owned_glob: format!("app/{id}/**"),
             cites: cites.iter().map(|c| c.to_string()).collect(),
             brief: String::new(),
@@ -161,6 +162,7 @@ mod tests {
             skills: vec![],
         };
         Plan {
+            kind: Default::default(),
             contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new() }],
             pages: vec![page("dashboard", &["auth", "nav"]), page("settings", &["auth"])],
             estimate: Estimate { tokens: 0, usd: 0.0 },

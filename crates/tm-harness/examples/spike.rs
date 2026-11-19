@@ -60,6 +60,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 HarnessEvent::Text { text } => said.push_str(&text),
                 HarnessEvent::Thought { .. } => {}
+                HarnessEvent::ToolResult { id, text, diff } => {
+                    let text: String = text.chars().take(120).collect();
+                    println!("result {id} {text}");
+                    if let Some(diff) = diff {
+                        let diff: String = diff.chars().take(120).collect();
+                        println!("diff   {diff}");
+                    }
+                }
             }
         }
         let said: String = said.trim().chars().take(600).collect();

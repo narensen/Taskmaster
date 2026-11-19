@@ -229,7 +229,23 @@ pub enum HarnessEvent {
     Text { text: String },
     Thought { text: String },
     ToolCall { id: String, name: String, input: Value },
+    /// Output a harness attached to a tool call. `diff` is set only when the harness sent one.
+    /// An empty `text` with a `diff` is still a result. This is never a substitute for a thought.
+    ToolResult { id: String, text: String, diff: Option<String> },
     PermissionDecided { tool: String, allowed: bool },
+}
+
+/// Keep a tool result small enough for the transcript. The cut is marked, and nothing is added.
+pub(crate) fn clip_result(text: &str) -> String {
+    const MAX: usize = 16_000;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let mut end = MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

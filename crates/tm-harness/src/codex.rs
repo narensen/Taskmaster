@@ -76,7 +76,7 @@ impl Harness for Codex {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
                 match msg["type"].as_str() {
                     Some("item.completed") => {
-                        if let Some(event) = item_event(&msg["item"]) {
+                        for event in item_events(&msg["item"]) {
                             let _ = events.send(event).await;
                         }
                     }
@@ -103,25 +103,72 @@ fn error_message(error: &Value) -> String {
     error["message"].as_str().unwrap_or("unknown error").to_string()
 }
 
-fn item_event(item: &Value) -> Option<HarnessEvent> {
+fn item_events(item: &Value) -> Vec<HarnessEvent> {
     let text = || item["text"].as_str().unwrap_or_default().to_string();
     let id = item["id"].as_str().unwrap_or_default().to_string();
-    match item["type"].as_str()? {
-        "agent_message" => Some(HarnessEvent::Text { text: text() }),
-        "reasoning" => Some(HarnessEvent::Thought { text: text() }),
-        "command_execution" => {
-            Some(HarnessEvent::ToolCall { id, name: "shell".into(), input: item["command"].clone() })
-        }
-        "file_change" => {
-            Some(HarnessEvent::ToolCall { id, name: "edit".into(), input: item["changes"].clone() })
-        }
-        "mcp_tool_call" => {
+    match item["type"].as_str() {
+        Some("agent_message") => vec![HarnessEvent::Text { text: text() }],
+        Some("reasoning") => vec![HarnessEvent::Thought { text: text() }],
+        Some("command_execution") => with_result(
+            HarnessEvent::ToolCall { id: id.clone(), name: "shell".into(), input: item["command"].clone() },
+            &id,
+            item,
+        ),
+        Some("file_change") => with_result(
+            HarnessEvent::ToolCall { id: id.clone(), name: "edit".into(), input: item["changes"].clone() },
+            &id,
+            item,
+        ),
+        Some("mcp_tool_call") => {
             let server = item["server"].as_str().unwrap_or_default();
             let tool = item["tool"].as_str().unwrap_or_default();
-            Some(HarnessEvent::ToolCall { id, name: format!("{server}__{tool}"), input: item["arguments"].clone() })
+            with_result(
+                HarnessEvent::ToolCall { id: id.clone(), name: format!("{server}__{tool}"), input: item["arguments"].clone() },
+                &id,
+                item,
+            )
         }
-        _ => None,
+        _ => Vec::new(),
     }
+}
+
+/// The call, then its output when Codex recorded `aggregated_output`, `output`, `result`, or a diff.
+fn with_result(call: HarnessEvent, id: &str, item: &Value) -> Vec<HarnessEvent> {
+    let mut events = vec![call];
+    if let Some(result) = codex_result(id, item) {
+        events.push(result);
+    }
+    events
+}
+
+fn codex_result(id: &str, item: &Value) -> Option<HarnessEvent> {
+    let mut text = String::new();
+    for key in ["aggregated_output", "output", "result"] {
+        if let Some(value) = item.get(key) {
+            if let Some(line) = value.as_str() {
+                if !line.is_empty() {
+                    text = line.to_string();
+                    break;
+                }
+            } else if value.is_object() || value.is_array() {
+                text = value.to_string();
+                break;
+            }
+        }
+    }
+    let diff = item["diff"].as_str().filter(|d| !d.is_empty()).map(str::to_string).or_else(|| {
+        let parts: Vec<&str> = item["changes"]
+            .as_array()?
+            .iter()
+            .filter_map(|change| change["diff"].as_str())
+            .filter(|diff| !diff.is_empty())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    });
+    if text.is_empty() && diff.is_none() {
+        return None;
+    }
+    Some(HarnessEvent::ToolResult { id: id.to_string(), text: crate::clip_result(&text), diff: diff.map(|d| crate::clip_result(&d)) })
 }
 
 /// Codex counts cached tokens inside `input_tokens`.
@@ -144,11 +191,25 @@ mod tests {
     #[test]
     fn maps_items_to_events() {
         let message = json!({ "id": "item_1", "type": "agent_message", "text": "done" });
-        assert_eq!(item_event(&message), Some(HarnessEvent::Text { text: "done".into() }));
+        assert_eq!(item_events(&message), vec![HarnessEvent::Text { text: "done".into() }]);
         let call = json!({ "id": "item_2", "type": "mcp_tool_call", "server": "dict", "tool": "cite",
                            "arguments": { "key": "k" } });
-        assert!(matches!(item_event(&call), Some(HarnessEvent::ToolCall { ref name, .. }) if name == "dict__cite"));
-        assert_eq!(item_event(&json!({ "type": "todo_list" })), None);
+        assert!(matches!(&item_events(&call)[..], [HarnessEvent::ToolCall { name, .. }] if name == "dict__cite"));
+        assert!(item_events(&json!({ "type": "todo_list" })).is_empty());
+        let shell = json!({
+            "id": "item_3", "type": "command_execution", "command": "ls",
+            "aggregated_output": "Cargo.toml\n", "exit_code": 0
+        });
+        let events = item_events(&shell);
+        assert!(matches!(&events[0], HarnessEvent::ToolCall { name, .. } if name == "shell"));
+        assert!(matches!(&events[1], HarnessEvent::ToolResult { text, diff: None, .. } if text == "Cargo.toml\n"));
+        let edit = json!({
+            "id": "item_4", "type": "file_change",
+            "changes": [{ "path": "a.ts", "diff": "--- a/a.ts\n+++ b/a.ts\n+x\n" }]
+        });
+        let events = item_events(&edit);
+        assert!(matches!(&events[1], HarnessEvent::ToolResult { diff: Some(diff), text, .. } if text.is_empty() && diff.contains("+x")));
+        assert!(!events.iter().any(|event| matches!(event, HarnessEvent::Thought { .. })));
     }
 
     #[test]

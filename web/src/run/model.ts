@@ -18,12 +18,16 @@ import { checksFailed, pageDone } from "../notify";
 
 export interface ToolItem {
   t: "tool";
+  /** The harness's id for this call, when it sent one. */
+  id?: string;
   name: string;
   target: string | null;
   allowed?: boolean;
   input?: unknown;
   /** Text the harness printed for this call, when it sent any. */
   output?: string;
+  /** A diff the harness attached. Absent when it sent none. */
+  diff?: string;
   at: string;
 }
 /** A lifecycle line: the agent stalled and was replaced, or was released when done. */
@@ -63,6 +67,13 @@ export interface TokenSplit {
   output: number;
   cache_read: number;
   cache_write: number;
+}
+
+/** A later chunk replaces a result it already contains. Otherwise the new text follows. */
+function mergeChunk(prev: string | undefined, next: string): string {
+  if (!prev) return next;
+  if (next.startsWith(prev) || prev.endsWith(next)) return next.startsWith(prev) ? next : prev;
+  return prev + next;
 }
 
 export function surfaceOf(entry: LedgerEntry): string {
@@ -132,15 +143,20 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
         else call.items.push({ t: "thought", text: e.text ?? "", at: e.at });
         break;
       case "tool_call":
-        call.items.push({ t: "tool", name: e.name ?? "tool", target: e.target ?? null, input: e.input, at: e.at });
+        call.items.push({ t: "tool", id: e.id, name: e.name ?? "tool", target: e.target ?? null, input: e.input, at: e.at });
         break;
       case "command":
         call.items.push({ t: "tool", name: "command", target: e.command ?? null, at: e.at });
         break;
       case "output": {
-        const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.output === undefined);
-        if (open) open.output = e.text ?? "";
-        else if (e.text) call.items.push({ t: "text", text: e.text, at: e.at });
+        const byId = e.id
+          ? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.id === e.id)
+          : undefined;
+        const open = byId ?? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.output === undefined && i.diff === undefined);
+        if (open) {
+          if (e.text) open.output = mergeChunk(open.output, e.text);
+          if (e.diff) open.diff = mergeChunk(open.diff, e.diff);
+        } else if (e.text) call.items.push({ t: "text", text: e.text, at: e.at });
         break;
       }
       case "preview":

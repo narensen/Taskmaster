@@ -252,7 +252,7 @@ impl Session {
         match msg["method"].as_str() {
             Some("session/update") => {
                 track_tool(&mut self.tools, &params["update"]);
-                if let Some(event) = update_event(&params["update"]) {
+                for event in update_events(&params["update"]) {
                     let _ = self.events.send(event).await;
                 }
             }
@@ -324,18 +324,153 @@ fn track_tool(tools: &mut BTreeSet<String>, update: &Value) {
     }
 }
 
-fn update_event(update: &Value) -> Option<HarnessEvent> {
+fn update_events(update: &Value) -> Vec<HarnessEvent> {
     let text = || update["content"]["text"].as_str().unwrap_or_default().to_string();
-    match update["sessionUpdate"].as_str()? {
-        "agent_message_chunk" => Some(HarnessEvent::Text { text: text() }),
-        "agent_thought_chunk" => Some(HarnessEvent::Thought { text: text() }),
-        "tool_call" => Some(HarnessEvent::ToolCall {
-            id: update["toolCallId"].as_str().unwrap_or_default().to_string(),
-            name: tool_name(update),
-            input: update["rawInput"].clone(),
-        }),
-        _ => None,
+    match update["sessionUpdate"].as_str() {
+        Some("agent_message_chunk") => vec![HarnessEvent::Text { text: text() }],
+        Some("agent_thought_chunk") => vec![HarnessEvent::Thought { text: text() }],
+        Some("tool_call") => {
+            let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
+            let mut events = vec![HarnessEvent::ToolCall {
+                id: id.clone(),
+                name: tool_name(update),
+                input: update["rawInput"].clone(),
+            }];
+            if let Some(result) = tool_result(&id, update) {
+                events.push(result);
+            }
+            events
+        }
+        // A later update carries the call's output. Status alone is not a result.
+        Some("tool_call_update") => {
+            let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
+            tool_result(&id, update).into_iter().collect()
+        }
+        _ => Vec::new(),
     }
+}
+
+/// Text and a diff from an ACP tool call, only from fields the agent sent.
+/// `content` is a list of `{ type: "content", content: { type: "text", text } }`
+/// or `{ type: "diff", path, oldText?, newText }`. `rawOutput` is the fallback.
+fn tool_result(id: &str, update: &Value) -> Option<HarnessEvent> {
+    let mut text = String::new();
+    let mut diffs = Vec::new();
+    if let Some(blocks) = update["content"].as_array() {
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("content") => push_text(&mut text, content_text(&block["content"])),
+                Some("diff") => {
+                    if let Some(diff) = acp_diff(block) {
+                        diffs.push(diff);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if text.is_empty() {
+        push_text(&mut text, loose_output(&update["rawOutput"]));
+    }
+    if text.is_empty() {
+        push_text(&mut text, loose_output(&update["output"]));
+    }
+    if text.is_empty() && diffs.is_empty() {
+        return None;
+    }
+    Some(HarnessEvent::ToolResult {
+        id: id.to_string(),
+        text: crate::clip_result(&text),
+        diff: (!diffs.is_empty()).then(|| crate::clip_result(&diffs.join("\n"))),
+    })
+}
+
+fn push_text(into: &mut String, next: String) {
+    if next.is_empty() {
+        return;
+    }
+    if !into.is_empty() {
+        into.push('\n');
+    }
+    into.push_str(&next);
+}
+
+fn content_text(content: &Value) -> String {
+    if let Some(text) = content["text"].as_str() {
+        return text.to_string();
+    }
+    content.as_str().unwrap_or_default().to_string()
+}
+
+fn loose_output(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    for key in ["stdout", "output", "text", "content"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            return text.to_string();
+        }
+    }
+    String::new()
+}
+
+/// A unified diff from the `oldText` and `newText` an ACP diff block already carried.
+fn acp_diff(block: &Value) -> Option<String> {
+    if let Some(diff) = block["diff"].as_str().filter(|d| !d.is_empty()) {
+        return Some(diff.to_string());
+    }
+    if block.get("newText").is_none() && block.get("oldText").is_none() {
+        return None;
+    }
+    let path = block["path"].as_str().filter(|p| !p.is_empty()).unwrap_or("file");
+    let old = block["oldText"].as_str().unwrap_or("");
+    let new = block["newText"].as_str().unwrap_or("");
+    Some(unified(path, old, new))
+}
+
+fn unified(path: &str, old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = split_lines(old);
+    let new_lines: Vec<&str> = split_lines(new);
+    let mut prefix = 0;
+    while prefix < old_lines.len() && prefix < new_lines.len() && old_lines[prefix] == new_lines[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_hunk = &old_lines[prefix..old_lines.len() - suffix];
+    let new_hunk = &new_lines[prefix..new_lines.len() - suffix];
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    if old_hunk.is_empty() && new_hunk.is_empty() {
+        return out;
+    }
+    out.push_str(&format!("@@ -{},{} +{},{} @@\n", prefix + 1, old_hunk.len(), prefix + 1, new_hunk.len()));
+    for line in old_hunk {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new_hunk {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn split_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
 }
 
 /// Token counts from the prompt result. Harnesses put them in different places, and some
@@ -553,9 +688,46 @@ mod tests {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "hi" }
         });
-        assert_eq!(update_event(&chunk), Some(HarnessEvent::Text { text: "hi".into() }));
-        let call = update_event(&shell_call()).unwrap();
-        assert!(matches!(call, HarnessEvent::ToolCall { ref name, .. } if name == "run_command"));
-        assert_eq!(update_event(&json!({ "sessionUpdate": "usage_update", "used": 0 })), None);
+        assert_eq!(update_events(&chunk), vec![HarnessEvent::Text { text: "hi".into() }]);
+        let call = update_events(&shell_call());
+        assert!(matches!(&call[..], [HarnessEvent::ToolCall { name, .. }] if name == "run_command"));
+        assert!(update_events(&json!({ "sessionUpdate": "usage_update", "used": 0 })).is_empty());
+    }
+
+    #[test]
+    fn a_tool_update_attaches_its_output_and_diff_and_nothing_else() {
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "completed",
+            "content": [
+                { "type": "content", "content": { "type": "text", "text": "ok\n" } },
+                { "type": "diff", "path": "a.ts", "oldText": "a\n", "newText": "b\n" }
+            ]
+        });
+        let events = update_events(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            HarnessEvent::ToolResult { id, text, diff } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(text, "ok\n");
+                let diff = diff.as_deref().unwrap();
+                assert!(diff.contains("--- a/a.ts") && diff.contains("-a") && diff.contains("+b"), "{diff}");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+        assert!(update_events(&json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "call_1", "status": "completed"
+        }))
+        .is_empty());
+        let both = json!({
+            "sessionUpdate": "tool_call", "toolCallId": "call_2", "name": "write",
+            "rawInput": { "file_path": "a.ts" }, "status": "completed",
+            "rawOutput": "wrote a.ts"
+        });
+        let events = update_events(&both);
+        assert!(matches!(&events[0], HarnessEvent::ToolCall { name, .. } if name == "write"));
+        assert!(matches!(&events[1], HarnessEvent::ToolResult { text, diff: None, .. } if text == "wrote a.ts"));
+        assert!(!events.iter().any(|event| matches!(event, HarnessEvent::Thought { .. })));
     }
 }

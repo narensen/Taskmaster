@@ -92,6 +92,11 @@ impl Harness for ClaudeCode {
                             let _ = events.send(event).await;
                         }
                     }
+                    Some("user") => {
+                        for event in tool_results(&msg["message"]["content"]) {
+                            let _ = events.send(event).await;
+                        }
+                    }
                     Some("result") => return Ok(summary(&msg)),
                     _ => {}
                 }
@@ -229,6 +234,9 @@ impl Transcript {
 
     pub fn line(&mut self, line: &str) -> Vec<HarnessEvent> {
         let Ok(value) = serde_json::from_str::<Value>(line) else { return Vec::new() };
+        if value["type"] == "user" {
+            return tool_results(&value["message"]["content"]);
+        }
         if value["type"] != "assistant" {
             return Vec::new();
         }
@@ -322,10 +330,39 @@ fn content_events(content: &Value) -> Vec<HarnessEvent> {
                     name: text("name"),
                     input: block["input"].clone(),
                 }),
+                "tool_result" => tool_result_event(block),
                 _ => None,
             }
         })
         .collect()
+}
+
+/// A `tool_result` block. Its content is a string or a list of text blocks. Other user
+/// text is left alone, so a prompt echo does not become a step.
+fn tool_results(content: &Value) -> Vec<HarnessEvent> {
+    let Some(blocks) = content.as_array() else { return Vec::new() };
+    blocks.iter().filter(|block| block["type"] == "tool_result").filter_map(tool_result_event).collect()
+}
+
+fn tool_result_event(block: &Value) -> Option<HarnessEvent> {
+    let id = block["tool_use_id"].as_str().unwrap_or_default().to_string();
+    let text = result_text(&block["content"]);
+    if text.is_empty() {
+        return None;
+    }
+    Some(HarnessEvent::ToolResult { id, text: crate::clip_result(&text), diff: None })
+}
+
+fn result_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    content
+        .as_array()
+        .map(|blocks| {
+            blocks.iter().filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn summary(result: &Value) -> RunSummary {
@@ -363,9 +400,13 @@ mod tests {
         events.extend(t.line(&line("m1", json!([{ "type": "text", "text": "Reading the brief." }]), 9)));
         events.extend(t.line(&line("m1", json!([{ "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "a" } }]), 30)));
         events.extend(t.line(&line("m2", json!([{ "type": "text", "text": "Done." }]), 3)));
+        events.extend(t.line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"wrote a"},{"type":"text","text":"not a result"}]}}"#,
+        ));
         events.extend(t.line(r#"{"type":"user","message":{"content":"x"}}"#));
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 4);
         assert!(matches!(&events[1], HarnessEvent::ToolCall { name, .. } if name == "Write"));
+        assert!(matches!(&events[3], HarnessEvent::ToolResult { id, text, diff: None } if id == "t1" && text == "wrote a"));
         // m1's last line carries its totals; m2 adds its own.
         assert_eq!(t.usage(), Usage { input: 20, output: 33, cache_read: 1000, cache_write: 80 });
     }

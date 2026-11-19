@@ -400,7 +400,11 @@ export interface AgentEntry {
   at: string;
   agent: AgentTag;
   kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved" | "stalled" | "released";
+  /** Tool call id, on a `tool_call` and on the `output` that belongs to it. */
+  id?: string;
   text?: string;
+  /** Unified diff attached to an `output`, when the harness sent one. */
+  diff?: string;
   brief?: string;
   name?: string;
   target?: string | null;

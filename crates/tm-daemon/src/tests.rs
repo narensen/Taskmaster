@@ -98,6 +98,11 @@ impl Harness for Fake {
         for (path, _) in &script.files {
             let input = serde_json::json!({ "file_path": path });
             let _ = events.send(HarnessEvent::ToolCall { id: "t1".into(), name: "Write".into(), input }).await;
+            let _ = events.send(HarnessEvent::ToolResult {
+                id: "t1".into(),
+                text: "recorded-tool-result".into(),
+                diff: Some("--- a/app/a/page.ts\n+++ b/app/a/page.ts\n+export\n".into()),
+            }).await;
             let _ = events.send(HarnessEvent::PermissionDecided { tool: "Write".into(), allowed: true }).await;
         }
         for (path, content) in script.files {
@@ -1735,6 +1740,10 @@ mod http {
         assert!(of("start") >= 2 && of("end") >= 2 && of("text") >= 2 && of("thought") >= 2, "{said}");
         let call = entries.iter().find(|e| e["kind"] == "tool_call").unwrap();
         assert_eq!((call["name"].as_str(), call["target"].as_str()), (Some("Write"), Some("app/a/page.ts")));
+        let output = entries.iter().find(|e| e["kind"] == "output" && e["id"] == "t1").unwrap();
+        assert_eq!(output["text"].as_str(), Some("recorded-tool-result"));
+        assert!(output["diff"].as_str().unwrap_or("").contains("+++ b/app/a/page.ts"));
+        assert!(!briefs.iter().any(|brief| brief.contains("recorded-tool-result")), "a tool result stays out of the answer");
         assert!(entries.iter().any(|e| e["kind"] == "permission" && e["allowed"] == true));
         let end = entries.iter().find(|e| e["kind"] == "end").unwrap();
         assert_eq!(end["usage"]["input"], 100);

@@ -2908,6 +2908,13 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
                     HarnessEvent::PermissionDecided { tool, allowed } => {
                         live.push(run, agent, "permission", serde_json::json!({ "tool": tool, "allowed": allowed }))
                     }
+                    HarnessEvent::ToolResult { id, text, diff } => {
+                        let mut fields = serde_json::json!({ "id": id, "text": text });
+                        if let Some(diff) = diff {
+                            fields["diff"] = serde_json::json!(diff);
+                        }
+                        live.push(run, agent, "output", fields);
+                    }
                 }
             }
             if let HarnessEvent::Text { text: chunk } = event

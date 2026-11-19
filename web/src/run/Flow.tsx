@@ -110,7 +110,7 @@ function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null
         {target && looksLikePath(head) ? <KnownPath path={head} /> : target}
       </span>
       <span className="step-dur">{item.allowed === false ? "refused" : (seconds ?? "")}</span>
-      {shown && (input || item.output) && (
+      {shown && (input || item.output || item.diff) && (
         <div className="step-body">
           {input && <pre className="step-io">{input}</pre>}
           {item.output && (
@@ -118,6 +118,7 @@ function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null
               <Rich text={item.output} />
             </pre>
           )}
+          {item.diff && <pre className="step-io">{item.diff}</pre>}
         </div>
       )}
     </div>

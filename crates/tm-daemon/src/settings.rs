@@ -97,6 +97,11 @@ pub struct TelemetrySettings {
 pub struct CodeModeSettings {
     /// Workers get `run_code`, and Claude Code runs its native code mode (see `code.rs`).
     pub enabled: bool,
+    /// Seconds one `run_code` script may run; 0 keeps the default (600). A script that runs
+    /// the tests needs room.
+    pub script_secs: u64,
+    /// Seconds one `sh()` or `test()` call inside a script may run; 0 keeps the default (300).
+    pub sh_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -163,6 +163,8 @@ async fn run() -> anyhow::Result<Outcome> {
     config.store = settings.store(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone()))?;
     config.checker = settings.checker.enabled;
     config.code_mode = settings.code_mode.enabled;
+    config.code_script_secs = settings.code_mode.script_secs;
+    config.code_sh_secs = settings.code_mode.sh_secs;
     config.worker_shell = settings.sandbox.shell;
     config.package_indexes = settings.sandbox.package_indexes;
     config.remote = settings.remote();

@@ -384,7 +384,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     // Workers on a web page get a browser on that page's own preview.
     let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
     // Code Mode: run_code, beside the browser, on the same server.
-    let code = if config.code_mode { crate::code::CodeTools::new(browsers.clone()) } else { None };
+    let code = if config.code_mode { crate::code::CodeTools::with_limits(browsers.clone(), config.code_script_secs, config.code_sh_secs) } else { None };
     let mut extensions: Vec<Arc<dyn tm_dictionary::Extension>> = Vec::new();
     if let Some(browsers) = &browsers {
         extensions.push(browsers.clone());

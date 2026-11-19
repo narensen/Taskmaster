@@ -669,6 +669,8 @@ impl App {
         let saved = crate::settings::Settings::load(&self.project()).unwrap_or_default();
         config.checker = saved.checker.enabled;
         config.code_mode = saved.code_mode.enabled;
+        config.code_script_secs = saved.code_mode.script_secs;
+        config.code_sh_secs = saved.code_mode.sh_secs;
         config.worker_shell = saved.sandbox.shell;
         config.package_indexes = saved.sandbox.package_indexes;
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);

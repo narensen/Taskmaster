@@ -12,9 +12,11 @@
 //! await read(path)                    file text
 //! await write(path, text)
 //! await edit(path, find, replace, all?)   find must occur once unless all is true
+//! await readMany(globs)               {path: text} for every file the globs match
 //! await grep(text, glob?)             ["path:line: text", ...]
 //! await ls(glob?)                     project files
 //! await sh(command)                   {code, output}; only inside bubblewrap, when the gate allows a shell
+//! await test()                        {ok, failed, output}: the project's tests, in the sandbox
 //! await check()                       problems the static checks find in the worktree
 //! await browser(action, args)         open | click | type | screenshot | console on the page's preview
 //! console.log(...)                    lines returned with the result
@@ -35,9 +37,10 @@ use tm_dictionary::{Extension, Grant};
 use tm_harness::{Decision, PermissionGate, PermissionRequest, ToolKind};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// How long one script may run, all calls included.
-const SCRIPT_TIMEOUT: Duration = Duration::from_secs(120);
-const SH_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long one script may run, all calls included, unless the settings say otherwise.
+pub const SCRIPT_SECS: u64 = 600;
+/// How long one `sh` or `test` call may run, unless the settings say otherwise.
+pub const SH_SECS: u64 = 300;
 const MAX_READ: usize = 256 * 1024;
 const MAX_REPLY: usize = 24 * 1024;
 const MAX_CALLS: usize = 200;
@@ -66,6 +69,8 @@ const write = (path, text) => call("write", { path, text: String(text) });
 const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
 const grep = (text, glob) => call("grep", { text, glob });
 const ls = (glob) => call("ls", { glob });
+const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
+const test = () => call("test", {});
 const sh = (command) => call("sh", { command });
 const check = () => call("check", {});
 const browser = (action, args = {}) => call("browser", { action, args });
@@ -99,6 +104,10 @@ pub struct CodeTools {
     bwrap: Option<PathBuf>,
     scopes: Mutex<HashMap<String, Arc<Scope>>>,
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
+    /// How long one script may run.
+    script_limit: Duration,
+    /// How long one `sh` or `test` call may run.
+    sh_limit: Duration,
 }
 
 impl CodeTools {
@@ -106,7 +115,21 @@ impl CodeTools {
     pub fn new(browsers: Option<Arc<crate::browser::PageBrowsers>>) -> Option<Arc<CodeTools>> {
         let node = tm_harness::sandbox::resolve_binary("node").ok()?;
         let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| bwrap_works() && tm_harness::sandbox::bwrap_usable());
-        Some(Arc::new(CodeTools { node, bwrap, scopes: Mutex::new(HashMap::new()), browsers }))
+        Some(Arc::new(CodeTools {
+            node,
+            bwrap,
+            scopes: Mutex::new(HashMap::new()),
+            browsers,
+            script_limit: Duration::from_secs(SCRIPT_SECS),
+            sh_limit: Duration::from_secs(SH_SECS),
+        }))
+    }
+
+    /// [`CodeTools::new`] with the time limits from the settings (seconds; 0 keeps the default).
+    pub fn with_limits(browsers: Option<Arc<crate::browser::PageBrowsers>>, script_secs: u64, sh_secs: u64) -> Option<Arc<CodeTools>> {
+        let tools = Arc::try_unwrap(Self::new(browsers)?).ok()?;
+        let pick = |secs: u64, default: u64| Duration::from_secs(if secs == 0 { default } else { secs });
+        Some(Arc::new(CodeTools { script_limit: pick(script_secs, SCRIPT_SECS), sh_limit: pick(sh_secs, SH_SECS), ..tools }))
     }
 
     pub fn attach(&self, page: &str, cwd: &Path, gate: Arc<dyn PermissionGate>, shell: Option<tm_harness::ShellScope>) {
@@ -126,11 +149,11 @@ impl CodeTools {
         std::fs::create_dir_all(&scratch)?;
         let script = scratch.join("run.js");
         std::fs::write(&script, PRELUDE.replace("/*CODE*/", code))?;
-        let result = tokio::time::timeout(SCRIPT_TIMEOUT, self.drive(grant, &scope, &scratch, &script)).await;
+        let result = tokio::time::timeout(self.script_limit, self.drive(grant, &scope, &scratch, &script)).await;
         let _ = std::fs::remove_dir_all(&scratch);
         match result {
             Ok(result) => result,
-            Err(_) => bail!("the script ran longer than {}s and was stopped", SCRIPT_TIMEOUT.as_secs()),
+            Err(_) => bail!("the script ran longer than {}s and was stopped", self.script_limit.as_secs()),
         }
     }
 
@@ -184,6 +207,26 @@ impl CodeTools {
         let mut said = String::new();
         let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut said).await;
         bail!("the script stopped before it finished: {}", said.lines().take(6).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Run `command` with `sh -c` in the agent's sandbox: the worktree and its scratch are
+    /// writable and nothing else. Refused without the sandbox, never run loose.
+    async fn sandboxed(&self, scope: &Scope, command: &str) -> anyhow::Result<(Option<i32>, String)> {
+        let (Some(_), Some(shell)) = (&self.bwrap, &scope.shell) else {
+            bail!("refused: sh needs the sandbox, and this agent has none");
+        };
+        let sh = std::fs::canonicalize("/bin/sh").context("no /bin/sh")?;
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
+        let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(shell));
+        let mut cmd = tokio::process::Command::new("bwrap");
+        cmd.args(args).current_dir(&scope.cwd).stdin(Stdio::null());
+        let output = tokio::time::timeout(self.sh_limit, tm_harness::spawn_grouped(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?.0.wait_with_output())
+            .await
+            .map_err(|_| anyhow::anyhow!("`{command}` ran longer than {}s", self.sh_limit.as_secs()))??;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok((output.status.code(), text))
     }
 
     async fn allowed(&self, scope: &Scope, op: &str, kind: ToolKind, path: Option<&Path>, command: Option<&str>) -> anyhow::Result<()> {
@@ -266,23 +309,46 @@ impl CodeTools {
             "sh" => {
                 let command = args["command"].as_str().context("`command` is required")?;
                 self.allowed(scope, op, ToolKind::Execute, None, Some(command)).await?;
-                // The command runs in the same sandbox as the agent's own shell, never loose
-                // on this machine: no sandbox, no `sh`.
-                let (Some(_), Some(shell)) = (&self.bwrap, &scope.shell) else {
-                    bail!("refused: sh needs the sandbox, and this agent has none");
+                let (code, text) = self.sandboxed(scope, command).await?;
+                Ok(json!({ "code": code, "output": tail(&text, 8000) }))
+            }
+            "test" => {
+                self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
+                let venv = scope.shell.as_ref().and_then(|s| s.writable.first()).map(|scratch| scratch.join("venv")).unwrap_or_else(|| scope.cwd.join(".venv"));
+                let steps = crate::runtime::steps(&scope.cwd, &venv);
+                if !steps.iter().any(|step| !step.setup) {
+                    return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
+                }
+                let command = test_command(&steps);
+                let (code, text) = self.sandboxed(scope, &command).await?;
+                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, 6000) }))
+            }
+            "readMany" => {
+                self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
+                let mut out = serde_json::Map::new();
+                let mut total = 0usize;
+                let globs: Vec<String> = match &args["globs"] {
+                    Value::Array(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+                    Value::String(one) => vec![one.clone()],
+                    _ => Vec::new(),
                 };
-                let sh = std::fs::canonicalize("/bin/sh").context("no /bin/sh")?;
-                let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-                let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
-                let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(shell));
-                let mut cmd = tokio::process::Command::new("bwrap");
-                cmd.args(args).current_dir(&scope.cwd).stdin(Stdio::null());
-                let output = tokio::time::timeout(SH_TIMEOUT, tm_harness::spawn_grouped(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?.0.wait_with_output())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("`{command}` ran longer than {}s", SH_TIMEOUT.as_secs()))??;
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                Ok(json!({ "code": output.status.code(), "output": tail(&text, 8000) }))
+                for glob in globs {
+                    for file in files(&scope.cwd, Some(&glob))? {
+                        if out.contains_key(&file) {
+                            continue;
+                        }
+                        let full = scope.cwd.join(&file);
+                        self.allowed(scope, op, ToolKind::Read, Some(&full), None).await?;
+                        let Ok(bytes) = std::fs::read(&full) else { continue };
+                        if total + bytes.len() > MAX_READ {
+                            out.insert(file, json!(null));
+                            continue;
+                        }
+                        total += bytes.len();
+                        out.insert(file, json!(String::from_utf8_lossy(&bytes)));
+                    }
+                }
+                Ok(Value::Object(out))
             }
             "check" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -317,6 +383,64 @@ impl CodeTools {
 }
 
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
+/// One shell line that runs the project's test steps: setup steps may fail and are reported,
+/// the checks must all pass.
+fn test_command(steps: &[crate::runtime::Step]) -> String {
+    let line = |step: &crate::runtime::Step| {
+        let mut parts: Vec<String> = step.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();
+        parts.push(quote(&step.program));
+        parts.extend(step.args.iter().map(|a| quote(a)));
+        parts.join(" ")
+    };
+    let mut out = Vec::new();
+    for step in steps {
+        if step.setup {
+            out.push(format!("{{ {} >/dev/null 2>&1 || echo 'setup failed: {}'; }}", line(step), step.line().replace('\'', "")));
+        } else {
+            out.push(line(step));
+        }
+    }
+    // Setup steps are joined with `;`, so a failed one does not stop the tests.
+    let mut command = String::new();
+    for (i, part) in out.iter().enumerate() {
+        if i > 0 {
+            command.push_str(if steps[i - 1].setup { "; " } else { " && " });
+        }
+        command.push_str(part);
+    }
+    command
+}
+
+fn quote(text: &str) -> String {
+    if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c)) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The failing tests a runner named: pytest's `FAILED tests/x.py::t`, cargo's
+/// `test a::b ... FAILED`, and node's `✗`/`not ok` lines.
+fn failed_tests(output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let name = if let Some(rest) = line.strip_prefix("FAILED ") {
+            Some(rest.split(" - ").next().unwrap_or(rest).to_string())
+        } else if line.starts_with("test ") && line.ends_with("... FAILED") {
+            Some(line.trim_start_matches("test ").trim_end_matches("... FAILED").trim().to_string())
+        } else {
+            line.strip_prefix("not ok ").map(str::to_string)
+        };
+        if let Some(name) = name
+            && !out.contains(&name)
+            && out.len() < 50
+        {
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn files(cwd: &Path, glob: Option<&str>) -> anyhow::Result<Vec<String>> {
     let output = std::process::Command::new("git").arg("-C").arg(cwd).args(["ls-files", "--cached", "--others", "--exclude-standard"]).output()?;
     let all = String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect::<Vec<_>>();
@@ -376,9 +500,11 @@ impl Extension for CodeTools {
         vec![json!({
             "name": "run_code",
             "description": "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
-                Functions: read(path), write(path, text), edit(path, find, replace, all?), grep(text, glob?), ls(glob?), sh(command), check(), \
+                Functions: read(path), readMany(globs), write(path, text), edit(path, find, replace, all?), grep(text, glob?), ls(glob?), \
+                sh(command), test() which runs the project's tests and returns {ok, failed, output}, check(), \
                 browser(action, args) with action open|click|type|console, and console.log. Paths are relative to your worktree. \
-                The same permissions as your own tools apply. Returns the log lines and the returned value.",
+                The same permissions as your own tools apply. Batch steps into one script and end with `return await test()`. \
+                Returns the log lines and the returned value.",
             "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The body of an async function" } }, "required": ["code"] },
         })]
     }
@@ -508,6 +634,61 @@ mod tests {
         assert!(!outside.join("x.txt").exists(), "{text}");
         assert!(text.contains("refused-outside"), "{text}");
         for d in [&dir, &scratch, &outside] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn read_many_loads_every_file_the_globs_match_in_one_call() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("read-many");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+        let text = tools.run(&grant(), r#"const files = await readMany(["app/*.html", "app/*.json"]); return Object.keys(files).sort();"#).await.unwrap();
+        assert!(text.contains("app/data.json") && text.contains("app/index.html"), "{text}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failing_tests_are_read_from_each_runners_output() {
+        let pytest = "tests/test_db.py::test_insert FAILED\nFAILED tests/test_db.py::test_insert - assert 1 == 2\n1 failed, 3 passed";
+        assert_eq!(failed_tests(pytest), vec!["tests/test_db.py::test_insert"]);
+        let cargo = "test store::tests::keeps_order ... FAILED\ntest store::tests::ok ... ok";
+        assert_eq!(failed_tests(cargo), vec!["store::tests::keeps_order"]);
+        let steps = vec![
+            crate::runtime::Step { name: "setup".into(), program: "python3".into(), args: vec!["-m".into(), "venv".into(), "/s/venv".into()], setup: true, ..Default::default() },
+            crate::runtime::Step { name: "test".into(), program: "/s/venv/bin/python".into(), args: vec!["-m".into(), "pytest".into(), "-q".into()], env: vec![("VIRTUAL_ENV".into(), "/s/venv".into())], ..Default::default() },
+        ];
+        let line = test_command(&steps);
+        assert!(line.starts_with("{ python3 -m venv /s/venv >/dev/null 2>&1 || echo"), "{line}");
+        assert!(line.ends_with("; VIRTUAL_ENV=/s/venv /s/venv/bin/python -m pytest -q"), "{line}");
+        assert_eq!(quote("it's"), "'it'\\''s'");
+    }
+
+    /// `test()` runs the project's own tests in the sandbox and names what failed. Skipped
+    /// without bubblewrap, or without Python and pytest.
+    #[tokio::test]
+    async fn test_runs_the_projects_tests_in_the_sandbox_and_names_failures() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let pytest = std::process::Command::new("python3").args(["-c", "import pytest"]).status().is_ok_and(|s| s.success());
+        if tools.bwrap.is_none() || !pytest {
+            eprintln!("bubblewrap or pytest is missing; skipping");
+            return;
+        }
+        let dir = repo("test-op");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("conftest.py"), "").unwrap();
+        std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        std::fs::write(dir.join("tests/test_calc.py"), "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n").unwrap();
+        let scratch = dir.with_extension("scratch");
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
+        let text = tools.run(&grant(), "const r = await test(); return { ok: r.ok, failed: r.failed };").await.unwrap();
+        assert!(text.contains("\"ok\": false") && text.contains("tests/test_calc.py::test_add"), "{text}");
+        assert!(scratch.join("venv/pyvenv.cfg").is_file(), "the venv is made in the agent's scratch, not the worktree");
+        std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        let text = tools.run(&grant(), "return (await test()).ok;").await.unwrap();
+        assert!(text.contains("true"), "{text}");
+        for d in [&dir, &scratch] {
             std::fs::remove_dir_all(d).ok();
         }
     }

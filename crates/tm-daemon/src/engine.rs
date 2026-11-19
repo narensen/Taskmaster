@@ -415,6 +415,19 @@ impl Driver {
                 Ok(Step::Continue)
             }
             RunPhase::Done | RunPhase::Failed => {
+                // A note that arrived after the last worker, or after the run had already
+                // stopped, is a new master turn. The master reads it before anyone builds.
+                let pending = self.live.has_pending_where(&self.id, |note| {
+                    note.to == "master"
+                        || note.to == "workers"
+                        || note.to == "reviewer"
+                        || note.to == "verifier"
+                        || note.to.starts_with("page:")
+                });
+                if pending {
+                    self.push_event(Event::FollowUp)?;
+                    return Ok(Step::Continue);
+                }
                 let ok = self.run.phase == RunPhase::Done;
                 self.write_status(ok)?;
                 self.records.save_inflight(&self.id, &[])?;
@@ -777,7 +790,8 @@ impl Driver {
             return Ok(());
         }
         let repair = errors.is_some();
-        if !repair && self.citations_fresh(&page)? && !self.live.has_pending_where(&self.id, |note| note.to == "master" || note.to == "workers") {
+        let steer = self.live.has_pending_where(&self.id, |note| note.to == "master" || note.to == "workers");
+        if !repair && self.citations_fresh(&page)? && !steer && !self.opened_by_note(&page) {
             eprintln!("taskmaster: {page} citations are unchanged");
             self.push_event(Event::PageFresh { page })?;
             return Ok(());
@@ -2242,7 +2256,12 @@ impl Driver {
     /// on a repair, and only that repair's briefs carry it.
     async fn read_notes_before_workers(&mut self, page: &str, repair: bool) -> anyhow::Result<()> {
         self.repair_decision.clear();
-        if let Some(text) = self.consult(|note| note.to == "master" || note.to == "workers").await? {
+        // A follow-up is one master turn over every note still waiting, including one
+        // addressed to a single page, before any worker starts.
+        let reopen = self.opened_by_note(page);
+        if let Some(text) = self.consult(|note| {
+            reopen || note.to == "master" || note.to == "workers"
+        }).await? {
             if !self.handed.is_empty() {
                 self.handed.push('\n');
             }
@@ -2625,6 +2644,19 @@ impl Driver {
         self.records.save_book(&book)
     }
 
+    /// True when a follow-up reopened this page and it has not been built since.
+    fn opened_by_note(&self, page: &str) -> bool {
+        let mut opened = false;
+        for event in &self.events {
+            match event {
+                Event::FollowUp => opened = true,
+                Event::WorkerFinished { page: id, .. } | Event::PageFresh { page: id } if id == page => opened = false,
+                _ => {}
+            }
+        }
+        opened
+    }
+
     fn citations_fresh(&self, page: &str) -> anyhow::Result<bool> {
         if !self.config.incremental {
             return Ok(false);
@@ -2692,10 +2724,14 @@ impl Driver {
     /// is not touched until the run is over. A run with no branch builds in the project.
     fn open_tree(&mut self, base: Option<&str>) -> anyhow::Result<()> {
         let Some(branch) = self.branch.clone() else { return Ok(()) };
-        if !git::branch_exists(&self.project, &branch) && matches!(self.run.phase, RunPhase::Done | RunPhase::Failed) {
-            // Delivered and tidied away on an earlier pass.
-            self.branch = None;
-            return Ok(());
+        if !git::branch_exists(&self.project, &branch) {
+            let followed_up = self.events.iter().any(|event| matches!(event, Event::FollowUp));
+            if followed_up || matches!(self.run.phase, RunPhase::Done | RunPhase::Failed) {
+                // Delivered and tidied away on an earlier pass. A follow-up continues
+                // on the project as it stands, rather than recreating the old branch.
+                self.branch = None;
+                return Ok(());
+            }
         }
         let path = git::worktree_dir(&self.project, &self.id, "tree");
         if path.exists() {
@@ -2812,6 +2848,27 @@ fn agent_lines(plan: &Plan) -> String {
     out
 }
 
+fn role_label(role: &str) -> &'static str {
+    match role {
+        "planner" | "master" | "arbiter" => "Master",
+        "worker" => "Worker",
+        "mid" => "Mid",
+        "reviewer" | "security" => "Reviewer",
+        "verifier" => "Verifier",
+        _ => "Agent",
+    }
+}
+
+fn reported_limit(request: &AgentRequest, hit: reply::ProviderLimit) -> reply::ReportedLimit {
+    let role = request
+        .feed
+        .as_ref()
+        .and_then(|feed| feed.agent["role"].as_str())
+        .map(role_label)
+        .unwrap_or("Agent");
+    reply::ReportedLimit::new(request.harness.id(), role, hit)
+}
+
 fn failed(errors: impl Into<String>) -> WorkerOutcome {
     WorkerOutcome::CheckFailed { errors: errors.into() }
 }
@@ -2844,7 +2901,18 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
                     feed.live.push(&feed.run, &feed.agent, "stalled", serde_json::json!({ "error": format!("{err:#}"), "restart": restart + 1 }));
                 }
             }
-            other => return other,
+            Err(err) => {
+                if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                    return Err(reported_limit(&request, hit).into());
+                }
+                return Err(err);
+            }
+            Ok(answer) => {
+                if let Some(hit) = reply::limit_of(&answer.text) {
+                    return Err(reported_limit(&request, hit).into());
+                }
+                return Ok(answer);
+            }
         }
     }
     unreachable!("the last attempt always returns")

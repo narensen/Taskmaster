@@ -91,7 +91,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use futures_util::stream::{self, Stream};
-use tm_core::{DictTier, DictionaryEntry, EntryStats, Plan, Run, RunPhase, totals, valid_key};
+use tm_core::{DictTier, DictionaryEntry, EntryStats, Event, Plan, Run, RunPhase, totals, valid_key};
 use tm_dictionary::{Catalog, CommonsRemote, LocalStore};
 use tm_harness::{HARNESSES, Harness, provider_report, provider_reports};
 use tokio::net::TcpListener;
@@ -619,6 +619,7 @@ impl App {
             "active": self.is_active(id),
             "pending_approvals": self.live.approvals.count(id),
             "error": status.get("error"),
+            "limit": status.get("limit"),
             "branch": status.get("branch"),
             "merged": status.get("merged"),
             "base": status.get("base"),
@@ -688,8 +689,48 @@ impl App {
             }
             app.record_outcome(&id, result);
             app.active.lock().unwrap().remove(&id);
+            // A note can land in the moment the driver stops. Pick it up once the run is idle.
+            if let Err(err) = app.wake_for_note(&id) {
+                eprintln!("taskmaster: run {id}: a note was not picked up: {}", err.1);
+            }
         });
         Ok(())
+    }
+
+    /// A note on a finished run starts the master again. The event is written before the
+    /// driver starts, so a crash mid-follow-up resumes the pages instead of stopping.
+    fn wake_for_note(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
+        let _notes = self.live.write_lock();
+        if self.is_active(id) {
+            return Ok(());
+        }
+        let run = match self.replay(id) {
+            Ok(Some(run)) => run,
+            _ => return Ok(()),
+        };
+        if !matches!(run.phase, RunPhase::Done | RunPhase::Failed) || run.pages.is_empty() {
+            return Ok(());
+        }
+        if !self.live.has_pending_where(id, |_| true) {
+            return Ok(());
+        }
+        let mut events = self.records().events(id)?;
+        let appended = !matches!(events.last(), Some(Event::FollowUp));
+        if appended {
+            events.push(Event::FollowUp);
+            self.records().save_events(id, &events)?;
+        }
+        // The lock is held through start so a second note cannot start a second driver.
+        match self.start(id, self.request_for(id)?, Decision::Continue) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if appended {
+                    events.pop();
+                    let _ = self.records().save_events(id, &events);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// An error is kept with the run, so a client that was not connected still sees it.
@@ -698,12 +739,24 @@ impl App {
         let Some(fields) = status.as_object_mut() else { return };
         match result {
             Ok(_) => {
-                if fields.remove("error").is_none() {
+                let error_gone = fields.remove("error").is_none();
+                let limit_gone = fields.remove("limit").is_none();
+                if error_gone && limit_gone {
                     return;
                 }
             }
             Err(err) => {
-                fields.insert("error".into(), json!(format!("{err:#}")));
+                if let Some(limit) = err.downcast_ref::<crate::reply::ReportedLimit>() {
+                    fields.insert("error".into(), json!(limit.sentence()));
+                    fields.insert("limit".into(), json!(limit));
+                    if let Ok(mut book) = self.records().book() {
+                        book.record(&limit.provider, &limit.sentence());
+                        let _ = self.records().save_book(&book);
+                    }
+                } else {
+                    fields.insert("error".into(), json!(format!("{err:#}")));
+                    fields.remove("limit");
+                }
             }
         }
         let _ = self.records().save_status(id, &status);

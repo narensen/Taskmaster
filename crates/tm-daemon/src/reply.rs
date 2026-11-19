@@ -1,7 +1,7 @@
 //! Pull the JSON an agent was told to reply with out of its prose.
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, Plan};
 
@@ -111,6 +111,9 @@ pub struct Amendment {
 /// The planner's contracts, pages, estimate, and new Dictionary entries.
 /// Missing `dictionary` and `estimate` mean none and zero.
 pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
+    if let Some(hit) = limit_of(text) {
+        return Err(hit.into());
+    }
     let value = last_json(text, '{', '}').context("the plan reply had no JSON object")?;
     let raw: RawPlan = serde_json::from_value(value).context("the plan reply was not a plan")?;
     let estimate = raw.estimate.unwrap_or(Estimate { tokens: 0, usd: 0.0 });
@@ -119,6 +122,9 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
 }
 
 pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {
+    if let Some(hit) = limit_of(text) {
+        return Err(hit.into());
+    }
     let value = last_json(text, '{', '}').context("the arbitration reply had no JSON object")?;
     match value["resolution"].as_str().unwrap_or("").to_ascii_lowercase().as_str() {
         "conform" => Ok(Resolution::Conform),
@@ -142,6 +148,186 @@ pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {
         }
         other => bail!("unknown resolution `{other}`"),
     }
+}
+
+/// Why a provider stopped the turn. The raw reply stays on the value and out of the sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    Quota,
+    RateLimit,
+    Auth,
+}
+
+/// A provider limit found in a reply, before any role or provider name is known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderLimit {
+    pub kind: LimitKind,
+    pub reset: Option<String>,
+    pub raw: String,
+}
+
+impl std::fmt::Display for ProviderLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            LimitKind::Quota => write!(f, "the provider hit its usage limit"),
+            LimitKind::RateLimit => write!(f, "the provider is rate limited"),
+            LimitKind::Auth => write!(f, "the provider needs a sign-in"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderLimit {}
+
+/// The same limit, named for the role that was asking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReportedLimit {
+    pub provider: String,
+    pub role: String,
+    pub kind: LimitKind,
+    pub reset: Option<String>,
+    pub raw: String,
+}
+
+impl ReportedLimit {
+    pub fn new(provider: &str, role: &str, hit: ProviderLimit) -> Self {
+        Self { provider: provider.to_string(), role: role.to_string(), kind: hit.kind, reset: hit.reset, raw: hit.raw }
+    }
+
+    pub fn sentence(&self) -> String {
+        let who = provider_label(&self.provider);
+        let what = match self.kind {
+            LimitKind::Quota => format!("{who} hit its usage limit ({})", self.role),
+            LimitKind::RateLimit => format!("{who} is rate limited ({})", self.role),
+            LimitKind::Auth => format!("{who} needs a sign-in ({})", self.role),
+        };
+        match &self.reset {
+            Some(reset) => format!("{what}. Resets {reset}."),
+            None => format!("{what}."),
+        }
+    }
+}
+
+impl std::fmt::Display for ReportedLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.sentence())
+    }
+}
+
+impl std::error::Error for ReportedLimit {}
+
+pub fn provider_label(id: &str) -> String {
+    match id {
+        "claude" => "Claude".into(),
+        "codex" => "Codex".into(),
+        "grok" | "grok-build" => "Grok".into(),
+        "cursor" => "Cursor".into(),
+        "opencode" => "OpenCode".into(),
+        "agy" | "antigravity" => "Antigravity".into(),
+        "kiro" => "Kiro".into(),
+        "" => "The provider".into(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "The provider".into(),
+            }
+        }
+    }
+}
+
+/// A quota, rate-limit, or auth failure in a harness reply. A plan, a review, or an
+/// arbitration that parses is left alone, even if its prose mentions a limit.
+pub fn limit_of(text: &str) -> Option<ProviderLimit> {
+    let raw = text.trim();
+    if raw.is_empty() || has_answer_json(raw) {
+        return None;
+    }
+    let head = raw.lines().find(|line| !line.trim().is_empty()).unwrap_or(raw);
+    let window = if raw.chars().count() <= 1200 { raw } else { head };
+    let lower = window.to_ascii_lowercase();
+    let kind = if auth_failure(&lower) {
+        LimitKind::Auth
+    } else if rate_failure(&lower) {
+        LimitKind::RateLimit
+    } else if quota_failure(&lower) {
+        LimitKind::Quota
+    } else {
+        return None;
+    };
+    let raw = {
+        let mut cut = raw.chars().take(2000).collect::<String>();
+        if raw.chars().count() > 2000 {
+            cut.push('…');
+        }
+        cut
+    };
+    Some(ProviderLimit { kind, reset: reset_time(window), raw })
+}
+
+fn has_answer_json(text: &str) -> bool {
+    if let Some(value) = last_json(text, '{', '}')
+        && (value.get("pages").is_some() || value.get("resolution").is_some() || value.get("contracts").is_some() || value.get("flag").is_some())
+    {
+        return true;
+    }
+    last_json(text, '[', ']').and_then(|value| value.as_array().cloned()).is_some_and(|items| {
+        items.iter().any(|item| item.get("failure").is_some() || item.get("page").is_some())
+    })
+}
+
+fn auth_failure(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "please run /login",
+        "please log in",
+        "not logged in",
+        "not signed in",
+        "sign in to",
+        "session expired",
+        "auth expired",
+        "authentication expired",
+        "invalid api key",
+        "invalid_api_key",
+        "authentication_error",
+        "401 unauthorized",
+    ];
+    PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+fn rate_failure(text: &str) -> bool {
+    const PHRASES: &[&str] = &["rate limit", "rate_limit", "too many requests", "429 too many"];
+    PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+fn quota_failure(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "usage limit",
+        "usage_limit",
+        "you've hit your usage",
+        "you have hit your usage",
+        "hit your limit",
+        "insufficient_quota",
+        "credit balance is too low",
+        "out of credits",
+        "spend limit",
+        "exceeded your current quota",
+    ];
+    PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+fn reset_time(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for marker in ["resets at ", "reset at ", "resets ", "try again at ", "retry after ", "available again at "] {
+        let Some(at) = lower.find(marker) else { continue };
+        let rest = text[at + marker.len()..].trim();
+        let end = rest.find(['.', '\n']).unwrap_or(rest.len());
+        let phrase = rest[..end].trim().trim_matches(|c: char| c == ',' || c == ';');
+        if phrase.is_empty() || phrase.chars().count() > 40 {
+            continue;
+        }
+        return Some(phrase.to_string());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -205,5 +391,36 @@ mod tests {
         assert_eq!(plan.design, "- a11y: label inputs; focus-visible ring\n- palette: bg #0b0b0c");
         let (plan, _) = parse_plan("{\"pages\":[]}").unwrap();
         assert!(plan.design.is_empty());
+    }
+
+    #[test]
+    fn a_provider_limit_is_not_read_as_a_missing_plan() {
+        // Recorded from Codex 0.169 when the account was over its usage limit.
+        let err = parse_plan("You've hit your usage limit.").unwrap_err();
+        let hit = err.downcast_ref::<ProviderLimit>().expect("a typed limit");
+        assert_eq!(hit.kind, LimitKind::Quota);
+        assert!(!err.to_string().contains("JSON"));
+        assert_eq!(hit.raw, "You've hit your usage limit.");
+
+        let hit = limit_of("Claude is at its usage limit. Resets 6:30 PM.").unwrap();
+        assert_eq!((hit.kind, hit.reset.as_deref()), (LimitKind::Quota, Some("6:30 PM")));
+        let named = ReportedLimit::new("claude", "Master", hit);
+        assert_eq!(named.sentence(), "Claude hit its usage limit (Master). Resets 6:30 PM.");
+
+        let hit = limit_of("Rate limit exceeded. Try again at 4:00 PM.").unwrap();
+        assert_eq!((hit.kind, hit.reset.as_deref()), (LimitKind::RateLimit, Some("4:00 PM")));
+        assert_eq!(ReportedLimit::new("codex", "Worker", hit).sentence(), "Codex is rate limited (Worker). Resets 4:00 PM.");
+
+        let hit = limit_of("Please run /login. Your session expired.").unwrap();
+        assert_eq!(hit.kind, LimitKind::Auth);
+        assert_eq!(ReportedLimit::new("claude", "Reviewer", hit).sentence(), "Claude needs a sign-in (Reviewer).");
+
+        assert!(limit_of("{\"pages\":[]}").is_none());
+        assert!(parse_plan("{\"pages\":[]}").is_ok());
+        match parse_resolution("You've hit your usage limit.") {
+            Err(err) => assert!(err.downcast_ref::<ProviderLimit>().is_some()),
+            Ok(_) => panic!("a usage limit is not an arbitration"),
+        }
+        assert!(matches!(parse_resolution("{\"resolution\":\"conform\"}").unwrap(), Resolution::Conform));
     }
 }

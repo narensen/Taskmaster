@@ -3981,3 +3981,6 @@ button.lane-diff { opacity: 0; }
 }
 .home-clone input { width: 100%; min-height: 28px; height: 28px; padding: 0 8px; font-size: var(--fs-sm); }
 .home-clone .small { align-self: center; }
+.limit-note { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.limit-note p { margin: 0; }
+.limit-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }

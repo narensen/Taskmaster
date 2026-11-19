@@ -199,7 +199,9 @@ pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
     if body.text.trim().is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "a note needs text"));
     }
-    ok(json!(app.live.add_note(&id, &body.to, body.text.trim())?))
+    let note = app.live.add_note(&id, &body.to, body.text.trim())?;
+    app.wake_for_note(&id)?;
+    ok(json!(note))
 }
 
 #[derive(Deserialize, Default)]

@@ -138,6 +138,11 @@ impl Live {
         self.store.write(&Self::key(run, "notes.json"), &serde_json::to_vec_pretty(notes)?)
     }
 
+    /// Hold the note lock across a check-then-append, so two wakes cannot both start a run.
+    pub fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write.lock().unwrap()
+    }
+
     pub fn add_note(&self, run: &str, to: &str, text: &str) -> anyhow::Result<Note> {
         let _guard = self.write.lock().unwrap();
         let mut notes = self.notes(run);

@@ -95,6 +95,9 @@ pub enum Event {
     VerifyFinished { failing: BTreeMap<PageId, String>, ok: bool },
     /// The page's citations still match the last build, so it was not rebuilt.
     PageFresh { page: PageId },
+    /// A note arrived after the run had finished. The master reads it, then the pages
+    /// are built again.
+    FollowUp,
     Cancelled,
 }
 
@@ -277,6 +280,31 @@ impl Run {
                 self.phase = RunPhase::Done;
                 out.push(Command::Finish { ok: true });
             }
+            (RunPhase::Done | RunPhase::Failed, Event::FollowUp) => {
+                self.phase = RunPhase::Building;
+                let ids: Vec<PageId> = self.pages.keys().cloned().collect();
+                for id in ids {
+                    let Some(page) = self.pages.get_mut(&id) else { continue };
+                    match page.state {
+                        PageState::Passed | PageState::Failed | PageState::Queued => {
+                            page.state = PageState::Building;
+                            page.pending_errors = None;
+                            page.repairs = 0;
+                            page.tier = Tier::Worker;
+                            page.stale = false;
+                            self.dirty.insert(id.clone());
+                            out.push(Command::SpawnWorker { page: id, tier: Tier::Worker, errors: None });
+                        }
+                        PageState::Building => {
+                            let tier = page.tier;
+                            let errors = page.pending_errors.clone();
+                            self.dirty.insert(id.clone());
+                            out.push(Command::SpawnWorker { page: id, tier, errors });
+                        }
+                        PageState::Flagged => {}
+                    }
+                }
+            }
             (RunPhase::Verifying, Event::VerifyFinished { ok: false, failing }) => {
                 if failing.is_empty() {
                     // Nothing to attribute the failure to, so no worker can repair it.
@@ -441,6 +469,11 @@ mod tests {
         let done = run.step(Event::VerifyFinished { ok: true, failing: BTreeMap::new() });
         assert_eq!(done, vec![Command::Finish { ok: true }]);
         assert_eq!(run.phase, RunPhase::Done);
+        let again = run.step(Event::FollowUp);
+        assert_eq!(run.phase, RunPhase::Building);
+        assert_eq!(again, vec![spawn("a", Tier::Worker, None), spawn("b", Tier::Worker, None)]);
+        assert!(run.pages.values().all(|page| page.state == PageState::Building));
+        assert!(run.step(Event::FollowUp).is_empty(), "a follow-up while building waits");
     }
 
     #[test]

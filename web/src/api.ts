@@ -111,6 +111,8 @@ export interface RunSummary {
   /** The run was cancelled. Its phase is `failed`. */
   cancelled: boolean;
   error: string | null;
+  /** A quota, rate-limit, or sign-in stop, when the daemon classified one. */
+  limit?: RunLimit | null;
   branch: string | null;
   merged: boolean | null;
   /** The branch the run was merged into, and the short merge commit. */
@@ -123,6 +125,14 @@ export interface RunSummary {
   amendments: number;
   /** Risky tool calls waiting for a person. */
   pending_approvals?: number;
+}
+
+export interface RunLimit {
+  provider: string;
+  role: string;
+  kind: "quota" | "rate_limit" | "auth";
+  reset?: string | null;
+  raw: string;
 }
 
 export interface RunDetail extends RunSummary {
@@ -153,6 +163,7 @@ export type RunEvent =
   | "plan_approved"
   | "plan_rejected"
   | "cancelled"
+  | "follow_up"
   | { plan_ready: Plan }
   | { worker_finished: { page: string; outcome: WorkerOutcome } }
   | { flag_resolved: { page: string; key: string; resolution: "conform" | "amended" } }

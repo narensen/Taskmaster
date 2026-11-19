@@ -291,7 +291,7 @@ impl World {
             Mode::Learn if id == "a" && n < 3 => Ok(Script::text("no files yet")),
             Mode::Learn if id == "a" => Ok(Script {
                 text: "Read the route param before rendering the header.".into(),
-                files: vec![("app/a/page.ts".into(), Some("export const a = 1;\n".into()))],
+                files: vec![("app/a/page.ts".into(), Some(format!("export const a = {n};\n")))],
             }),
             Mode::Rebuild => Ok(Script::page(id, &format!("export const rebuilt = \"{id}\";\n"))),
             Mode::Checked => Ok(Script {
@@ -1763,6 +1763,20 @@ mod http {
         assert_eq!(feed.matches("event: agent").count(), entries.len(), "{feed}");
         let (_, rest) = client.text(&format!("/api/runs/talk/stream?token={token}&agents_after={}", entries.len())).await;
         assert!(!rest.contains("event: agent"), "{rest}");
+
+        // A note after the run has finished starts a new master turn, then a worker.
+        let before = world.calls.lock().unwrap().len();
+        let (status, noted) = client.post("/api/runs/talk/notes", json!({ "to": "master", "text": "rename the title" })).await;
+        assert_eq!(status, 200, "{noted}");
+        client.settled("talk", "done").await;
+        let briefs = world.calls.lock().unwrap().clone();
+        let later = &briefs[before..];
+        let master = later.iter().position(|brief| brief.contains("Read these notes") && brief.contains("rename the title")).expect("the master reads the finished-run note");
+        let worker = later.iter().position(|brief| brief.contains("Build page `a`")).expect("a worker follows the master");
+        assert!(master < worker, "the master turn comes before the worker: {later:?}");
+        assert!(later[worker].contains("rename the title"), "the worker follows the master's decision: {}", later[worker]);
+        let (_, notes) = client.get("/api/runs/talk/notes").await;
+        assert!(notes["notes"].as_array().unwrap().iter().all(|note| note["delivered"] == true), "{notes}");
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ import { setRunChrome } from "../shell/runChrome";
 import { Problem } from "../ui";
 import { DiffTab, type Scope } from "../run/Diff";
 import { Flow, FlowSkeleton, fileTarget } from "../run/Flow";
+import { LimitNotice } from "../run/LimitNotice";
 import { LivePreview } from "../run/LivePreview";
 import { surfaces, useRun } from "../run/model";
 import { Stage } from "../run/Stage";
@@ -204,7 +205,7 @@ function ReviewAsk({ id }: { id: string }) {
   );
 }
 
-function EndLine({ detail, onDiff }: { detail: RunDetail; onDiff: () => void }) {
+function EndLine({ detail, onDiff, onRetry }: { detail: RunDetail; onDiff: () => void; onRetry: () => void }) {
   const ok = detail.phase === "done";
   const passed = detail.pages.filter((p) => p.state === "passed").length;
   const word = detail.cancelled ? "Cancelled" : ok ? (detail.merged && detail.merge_commit ? `Merged into ${detail.base || "the project"}` : "Done") : "Failed";
@@ -216,10 +217,14 @@ function EndLine({ detail, onDiff }: { detail: RunDetail; onDiff: () => void }) 
           {passed} of {detail.pages.length} page{detail.pages.length === 1 ? "" : "s"} passed
         </span>
       </header>
-      {detail.error && (
-        <p className="flow-fail">
-          <Rich text={detail.error} />
-        </p>
+      {detail.limit && detail.error ? (
+        <LimitNotice id={detail.id} limit={detail.limit} message={detail.error} onDone={onRetry} />
+      ) : (
+        detail.error && (
+          <p className="flow-fail">
+            <Rich text={detail.error} />
+          </p>
+        )
       )}
       <p className="flow-life">
         {detail.pages.map((p) => `${p.id} ${p.state}`).join("  ·  ")}
@@ -545,12 +550,16 @@ export function RunView({ id }: { id: string }) {
           }
         />
 
-        {detail.error && phase !== "done" && phase !== "failed" && (
-          <p className="flow-fail">
-            <Rich text={detail.error} />
-          </p>
+        {detail.limit && detail.error && phase !== "done" && phase !== "failed" ? (
+          <LimitNotice id={id} limit={detail.limit} message={detail.error} onDone={() => { void data.reload(); data.refollow(); }} />
+        ) : (
+          detail.error && phase !== "done" && phase !== "failed" && (
+            <p className="flow-fail">
+              <Rich text={detail.error} />
+            </p>
+          )
         )}
-        {settled && <EndLine detail={detail} onDiff={() => openTab("diff")} />}
+        {settled && <EndLine detail={detail} onDiff={() => openTab("diff")} onRetry={() => { void data.reload(); data.refollow(); }} />}
         {settled && detail.branch && <ReviewAsk id={id} />}
 
         {(pending.length > 0 || delivered.length > 0) && (

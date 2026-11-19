@@ -49,7 +49,8 @@ impl Check {
 }
 
 fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    let names = tm_harness::sandbox::program_names(program);
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| names.iter().any(|name| dir.join(name).is_file())))
 }
 
 fn has(files: &[String], exts: &[&str]) -> bool {

@@ -3988,3 +3988,5 @@ button.lane-diff { opacity: 0; }
 .deck-harness li { margin: 0; }
 .log-view { margin: 8px 0 0; max-height: 240px; overflow: auto; padding: 8px; background: var(--bg-sunken); color: var(--ink); font-family: var(--mono); font-size: var(--fs-sm); white-space: pre-wrap; border: 1px solid var(--line); border-radius: 8px; }
 .settings-transfer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+/* A daemon with no terminal (Windows, for now) says so in the terminal's place. */
+.qterm-none { margin: 0; padding: 14px 16px; color: var(--muted); font-size: var(--fs-sm); max-width: 60ch; }

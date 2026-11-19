@@ -127,6 +127,9 @@ pub struct OpenBody {
 
 pub async fn open(State(app): State<Arc<App>>, body: Option<Json<OpenBody>>) -> Reply {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    if !pty::AVAILABLE {
+        return Err(fail(StatusCode::NOT_IMPLEMENTED, pty::UNAVAILABLE));
+    }
     if app.terms.open.lock().unwrap().len() >= MAX_OPEN {
         return Err(fail(StatusCode::CONFLICT, format!("{MAX_OPEN} terminals are open; close one first")));
     }

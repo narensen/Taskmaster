@@ -324,7 +324,9 @@ struct Running {
 
 fn start(step: &Step, tx: mpsc::Sender<Vec<u8>>) -> anyhow::Result<Running> {
     let cwd = home();
-    if step.terminal {
+    // Without a terminal (Windows, for now) a terminal step runs on pipes: its output is
+    // shown, and it takes no typing.
+    if step.terminal && pty::AVAILABLE {
         let mut child = pty::spawn(std::path::Path::new(&step.program), &step.args.iter().map(String::as_str).collect::<Vec<_>>(), &cwd, env(), ROWS, COLS)?;
         let mut output = std::mem::replace(&mut child.output, mpsc::channel(1).1);
         tokio::spawn(async move {

@@ -314,11 +314,7 @@ impl PageBrowsers {
             Served::Reserved(_) => {}
         }
         let command = crate::preview::dev_command(&site.root, "", site.port).context("no dev script")?;
-        let installed = self.project.join("node_modules");
-        #[cfg(unix)]
-        if installed.is_dir() && !site.root.join("node_modules").exists() {
-            let _ = std::os::unix::fs::symlink(&installed, site.root.join("node_modules"));
-        }
+        crate::git::borrow_node_modules(&self.project, &site.root);
         // The dev server binds the port itself.
         *served = Served::Failed("it was starting".into());
         let mut cmd = Command::new("sh");

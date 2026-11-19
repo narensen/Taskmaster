@@ -90,7 +90,9 @@ pub fn group_members(pgid: u32) -> usize {
         .count()
 }
 
-/// Send SIGKILL to every process in the group led by `pgid`.
+/// Send SIGKILL to every process in the group led by `pgid`. Windows has no process
+/// groups here: the direct child is ended by `kill_on_drop`, and a tree kill by id could
+/// reach a process that reused the id after the child exited.
 pub fn kill_group(pgid: u32) {
     if pgid > 1 {
         // SAFETY: killpg only sends a signal; a stale group id fails with ESRCH.
@@ -98,8 +100,6 @@ pub fn kill_group(pgid: u32) {
         unsafe {
             libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
         }
-        #[cfg(windows)]
-        let _ = pgid;
     }
 }
 
@@ -273,7 +273,7 @@ pub trait Harness: Send + Sync {
     ) -> anyhow::Result<RunSummary>;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod group_tests {
     use super::*;
 

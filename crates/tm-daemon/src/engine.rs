@@ -2749,11 +2749,7 @@ impl Driver {
         self.trees.push(path.clone());
         // The project's installed packages are what its typecheck and linters run from.
         // They are not in git, so the checkout borrows them.
-        let installed = self.project.join("node_modules");
-        if installed.is_dir() && !path.join("node_modules").exists() {
-            #[cfg(unix)]
-            let _ = std::os::unix::fs::symlink(&installed, path.join("node_modules"));
-        }
+        git::borrow_node_modules(&self.project, &path);
         self.tree = path;
         Ok(())
     }

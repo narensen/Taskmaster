@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type TerminalInfo } from "../api";
 import { toast, useOn } from "../overlay";
 import { setPrefs, useMotion, usePrefs } from "../prefs";
-import { useSettings } from "../query";
+import { useHealth, useSettings } from "../query";
 import { TerminalSession } from "./Xterm";
 import { MOD } from "../desktop";
 
@@ -18,6 +18,9 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
   const p = usePrefs();
   const on = useMotion();
   const settings = useSettings();
+  // A daemon with no terminal (Windows, for now) says so here instead of failing to open one.
+  const health = useHealth();
+  const unavailable = health.data?.terminal === false;
   const [tabs, setTabs] = useState<TerminalInfo[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [height, setHeight] = useState(p.termHeight);
@@ -38,7 +41,7 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
 
   // Shells the daemon still has (from before a reload) come back as tabs.
   useEffect(() => {
-    if (!open || loaded) return;
+    if (!open || loaded || !health.isSuccess || unavailable) return;
     setLoaded(true);
     void api
       .terminals()
@@ -50,7 +53,7 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
         } else void add();
       })
       .catch(() => void add());
-  }, [open, loaded, add]);
+  }, [open, loaded, add, health.isSuccess, unavailable]);
 
   const close = (id: string) => {
     void api.closeTerminal(id).catch(() => undefined);
@@ -62,7 +65,9 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
     });
   };
 
-  useOn("terminal-new", () => void add());
+  useOn("terminal-new", () => {
+    if (!unavailable) void add();
+  });
 
   // Escape closes, unless a full-screen program in the terminal wants it.
   useEffect(() => {
@@ -142,9 +147,11 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
               </motion.div>
             ))}
           </AnimatePresence>
-          <button type="button" className="tb-btn" aria-label="New shell" onClick={() => void add()}>
-            <Plus size={13} />
-          </button>
+          {!unavailable && (
+            <button type="button" className="tb-btn" aria-label="New shell" onClick={() => void add()}>
+              <Plus size={13} />
+            </button>
+          )}
         </div>
         <span className="qterm-cwd mono clip" title={project}>
           {project}
@@ -157,7 +164,12 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
         </button>
       </div>
       <div className="qterm-body">
-        {tabs.length === 0 && (
+        {unavailable && (
+          <p className="qterm-none" role="status">
+            The terminal is not available on Windows yet. Runs, previews, and everything else in Taskmaster work as usual.
+          </p>
+        )}
+        {!unavailable && tabs.length === 0 && (
           <div className="qterm-skel" aria-hidden>
             <span className="skeleton" style={{ width: "38%" }} />
             <span className="skeleton" style={{ width: "22%" }} />

@@ -41,8 +41,9 @@ pub struct Failure {
 }
 
 fn on_path(program: &str) -> bool {
+    let names = tm_harness::sandbox::program_names(program);
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .map(|paths| std::env::split_paths(&paths).any(|dir| names.iter().any(|name| dir.join(name).is_file())))
         .unwrap_or(false)
 }
 

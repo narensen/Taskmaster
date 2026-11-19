@@ -362,7 +362,8 @@ fn store(path: &Path, saved: &[Saved]) -> Result<(), String> {
 
 fn which(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
-    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+    let names = tm_harness::sandbox::program_names(program);
+    std::env::split_paths(&path).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
 }
 
 fn run_cli(program: &str, args: &[&str], dir: Option<&Path>) -> Result<String, String> {

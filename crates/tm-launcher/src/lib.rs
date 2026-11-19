@@ -60,6 +60,13 @@ pub fn start(launch: &Launch<'_>) -> anyhow::Result<Daemon> {
     let port = launch.port.filter(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()).unwrap_or(0);
     let mut cmd = Command::new(launch.program);
     cmd.arg("serve").arg(launch.project).args(["--bind", &format!("127.0.0.1:{port}")]);
+    // The daemon keeps its settings and logs under HOME. Windows names that folder
+    // USERPROFILE and usually leaves HOME unset.
+    if std::env::var_os("HOME").is_none()
+        && let Some(profile) = std::env::var_os("USERPROFILE")
+    {
+        cmd.env("HOME", profile);
+    }
     if let Some(web) = launch.web {
         cmd.arg("--web").arg(web);
     }
@@ -86,6 +93,9 @@ pub fn start(launch: &Launch<'_>) -> anyhow::Result<Daemon> {
 pub fn spawn_and_read(mut cmd: Command, within: Duration, wanted: impl Fn(&str) -> bool + Send + 'static) -> anyhow::Result<(Child, String)> {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // A console program started from a window app would open a console window of its own.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NO_WINDOW);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().context("could not start tm-daemon")?;
     let (tx, rx) = mpsc::channel::<String>();
@@ -143,7 +153,12 @@ pub fn pair(url: &str, code: &str) -> anyhow::Result<String> {
     reply["token"].as_str().map(str::to_string).context("tm-daemon gave no token")
 }
 
-/// Stop a daemon and everything it started: TERM to its group, then KILL.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Stop a daemon and everything it started: TERM to its group, then KILL. On Windows the
+/// daemon's process tree is ended; `child` still holds its handle, so the id cannot have
+/// been reused by another process.
 pub fn stop(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -161,6 +176,17 @@ pub fn stop(child: &mut Child) {
         unsafe {
             libc::killpg(pgid, libc::SIGKILL);
         }
+    }
+    #[cfg(windows)]
+    if matches!(child.try_wait(), Ok(None)) {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -200,6 +226,7 @@ mod tests {
         assert_ne!(unsafe { libc::kill(grandchild, 0) }, 0, "the daemon's children stop with it");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_program_that_never_says_where_it_is_is_stopped_with_its_last_words() {
         let mut cmd = Command::new("sh");

@@ -16,6 +16,7 @@ export const queryClient = new QueryClient({
 });
 
 export const keys = {
+  health: ["health"] as const,
   settings: ["settings"] as const,
   providers: ["providers"] as const,
   run: (id: string) => ["run", id] as const,
@@ -24,6 +25,11 @@ export const keys = {
   projects: ["projects"] as const,
   diff: (id: string) => ["diff", id, "run"] as const,
 };
+
+/** What the daemon is and can do. It does not change while it runs. */
+export function useHealth() {
+  return useQuery({ queryKey: keys.health, queryFn: api.health, staleTime: Infinity });
+}
 
 export function useSettings() {
   return useQuery({ queryKey: keys.settings, queryFn: api.settings, staleTime: 30_000 });

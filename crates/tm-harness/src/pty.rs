@@ -4,19 +4,33 @@
 //! The child is the leader of a new session, with the terminal as its controlling one, so
 //! it and everything it starts can be killed as one group. Output arrives as raw bytes on
 //! a channel; [`crate::screen::Screen`] turns them into text.
+//!
+//! Windows has no backend yet (no ConPTY): [`AVAILABLE`] is false there, [`spawn`] refuses
+//! with [`UNAVAILABLE`], and callers fall back to pipes or say so.
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use anyhow::Context;
 use tokio::sync::mpsc;
 
 use crate::GroupGuard;
+
+/// Whether this build can run a program on a terminal.
+pub const AVAILABLE: bool = cfg!(unix);
+
+/// What a caller says when [`AVAILABLE`] is false.
+pub const UNAVAILABLE: &str = "The terminal is not available on Windows yet.";
 
 /// Keys a person can send to a terminal program besides plain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +90,7 @@ impl PtyWriter {
     }
 
     /// Change the terminal's size. The kernel tells the program with SIGWINCH.
+    #[cfg(unix)]
     pub fn resize(&self, rows: u16, cols: u16) -> std::io::Result<()> {
         let file = self.0.lock().unwrap();
         let size = libc::winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0 };
@@ -84,6 +99,11 @@ impl PtyWriter {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn resize(&self, _rows: u16, _cols: u16) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, UNAVAILABLE))
     }
 }
 
@@ -96,7 +116,19 @@ pub struct PtyChild {
     pub output: mpsc::Receiver<Vec<u8>>,
 }
 
+/// Start `program` on a new terminal. This build has none, so it refuses.
+#[cfg(not(unix))]
+pub fn spawn<I, K, V>(_program: &Path, _args: &[&str], _cwd: &Path, _env: I, _rows: u16, _cols: u16) -> anyhow::Result<PtyChild>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    anyhow::bail!(UNAVAILABLE)
+}
+
 /// Start `program` on a new terminal of `rows` by `cols` in `cwd`, with `env` added.
+#[cfg(unix)]
 pub fn spawn<I, K, V>(program: &Path, args: &[&str], cwd: &Path, env: I, rows: u16, cols: u16) -> anyhow::Result<PtyChild>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -139,6 +171,7 @@ where
     Ok(PtyChild { child, guard, writer, output })
 }
 
+#[cfg(unix)]
 fn read_loop(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 8192];
     loop {
@@ -154,18 +187,18 @@ fn read_loop(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
-
 // Apple's openpty takes *mut termios and *mut winsize; Linux takes *const of both.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe fn call_openpty(master: &mut libc::c_int, slave: &mut libc::c_int, mut size: libc::winsize) -> libc::c_int {
     unsafe { libc::openpty(master, slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 unsafe fn call_openpty(master: &mut libc::c_int, slave: &mut libc::c_int, size: libc::winsize) -> libc::c_int {
     unsafe { libc::openpty(master, slave, std::ptr::null_mut(), std::ptr::null(), &size) }
 }
 
+#[cfg(unix)]
 fn open(rows: u16, cols: u16) -> anyhow::Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -185,7 +218,7 @@ fn open(rows: u16, cols: u16) -> anyhow::Result<(OwnedFd, OwnedFd)> {
     Ok((master, slave))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

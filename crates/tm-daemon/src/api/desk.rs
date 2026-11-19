@@ -540,7 +540,8 @@ pub fn which(program: &str) -> Option<PathBuf> {
         return path.is_file().then_some(path);
     }
     let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
-    on_path.into_iter().chain(extra_dirs()).map(|dir| dir.join(program)).find(|path| path.is_file())
+    let names = tm_harness::sandbox::program_names(program);
+    on_path.into_iter().chain(extra_dirs()).flat_map(|dir| names.iter().map(move |name| dir.join(name))).find(|path| path.is_file())
 }
 
 /// Editors that need a terminal of their own, which a daemon cannot give them.

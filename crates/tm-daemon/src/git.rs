@@ -227,6 +227,22 @@ pub fn safe_rel(path: &str) -> bool {
         && !path.as_os_str().is_empty()
 }
 
+/// Let a checkout use the project's installed packages: they are not in git. A link is
+/// made only when the project has `node_modules` and the checkout does not. Windows allows
+/// a directory link only with Developer Mode on or as an administrator; without it the
+/// checkout goes without, as it would with no packages installed.
+pub fn borrow_node_modules(project: &Path, tree: &Path) {
+    let installed = project.join("node_modules");
+    let link = tree.join("node_modules");
+    if !installed.is_dir() || link.exists() {
+        return;
+    }
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(&installed, &link);
+    #[cfg(windows)]
+    let _ = std::os::windows::fs::symlink_dir(&installed, &link);
+}
+
 pub fn worktree_dir(project: &Path, run_id: &str, label: &str) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

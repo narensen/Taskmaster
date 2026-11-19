@@ -133,11 +133,7 @@ impl Previews {
                     let _ = std::fs::remove_dir_all(&tree);
                 }
                 git::add_worktree(&self.project(), &tree, branch)?;
-                let installed = self.project().join("node_modules");
-                #[cfg(unix)]
-                if installed.is_dir() && !tree.join("node_modules").exists() {
-                    let _ = std::os::unix::fs::symlink(&installed, tree.join("node_modules"));
-                }
+                git::borrow_node_modules(&self.project(), &tree);
                 (tree.clone(), Some(tree))
             }
             None => (self.project(), None),

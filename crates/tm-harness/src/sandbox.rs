@@ -83,12 +83,24 @@ pub fn resolve_binary(name: &str) -> anyhow::Result<PathBuf> {
     // Installers put a harness in its own directory and add that to the shell profile.
     // A daemon started from somewhere else does not have that profile, so look there too.
     for dir in std::env::split_paths(&path).chain(crate::setup::install_dirs()) {
-        if let Ok(found) = std::fs::canonicalize(dir.join(name))
-            && found.is_file() {
-                return Ok(found);
-            }
+        for file in program_names(name) {
+            if let Ok(found) = std::fs::canonicalize(dir.join(&file))
+                && found.is_file() {
+                    return Ok(found);
+                }
+        }
     }
     bail!("`{name}` was not found on PATH")
+}
+
+/// The file names a program may have. Windows adds an extension (`claude.exe`, or
+/// `codex.cmd` for an npm install), so each of `PATHEXT` is tried there.
+pub fn program_names(name: &str) -> Vec<String> {
+    if !cfg!(windows) || Path::new(name).extension().is_some() {
+        return vec![name.to_string()];
+    }
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    exts.split(';').filter(|e| !e.is_empty()).map(|e| format!("{name}{}", e.to_ascii_lowercase())).collect()
 }
 
 #[cfg(test)]

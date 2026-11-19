@@ -45,7 +45,8 @@ impl Harness for ClaudeCode {
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        if task.code_mode && !task.read_only {
+        // Code mode is an interactive session, which needs a terminal.
+        if task.code_mode && !task.read_only && crate::pty::AVAILABLE {
             return self.run_code_mode(task, events).await;
         }
         let mut cmd = Command::new(&self.binary);

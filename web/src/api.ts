@@ -355,6 +355,8 @@ export interface Health {
   ok: boolean;
   version: string;
   auth: { methods: ("pairing" | "account")[]; sign_in?: string | null };
+  /** False where the daemon has no terminal (Windows, for now). Older daemons leave it out. */
+  terminal?: boolean;
 }
 
 export interface NewRun {

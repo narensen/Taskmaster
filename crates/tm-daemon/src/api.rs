@@ -458,7 +458,8 @@ fn accepted(body: Value) -> Reply {
 }
 
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
-    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "auth": app.auth.describe() }))
+    // `terminal` is false where this build has no terminal (Windows, for now).
+    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "auth": app.auth.describe(), "terminal": tm_harness::pty::AVAILABLE }))
 }
 
 /// Everything that is not the API: the built frontend, or the small built-in page.

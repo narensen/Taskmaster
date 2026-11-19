@@ -77,17 +77,16 @@ tm-daemon . --yes                      # approve the plan and build it
 
 The [guide](docs/GUIDE.md) covers roles, configuration, the API, Commons, and reviewing any repository with `tm-review`.
 
-## Built to be kind to your hands
+## Recursive self-improvement
 
-Taskmaster is built so you don't have to reach for the mouse all day, because constant clicking and dragging is how repetitive strain builds up.
+Taskmaster gets better the more it runs, because every mistake feeds back into the system that made it.
 
-- **Command palette.** `⌘K` / `Ctrl-K` jumps to runs, pages and commands without leaving the keyboard.
-- **Shell in place.** `Ctrl-J` opens a shell in the project; hiding it keeps the shell and its output.
-- **Visible focus.** Every element the keyboard can reach shows a clear focus ring, so you always know where you are.
-- **Every input labelled.** Every field, checkbox and icon-only button has a label or an `aria-label`, so the page is predictable by keyboard and by screen reader.
-- **Reduced motion.** `prefers-reduced-motion` is respected; animations stay out of the way.
+- **Errorography.** Each model's repeated mistakes are recorded per model (`errorography.json`). The same mistake, three times for that model, is handed back to it on its next attempt — with the fix that was learned — so a model doesn't repeat itself.
+- **Citations.** Each page records the Dictionary hash it was built against. A later run skips a page whose cited hashes still match, so the system builds on work it already proved.
+- **Reviews that improve reviews.** Reviewer and verifier are different models, so one model never grades its own page. Confirmed and rejected findings are appended to the review history, and the next review reads what earlier ones found.
+- **The event log is the run.** `events.jsonl` is the source of truth. Replaying it rebuilds the state, so a crashed run resumes from the log instead of from a model's memory.
 
-Shortcuts, not reaches.
+Every run leaves the system sharper than it found it.
 
 ## Code Mode (optional)
 

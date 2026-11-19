@@ -14,7 +14,7 @@
 //! await edit(path, find, replace, all?)   find must occur once unless all is true
 //! await grep(text, glob?)             ["path:line: text", ...]
 //! await ls(glob?)                     project files
-//! await sh(command)                   {code, output}; refused unless the gate allows a shell
+//! await sh(command)                   {code, output}; only inside bubblewrap, when the gate allows a shell
 //! await check()                       problems the static checks find in the worktree
 //! await browser(action, args)         open | click | type | screenshot | console on the page's preview
 //! console.log(...)                    lines returned with the result
@@ -90,6 +90,8 @@ console.log = console.info = console.warn = console.error = (...parts) =>
 struct Scope {
     cwd: PathBuf,
     gate: Arc<dyn PermissionGate>,
+    /// The agent's sandboxed shell: what `sh` may write besides the worktree.
+    shell: Option<tm_harness::ShellScope>,
 }
 
 pub struct CodeTools {
@@ -103,12 +105,12 @@ impl CodeTools {
     /// `None` when Node is not installed: there is nothing to run scripts with.
     pub fn new(browsers: Option<Arc<crate::browser::PageBrowsers>>) -> Option<Arc<CodeTools>> {
         let node = tm_harness::sandbox::resolve_binary("node").ok()?;
-        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| bwrap_works());
+        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| bwrap_works() && tm_harness::sandbox::bwrap_usable());
         Some(Arc::new(CodeTools { node, bwrap, scopes: Mutex::new(HashMap::new()), browsers }))
     }
 
-    pub fn attach(&self, page: &str, cwd: &Path, gate: Arc<dyn PermissionGate>) {
-        self.scopes.lock().unwrap().insert(page.to_string(), Arc::new(Scope { cwd: cwd.to_path_buf(), gate }));
+    pub fn attach(&self, page: &str, cwd: &Path, gate: Arc<dyn PermissionGate>, shell: Option<tm_harness::ShellScope>) {
+        self.scopes.lock().unwrap().insert(page.to_string(), Arc::new(Scope { cwd: cwd.to_path_buf(), gate, shell }));
     }
 
     pub fn detach(&self, page: &str) {
@@ -262,8 +264,17 @@ impl CodeTools {
             "sh" => {
                 let command = args["command"].as_str().context("`command` is required")?;
                 self.allowed(scope, op, ToolKind::Execute, None, Some(command)).await?;
-                let mut cmd = tokio::process::Command::new("sh");
-                cmd.arg("-c").arg(command).current_dir(&scope.cwd).stdin(Stdio::null());
+                // The command runs in the same sandbox as the agent's own shell, never loose
+                // on this machine: no sandbox, no `sh`.
+                let (Some(_), Some(shell)) = (&self.bwrap, &scope.shell) else {
+                    bail!("refused: sh needs the sandbox, and this agent has none");
+                };
+                let sh = std::fs::canonicalize("/bin/sh").context("no /bin/sh")?;
+                let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+                let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
+                let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(shell));
+                let mut cmd = tokio::process::Command::new("bwrap");
+                cmd.args(args).current_dir(&scope.cwd).stdin(Stdio::null());
                 let output = tokio::time::timeout(SH_TIMEOUT, tm_harness::spawn_grouped(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?.0.wait_with_output())
                     .await
                     .map_err(|_| anyhow::anyhow!("`{command}` ran longer than {}s", SH_TIMEOUT.as_secs()))??;
@@ -427,7 +438,7 @@ mod tests {
             return;
         };
         let dir = repo("many");
-        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])));
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
         let code = r#"
             const page = await read("app/index.html");
             console.log("lines:", page.split("\n").length - 1);
@@ -448,7 +459,7 @@ mod tests {
     async fn the_gate_and_the_sandbox_hold() {
         let Some(tools) = CodeTools::new(None) else { return };
         let dir = repo("held");
-        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])));
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
         // Outside the worktree, and a shell: the gate refuses both, as it does for the agent's own tools.
         let text = tools.run(&grant(), r#"try { await read("/etc/hostname"); } catch (e) { console.log(e.message); } return await sh("echo hi");"#).await.unwrap();
         assert!(text.contains("refused: read /etc/hostname"), "{text}");
@@ -470,11 +481,40 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// With a shell, `sh` runs inside bubblewrap: the worktree and the scratch can be written,
+    /// nothing else can. Skipped where bubblewrap cannot run.
+    #[tokio::test]
+    async fn sh_runs_in_the_sandbox_and_writes_only_the_worktree() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        if tools.bwrap.is_none() {
+            eprintln!("bubblewrap is not usable here; skipping");
+            return;
+        }
+        let dir = repo("sh-sandbox");
+        let scratch = dir.with_extension("scratch");
+        let outside = dir.with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
+        let script = format!(
+            r#"return await sh("echo in > made.txt && echo s > $TASKMASTER_SCRATCH/s.txt && (echo out > {}/x.txt || echo refused-outside)");"#,
+            outside.display()
+        );
+        let text = tools.run(&grant(), &script).await.unwrap();
+        assert!(dir.join("made.txt").is_file(), "{text}");
+        assert!(scratch.join("s.txt").is_file(), "{text}");
+        assert!(!outside.join("x.txt").exists(), "{text}");
+        assert!(text.contains("refused-outside"), "{text}");
+        for d in [&dir, &scratch, &outside] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     #[tokio::test]
     async fn a_script_that_never_returns_is_stopped() {
         let Some(tools) = CodeTools::new(None) else { return };
         let dir = repo("crash");
-        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])));
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
         let text = tools.run(&grant(), "throw new Error('nope')").await.unwrap();
         assert!(text.contains("Error: Error: nope"), "{text}");
         let syntax = tools.run(&grant(), "return (").await;

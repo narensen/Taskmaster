@@ -111,13 +111,49 @@ pub fn tracked_files(repo: &Path) -> anyhow::Result<Vec<String>> {
 /// Staged and unstaged edits plus untracked files, against the worktree's `HEAD`.
 pub fn worktree_changes(repo: &Path) -> anyhow::Result<Vec<Change>> {
     let mut changes = parse_name_status(&git(repo, &["diff", "--no-renames", "--name-status", "-z", "HEAD"])?);
-    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut args = vec!["ls-files".to_string(), "--others".into(), "--exclude-standard".into(), "-z".into()];
+    args.extend(ARTIFACTS.iter().map(|pattern| format!("--exclude={pattern}")));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let untracked = git(repo, &refs)?;
     for path in untracked.split('\0').filter(|p| !p.is_empty()) {
         if !changes.iter().any(|c| c.path == path) {
             changes.push(Change { status: 'A', path: path.into() });
         }
     }
+    changes.retain(|c| c.status != 'A' || !is_artifact(&c.path));
     Ok(changes)
+}
+
+/// What running a project's tests or installing its packages leaves in a worktree. A worker
+/// with a shell makes these; they are never its work, so they are never merged or counted.
+pub const ARTIFACTS: [&str; 15] = [
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".hypothesis/",
+    ".tox/",
+    ".nox/",
+    ".venv/",
+    "venv/",
+    "*.egg-info/",
+    ".coverage",
+    "htmlcov/",
+    "node_modules/",
+    "target/",
+];
+
+/// Whether a new file is a build or test leftover (see [`ARTIFACTS`]).
+pub fn is_artifact(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    let name = parts.last().copied().unwrap_or("");
+    dirs.iter().any(|d| {
+        ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis", ".tox", ".nox", ".venv", "venv", "htmlcov", "node_modules", "target"].contains(d)
+            || d.ends_with(".egg-info")
+    }) || name.ends_with(".pyc")
+        || name == ".coverage"
 }
 
 /// Everything changed in a scratch worktree as one diff, new files included. Stages the
@@ -496,5 +532,34 @@ mod tests {
         assert!(check_remote_name(".origin").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
-}
 
+    #[test]
+    fn test_runs_and_installs_leave_nothing_a_worker_is_charged_with() {
+        let root = std::env::temp_dir().join(format!("tm-git-artifacts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&root).status().unwrap();
+        git(&root, &["config", "user.name", "Test"]).unwrap();
+        git(&root, &["config", "user.email", "test@example.com"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-q", "-m", "start"]).unwrap();
+        for (path, body) in [
+            ("db/engine.py", "x = 1\n"),
+            ("db/__pycache__/engine.cpython-312.pyc", "\0"),
+            ("tests/test_engine.py", "def test(): pass\n"),
+            (".pytest_cache/v/cache/lastfailed", "{}"),
+            (".venv/bin/python", ""),
+            ("pkg.egg-info/PKG-INFO", ""),
+            ("node_modules/x/index.js", ""),
+            (".coverage", ""),
+        ] {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        let mut found: Vec<String> = worktree_changes(&root).unwrap().into_iter().map(|c| c.path).collect();
+        found.sort();
+        assert_eq!(found, vec!["db/engine.py".to_string(), "tests/test_engine.py".to_string()]);
+        assert!(is_artifact("a/b/__pycache__/c.pyc") && is_artifact("target/debug/x") && !is_artifact("src/target.rs"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

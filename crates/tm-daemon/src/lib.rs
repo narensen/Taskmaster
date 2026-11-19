@@ -261,6 +261,10 @@ pub struct Config {
     pub checker: bool,
     /// Code Mode: workers get `run_code`, and Claude Code runs its own code mode.
     pub code_mode: bool,
+    /// Builders whose harness runs inside the sandbox get a shell there.
+    pub worker_shell: bool,
+    /// Fetch tools may reach the package indexes.
+    pub package_indexes: bool,
 }
 
 impl Config {
@@ -292,6 +296,8 @@ impl Config {
             browser: true,
             checker: false,
             code_mode: false,
+            worker_shell: true,
+            package_indexes: true,
         }
     }
 }

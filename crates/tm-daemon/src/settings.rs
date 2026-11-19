@@ -41,6 +41,25 @@ pub struct Settings {
     pub telemetry: TelemetrySettings,
     /// How long one agent call may run.
     pub agents: AgentSettings,
+    /// What a worker's sandbox lets it do.
+    pub sandbox: SandboxSettings,
+}
+
+/// A builder's shell. It is only ever given inside the bubblewrap sandbox (or Codex's own),
+/// where it can write nothing but the worktree and the run's scratch and caches.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SandboxSettings {
+    /// Builders get a shell, so they can run their tests and install what those need.
+    pub shell: bool,
+    /// Fetch tools may reach the package indexes (PyPI, npm, crates.io), and nothing else.
+    pub package_indexes: bool,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        SandboxSettings { shell: true, package_indexes: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

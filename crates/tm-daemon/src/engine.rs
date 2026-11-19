@@ -17,7 +17,7 @@ use tm_core::{
 };
 use tm_dictionary::{Catalog, CommonsRemote, Grant, LocalStore, McpState};
 use tm_harness::{
-    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, PermissionGate, RunSummary, Usage, WorkerTask, WorktreeGate,
+    DictionaryAccess, HARNESS_STATE_DIRS, Harness, HarnessEvent, PermissionGate, RunSummary, ShellScope, Usage, WorkerTask, WorktreeGate,
 };
 use crate::checks::{self, Timing};
 use tm_verify::{ImportGraph, Owners, load_sources, outside_owned};
@@ -94,6 +94,10 @@ struct AgentRequest {
     code_mode: bool,
     /// For a planner: when to stop looking and write. See [`Commit`].
     commit: Option<Commit>,
+    /// A sandboxed shell, for a builder whose harness runs inside the sandbox.
+    shell: Option<ShellScope>,
+    /// Fetches may reach the package indexes (see [`tm_harness::PACKAGE_INDEXES`]).
+    fetch: bool,
 }
 
 /// When a planner has looked and thought long enough. It is stopped after `tools` tool
@@ -187,6 +191,9 @@ struct Ran {
     pages: BTreeMap<PageId, String>,
     /// For the master: shared files the output names, and the output (with no file).
     shared: Vec<(String, String)>,
+    /// A failure whose output names no file any unit owns and no shared file: the step
+    /// and its output. The master gets it as a repair; it is never passed over.
+    unowned: Option<String>,
     timings: Vec<Timing>,
 }
 
@@ -291,6 +298,8 @@ struct Driver {
     checked: BTreeSet<PageId>,
     /// UI findings already sent to their page for one repair: (page, check).
     ui_sent: BTreeSet<(PageId, String)>,
+    /// Harnesses already reported as having no shell in this run.
+    no_shell: BTreeSet<String>,
 }
 
 impl Drop for Driver {
@@ -421,6 +430,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         checks: JoinSet::new(),
         checked: BTreeSet::new(),
         ui_sent: BTreeSet::new(),
+        no_shell: BTreeSet::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -574,7 +584,13 @@ impl Driver {
                 errors = vec!["the planner did not finish".into()];
             } else {
                 match reply::parse_plan(&text) {
-                    Ok((mut plan, drafts)) => {
+                    Ok((mut plan, mut drafts)) => {
+                        for note in tm_core::normalize_plan(&mut plan, &mut drafts) {
+                            eprintln!("taskmaster: plan fixed in place: {note}");
+                        }
+                        for note in self.importable_contracts(&mut plan) {
+                            eprintln!("taskmaster: plan fixed in place: {note}");
+                        }
                         self.settle_skills(&mut plan, prompt);
                         let existing = self.existing_content(&plan, &drafts)?;
                         match check_plan(&plan, &drafts, &existing) {
@@ -582,8 +598,10 @@ impl Driver {
                                 let published = self.publish_drafts(&drafts, &existing)?;
                                 self.records.save_plan(&self.id, &plan)?;
                                 eprintln!(
-                                    "taskmaster: planned {} pages and {} new dictionary entries",
+                                    "taskmaster: planned {} {} ({}) and {} new dictionary entries",
                                     plan.pages.len(),
+                                    if plan.has_ui() { "pages" } else { "units" },
+                                    plan.kind.id(),
                                     published
                                 );
                                 for line in agent_lines(&plan).lines() {
@@ -598,7 +616,10 @@ impl Driver {
                 }
             }
             if attempt == 1 {
-                eprintln!("taskmaster: plan rejected, asking once more");
+                eprintln!("taskmaster: plan rejected, asking once more. The reasons:");
+                for error in &errors {
+                    eprintln!("taskmaster:   - {error}");
+                }
             }
         }
         bail!("plan is not usable:\n{}", errors.join("\n"))
@@ -608,6 +629,23 @@ impl Driver {
     /// nothing a planner could find with tools that it is not already given.
     fn fresh_project(&self) -> anyhow::Result<bool> {
         Ok(self.existing_files() == 0 && self.entry_listing()?.len() < ENTRIES_LISTED)
+    }
+
+    /// A Python contract at the project root cannot be imported by tests under `tests/`
+    /// unless pytest puts the root on the path, which a root `conftest.py` does. Lock an
+    /// empty one beside it when the project has none and no unit owns that file.
+    fn importable_contracts(&self, plan: &mut Plan) -> Vec<String> {
+        let loose = plan.contracts.iter().any(|c| c.path.ends_with(".py") && !c.path.contains('/'));
+        let has = plan.contracts.iter().any(|c| c.path == "conftest.py") || self.tree.join("conftest.py").exists();
+        let owned = plan.pages.iter().any(|p| globset::Glob::new(&p.owned_glob).is_ok_and(|g| g.compile_matcher().is_match("conftest.py")));
+        if !loose || has || owned {
+            return Vec::new();
+        }
+        plan.contracts.push(tm_core::ContractFile {
+            path: "conftest.py".into(),
+            content: "# Puts the project root on the import path, so the tests can import the contracts beside it.\n".into(),
+        });
+        vec!["a Python contract sits at the project root, so a root conftest.py is locked to make it importable from the tests".into()]
     }
 
     /// How long a planner may look and think before it must write. A fresh project gives
@@ -749,20 +787,14 @@ impl Driver {
         brief.push_str(
             "\nReply with one JSON object and do not edit files. \
              Leave `estimate` at zero: Taskmaster works it out from what past runs cost. \
-             `contracts` are shared source files. Each page owns one glob. \
-             `dictionary` holds new entries those pages cite. \
-             `kind` is schema, routes, component_api, pattern, or hint. \
-             Every page, and every unit, is one agent: its `brief` is that agent's whole task and `done` is one line \
-             saying how it knows it is finished.\n\
-             {\"design\":\"...\",\"contracts\":[{\"path\":\"app/types.ts\",\"content\":\"...\"}],\
-             \"pages\":[{\"id\":\"home\",\"route\":\"/home\",\"owned_glob\":\"app/home/**\",\"cites\":[\"theme\"],\"brief\":\"...\",\"done\":\"...\",\"skills\":[]}],\
-             \"estimate\":{\"tokens\":0,\"usd\":0},\
-             \"dictionary\":[{\"key\":\"theme\",\"kind\":\"hint\",\"summary\":\"...\",\"content\":\"...\",\"stack\":\"next\"}]}\n\
-             \nRules: at least one page; page ids use letters, digits, `_` and `-`; \
-             owned_glob and contract paths are relative and do not contain `..`; \
-             every cited key is an existing entry or one of the dictionary items; \
-             briefs and contents are non-empty.\n",
+             `kind` says what is being built: web, library, cli, server or migration. \
+             `contracts` are shared interface files that more than one unit imports, locked before any unit starts. \
+             `units` are the pieces of work; each owns one glob. \
+             `dictionary` holds new entries those units cite; an entry's `kind` is schema, routes, component_api, pattern, or hint. \
+             Every unit, and every part of one, is one agent: its `brief` is that agent's whole task and `done` is one line \
+             saying how it knows it is finished.\n",
         );
+        brief.push_str(&crate::small::plan_shape());
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
@@ -1111,6 +1143,8 @@ impl Driver {
             browser: None,
             code_mode: false,
             commit: None,
+            shell: None,
+            fetch: false,
         };
         self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
         let bill = request.bill(Role::Checker, Some(page));
@@ -1270,7 +1304,14 @@ impl Driver {
             }
         }
         if all.is_empty() {
-            let ok = products.iter().any(|(_, p)| p.answer.ok);
+            let ok = products.iter().all(|(_, p)| p.answer.ok);
+            // The files were already right, from an earlier run, the plan, or a template: the
+            // unit is done. Its tests and the project's checks still run at verify. A run told
+            // to rebuild every page (an eval's baseline) still expects each to be written.
+            if ok && self.config.incremental && self.owned_files_exist(page) {
+                eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
+                return Ok(WorkerOutcome::Passed);
+            }
             let why = if ok {
                 "worker produced no changes under its owned files"
             } else {
@@ -1561,7 +1602,9 @@ impl Driver {
         eprintln!("taskmaster: verifying the project");
         let mut timings = Vec::new();
         let verdict = self.verify_checks(&mut timings).await;
-        let text = checks::report(&timings);
+        // A skipped smoke check is not a check: say plainly when nothing ran at all.
+        let ran_any = timings.iter().any(|t| matches!(t.status, "ok" | "failed" | "timeout"));
+        let text = if ran_any { checks::report(&timings) } else { format!("verify: nothing ran ({})", checks::report(&timings).trim_start_matches("verify: ")) };
         eprintln!("taskmaster: {text}");
         self.terminal("output", serde_json::json!({ "ok": matches!(&verdict, Ok((true, _))), "text": text }));
         verdict
@@ -1573,7 +1616,7 @@ impl Driver {
         let sources = load_sources(&self.tree)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
         // The static checks and the project's own build and tests do not wait for each other.
-        let steps = if self.config.runtime_checks { runtime::steps(&self.tree) } else { Vec::new() };
+        let steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
         let (checked, built) = {
             let tree = self.tree.clone();
             let build = async {
@@ -1617,18 +1660,30 @@ impl Driver {
             return Ok((false, BTreeMap::new()));
         }
         if failing.is_empty() && self.config.runtime_checks {
-            let routes: Vec<(PageId, String)> = plan.pages.iter().map(|p| (p.id.clone(), p.route.clone())).collect();
+            // Only units a browser shows are opened in one.
+            let routes: Vec<(PageId, String)> = plan.ui_routes();
             let mut ran = self.runtime_checks(&owners, &routes, built).await?;
             timings.append(&mut ran.timings);
-            if ran.pages.is_empty() && !ran.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
-                self.repair_shared(&ran.shared).await?;
+            // A failure no unit owns goes to the master, for as many repairs as the run has left.
+            while ran.pages.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) && self.shared_repairs() < MAX_SHARED_REPAIRS {
+                if ran.shared.is_empty() {
+                    let output = ran.unowned.clone().unwrap_or_default();
+                    self.repair_unowned(&output).await?;
+                } else {
+                    self.repair_shared(&ran.shared).await?;
+                }
                 ran = self.runtime_checks(&owners, &routes, None).await?;
                 timings.append(&mut ran.timings);
             }
             failing.extend(ran.pages);
-            if failing.is_empty() && !ran.shared.is_empty() {
-                let lines: Vec<String> = ran.shared.iter().map(|(_, line)| line.clone()).collect();
-                eprintln!("taskmaster: the project's build or tests still fail in shared files:\n{}", lines.join("\n"));
+            if failing.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) {
+                let mut lines: Vec<String> = ran.shared.iter().map(|(_, line)| line.clone()).filter(|l| !l.is_empty()).collect();
+                lines.extend(ran.unowned.clone());
+                eprintln!(
+                    "taskmaster: the project's build or tests still fail after {} repair(s), so the run fails and is not merged:\n{}",
+                    self.shared_repairs(),
+                    lines.join("\n")
+                );
                 let entry = ChangeEntry {
                     at: rfc3339_now(),
                     kind: ChangeKind::VerifyFailed,
@@ -1638,6 +1693,26 @@ impl Driver {
                     files: ran.shared.iter().map(|(file, _)| file.clone()).filter(|f| !f.is_empty()).collect(),
                     keys: vec![],
                     summary: clip(&lines.join("\n"), 4000),
+                };
+                self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
+                return Ok((false, BTreeMap::new()));
+            }
+            // A project with tests whose tests never ran has not been verified.
+            let tested = timings.iter().any(|t| t.name == "test" && matches!(t.status, "ok" | "failed"));
+            if failing.is_empty() && !tested && runtime::has_tests(&self.tree) {
+                let why = runtime::missing_runner(&self.tree).unwrap_or_else(|| "no test runner could be started".into());
+                let line = format!("verify: nothing ran. The project has tests, but they were not run: {why}");
+                eprintln!("taskmaster: {line}");
+                self.terminal("output", serde_json::json!({ "ok": false, "text": line }));
+                let entry = ChangeEntry {
+                    at: rfc3339_now(),
+                    kind: ChangeKind::VerifyFailed,
+                    page: None,
+                    commit: None,
+                    model: None,
+                    files: vec![],
+                    keys: vec![],
+                    summary: line,
                 };
                 self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
                 return Ok((false, BTreeMap::new()));
@@ -1699,15 +1774,16 @@ impl Driver {
         built: Option<(Vec<Timing>, Option<runtime::Failure>)>,
     ) -> anyhow::Result<Ran> {
         let mut ran = Ran::default();
-        let steps = runtime::steps(&self.tree);
+        let steps = runtime::steps(&self.tree, &self.verify_venv());
         for step in &steps {
             self.terminal(
                 "command",
-                serde_json::json!({ "command": format!("{} {}", step.program, step.args.join(" ")), "cwd": self.tree.display().to_string() }),
+                serde_json::json!({ "command": step.line(), "cwd": self.tree.display().to_string() }),
             );
         }
-        // A static site's smoke check does not need a build, so it runs alongside one.
-        let alongside = checks::is_static_site(&self.tree);
+        // A static site's smoke check does not need a build, so it runs alongside one. A plan
+        // with nothing shown in a browser has no smoke check at all.
+        let alongside = !routes.is_empty() && checks::is_static_site(&self.tree);
         let (steps_timed, failed, early_smoke) = match built {
             Some((timed, failed)) => (timed, failed, None),
             None if alongside => {
@@ -1743,12 +1819,15 @@ impl Driver {
                     ran.shared = named.into_iter().map(|file| (file, String::new())).collect();
                     ran.shared.push((String::new(), text));
                 } else if ran.pages.is_empty() {
-                    eprintln!(
-                        "taskmaster: `{}` failed, and the output names no file this run wrote, so nothing was sent for repair:\n{rest}",
-                        failure.step
-                    );
+                    // No unit owns it, and it is not in a shared file: still a failure. The
+                    // master gets it, and if the master cannot fix it the run fails.
+                    eprintln!("taskmaster: `{}` failed, and the output names no file a unit owns:\n{rest}", failure.step);
+                    ran.unowned = Some(format!("`{}` failed:\n{rest}", failure.step));
                 }
             }
+            return Ok(ran);
+        }
+        if routes.is_empty() {
             return Ok(ran);
         }
         self.terminal(
@@ -1855,6 +1934,106 @@ impl Driver {
         self.changes.iter().filter(|entry| entry.kind == ChangeKind::SharedRepaired).count()
     }
 
+    /// The run's own Python environment for verify, made on first use and kept for the run.
+    fn verify_venv(&self) -> PathBuf {
+        crate::run_directory(&self.project, &self.id).join("venv")
+    }
+
+    /// Ask the master to fix a build or test failure no unit owns. It may change any file of
+    /// the project (the configuration, a test, a dependency file); a failing check is never
+    /// passed over in silence.
+    async fn repair_unowned(&mut self, output: &str) -> anyhow::Result<()> {
+        eprintln!("taskmaster: asking the master to repair a failure no unit owns");
+        let mut brief = String::from(
+            "The project's own build or tests fail, and the output names no file any unit owns. Find the cause and fix it. \
+             It may be the project's configuration, a test, a shared file, a missing dependency or a dependency file \
+             (a lockfile, pyproject.toml, package.json). Change as little as you can, and do not rewrite a unit's work \
+             unless the output shows it is wrong. Taskmaster runs the checks again after you.\n\nOutput:\n",
+        );
+        brief.push_str(&clip(output, 8000));
+        brief.push('\n');
+        let notes = self.live.take_notes(&self.id, &["master"]);
+        let brief = self.with_notes(brief, &notes);
+        let worktree = self.fresh_worktree("unowned")?;
+        let harness = self.harnesses.master.clone();
+        let shell = self.shell_for(&harness, "master-repair");
+        let mut request = AgentRequest {
+            harness,
+            brief,
+            cwd: worktree.clone(),
+            model: self.config.models.master.clone(),
+            effort: None,
+            dictionary: Some(self.access(&self.master_token.clone())),
+            timeout: self.config.timeout,
+            stall: None,
+            read_only: false,
+            feed: None,
+            browser: None,
+            code_mode: false,
+            commit: None,
+            shell,
+            fetch: self.config.package_indexes,
+        };
+        self.tag(&mut request, "master", "master", None, None);
+        let bill = request.bill(Role::Master, None);
+        let asked = ask(request).await;
+        let merged = match asked {
+            Ok(answer) => {
+                self.charge(&bill, &answer)?;
+                self.merge_any(&worktree)
+            }
+            Err(err) => Err(err),
+        };
+        self.drop_worktree(&worktree);
+        let files = merged?;
+        let summary = if files.is_empty() { "the master changed nothing for a failure no unit owns".to_string() } else { format!("repaired {}", files.join(", ")) };
+        let entry = ChangeEntry {
+            at: rfc3339_now(),
+            kind: ChangeKind::SharedRepaired,
+            page: None,
+            commit: None,
+            model: Some(self.byline(self.harnesses.master.id(), &self.config.models.master)),
+            files: files.clone(),
+            keys: vec![],
+            summary,
+        };
+        // Recorded even when nothing changed, so the repair is not asked for forever.
+        if self.commit_entries(vec![entry.clone()], files, "taskmaster: repair a failure no unit owns")?.is_none() {
+            self.changes.push(entry);
+            self.save_changes()?;
+        }
+        Ok(())
+    }
+
+    /// Copy every change the master made in `worktree` into the run's tree, except the
+    /// run's own records and anything that is not a plain file inside the project.
+    fn merge_any(&self, worktree: &Path) -> anyhow::Result<Vec<String>> {
+        let mut files = Vec::new();
+        for change in git::worktree_changes(worktree)? {
+            if !git::safe_rel(&change.path) || change.path.starts_with(".taskmaster/") {
+                continue;
+            }
+            let src = worktree.join(&change.path);
+            let dest = self.tree.join(&change.path);
+            if change.status == 'D' {
+                if dest.is_file() {
+                    fs::remove_file(&dest)?;
+                    files.push(change.path);
+                }
+                continue;
+            }
+            if fs::symlink_metadata(&src)?.file_type().is_symlink() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src, &dest).with_context(|| format!("cannot copy {}", change.path))?;
+            files.push(change.path);
+        }
+        Ok(files)
+    }
+
     /// Ask the master to fix shared files the run wrote. Workers may not touch them, and
     /// the master may touch nothing else: any other edit it makes is discarded.
     async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<()> {
@@ -1874,8 +2053,10 @@ impl Driver {
         let notes = self.live.take_notes(&self.id, &["master"]);
         let brief = self.with_notes(brief, &notes);
         let worktree = self.fresh_worktree("shared")?;
+        let harness = self.harnesses.master.clone();
+        let shell = self.shell_for(&harness, "master-shared");
         let mut request = AgentRequest {
-            harness: self.harnesses.master.clone(),
+            harness,
             brief,
             cwd: worktree.clone(),
             model: self.config.models.master.clone(),
@@ -1888,6 +2069,8 @@ impl Driver {
             browser: None,
             code_mode: false,
             commit: None,
+            shell,
+            fetch: self.config.package_indexes,
         };
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
@@ -2083,8 +2266,11 @@ impl Driver {
         }
         brief.push_str(&self.deliver_skills(page, &cwd));
         let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
+        let harness = self.harness_for(tier);
+        let label = if units > 1 { format!("{page}-{unit}") } else { page.to_string() };
+        let shell = self.shell_for(&harness, &label);
         Ok(AgentRequest {
-            harness: self.harness_for(tier),
+            harness,
             brief,
             cwd,
             model: self.model_for(tier),
@@ -2098,14 +2284,60 @@ impl Driver {
             browser: None,
             code_mode: false,
             commit: None,
+            shell,
+            fetch: self.config.package_indexes,
         })
+    }
+
+    /// The sandboxed shell an agent gets: its own scratch directory and the run's package
+    /// caches, writable, and nothing else outside its worktree. `None` when the setting is
+    /// off or the harness cannot be confined here, which is said once per harness.
+    fn shell_for(&mut self, harness: &Arc<dyn Harness>, label: &str) -> Option<ShellScope> {
+        if !self.config.worker_shell {
+            return None;
+        }
+        if !harness.sandboxed_shell() {
+            if self.no_shell.insert(harness.id().to_string()) {
+                let why = if tm_harness::sandbox::bwrap_usable() { "this harness does not run inside the sandbox" } else { "bubblewrap is not usable on this machine" };
+                let line = format!("{} agents get no shell in this run: {why}, so they cannot run tests or install packages", harness.id());
+                eprintln!("taskmaster: {line}");
+                self.terminal("output", serde_json::json!({ "ok": true, "text": line }));
+            }
+            return None;
+        }
+        let run = crate::run_directory(&self.project, &self.id);
+        let slug: String = label.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+        let scratch = run.join("scratch").join(slug);
+        let cache = run.join("cache");
+        for dir in [&scratch, &cache] {
+            if let Err(err) = fs::create_dir_all(dir) {
+                eprintln!("taskmaster: no scratch directory for {label} ({err}); it gets no shell");
+                return None;
+            }
+        }
+        let at = |dir: &Path| dir.display().to_string();
+        let env = vec![
+            ("TASKMASTER_SCRATCH".to_string(), at(&scratch)),
+            ("XDG_CACHE_HOME".into(), at(&cache)),
+            ("PIP_CACHE_DIR".into(), at(&cache.join("pip"))),
+            ("UV_CACHE_DIR".into(), at(&cache.join("uv"))),
+            ("POETRY_CACHE_DIR".into(), at(&cache.join("poetry"))),
+            ("npm_config_cache".into(), at(&cache.join("npm"))),
+            // Build products stay out of the worktree, so they are never taken for the unit's work.
+            ("CARGO_TARGET_DIR".into(), at(&scratch.join("target"))),
+            ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+            ("PYTEST_ADDOPTS".into(), "-p no:cacheprovider".into()),
+            ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
+        ];
+        Some(ShellScope { writable: vec![scratch, cache], env })
     }
 
     /// Serve the worktree as the page's preview and give the agent the browser on it, when
     /// this is a web project and Chrome is here.
     fn offer_browser(&self, page: &str, cwd: &Path, request: &mut AgentRequest) {
         let Some(browsers) = &self.browsers else { return };
-        if !self.looks_like_web(cwd) {
+        let shown = self.plan().ok().zip(self.page(page).ok()).is_some_and(|(plan, unit)| plan.is_ui(unit));
+        if !shown || !self.looks_like_web(cwd) {
             return;
         }
         let Ok(origin) = browsers.attach(page, cwd) else { return };
@@ -2123,7 +2355,7 @@ impl Driver {
     /// Give the agent `run_code` over its worktree, through the gate its own tools face.
     fn offer_code(&self, page: &str, cwd: &Path, request: &mut AgentRequest) {
         let Some(code) = &self.code else { return };
-        code.attach(page, cwd, gate_for(request));
+        code.attach(page, cwd, gate_for(request), request.shell.clone());
         request.brief.push_str(
             "\nYou have run_code: one call runs a short async JavaScript program with read, write, edit, grep, ls, check, sh and browser. \
              Prefer one run_code call that does several steps (read what you need, write your files, then `return await check()`) \
@@ -2134,6 +2366,9 @@ impl Driver {
     /// A project a browser can show: one with a package.json, an HTML start page, or plan
     /// files of the web's kinds.
     fn looks_like_web(&self, cwd: &Path) -> bool {
+        if self.plan().is_ok_and(|plan| !plan.has_ui()) {
+            return false;
+        }
         if cwd.join("package.json").is_file() || crate::static_site::start_page(cwd).is_some() {
             return true;
         }
@@ -2158,6 +2393,15 @@ impl Driver {
             out.push_str(&format!("- `.taskmaster/skills/{name}/SKILL.md`{}\n", if about.is_empty() { String::new() } else { format!(": {about}") }));
         }
         out
+    }
+
+    /// Whether the run's tree already has a file the unit owns that is not a locked contract.
+    fn owned_files_exist(&self, page: &str) -> bool {
+        let Ok(unit) = self.page(page) else { return false };
+        let Ok(glob) = globset::Glob::new(&unit.owned_glob) else { return false };
+        let matcher = glob.compile_matcher();
+        let locked = self.locked_files();
+        git::tracked_files(&self.tree).unwrap_or_default().iter().any(|f| matcher.is_match(f) && !locked.contains(f))
     }
 
     /// Files already in the worktree that this agent owns, so it need not look for them.
@@ -2188,17 +2432,27 @@ impl Driver {
             contracts.iter().map(|c| format!("- `{}`\n", c.path)).collect()
         };
         let split = if units > 1 { page.work_units().get(unit).cloned() } else { None };
+        let ui = self.plan()?.is_ui(&page);
+        // A page of a web app opens at a route; a module of anything else has none.
+        let opening = if ui {
+            format!("Build page `{}` for route `{}`.", page.id, page.route)
+        } else {
+            format!("Build unit `{}` of this {} project.", page.id, self.plan()?.kind.id())
+        };
+        let relative = if ui {
+            "File paths in this brief and in Dictionary entries are from the project root; a link or import inside a file \
+             is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n"
+        } else {
+            "File paths in this brief and in Dictionary entries are from the project root.\n"
+        };
         let mut brief = format!(
-            "Build page `{id}` for route `{route}`.\n\
-             You may create or edit only files matching `{glob}`. Files outside it are discarded and the page fails its check.\n\
+            "{opening}\n\
+             You may create or edit only files matching `{glob}`. Files outside it are discarded and the unit fails its check.\n\
              Cite only these Dictionary keys, and follow them: {cites}.\n\
              Contracts{given} in the tree:\n{contract_list}\n\
              {body}\n\
-             File paths in this brief and in Dictionary entries are from the project root; a link or import inside a file \
-             is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n\
-             If a Dictionary entry is wrong, stop and reply with {{\"flag\":{{\"key\":\"...\",\"issue\":\"...\"}}}} and do not edit other pages.\n",
-            id = page.id,
-            route = page.route,
+             {relative}\
+             If a Dictionary entry is wrong, stop and reply with {{\"flag\":{{\"key\":\"...\",\"issue\":\"...\"}}}} and do not edit other units.\n",
             glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
             body = page.brief,
             given = if inline && !contracts.is_empty() { ", given in full and already" } else { " already" },
@@ -2287,7 +2541,7 @@ impl Driver {
             // Each lookup is another model turn; the entries are already here.
             brief.push_str("\nThe cited entries above are complete: do not look them up again with the Dictionary tools.\n");
         }
-        let design = self.plan()?.design.trim().to_string();
+        let design = if ui { self.plan()?.design.trim().to_string() } else { String::new() };
         if !design.is_empty() {
             brief.push_str(&format!(
                 "\nDesign spec, shared by every agent of this run. Follow it exactly; do not invent another look:\n{design}\n"
@@ -2381,6 +2635,8 @@ impl Driver {
             browser: None,
             code_mode: false,
             commit: None,
+            shell: None,
+            fetch: false,
         })
     }
 
@@ -3075,6 +3331,12 @@ fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
     if let Some(origin) = &request.browser {
         gate = gate.with_browser(origin.clone());
     }
+    if request.shell.is_some() && !request.read_only {
+        gate = gate.with_shell();
+    }
+    if request.fetch && !request.read_only {
+        gate = gate.with_fetch_hosts(&tm_harness::PACKAGE_INDEXES);
+    }
     for dir in HARNESS_STATE_DIRS {
         gate = gate.with_readable(format!("{home}/{dir}"));
     }
@@ -3097,7 +3359,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         stall: request.stall,
         read_only: request.read_only,
         code_mode: request.code_mode,
-        shell: None,
+        shell: request.shell.clone().filter(|_| !request.read_only),
     };
     let feed = &request.feed;
     if let Some(feed) = &feed {

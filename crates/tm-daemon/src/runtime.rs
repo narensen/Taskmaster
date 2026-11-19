@@ -1,8 +1,9 @@
 //! Checks that run the code. They cost no tokens.
 //!
 //! [`run_steps`] runs the project's own build and tests: the `build` and `test` scripts
-//! in `package.json`, `cargo test` for a Rust project, and `pytest` where a Python
-//! project has its configuration. [`browse`] starts a built Next.js app, opens every
+//! in `package.json`, `cargo test` for a Rust project, and pytest wherever there are Python
+//! tests, through the project's own runner (poetry, uv, hatch) or pip, in a venv the run makes
+//! for itself with nothing inherited from the daemon's environment. [`browse`] starts a built Next.js app, opens every
 //! page's route in headless Chrome over the DevTools protocol, and reports uncaught
 //! errors, console errors, failed loads and error statuses. It keeps a screenshot of each
 //! page.
@@ -30,11 +31,30 @@ const KEEP: usize = 6000;
 /// The UI checks of one page may take this long.
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Step {
     pub name: String,
     pub program: String,
     pub args: Vec<String>,
+    /// Set on top of the cleaned environment (see [`clean_env`]).
+    pub env: Vec<(String, String)>,
+    /// Preparing the environment (a venv, an install). A failure here is kept and shown with
+    /// the next check's output, but does not stop the checks: an install that cannot reach
+    /// the network may still leave enough to run the tests.
+    pub setup: bool,
+    /// Written once the step succeeds, so an unchanged environment is not prepared twice.
+    pub stamp: Option<(PathBuf, String)>,
+}
+
+impl Step {
+    fn new(name: &str, program: impl Into<String>, args: &[&str]) -> Self {
+        Step { name: name.into(), program: program.into(), args: args.iter().map(|a| a.to_string()).collect(), ..Default::default() }
+    }
+
+    /// How the step reads in a log line.
+    pub fn line(&self) -> String {
+        format!("{} {}", self.program, self.args.join(" ")).trim().to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,15 +63,201 @@ pub struct Failure {
     pub output: String,
 }
 
-fn on_path(program: &str) -> bool {
-    let names = tm_harness::sandbox::program_names(program);
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| names.iter().any(|name| dir.join(name).is_file())))
-        .unwrap_or(false)
+/// Variables that tie a process to someone else's Python or Conda environment. Verify and the
+/// workers' shells run without them, so a venv the daemon was started from never leaks in.
+pub use tm_harness::sandbox::LEAKY_VARS;
+
+/// `PATH` without any directory that belongs to a virtualenv or a Conda environment.
+pub fn clean_path() -> std::ffi::OsString {
+    tm_harness::sandbox::clean_path()
 }
 
-/// What to run in `tree`, in order. A step whose tool is missing is left out.
-pub fn steps(tree: &Path) -> Vec<Step> {
+/// Strip what [`LEAKY_VARS`] names and every `CONDA_*` variable, and use [`clean_path`].
+pub fn clean_env(cmd: &mut Command) {
+    for name in LEAKY_VARS {
+        cmd.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("CONDA_") {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("PATH", clean_path());
+}
+
+fn on_path(program: &str) -> bool {
+    let names = tm_harness::sandbox::program_names(program);
+    std::env::split_paths(&clean_path()).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+}
+
+/// Python test files: a `tests/` or `test/` directory with Python in it, or `test_*.py` and
+/// `*_test.py` beside the code.
+pub fn python_tests(tree: &Path) -> bool {
+    let is_test = |name: &str| name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"));
+    let any_py = |dir: &Path| {
+        walk(dir, 3).into_iter().any(|p| p.extension().is_some_and(|e| e == "py"))
+    };
+    if ["tests", "test"].iter().any(|d| tree.join(d).is_dir() && any_py(&tree.join(d))) {
+        return true;
+    }
+    walk(tree, 2).into_iter().any(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(is_test))
+}
+
+/// Files under `dir`, `depth` levels down, skipping hidden directories and environments.
+fn walk(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            let skip = name.starts_with('.') || ["node_modules", "venv", "target", "__pycache__", "site-packages"].contains(&name.as_str());
+            if depth > 1 && !skip {
+                out.extend(walk(&path, depth - 1));
+            }
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Whether the project has tests of its own. Such a project must have them run: a verify
+/// that ran nothing is a failure, not a pass.
+pub fn has_tests(tree: &Path) -> bool {
+    let npm_test = std::fs::read_to_string(tree.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|package| package["scripts"]["test"].as_str().map(|s| !s.contains("no test specified")))
+        .unwrap_or(false);
+    python_tests(tree) || tree.join("Cargo.toml").is_file() || npm_test
+}
+
+/// The dependency files that decide what a Python environment holds, as one stamp.
+fn python_stamp(tree: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut names: Vec<PathBuf> = ["pyproject.toml", "poetry.lock", "uv.lock", "setup.py", "setup.cfg", "Pipfile.lock"].iter().map(|f| tree.join(f)).collect();
+    names.extend(requirement_files(tree).into_iter().map(|f| tree.join(f)));
+    for name in names {
+        name.file_name().hash(&mut hasher);
+        std::fs::read(&name).unwrap_or_default().hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
+fn requirement_files(tree: &Path) -> Vec<String> {
+    let mut out: Vec<String> = ["requirements.txt", "requirements-dev.txt", "requirements_dev.txt", "requirements-test.txt", "requirements_test.txt", "dev-requirements.txt", "test-requirements.txt"]
+        .iter()
+        .filter(|f| tree.join(f).is_file())
+        .map(|f| f.to_string())
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(tree.join("requirements")) {
+        let mut more: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".txt")).map(|n| format!("requirements/{n}")).collect();
+        more.sort();
+        out.extend(more);
+    }
+    out
+}
+
+/// The extras of `[project.optional-dependencies]` that hold what tests need.
+fn test_extras(pyproject: &str) -> Vec<String> {
+    let mut inside = false;
+    let mut out = Vec::new();
+    for line in pyproject.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == "[project.optional-dependencies]";
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            let key = key.trim().trim_matches('"');
+            if ["dev", "test", "tests", "testing"].contains(&key) {
+                out.push(key.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// How a Python project's tests are run, in its own runner where it has one, in `venv`.
+fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
+    let pyproject = std::fs::read_to_string(tree.join("pyproject.toml")).unwrap_or_default();
+    let python = if on_path("python3") { "python3" } else if on_path("python") { "python" } else { return Vec::new() };
+    let bin = venv.join(if cfg!(windows) { "Scripts" } else { "bin" });
+    let mut path = std::ffi::OsString::from(bin.as_os_str());
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(clean_path());
+    let path = path.to_string_lossy().into_owned();
+    let venv_env = vec![("VIRTUAL_ENV".to_string(), venv.display().to_string()), ("PATH".to_string(), path), ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into())];
+    let stamp = python_stamp(tree);
+    let stamp_file = venv.join(".taskmaster-deps");
+    let ready = std::fs::read_to_string(&stamp_file).is_ok_and(|have| have == stamp) && bin.is_dir();
+    let mut out = Vec::new();
+    let with_env = |mut step: Step| {
+        step.env = venv_env.clone();
+        step
+    };
+    let setup = |mut step: Step| {
+        step.setup = true;
+        step
+    };
+    if !ready {
+        // System packages stay visible underneath, so a machine with no network still has pytest.
+        out.push(setup(Step::new("setup", python, &["-m", "venv", "--system-site-packages", &venv.display().to_string()])));
+    }
+    let venv_python = bin.join(if cfg!(windows) { "python.exe" } else { "python" }).display().to_string();
+    let poetry = (pyproject.contains("[tool.poetry") || tree.join("poetry.lock").is_file()) && on_path("poetry");
+    let uv = (tree.join("uv.lock").is_file() || pyproject.contains("[tool.uv")) && on_path("uv");
+    let hatch = pyproject.contains("[tool.hatch.envs") && on_path("hatch");
+    let mut install: Vec<Step> = Vec::new();
+    let test = if poetry {
+        install.push(with_env(Step::new("setup", "poetry", &["install", "--no-interaction"])));
+        with_env(Step::new("test", "poetry", &["run", "pytest", "-q"]))
+    } else if uv {
+        let mut sync = with_env(Step::new("setup", "uv", &["sync", "--all-extras"]));
+        sync.env.push(("UV_PROJECT_ENVIRONMENT".into(), venv.display().to_string()));
+        install.push(sync);
+        let mut run = with_env(Step::new("test", "uv", &["run", "pytest", "-q"]));
+        run.env.push(("UV_PROJECT_ENVIRONMENT".into(), venv.display().to_string()));
+        run
+    } else if hatch {
+        with_env(Step::new("test", "hatch", &["run", "pytest", "-q"]))
+    } else {
+        let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into(), "-q".into()];
+        let installable = pyproject.contains("[project]") || pyproject.contains("[build-system]") || tree.join("setup.py").is_file() || tree.join("setup.cfg").is_file();
+        if installable {
+            let extras = test_extras(&pyproject);
+            args.push("-e".into());
+            args.push(if extras.is_empty() { ".".into() } else { format!(".[{}]", extras.join(",")) });
+        }
+        for file in requirement_files(tree) {
+            args.push("-r".into());
+            args.push(file);
+        }
+        args.push("pytest".into());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        install.push(with_env(Step::new("setup", venv_python.clone(), &refs)));
+        with_env(Step::new("test", venv_python, &["-m", "pytest", "-q"]))
+    };
+    if !ready {
+        for step in install {
+            out.push(setup(step));
+        }
+        if let Some(last) = out.last_mut() {
+            last.stamp = Some((stamp_file, stamp));
+        }
+    }
+    out.push(test);
+    out
+}
+
+/// What to run in `tree`, in order. A step whose tool is missing is left out. Python runs in
+/// `venv`, an environment of the run's own that is made and filled on first use.
+pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
     let mut out = Vec::new();
     if let Ok(text) = std::fs::read_to_string(tree.join("package.json"))
         && let Ok(package) = serde_json::from_str::<Value>(&text)
@@ -73,19 +279,32 @@ pub fn steps(tree: &Path) -> Vec<Step> {
                 if body.contains("no test specified") {
                     continue;
                 }
-                out.push(Step { name: script.into(), program: manager.into(), args: vec!["run".into(), script.into()] });
+                out.push(Step::new(script, manager, &["run", script]));
             }
         }
     }
     if tree.join("Cargo.toml").is_file() && on_path("cargo") {
-        out.push(Step { name: "test".into(), program: "cargo".into(), args: vec!["test".into(), "--quiet".into()] });
+        out.push(Step::new("test", "cargo", &["test", "--quiet"]));
     }
-    let python = ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"].iter().any(|f| tree.join(f).is_file())
-        && (tree.join("tests").is_dir() || tree.join("test").is_dir());
-    if python && on_path("pytest") {
-        out.push(Step { name: "test".into(), program: "pytest".into(), args: vec!["-q".into(), "-x".into()] });
+    if python_tests(tree) {
+        out.extend(python_steps(tree, venv));
     }
     out
+}
+
+/// Why a project with tests has nothing to run them with, when that is so.
+pub fn missing_runner(tree: &Path) -> Option<String> {
+    if python_tests(tree) && !on_path("python3") && !on_path("python") {
+        return Some("the project has Python tests, but no python3 is on PATH".into());
+    }
+    if tree.join("Cargo.toml").is_file() && !on_path("cargo") {
+        return Some("the project is a Rust crate, but cargo is not on PATH".into());
+    }
+    let npm_test = std::fs::read_to_string(tree.join("package.json")).is_ok_and(|t| t.contains("\"test\""));
+    if npm_test && !tree.join("node_modules").exists() {
+        return Some("the project has a test script, but its packages are not installed (no node_modules)".into());
+    }
+    None
 }
 
 fn tail(text: &str) -> String {
@@ -99,30 +318,37 @@ fn tail(text: &str) -> String {
     format!("…\n{}", &text[start..])
 }
 
-/// Run the steps in order and stop at the first that fails: tests after a failed build
-/// say nothing new.
+/// Run the steps in order and stop at the first check that fails: tests after a failed build
+/// say nothing new. A failed setup step is kept and shown with the next failure.
 pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> (Vec<Timing>, Option<Failure>) {
     let mut timings = Vec::new();
+    let mut setup_said = String::new();
     for step in steps {
         let began = Instant::now();
-        eprintln!("taskmaster: running `{} {}`", step.program, step.args.join(" "));
-        let child = Command::new(&step.program)
-            .args(&step.args)
+        eprintln!("taskmaster: running `{}`", step.line());
+        let mut cmd = Command::new(&step.program);
+        clean_env(&mut cmd);
+        cmd.args(&step.args)
             .current_dir(tree)
             .env("CI", "1")
             .env("NEXT_TELEMETRY_DISABLED", "1")
             .env("FORCE_COLOR", "0")
             .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+        for (key, value) in &step.env {
+            cmd.env(key, value);
+        }
+        let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn();
         let mut child = match child {
             Ok(child) => child,
             Err(err) => {
                 timings.push(Timing::new(&step.name, began.elapsed(), "failed"));
-                return (timings, Some(Failure { step: step.name.clone(), output: format!("could not start {}: {err}", step.program) }));
+                let said = format!("could not start {}: {err}", step.program);
+                if step.setup {
+                    setup_said.push_str(&format!("`{}` failed: {said}\n", step.line()));
+                    continue;
+                }
+                return (timings, Some(Failure { step: step.name.clone(), output: format!("{setup_said}{said}") }));
             }
         };
         let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
@@ -133,24 +359,29 @@ pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> (Vec<T
             (status, a, b)
         };
         match tokio::time::timeout(timeout, read).await {
-            Ok((Ok(status), a, b)) if status.success() => {
-                let _ = (a, b);
+            Ok((Ok(status), _, _)) if status.success() => {
                 timings.push(Timing::new(&step.name, began.elapsed(), "ok"));
+                if let Some((file, stamp)) = &step.stamp {
+                    let _ = std::fs::write(file, stamp);
+                }
             }
             Ok((_, a, b)) => {
                 let text = format!("{}\n{}", String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
                 timings.push(Timing::new(&step.name, began.elapsed(), "failed"));
-                return (timings, Some(Failure { step: step.name.clone(), output: tail(text.trim()) }));
+                if step.setup {
+                    setup_said.push_str(&format!("`{}` failed:\n{}\n", step.line(), tail(text.trim())));
+                    continue;
+                }
+                return (timings, Some(Failure { step: step.name.clone(), output: tail(&format!("{setup_said}{}", text.trim())) }));
             }
             Err(_) => {
                 timings.push(Timing::new(&step.name, began.elapsed(), "timeout"));
-                return (
-                    timings,
-                    Some(Failure {
-                        step: step.name.clone(),
-                        output: format!("`{} {}` did not finish in {} seconds", step.program, step.args.join(" "), timeout.as_secs()),
-                    }),
-                );
+                let said = format!("`{}` did not finish in {} seconds", step.line(), timeout.as_secs());
+                if step.setup {
+                    setup_said.push_str(&format!("{said}\n"));
+                    continue;
+                }
+                return (timings, Some(Failure { step: step.name.clone(), output: format!("{setup_said}{said}") }));
             }
         }
     }
@@ -536,27 +767,80 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tm-runtime-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let ok = Step { name: "build".into(), program: "sh".into(), args: vec!["-c".into(), "echo built".into()] };
-        let bad = Step { name: "test".into(), program: "sh".into(), args: vec!["-c".into(), "echo 'app/cart/page.tsx:1 boom' >&2; exit 1".into()] };
-        let never = Step { name: "after".into(), program: "sh".into(), args: vec!["-c".into(), "touch ran".into()] };
+        let ok = Step::new("build", "sh", &["-c", "echo built"]);
+        let bad = Step::new("test", "sh", &["-c", "echo 'app/cart/page.tsx:1 boom' >&2; exit 1"]);
+        let never = Step::new("after", "sh", &["-c", "touch ran"]);
         let (timed, failure) = run_steps(&dir, &[ok, bad, never], Duration::from_secs(10)).await;
         let failure = failure.unwrap();
         assert_eq!(timed.iter().map(|t| (t.name.as_str(), t.status)).collect::<Vec<_>>(), vec![("build", "ok"), ("test", "failed")]);
         assert_eq!(failure.step, "test");
         assert!(failure.output.contains("boom"));
         assert!(!dir.join("ran").exists(), "nothing runs after a failure");
-        let slow = Step { name: "build".into(), program: "sleep".into(), args: vec!["5".into()] };
+        let slow = Step::new("build", "sleep", &["5"]);
         let (timed, slow_failure) = run_steps(&dir, &[slow], Duration::from_millis(200)).await;
         assert!(slow_failure.unwrap().output.contains("did not finish"));
         assert_eq!(timed[0].status, "timeout");
 
         std::fs::write(dir.join("package.json"), r#"{"scripts":{"build":"next build","test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
-        assert!(steps(&dir).is_empty(), "nothing is installed yet");
+        let venv = dir.join("venv");
+        assert!(steps(&dir, &venv).is_empty(), "nothing is installed yet");
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
-        let found = steps(&dir);
+        let found = steps(&dir, &venv);
         if on_path("npm") {
             assert_eq!(found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["build"]);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn python_tests_are_found_without_any_config_file() {
+        let dir = std::env::temp_dir().join(format!("tm-pytests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("toyredis")).unwrap();
+        std::fs::write(dir.join("toyredis/server.py"), "x = 1\n").unwrap();
+        assert!(!python_tests(&dir) && !has_tests(&dir));
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_server.py"), "def test(): pass\n").unwrap();
+        assert!(python_tests(&dir) && has_tests(&dir), "a tests/ directory alone means pytest");
+        let _ = std::fs::remove_dir_all(dir.join("tests"));
+        std::fs::write(dir.join("test_server.py"), "def test(): pass\n").unwrap();
+        assert!(python_tests(&dir), "so does a test_*.py beside the code");
+        assert_eq!(test_extras("[project]\nname='x'\n[project.optional-dependencies]\ndev = ['pytest-cov']\ndocs = ['x']\ntest=['y']\n"), vec!["dev", "test"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Runs pytest for real, in a venv the run makes, where Python and pytest are installed.
+    #[tokio::test]
+    async fn python_tests_run_in_the_runs_own_venv_and_a_failure_is_kept() {
+        let pytest = std::process::Command::new("python3").args(["-c", "import pytest"]).status().is_ok_and(|s| s.success());
+        if !pytest {
+            eprintln!("python3 with pytest is not installed; skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tm-pyvenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        std::fs::write(dir.join("conftest.py"), "").unwrap();
+        std::fs::write(dir.join("tests/test_calc.py"), "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 2\n").unwrap();
+        let venv = dir.join(".run/venv");
+        let found = steps(&dir, &venv);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.last(), Some(&"test"), "{names:?}");
+        assert!(found.iter().filter(|s| s.setup).count() >= 2, "a venv, then an install: {names:?}");
+        assert!(found.last().unwrap().program.starts_with(&venv.display().to_string()), "pytest runs from the run's venv");
+        let (_, failure) = run_steps(&dir, &found, Duration::from_secs(120)).await;
+        let failure = failure.expect("the broken add fails its test");
+        assert_eq!(failure.step, "test");
+        assert!(failure.output.contains("test_add") && failure.output.contains("1 failed"), "{}", failure.output);
+        assert!(venv.join("pyvenv.cfg").is_file());
+        assert!(!dir.join("tests/__pycache__").exists(), "no bytecode is left in the tree");
+        // The environment is kept: the second verify only runs the tests.
+        std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        let again = steps(&dir, &venv);
+        assert_eq!(again.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["test"]);
+        let (_, failure) = run_steps(&dir, &again, Duration::from_secs(120)).await;
+        assert!(failure.is_none(), "{failure:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

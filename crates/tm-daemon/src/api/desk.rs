@@ -1090,7 +1090,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
 }
 
 const SETTING_KEYS: &[&str] = &[
-    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents",
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox",
 ];
 
 /// Tokens are not part of an export. Host connections live in another file and stay there.
@@ -1158,6 +1158,7 @@ pub async fn reset_settings(State(app): State<Arc<App>>) -> Reply {
         ("code_mode", json!({ "enabled": false })),
         ("telemetry", json!({ "enabled": false })),
         ("agents", json!({ "timeout_secs": crate::settings::DEFAULT_AGENT_SECS })),
+        ("sandbox", json!({ "shell": true, "package_indexes": true })),
     ];
     for (key, value) in defaults {
         set_setting(&project, key, value).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;

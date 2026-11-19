@@ -56,6 +56,10 @@ enum Mode {
 struct World {
     mode: Mode,
     calls: Mutex<Vec<String>>,
+    /// The fake says its agents run inside the sandbox, so builders get a shell.
+    sandboxed: std::sync::atomic::AtomicBool,
+    /// For each call: whether it was read-only, and the shell it was given.
+    shells: Mutex<Vec<(bool, Option<tm_harness::ShellScope>)>>,
     plans: AtomicUsize,
     a: AtomicUsize,
     b: AtomicUsize,
@@ -88,6 +92,10 @@ impl Harness for Fake {
         "fake"
     }
 
+    fn sandboxed_shell(&self) -> bool {
+        self.0.sandboxed.load(Ordering::SeqCst)
+    }
+
     async fn run(
         &self,
         task: WorkerTask,
@@ -105,6 +113,7 @@ impl Harness for Fake {
             tokio::time::sleep(Duration::from_secs(60)).await;
             anyhow::bail!("the planner was never stopped");
         }
+        self.0.shells.lock().unwrap().push((task.read_only, task.shell.clone()));
         let script = self.0.respond(&task).await?;
         // Thoughts and tool calls go to the transcript, never into the answer.
         let _ = events.send(HarnessEvent::Thought { text: "thinking".into() }).await;
@@ -141,6 +150,8 @@ impl World {
         Arc::new(World {
             mode,
             calls: Mutex::new(Vec::new()),
+            sandboxed: std::sync::atomic::AtomicBool::new(false),
+            shells: Mutex::new(Vec::new()),
             plans: AtomicUsize::new(0),
             a: AtomicUsize::new(0),
             b: AtomicUsize::new(0),
@@ -184,7 +195,7 @@ impl World {
             let (path, body) = if unit == "markup" { ("app/a/index.html", "<h1>a</h1>\n") } else { ("app/a/main.js", "console.log(1);\n") };
             return Ok(Script { text: format!("done\nRELEASE page:a/{unit}"), files: vec![(path.into(), Some(body.into()))] });
         }
-        if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
+        if let Some(id) = brief.split("Build page `").nth(1).or_else(|| brief.split("Build unit `").nth(1)).and_then(|rest| rest.split('`').next()) {
             if matches!(self.mode, Mode::Stall) && id == "a" && self.a.load(Ordering::SeqCst) == 0 {
                 assert!(task.stall.is_some(), "a worker runs with a stall limit");
                 self.a.fetch_add(1, Ordering::SeqCst);
@@ -206,6 +217,10 @@ impl World {
         if brief.contains("Decide whether it is real") {
             let real = matches!(self.mode, Mode::ConfirmFinding);
             return Ok(Script::text(if real { "{\"real\": true}" } else { "{\"real\": false}" }));
+        }
+        if brief.contains("the output names no file any unit owns") {
+            // The master's fix: a file the project's build looks for.
+            return Ok(Script { text: "fixed".into(), files: vec![("fixed.txt".into(), Some("ok\n".into()))] });
         }
         if brief.contains("Shared files this run wrote fail the project's checks") {
             if matches!(self.mode, Mode::Nothing) {
@@ -1132,13 +1147,98 @@ async fn a_failing_build_goes_back_to_the_page_its_output_names() {
 }
 
 #[tokio::test]
-async fn a_build_failure_in_no_file_of_this_run_costs_nothing() {
+async fn a_failure_no_unit_owns_goes_to_the_master_and_is_never_merged() {
     let Some(tmp) = buildable("build-elsewhere", "lib/legacy.ts:3:1 something old is broken", "false") else { return };
     let world = World::new(Mode::Write);
     let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    // It still fails after the master's repairs: the run fails, and the exit code says so.
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    let calls = world.calls.lock().unwrap().clone();
+    let repairs: Vec<&String> = calls.iter().filter(|call| call.contains("the output names no file any unit owns")).collect();
+    assert_eq!(repairs.len(), 2, "the master gets every repair the run has");
+    assert!(repairs[0].contains("something old is broken"), "{}", repairs[0]);
+    // Nothing was merged: the project is as it was, and the work stays on the run's branch.
+    assert!(!tmp.0.join("app/a/page.ts").exists());
+    assert!(!tmp.0.join("fixed.txt").exists());
+    assert!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).contains("taskmaster/current"));
+    let status = Records::files(&tmp.0).status("current").unwrap().unwrap();
+    assert_eq!(status["ok"], false);
+    assert_ne!(status["merged"], true);
+}
+
+#[tokio::test]
+async fn the_master_repairs_a_failure_no_unit_owns_and_the_run_passes() {
+    let Some(tmp) = buildable("build-unowned-fixed", "the build needs fixed.txt", "test -f fixed.txt") else { return };
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(read(&tmp.0.join("fixed.txt")), "ok\n", "the master's fix was merged with the run");
+    assert!(log(&tmp.0).contains("taskmaster: repair a failure no unit owns"));
+}
+
+#[tokio::test]
+async fn a_library_plan_builds_modules_with_no_route_and_no_browser() {
+    let tmp = seeded("library");
+    let world = World::new(Mode::Write);
+    let mut planned = plan(&[("a", &[]), ("b", &[])]);
+    planned.kind = tm_core::ProjectKind::Library;
+    for page in &mut planned.pages {
+        page.route.clear();
+    }
+    let outcome = run(config(&tmp.0, planned, true, 2), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     let calls = world.calls.lock().unwrap().clone();
-    assert!(!calls.iter().any(|call| call.contains("failed:")), "nobody was asked to fix it");
+    let builds: Vec<&String> = calls.iter().filter(|c| c.contains("Build unit `")).collect();
+    assert_eq!(builds.len(), 2, "{calls:#?}");
+    assert!(builds.iter().all(|b| !b.contains("for route") && !b.contains("app/index.html") && !b.contains("Design spec")));
+    let transcript = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
+    assert!(!transcript.contains("browser check"), "nothing is opened in a browser");
+}
+
+#[tokio::test]
+async fn a_sandboxed_builder_gets_a_shell_and_a_reviewer_never_does() {
+    let tmp = seeded("shell");
+    let world = World::new(Mode::Write);
+    world.sandboxed.store(true, Ordering::SeqCst);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let shells = world.shells.lock().unwrap().clone();
+    let builder = shells.iter().find(|(read_only, shell)| !read_only && shell.is_some()).map(|(_, s)| s.clone().unwrap()).expect("the builder had a shell");
+    let scratch = builder.env.iter().find(|(k, _)| k == "TASKMASTER_SCRATCH").map(|(_, v)| PathBuf::from(v)).unwrap();
+    assert!(scratch.starts_with(run_directory(&tmp.0, "current")), "{scratch:?}");
+    assert!(builder.writable.contains(&scratch));
+    assert!(builder.env.iter().any(|(k, v)| k == "PYTHONDONTWRITEBYTECODE" && v == "1"));
+    assert!(shells.iter().filter(|(read_only, _)| *read_only).all(|(_, shell)| shell.is_none()), "readers get no shell");
+    let calls = world.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|c| c.contains("Build page `a`")));
+
+    // Off in the settings, or a harness the sandbox cannot hold: no shell for anyone.
+    let tmp = seeded("no-shell");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(world.shells.lock().unwrap().iter().all(|(_, shell)| shell.is_none()));
+    let tmp = seeded("shell-off");
+    let world = World::new(Mode::Write);
+    world.sandboxed.store(true, Ordering::SeqCst);
+    let mut cfg = config(&tmp.0, plan(&[("a", &["greet"])]), true, 1);
+    cfg.worker_shell = false;
+    run(cfg, &world).await.unwrap();
+    assert!(world.shells.lock().unwrap().iter().all(|(_, shell)| shell.is_none()));
+}
+
+#[tokio::test]
+async fn a_unit_whose_files_are_already_right_is_done_not_failed() {
+    let tmp = seeded("already");
+    std::fs::create_dir_all(tmp.0.join("app/a")).unwrap();
+    std::fs::write(tmp.0.join("app/a/page.ts"), "export const page = \"a\";\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "a exists"]);
+    let world = World::new(Mode::Nothing);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let builds = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(builds, 1, "no repair or escalation for a unit that was already done");
 }
 
 #[tokio::test]

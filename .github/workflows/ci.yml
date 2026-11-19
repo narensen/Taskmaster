@@ -42,6 +42,10 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+      # macOS and Windows checkouts are case-insensitive: two paths that differ only by
+      # case collapse into one there and break the desktop build.
+      - run: scripts/check-case.sh
+        working-directory: .
       - uses: actions/setup-node@v4
         with:
           node-version: 24

@@ -142,6 +142,10 @@ pub struct Meta {
     /// The template whose files are written when the contracts are locked.
     #[serde(default)]
     pub template: Option<String>,
+    /// Every tier was the same harness and model when the run started: no escalation
+    /// ladder (see `Run::focused`).
+    #[serde(default)]
+    pub focused: bool,
 }
 
 /// One go at building or repairing a page, kept so the next attempt knows what was tried.
@@ -437,7 +441,7 @@ pub(crate) mod tests {
         assert!(records.inflight("r1").unwrap().is_none());
         records.save_events("r1", &[Event::PlanApproved, Event::Cancelled]).unwrap();
         records.save_inflight("r1", &[Command::RunVerify]).unwrap();
-        records.save_meta("r1", &Meta { parallel: 3, branch: None, base: None, template: None }).unwrap();
+        records.save_meta("r1", &Meta { parallel: 3, branch: None, base: None, template: None, focused: false }).unwrap();
         records.mark_merged("r1", "home", "abc").unwrap();
         assert_eq!(records.events("r1").unwrap(), vec![Event::PlanApproved, Event::Cancelled]);
         assert_eq!(records.inflight("r1").unwrap(), Some(vec![Command::RunVerify]));

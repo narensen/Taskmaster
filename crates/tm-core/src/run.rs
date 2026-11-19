@@ -12,6 +12,9 @@ use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, Plan, ReviewS
 
 /// Repair rounds a page gets on one tier before it escalates.
 pub const MAX_REPAIRS: u8 = 2;
+/// Repairs a page gets when every tier is the same model: escalating would only repeat the
+/// attempt, so there is no ladder, just these focused repairs and then a clear failure.
+pub const MAX_FOCUSED_REPAIRS: u8 = 2;
 /// Dictionary amendments allowed per run. This cap is what bounds fix-and-revert loops.
 pub const MAX_AMENDMENTS: u8 = 1;
 /// Review rounds per run. After the last one the run goes straight to verification.
@@ -77,6 +80,10 @@ pub enum WorkerOutcome {
     /// Typecheck or ownership check failed; `errors` goes to the repair attempt.
     CheckFailed { errors: String },
     Flagged(Flag),
+    /// The attempt could not do its work for a reason another attempt would meet again
+    /// (a tool the gate refuses, such as a shell or the network). The page fails at once
+    /// with the reason instead of being retried.
+    Blocked { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,6 +137,10 @@ pub struct Run {
     /// Findings awaiting verification.
     pub pending_findings: Vec<Finding>,
     pub max_parallel: usize,
+    /// Every tier is the same harness and model, so a failing page is not escalated: it gets
+    /// [`MAX_FOCUSED_REPAIRS`] and then fails. Set by the executor from its configuration.
+    #[serde(default)]
+    pub focused: bool,
 }
 
 impl Run {
@@ -143,12 +154,19 @@ impl Run {
             dirty: BTreeSet::new(),
             pending_findings: Vec::new(),
             max_parallel: max_parallel.max(1),
+            focused: false,
         }
     }
 
     /// Rebuild a run from its event log.
     pub fn replay(max_parallel: usize, events: impl IntoIterator<Item = Event>) -> Self {
+        Self::replay_with(max_parallel, false, events)
+    }
+
+    /// [`Run::replay`] for a run whose tiers are all one model (see [`Run::focused`]).
+    pub fn replay_with(max_parallel: usize, focused: bool, events: impl IntoIterator<Item = Event>) -> Self {
         let mut run = Run::new(max_parallel);
+        run.focused = focused;
         for event in events {
             run.step(event);
         }
@@ -212,7 +230,11 @@ impl Run {
                 } else {
                     match outcome {
                         WorkerOutcome::Passed => p.state = PageState::Passed,
-                        WorkerOutcome::CheckFailed { errors } => Self::fail_page(p, errors),
+                        WorkerOutcome::CheckFailed { errors } => Self::fail_page(p, errors, self.focused),
+                        WorkerOutcome::Blocked { reason } => {
+                            p.state = PageState::Failed;
+                            p.pending_errors = Some(reason);
+                        }
                         WorkerOutcome::Flagged(flag) => {
                             p.state = PageState::Flagged;
                             out.push(Command::ArbitrateFlag(flag));
@@ -271,7 +293,7 @@ impl Run {
                     self.phase = RunPhase::Building;
                     for (page, lines) in by_page {
                         let p = self.pages.get_mut(&page).expect("pending findings name known pages");
-                        Self::fail_page(p, lines.join("\n"));
+                        Self::fail_page(p, lines.join("\n"), self.focused);
                     }
                     self.settle(&mut out);
                 }
@@ -314,7 +336,7 @@ impl Run {
                     self.phase = RunPhase::Building;
                     for (page, errors) in failing {
                         if let Some(p) = self.pages.get_mut(&page) {
-                            Self::fail_page(p, errors);
+                            Self::fail_page(p, errors, self.focused);
                         }
                     }
                     self.settle(&mut out);
@@ -330,8 +352,19 @@ impl Run {
         out
     }
 
-    /// Repair on the same tier, then escalate, then give up.
-    fn fail_page(p: &mut PageRun, errors: String) {
+    /// Repair on the same tier, then escalate, then give up. With `focused` (one model on
+    /// every tier) there is nothing to escalate to: a few repairs, then give up.
+    fn fail_page(p: &mut PageRun, errors: String, focused: bool) {
+        if focused {
+            if p.repairs < MAX_FOCUSED_REPAIRS {
+                p.repairs += 1;
+                p.state = PageState::Queued;
+                p.pending_errors = Some(errors);
+            } else {
+                p.state = PageState::Failed;
+            }
+            return;
+        }
         if p.repairs < MAX_REPAIRS {
             p.repairs += 1;
         } else if let Some(next) = p.tier.next() {
@@ -506,6 +539,31 @@ mod tests {
         use Tier::*;
         assert_eq!(seen, vec![Worker, Worker, Mid, Mid, Mid, Master, Master, Master]);
         assert_eq!(run.phase, RunPhase::Failed);
+    }
+
+    #[test]
+    fn one_model_on_every_tier_gets_focused_repairs_and_no_ladder() {
+        let (mut run, _) = started(&[("a", &[])], 1);
+        run.focused = true;
+        let mut seen = Vec::new();
+        loop {
+            match run.step(finished("a", check_failed("1 failed"))).as_slice() {
+                [Command::SpawnWorker { tier, .. }] => seen.push(*tier),
+                [Command::Finish { ok: false }] => break,
+                other => panic!("unexpected commands: {other:?}"),
+            }
+        }
+        assert_eq!(seen, vec![Tier::Worker; MAX_FOCUSED_REPAIRS as usize], "same model, so no escalation");
+        assert_eq!(run.phase, RunPhase::Failed);
+    }
+
+    #[test]
+    fn a_blocked_page_fails_at_once_with_its_reason() {
+        let (mut run, _) = started(&[("a", &[])], 1);
+        let cmds = run.step(finished("a", WorkerOutcome::Blocked { reason: "needs a shell: Bash `poetry lock`".into() }));
+        assert_eq!(cmds, vec![Command::Finish { ok: false }]);
+        assert_eq!(run.pages["a"].state, PageState::Failed);
+        assert!(run.pages["a"].pending_errors.as_deref().unwrap().contains("poetry lock"));
     }
 
     #[test]

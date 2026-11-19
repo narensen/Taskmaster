@@ -44,6 +44,8 @@ struct Answer {
     usage: Usage,
     cost_usd: Option<f64>,
     seconds: f64,
+    /// Tool calls the gate refused, each as `tool target`: what the agent tried and could not do.
+    refused: Vec<String>,
 }
 
 /// Who a call is charged to in the ledger.
@@ -339,10 +341,10 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         None => Records::files(&project),
     };
     let events = records.events(&id)?;
-    let meta = load_meta(&records, &project, &config, !events.is_empty())?;
+    let meta = load_meta(&records, &project, &config, !events.is_empty(), same_model(&harnesses, &config.models))?;
     let parallel = meta.parallel.max(1);
     let template = meta.template.as_deref().map(template::load).transpose()?;
-    let run = Run::replay(parallel, events.clone());
+    let run = Run::replay_with(parallel, meta.focused, events.clone());
     let changes = records.changes(&id)?;
     let inflight = records.inflight(&id)?;
     let pending = match inflight {
@@ -1074,6 +1076,7 @@ impl Driver {
             _ => (Tier::Worker, None),
         };
         let text = products.iter().map(|(_, p)| p.answer.text.as_str()).collect::<Vec<_>>().join("\n");
+        let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
         // What the checker needs, read before the worktrees go.
         let review = (self.config.checker && !self.checked.contains(&page)).then(|| {
             let diff: String = products.iter().filter_map(|(_, p)| git::worktree_diff(&p.worktree).ok()).collect::<Vec<_>>().join("\n");
@@ -1093,13 +1096,17 @@ impl Driver {
                 return Err(err);
             }
         };
+        // The log says what the ledger says: a call that had tools refused is not a clean pass.
+        let refused_note = if refused.is_empty() { String::new() } else { format!(" (refused: {})", refused.join(", ")) };
         match &outcome {
-            WorkerOutcome::Passed => eprintln!("taskmaster: {page} passed"),
-            WorkerOutcome::CheckFailed { .. } => eprintln!("taskmaster: {page} failed its checks"),
+            WorkerOutcome::Passed => eprintln!("taskmaster: {page} passed{refused_note}"),
+            WorkerOutcome::CheckFailed { .. } => eprintln!("taskmaster: {page} failed its checks{refused_note}"),
             WorkerOutcome::Flagged(flag) => eprintln!("taskmaster: {page} flagged {}", flag.key),
+            WorkerOutcome::Blocked { reason } => eprintln!("taskmaster: {reason}"),
         }
         match &outcome {
             WorkerOutcome::CheckFailed { errors: failure } => self.note_mistake(tier, failure)?,
+            WorkerOutcome::Blocked { .. } => {}
             WorkerOutcome::Passed => {
                 if let Some(failure) = &errors {
                     self.learn_fix(tier, failure, &text)?;
@@ -1239,6 +1246,7 @@ impl Driver {
                 ("discarded", Some(clip(errors, 1500)), diff)
             }
             WorkerOutcome::Flagged(flag) => ("flagged", Some(format!("objected to `{}`: {}", flag.key, flag.issue)), None),
+            WorkerOutcome::Blocked { reason } => ("blocked", Some(clip(reason, 1500)), None),
         };
         let attempt = Attempt {
             at: rfc3339_now(),
@@ -1321,11 +1329,30 @@ impl Driver {
                 eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
                 return Ok(WorkerOutcome::Passed);
             }
-            let why = if ok {
-                "worker produced no changes under its owned files"
+            let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
+            // A refused shell command or fetch is refused again next time, on any tier: retrying
+            // only spends the same tokens again. Say what it needed instead.
+            let needs: Vec<&String> = refused.iter().filter(|r| needs_capability(r)).collect();
+            if !needs.is_empty() {
+                let reason = format!(
+                    "{page} needs what this run cannot give it, so it was not retried: the agent changed nothing after these calls were refused: {}. \
+                     Turn on the sandboxed shell (sandbox.shell) or use a harness that runs in the sandbox.",
+                    needs.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                );
+                return Ok(WorkerOutcome::Blocked { reason });
+            }
+            let said: String = products.iter().map(|(_, p)| tail_chars(p.answer.text.trim(), 800)).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
+            let mut why = if ok {
+                "The last attempt changed none of your files. Write them this time; do not only describe them.".to_string()
             } else {
-                "harness failed and produced no changes"
+                "The last attempt stopped before it finished its turn and changed none of your files.".to_string()
             };
+            if !refused.is_empty() {
+                why.push_str(&format!(" These calls were refused, so do without them: {}.", refused.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")));
+            }
+            if !said.is_empty() {
+                why.push_str(&format!("\nWhat it said last:\n{said}"));
+            }
             return Ok(failed(why));
         }
         let mut files = Vec::new();
@@ -2845,6 +2872,7 @@ impl Driver {
             cost_usd: answer.cost_usd,
             seconds: answer.seconds,
             ok: answer.ok,
+            refused: answer.refused.clone(),
         };
         self.records.charge(&self.id, &entry)
     }
@@ -3489,7 +3517,22 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let collect = tokio::spawn(async move {
         // The answer is only the text. Thoughts and tool calls go to the transcript.
         let mut text = String::new();
+        // What each tool was last asked to do, so a refusal can say what was refused.
+        let mut asked: HashMap<String, String> = HashMap::new();
+        let mut refused: Vec<String> = Vec::new();
         while let Some(event) = rx.recv().await {
+            match &event {
+                HarnessEvent::ToolCall { name, input, .. } => {
+                    asked.insert(name.clone(), tool_target(input).unwrap_or_default());
+                }
+                HarnessEvent::PermissionDecided { tool, allowed: false } => {
+                    let what = asked.get(tool).filter(|t| !t.is_empty()).map(|t| format!("{tool} {t}")).unwrap_or_else(|| tool.clone());
+                    if refused.len() < 20 && !refused.contains(&what) {
+                        refused.push(what);
+                    }
+                }
+                _ => {}
+            }
             if let Some(watch) = &watching {
                 let mut seen = watch.lock().unwrap();
                 match &event {
@@ -3536,7 +3579,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
                     text.push_str(&chunk);
                 }
         }
-        text
+        (text, refused)
     });
     let started = Instant::now();
     let run = match request.commit {
@@ -3562,7 +3605,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             }
         }
     };
-    let text = collect.await.unwrap_or_default();
+    let (text, refused) = collect.await.unwrap_or_default();
     let run = run.map_err(|err| match err.downcast::<Overrun>() {
         Ok(over) => {
             let notes = tail_chars(&watch.lock().unwrap().thoughts, OVERRUN_NOTES);
@@ -3607,6 +3650,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         usage: summary.usage,
         cost_usd: summary.cost_usd,
         seconds: started.elapsed().as_secs_f64(),
+        refused,
     })
 }
 
@@ -3642,7 +3686,24 @@ fn kind_name(kind: EntryKind) -> &'static str {
 }
 
 /// The settings fixed when the run first started. A resumed run keeps them.
-fn load_meta(records: &Records, project: &Path, config: &Config, resuming: bool) -> anyhow::Result<Meta> {
+/// Whether a refused call (`tool target`) needed a shell or the network, which no later
+/// attempt in this run will be given.
+fn needs_capability(refused: &str) -> bool {
+    let tool = refused.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    ["bash", "shell", "exec", "command", "terminal", "run_command", "fetch", "web_fetch", "webfetch", "http", "curl", "web_search", "websearch", "download"]
+        .iter()
+        .any(|word| tool == *word || tool.contains(word))
+}
+
+/// Whether the worker, mid and master tiers would all run the same harness and model, so
+/// escalating from one to the next changes nothing.
+fn same_model(harnesses: &Harnesses, models: &crate::Models) -> bool {
+    let ids = [harnesses.worker.id(), harnesses.mid.id(), harnesses.master.id()];
+    let picked = [&models.worker, &models.mid, &models.master];
+    ids.iter().all(|id| *id == ids[0]) && picked.iter().all(|m| *m == picked[0])
+}
+
+fn load_meta(records: &Records, project: &Path, config: &Config, resuming: bool, focused: bool) -> anyhow::Result<Meta> {
     let requested = config.parallel.max(1);
     if let Some(meta) = records.meta(&config.run_id)? {
         if resuming && meta.parallel.max(1) != requested {
@@ -3663,7 +3724,11 @@ fn load_meta(records: &Records, project: &Path, config: &Config, resuming: bool)
             (_, false) => None,
         },
         template: config.template.clone(),
+        focused,
     };
+    if focused {
+        eprintln!("taskmaster: worker, mid and master are one model, so a failing unit gets focused repairs instead of an escalation ladder");
+    }
     if let Some(name) = &meta.template {
         template::load(name)?;
     }

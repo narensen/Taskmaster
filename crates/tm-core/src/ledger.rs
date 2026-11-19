@@ -73,6 +73,10 @@ pub struct LedgerEntry {
     pub seconds: f64,
     /// Whether the harness finished its turn.
     pub ok: bool,
+    /// Tool calls the gate refused in this call, each with what it asked for. A call can
+    /// finish its turn (`ok`) and still have had calls refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
 }
 
 impl LedgerEntry {
@@ -229,6 +233,7 @@ mod tests {
             cost_usd: cost,
             seconds: 1.5,
             ok: true,
+            refused: Vec::new(),
         }
     }
 

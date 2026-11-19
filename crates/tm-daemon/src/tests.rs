@@ -53,6 +53,8 @@ enum Mode {
     Overthink,
     /// Page `a`'s first build fails because the account has no balance left (HTTP 402).
     Broke,
+    /// Every build tries `poetry lock` in a shell, is refused, and changes nothing.
+    Refused,
 }
 
 struct World {
@@ -116,6 +118,11 @@ impl Harness for Fake {
             anyhow::bail!("the planner was never stopped");
         }
         self.0.shells.lock().unwrap().push((task.read_only, task.shell.clone()));
+        if matches!(self.0.mode, Mode::Refused) && task.brief.contains("Build page `") {
+            let input = serde_json::json!({ "command": "poetry lock" });
+            let _ = events.send(HarnessEvent::ToolCall { id: "sh1".into(), name: "Bash".into(), input }).await;
+            let _ = events.send(HarnessEvent::PermissionDecided { tool: "Bash".into(), allowed: false }).await;
+        }
         let script = self.0.respond(&task).await?;
         // Thoughts and tool calls go to the transcript, never into the answer.
         let _ = events.send(HarnessEvent::Thought { text: "thinking".into() }).await;
@@ -320,7 +327,7 @@ impl World {
             }
             Mode::CrossImport if id == "a" => Ok(Script::page(id, "export const a = 2;\n")),
             Mode::ConfirmFinding if id == "a" && n >= 1 => Ok(Script::page(id, "export const a = 2;\n")),
-            Mode::Nothing => Ok(Script::text("I made no edits to this page.")),
+            Mode::Nothing | Mode::Refused => Ok(Script::text("I made no edits to this page.")),
             Mode::Learn if id == "a" && n < 3 => Ok(Script::text("no files yet")),
             Mode::Learn if id == "a" => Ok(Script {
                 text: "Read the route param before rendering the header.".into(),
@@ -711,11 +718,14 @@ async fn mistakes_stay_with_the_model_that_made_them() {
     );
     Records::files(&tmp.0).save_book(&book).unwrap();
     let world = World::new(Mode::Learn);
-    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
+    // A different master model, so there is a ladder: a page that keeps failing climbs it.
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1);
+    cfg.models.master = Some("stronger".into());
+    let outcome = run(cfg, &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     let calls = world.calls.lock().unwrap().clone();
     let page_b = calls.iter().find(|call| call.contains("Build page `b`")).expect("page b ran");
-    assert!(page_b.contains("worker produced no changes under its owned files"));
+    assert!(page_b.contains("changed none of your files"), "{page_b}");
     assert!(page_b.contains("Read the route param before rendering the header."));
     assert!(!calls.iter().any(|call| call.contains("claude-only mistake")));
     let saved = Records::files(&tmp.0).book().unwrap();
@@ -1223,6 +1233,24 @@ fn only_commons_entries_that_bear_on_the_request_reach_the_planner() {
     let found = keys(crate::engine::relevant_entries(app, todo()));
     assert!(found.contains(&"todo-schema".to_string()) && found.contains(&"todo-dom".to_string()), "{found:?}");
     assert!(keys(crate::engine::relevant_entries("Use the todo-dom entry.", todo())).contains(&"todo-dom".to_string()));
+}
+
+#[tokio::test]
+async fn a_refused_shell_with_no_changes_is_not_retried_and_says_why() {
+    let tmp = seeded("refused");
+    let world = World::new(Mode::Refused);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    let builds = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(builds, 1, "the same refusal would meet every retry, so there is none");
+    let attempts = Records::files(&tmp.0).attempts("current", "a").unwrap();
+    let failure = attempts.last().and_then(|a| a.failure.clone()).unwrap_or_default();
+    assert!(failure.contains("Bash poetry lock") && failure.contains("sandbox.shell"), "{failure}");
+    // The ledger keeps what was refused beside whether the turn finished.
+    let ledger = read(&run_directory(&tmp.0, "current").join("ledger.jsonl"));
+    let row: serde_json::Value = ledger.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|r| r["page"] == "a").unwrap();
+    assert_eq!(row["ok"], true);
+    assert_eq!(row["refused"], serde_json::json!(["Bash poetry lock"]));
 }
 
 #[tokio::test]
@@ -1912,7 +1940,8 @@ mod http {
     #[tokio::test]
     async fn a_follow_up_note_produces_a_master_step_before_any_worker_step() {
         let tmp = repo("api-agents");
-        let world = World::new(Mode::Learn);
+        // The first attempt writes outside its files and fails; the repair passes.
+        let world = World::new(Mode::Outside);
         let (_server, mut client, code) = server(&tmp, &world).await;
         let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
         client.token = Some(paired["token"].as_str().unwrap().to_string());

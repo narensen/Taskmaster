@@ -331,7 +331,7 @@ mod tests {
         .unwrap();
         let settings = Settings::load(&dir).unwrap();
         let records = settings.records(&dir).unwrap();
-        records.save_meta("r", &crate::store::Meta { parallel: 1, branch: None, base: None, template: None }).unwrap();
+        records.save_meta("r", &crate::store::Meta { parallel: 1, branch: None, base: None, template: None, focused: false }).unwrap();
         assert!(dir.join(".taskmaster/taskmaster.db").is_file());
         assert!(!dir.join(".taskmaster/runs").exists());
         let (auth, _) = settings.auth(records).unwrap();

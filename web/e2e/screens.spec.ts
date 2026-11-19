@@ -31,9 +31,10 @@ for (const theme of ["dark", "light"] as const) {
     await themed(page, theme);
     await finishedRun(daemon.fixture!, "bookshop", "A bookshop: a home page with featured books, a searchable list, and a cart with a total.");
     await openFixture("/runs/bookshop");
-    await page.getByTestId("token-ledger").scrollIntoViewIfNeeded();
+    await page.getByTestId("run-flow").waitFor();
     await page.waitForTimeout(400);
     await page.screenshot({ path: `${out}/33-run-tokens-${theme}.png` });
+    await page.getByTestId("token-counter").hover();
     await page.getByTestId("token-ledger").screenshot({ path: `${out}/34-token-ledger-${theme}.png` });
     await page.goto(daemon.fixture!.url + "/");
     await page.getByRole("textbox", { name: /Tell the master/ }).waitFor();

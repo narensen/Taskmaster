@@ -47,6 +47,7 @@ import { readFile } from "./composer";
 import { bezier, dur } from "./motion";
 import { useLoad } from "./ui";
 import { typing } from "./keys";
+import { RunBar } from "./run/Meter";
 import { TitleBar, type Crumb } from "./shell/TitleBar";
 import { Shortcuts } from "./shell/Shortcuts";
 import { QuickTerminal } from "./lazy";
@@ -479,6 +480,7 @@ export function App() {
               onTerminal={toggleTerm}
               onMenu={() => setDrawer(!drawer)}
               terminalOpen={term}
+              extra={/^\/runs\/(?!new$)[^/]+/.test(path) ? <RunBar /> : null}
             />
             <aside className={`side ${drawer ? "open" : ""}`} aria-label="Main">
               <Link to="/" className="brand side-brand" onClick={() => setDrawer(false)}>

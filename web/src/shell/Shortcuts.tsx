@@ -24,8 +24,10 @@ export const SHORTCUTS: { group: string; items: [string, string[]][] }[] = [
       ["Open run 1 to 9 in the sidebar", [MOD, "1–9"]],
       ["Previous or next run", ["Alt", "↑ ↓"]],
       ["Show or hide the side panel", [MOD, "\\"]],
-      ["Close the panel tab", [MOD, "W"]],
-      ["Reopen the last closed tab", [MOD, "⇧", "T"]],
+      ["Move between agents", ["J", "K"]],
+      ["Expand the focused agent", ["Enter"]],
+      ["Open the focused file", ["E"]],
+      ["Close the side panel", ["Esc"]],
     ],
   },
   {

@@ -12,9 +12,11 @@ test("the run view splits every agent's tokens four ways", async ({ openFixture,
   expect(Object.keys(ledger.totals.by_agent)).toContain("master");
 
   await openFixture("/runs/token-split");
+  const counter = page.getByTestId("token-counter");
+  await expect(counter).toBeVisible();
+  await counter.hover();
   const tokens = page.getByTestId("token-ledger");
   await expect(tokens).toBeVisible();
-  // A finished run opens its summary.
   await expect(tokens).toHaveAttribute("open", "");
   await expect(tokens.locator("summary")).toContainText(" out · ");
   const table = tokens.getByRole("table", { name: "Tokens by agent" });

@@ -86,12 +86,12 @@ export function TitleBar({
       </nav>
       <div className="tb-fill" {...drag} />
       <div className="tb-actions">
-        {extra}
         <Tip label="Search and commands" keys={`${MOD} K`}>
           <button type="button" className="tb-btn" aria-label="Search and commands" onClick={onPalette}>
             <Command size={14} strokeWidth={1.75} />
           </button>
         </Tip>
+        {extra}
         <Tip label="Terminal" keys={`${MOD} J`}>
           <button type="button" className={`tb-btn ${terminalOpen ? "on" : ""}`} aria-label="Terminal" aria-pressed={terminalOpen} onClick={onTerminal}>
             <SquareTerminal size={14} strokeWidth={1.75} />

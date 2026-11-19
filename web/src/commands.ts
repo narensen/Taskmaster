@@ -59,10 +59,9 @@ export function commands(ctx: RunContext | null = runContext): Command[] {
     list.push({ id: "agent-reviewer", label: "Reviewer", group: "Agent", run: () => ctx.focusAgent("reviewer") });
     list.push({ id: "agent-verifier", label: "Verifier", group: "Agent", run: () => ctx.focusAgent("verifier") });
     for (const [tab, label] of [
-      ["plan", "Plan"],
+      ["files", "Files"],
       ["diff", "Diff"],
-      ["browser", "Browser"],
-      ["search", "Web search"],
+      ["preview", "Preview"],
       ["terminal", "Terminal"],
     ] as const) {
       list.push({ id: `tab-${tab}`, label, group: "Panel", run: () => ctx.openTab(tab) });

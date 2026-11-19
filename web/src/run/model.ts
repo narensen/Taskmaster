@@ -22,9 +22,16 @@ export interface ToolItem {
   target: string | null;
   allowed?: boolean;
   input?: unknown;
+  /** Text the harness printed for this call, when it sent any. */
+  output?: string;
+  at: string;
 }
 /** A lifecycle line: the agent stalled and was replaced, or was released when done. */
-export type Item = { t: "text"; text: string } | { t: "thought"; text: string } | { t: "life"; text: string } | ToolItem;
+export type Item =
+  | { t: "text"; text: string; at: string }
+  | { t: "thought"; text: string; at: string }
+  | { t: "life"; text: string; at: string }
+  | ToolItem;
 
 export interface Call {
   call: number;
@@ -67,15 +74,23 @@ export function surfaceOf(entry: LedgerEntry): string {
 
 /** Group transcript entries into calls per agent. */
 export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[]): Surface[] {
-  const pages = detail?.plan?.pages.map((p) => p.id) ?? detail?.pages.map((p) => p.id) ?? [];
-  const order = ["master", ...pages.map((p) => `page:${p}`), "reviewer", "verifier"];
+  const planPages = detail?.plan?.pages ?? [];
+  const pages = planPages.map((p) => p.id).length ? planPages.map((p) => p.id) : (detail?.pages.map((p) => p.id) ?? []);
+  // A page the plan split into units is one worker per unit, so six workers stay six blocks.
+  const workerIds = pages.flatMap((p) => {
+    const units = planPages.find((page) => page.id === p)?.units;
+    if (units && units.length > 1) return units.map((u) => `page:${p}/${u.id}`);
+    return [`page:${p}`];
+  });
+  const order = ["master", ...workerIds, "reviewer", "verifier"];
   const byId = new Map<string, Surface>();
   const make = (id: string): Surface => {
-    const page = id.startsWith("page:") ? id.slice(5) : null;
+    const raw = id.startsWith("page:") ? id.slice(5) : null;
+    const page = raw ? raw.split("/")[0]! : null;
     const role = page ? "worker" : id;
     return {
       id,
-      title: page ? `Worker · ${page}` : id[0]!.toUpperCase() + id.slice(1),
+      title: raw ? `Worker · ${raw.replaceAll("/", " / ")}` : id[0]!.toUpperCase() + id.slice(1),
       role,
       page,
       calls: [],
@@ -91,8 +106,7 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
   for (const id of order) byId.set(id, make(id));
   const calls = new Map<string, Call>();
   for (const e of entries) {
-    // A split page's units (`page:<page>/<unit>`) are separate agents shown on the page's surface.
-    const id = e.agent.id.startsWith("page:") ? e.agent.id.split("/")[0]! : e.agent.id;
+    const id = e.agent.id;
     if (id === "runtime" || id === "person") continue;
     if (!byId.has(id)) byId.set(id, make(id));
     const s = byId.get(id)!;
@@ -111,28 +125,40 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
         break;
       case "text":
         if (last?.t === "text") last.text += e.text ?? "";
-        else call.items.push({ t: "text", text: e.text ?? "" });
+        else call.items.push({ t: "text", text: e.text ?? "", at: e.at });
         break;
       case "thought":
         if (last?.t === "thought") last.text += e.text ?? "";
-        else call.items.push({ t: "thought", text: e.text ?? "" });
+        else call.items.push({ t: "thought", text: e.text ?? "", at: e.at });
         break;
       case "tool_call":
-        call.items.push({ t: "tool", name: e.name ?? "tool", target: e.target ?? null, input: e.input });
+        call.items.push({ t: "tool", name: e.name ?? "tool", target: e.target ?? null, input: e.input, at: e.at });
+        break;
+      case "command":
+        call.items.push({ t: "tool", name: "command", target: e.command ?? null, at: e.at });
+        break;
+      case "output": {
+        const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.output === undefined);
+        if (open) open.output = e.text ?? "";
+        else if (e.text) call.items.push({ t: "text", text: e.text, at: e.at });
+        break;
+      }
+      case "preview":
+        call.items.push({ t: "tool", name: "browser", target: e.routes?.map((r) => r.route).join(" ") || e.step || null, at: e.at });
         break;
       case "permission": {
-        const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.allowed === undefined && i.name === e.tool);
+        const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.allowed === undefined && i.name === (e.tool ?? e.name));
         if (open) open.allowed = e.allowed;
-        else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed });
+        else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed, at: e.at });
         break;
       }
       case "stalled":
-        call.items.push({ t: "life", text: `Stalled waiting on its model; fresh agent ${e.restart ?? 1} started.` });
+        call.items.push({ t: "life", text: `Stalled waiting on its model; fresh agent ${e.restart ?? 1} started.`, at: e.at });
         break;
       case "released": {
         const left = e.lingering ? `${e.lingering} still running` : "nothing left running";
         const n = e.processes ?? 0;
-        call.items.push({ t: "life", text: `${e.asked ? "Reported done and asked to be released" : "Turn ended"}; released ${n} process${n === 1 ? "" : "es"}, ${left}.` });
+        call.items.push({ t: "life", text: `${e.asked ? "Reported done and asked to be released" : "Turn ended"}; released ${n} process${n === 1 ? "" : "es"}, ${left}.`, at: e.at });
         break;
       }
       case "end":

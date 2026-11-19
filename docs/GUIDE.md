@@ -180,7 +180,9 @@ The reviewer and the verifier are different harnesses, so one model does not gra
 
 Before a run finishes, the files it built are typechecked and linted with tools the project already has: `tsc` from `node_modules`, eslint when it is configured, clippy for Rust, ruff for Python. Only errors count. A type error, a compile error, or a lint rule the project set to `error` goes back to the page that owns the file, and into that model's Errorography. Style warnings do not. An error in a shared file the run wrote, a contract or a template file, goes to the master, which may edit those files and nothing else. It gets two such repairs in a run; if the file still fails, the run fails. An error in a file the run did not write was there before, so it is printed and left alone. Taskmaster installs nothing here.
 
-When the types are clean, the project is run. Its own `build` and `test` scripts run through the package manager its lockfile names (npm, pnpm, yarn or bun). A Rust project gets `cargo test`, and a Python project with a test directory gets `pytest`. Each failure goes back to the page whose file or route the output names. A failure that names a shared file the run wrote goes to the master. One that names neither is printed and costs nothing.
+When the types are clean, the project is run. Its own `build` and `test` scripts run through the package manager its lockfile names (npm, pnpm, yarn or bun). A Rust project gets `cargo test`. Any Python tests (a `tests/` directory, or `test_*.py` files) are run with pytest through the project's own runner when it has one (`poetry run`, `uv run`, `hatch run`), or else from pip. Either way they run in a venv the run makes for itself, `.taskmaster/runs/<id>/venv`, with the project and its dev or test extras (or its `requirements*.txt`) installed, and with `VIRTUAL_ENV`, `PYTHONPATH`, `CONDA_*` and any other venv on `PATH` stripped from the environment. The venv is kept for the rest of the run and refilled only when a dependency file changes.
+
+Each failure goes back to the page whose file or route the output names. A failure that names a shared file the run wrote goes to the master. A failure that names neither also goes to the master, with its output, and the master may change any file to fix it. The run gets two such repairs; if the checks still fail after them, the run fails: it exits 1, and its branch is kept and not merged. A failing check never passes in silence. A project that has tests whose tests could not be run at all is not verified either: the run prints `verify: nothing ran` and fails.
 
 A Next.js app that built is then started and opened in headless Chrome, one page per route, over the DevTools protocol. A dynamic segment such as `[id]` gets a sample value, and its 404 is not counted against it. The page gets back:
 - an error status;
@@ -188,7 +190,15 @@ A Next.js app that built is then started and opened in headless Chrome, one page
 - a `console.error`;
 - a resource that failed to load.
 
-A screenshot of each page is kept, and the app shows it next to the page. Chrome is found on `PATH`, or at `$TASKMASTER_CHROME`. `--no-runtime-checks` skips all of this.
+A screenshot of each page is kept, and the app shows it next to the page. Chrome is found on `PATH`, or at `$TASKMASTER_CHROME`. Only units a browser shows are opened: a plan for a library, a command-line tool, a server or a migration has no routes, no design system and no browser check. `--no-runtime-checks` skips all of this.
+
+## What a plan is
+
+A plan names its `kind`: `web`, `library`, `cli`, `server` or `migration`. Its `units` are the pieces of work, each one agent (or several, when it is split into `parts`) owning one glob. Only a unit a browser shows (every unit of a `web` plan, or one marked `"ui": true`) has a `route`, and only a plan with such a unit has a `design`. Contracts are interfaces that more than one unit imports, never implementations: signatures, types, constants and schemas with stub bodies, at most 120 lines each and 400 in all, and never a file a unit owns. The planner is shown the same list of rules the plan is checked against, and a field with one sensible fix (a route on a module, a design on a library, a path written `./x`) is fixed in place rather than sending the plan back. A unit whose files are already right and whose agent changes nothing is done, not failed.
+
+## A worker's shell
+
+A builder whose harness runs inside the sandbox (bubblewrap for `agy`, `grok` and `opencode`, Codex's own sandbox for `codex`) gets a shell. The whole filesystem is read-only to it except its worktree, `/tmp`, an empty home, its own scratch directory and the run's package caches under `.taskmaster/runs/<id>/`; toolchains under the home directory (`~/.local/bin`, `~/.cargo/bin`, `~/.rustup` and the like) are mounted read-only so they still run. It is told to run the tests for its files before it says it is done. Fetch tools reach only the package indexes (PyPI, npm and crates.io). Test caches, `__pycache__`, venvs and `node_modules` it leaves behind are never counted as its work. Where bubblewrap cannot run, or for Claude Code, workers have no shell, and the run log says so once. `sandbox.shell` and `sandbox.package_indexes` in the settings file turn either off.
 
 ## Handing over
 

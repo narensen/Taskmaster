@@ -23,5 +23,9 @@
   },
   "telemetry": {
     "enabled": false
+  },
+  "sandbox": {
+    "shell": true,
+    "package_indexes": true
   }
 }

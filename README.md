@@ -21,26 +21,51 @@ Taskmaster is a multi-model coding harness that runs on your machine. You descri
 
 It drives the coding CLIs you already use: Claude Code, Codex, Grok Build, Antigravity and OpenCode. You pick a provider and model for each role.
 
-## What you get
-
-- **A locked plan.** Contracts are committed before any page is built, so workers can't drift apart.
-- **Parallel pages.** Each page builds in its own worktree and merges back only the files it owns.
-- **Independent review.** The reviewer and verifier are a different model from the one that wrote the page.
-- **Free checks first.** Type checks, linters, the project's own build and tests, and headless-browser checks run before any model is asked to grade.
-- **A token ledger.** Every call records input, output and cache tokens, time, and price where the provider reports it.
-- **Resumable runs.** The run is an event log, so a crash picks up where it stopped.
-- **Desktop app.** It starts the local daemon for you and updates itself from GitHub Releases.
+<table>
+  <tr>
+    <td><b>A locked plan</b></td>
+    <td>Contracts are committed before any page is built, so workers can't drift apart.</td>
+  </tr>
+  <tr>
+    <td><b>Parallel pages</b></td>
+    <td>Each page builds in its own worktree and merges back only the files it owns.</td>
+  </tr>
+  <tr>
+    <td><b>Independent review</b></td>
+    <td>The reviewer and verifier are a different model from the one that wrote the page.</td>
+  </tr>
+  <tr>
+    <td><b>Free checks first</b></td>
+    <td>Type checks, linters, the project's own build and tests, and headless-browser checks run before any model is asked to grade.</td>
+  </tr>
+  <tr>
+    <td><b>A token ledger</b></td>
+    <td>Every call records input, output and cache tokens, time, and price where the provider reports it.</td>
+  </tr>
+  <tr>
+    <td><b>Resumable runs</b></td>
+    <td>The run is an event log, so a crash picks up where it stopped.</td>
+  </tr>
+</table>
 
 ## Install
 
-| Platform | How |
-| --- | --- |
-| Ubuntu, Debian | `.deb` from [Releases](https://github.com/narensen/Taskmaster/releases/latest), then `sudo apt install ./Taskmaster_*_amd64.deb` |
-| Any Linux | `.AppImage` from [Releases](https://github.com/narensen/Taskmaster/releases/latest) |
-| Linux server | `taskmaster-*-x86_64-linux.tar.gz`, then `./install.sh` inside it. The app is copied to `~/.local/share/taskmaster/web`, so `tm-daemon serve <project>` finds it without `--web`. |
-| macOS, from source | `scripts/install.sh` (needs `cargo` and `git`) |
+One short line per platform. Verify the download with the checksum file that ships with every release.
 
-Then install and sign in to at least one provider. `tm-daemon providers` prints the commands for each one.
+| Platform | Get it |
+| --- | --- |
+| Ubuntu / Debian | `Taskmaster_<version>_amd64.deb` from [Releases](https://github.com/narensen/Taskmaster/releases/latest), then `sudo apt install ./Taskmaster_<version>_amd64.deb` |
+| Any Linux | `Taskmaster_<version>_amd64.AppImage`, then `chmod +x` and run it |
+| Linux server (headless) | `taskmaster-<version>-x86_64-linux.tar.gz`, then `./install.sh` inside it. The app is copied to `~/.local/share/taskmaster/web`, so `tm-daemon serve <project>` finds it without `--web`. |
+| macOS | Build from source with `scripts/install.sh` (needs `cargo` and `git`) |
+
+Then install and sign in to at least one provider. `tm-daemon providers` prints the install and sign-in commands for each one.
+
+Verify a download:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
 
 ## Use
 
@@ -51,6 +76,24 @@ tm-daemon . --yes                      # approve the plan and build it
 ```
 
 The [guide](docs/GUIDE.md) covers roles, configuration, the API, Commons, and reviewing any repository with `tm-review`.
+
+## Built to be kind to your hands
+
+Taskmaster is built so you don't have to reach for the mouse all day, because constant clicking and dragging is how repetitive strain builds up.
+
+- **Command palette.** `⌘K` / `Ctrl-K` jumps to runs, pages and commands without leaving the keyboard.
+- **Shell in place.** `Ctrl-J` opens a shell in the project; hiding it keeps the shell and its output.
+- **Visible focus.** Every element the keyboard can reach shows a clear focus ring, so you always know where you are.
+- **Every input labelled.** Every field, checkbox and icon-only button has a label or an `aria-label`, so the page is predictable by keyboard and by screen reader.
+- **Reduced motion.** `prefers-reduced-motion` is respected; animations stay out of the way.
+
+Shortcuts, not reaches.
+
+## Code Mode (optional)
+
+Workers can run sandboxed JavaScript instead of only writing files. Code Mode gives each worker `run_code`: one async call with `read`, `write`, `edit`, `grep`, `ls`, `sh`, `check` and `browser`, run in Node behind the same permission gate as the worker's own tools (no files, processes or workers of its own, and under bubblewrap no network). Claude Code workers use Claude Code's own native code mode instead.
+
+It's off by default. Turn it on in Settings (`code_mode.enabled`) when a worker benefits from computing, scraping its own preview, or transforming data in code.
 
 ## Develop
 

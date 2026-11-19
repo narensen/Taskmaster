@@ -25,6 +25,10 @@
 //! printed; nothing is built until a later run passes `--yes`. A run resumes from
 //! `.taskmaster/runs/<id>/`. `--eval` runs the plan again with one model and writes
 //! `.taskmaster/evals/<id>.json`. A prompt is planned once and reused for the baseline.
+//! `--timeout 0` lets an agent call run with no time limit. The exit code is 0 when the
+//! run finishes clean, 1 when it fails, 2 when the plan waits for `--yes`, and 3 when a
+//! provider stopped it (a usage limit, no balance left, a sign-in): run the same command
+//! again to resume.
 //! `--pair` serves the API and the phone page on this machine's Tailscale address for as
 //! long as the run lasts. `serve` keeps the API up with no run of its own: a frontend
 //! starts, approves and cancels runs through it. It listens on `127.0.0.1:8737` unless
@@ -77,6 +81,16 @@ fn main() -> ExitCode {
         Ok(Outcome::Finished { ok: true }) => ExitCode::SUCCESS,
         Ok(Outcome::Finished { ok: false }) => ExitCode::from(1),
         Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => ExitCode::from(2),
+        // A provider stopped the run (a usage limit, no balance, a sign-in): the run is kept
+        // where it stopped, and the same command picks it up again.
+        Err(err) if err.downcast_ref::<tm_daemon::reply::ReportedLimit>().is_some() => {
+            eprintln!("taskmaster: {err:#}");
+            eprintln!(
+                "taskmaster: the run is kept where it stopped. Run the same command again to resume it, \
+                 or pass a different --master/--mid/--worker/--reviewer/--verifier to switch the provider."
+            );
+            ExitCode::from(3)
+        }
         Err(err) => {
             eprintln!("taskmaster: {err:#}");
             ExitCode::from(1)
@@ -447,6 +461,12 @@ mod args_tests {
         assert!(rejected("proj --prompt hi --prompt-file p.txt").contains("only one"));
         assert!(rejected("proj --eval").contains("--eval needs"));
         assert!(parse("proj --prompt-file brief.txt").unwrap().prompt_file.is_some());
+        // The benchmark's own invocation: 0 is no limit.
+        let bench = parse("proj --prompt-file F --yes --worker grok --mid grok --master grok --reviewer grok --verifier grok --parallel 3 --timeout 0").unwrap();
+        assert_eq!(bench.timeout, Some(0));
+        assert_eq!(bench.parallel, 3);
+        assert!(bench.yes);
+        assert_eq!(tm_daemon::settings::agent_limit(0), tm_daemon::settings::NO_LIMIT);
     }
 
     #[test]

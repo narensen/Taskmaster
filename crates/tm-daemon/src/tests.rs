@@ -51,6 +51,8 @@ enum Mode {
     Checked,
     /// The planner thinks, keeps calling tools, and never writes, until it is stopped.
     Overthink,
+    /// Page `a`'s first build fails because the account has no balance left (HTTP 402).
+    Broke,
 }
 
 struct World {
@@ -196,6 +198,9 @@ impl World {
             return Ok(Script { text: format!("done\nRELEASE page:a/{unit}"), files: vec![(path.into(), Some(body.into()))] });
         }
         if let Some(id) = brief.split("Build page `").nth(1).or_else(|| brief.split("Build unit `").nth(1)).and_then(|rest| rest.split('`').next()) {
+            if matches!(self.mode, Mode::Broke) && id == "a" && self.a.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!(r#"`session/prompt` failed: {{"code":-32603,"message":"API error (status 402 Payment Required): Grok Build usage balance exhausted"}}"#);
+            }
             if matches!(self.mode, Mode::Stall) && id == "a" && self.a.load(Ordering::SeqCst) == 0 {
                 assert!(task.stall.is_some(), "a worker runs with a stall limit");
                 self.a.fetch_add(1, Ordering::SeqCst);
@@ -1174,6 +1179,22 @@ async fn the_master_repairs_a_failure_no_unit_owns_and_the_run_passes() {
     assert_eq!(outcome, Outcome::Finished { ok: true });
     assert_eq!(read(&tmp.0.join("fixed.txt")), "ok\n", "the master's fix was merged with the run");
     assert!(log(&tmp.0).contains("taskmaster: repair a failure no unit owns"));
+}
+
+#[tokio::test]
+async fn an_empty_balance_is_a_typed_limit_and_the_run_resumes() {
+    let tmp = seeded("broke");
+    let world = World::new(Mode::Broke);
+    let err = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap_err();
+    let limit = err.downcast_ref::<crate::reply::ReportedLimit>().expect("a typed limit, not a raw error");
+    assert!(limit.sentence().contains("no usage balance left"), "{}", limit.sentence());
+    assert!(!limit.sentence().contains("-32603"), "the raw reply stays out of the sentence");
+    // Nothing was thrown away: the same command picks the run up where it stopped.
+    let again = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &again).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));
+    assert!(again.calls.lock().unwrap().iter().all(|c| !c.contains("Plan this")), "it was not planned again");
 }
 
 #[tokio::test]

@@ -130,7 +130,7 @@ export interface RunSummary {
 export interface RunLimit {
   provider: string;
   role: string;
-  kind: "quota" | "rate_limit" | "auth";
+  kind: "quota" | "rate_limit" | "auth" | "balance";
   reset?: string | null;
   raw: string;
 }

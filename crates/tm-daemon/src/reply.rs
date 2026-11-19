@@ -197,6 +197,8 @@ pub enum LimitKind {
     Quota,
     RateLimit,
     Auth,
+    /// The account has no paid balance left (HTTP 402, "usage balance exhausted").
+    Balance,
 }
 
 /// A provider limit found in a reply, before any role or provider name is known.
@@ -213,6 +215,7 @@ impl std::fmt::Display for ProviderLimit {
             LimitKind::Quota => write!(f, "the provider hit its usage limit"),
             LimitKind::RateLimit => write!(f, "the provider is rate limited"),
             LimitKind::Auth => write!(f, "the provider needs a sign-in"),
+            LimitKind::Balance => write!(f, "the provider has no usage balance left"),
         }
     }
 }
@@ -240,6 +243,7 @@ impl ReportedLimit {
             LimitKind::Quota => format!("{who} hit its usage limit ({})", self.role),
             LimitKind::RateLimit => format!("{who} is rate limited ({})", self.role),
             LimitKind::Auth => format!("{who} needs a sign-in ({})", self.role),
+            LimitKind::Balance => format!("{who} has no usage balance left ({}); add credit or switch the provider, then retry", self.role),
         };
         match &self.reset {
             Some(reset) => format!("{what}. Resets {reset}."),
@@ -286,7 +290,9 @@ pub fn limit_of(text: &str) -> Option<ProviderLimit> {
     let head = raw.lines().find(|line| !line.trim().is_empty()).unwrap_or(raw);
     let window = if raw.chars().count() <= 1200 { raw } else { head };
     let lower = window.to_ascii_lowercase();
-    let kind = if auth_failure(&lower) {
+    let kind = if balance_failure(&lower) {
+        LimitKind::Balance
+    } else if auth_failure(&lower) {
         LimitKind::Auth
     } else if rate_failure(&lower) {
         LimitKind::RateLimit
@@ -330,6 +336,23 @@ fn auth_failure(text: &str) -> bool {
         "invalid_api_key",
         "authentication_error",
         "401 unauthorized",
+    ];
+    PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+/// A provider that wants payment before it answers again: an HTTP 402, or its words for an
+/// empty prepaid balance.
+fn balance_failure(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "402 payment required",
+        "status 402",
+        "status: 402",
+        "payment_required",
+        "usage balance exhausted",
+        "balance exhausted",
+        "insufficient balance",
+        "insufficient_balance",
+        "no remaining balance",
     ];
     PHRASES.iter().any(|phrase| text.contains(phrase))
 }
@@ -471,6 +494,14 @@ mod tests {
         let hit = limit_of("Please run /login. Your session expired.").unwrap();
         assert_eq!(hit.kind, LimitKind::Auth);
         assert_eq!(ReportedLimit::new("claude", "Reviewer", hit).sentence(), "Claude needs a sign-in (Reviewer).");
+
+        // Recorded from Grok Build when its prepaid balance ran out, as the ACP error arrives.
+        let grok = r#"`session/prompt` failed: {"code":-32603,"message":"API error (status 402 Payment Required): Grok Build usage balance exhausted","data":null}"#;
+        let hit = limit_of(grok).unwrap();
+        assert_eq!(hit.kind, LimitKind::Balance);
+        let named = ReportedLimit::new("grok", "Worker", hit);
+        assert!(named.sentence().contains("no usage balance left (Worker)"), "{}", named.sentence());
+        assert_eq!(limit_of("HTTP 402 Payment Required").unwrap().kind, LimitKind::Balance);
 
         assert!(limit_of("{\"pages\":[]}").is_none());
         assert!(parse_plan("{\"pages\":[]}").is_ok());

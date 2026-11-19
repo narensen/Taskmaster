@@ -292,7 +292,7 @@ pub struct RunSummary {
 /// A session kept open after its first turn, so a repair can be sent to the same agent as
 /// a follow-up turn: it keeps everything it read and did, and the provider's prompt cache.
 #[async_trait]
-pub trait Session: Send {
+pub trait Session: Send + Sync {
     /// Send one more turn. Events go to `events` until the turn ends.
     async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary>;
 

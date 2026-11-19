@@ -133,6 +133,42 @@ pub fn worktree_changes(repo: &Path) -> anyhow::Result<Vec<Change>> {
     Ok(changes)
 }
 
+/// Whether a change in `worktree` leaves the file as it already is in `tree`: the same
+/// bytes, or deleted where `tree` does not have it either.
+pub fn same_as(worktree: &Path, tree: &Path, change: &Change) -> bool {
+    let theirs = std::fs::read(tree.join(&change.path));
+    if change.status == 'D' {
+        return theirs.is_err();
+    }
+    match (std::fs::read(worktree.join(&change.path)), theirs) {
+        (Ok(mine), Ok(theirs)) => mine == theirs,
+        _ => false,
+    }
+}
+
+/// Bring a worktree kept open for a follow-up up to date with `tree`: every file that
+/// changed in `tree` since the worktree's commit is copied over (or removed). The worktree's
+/// own edits to other files stay. Only plain file writes; nothing in git moves.
+pub fn sync_worktree(worktree: &Path, tree: &Path) -> anyhow::Result<()> {
+    let base = head(worktree)?;
+    let changed = git(tree, &["diff", "--no-renames", "--name-status", "-z", &base, "HEAD"])?;
+    for change in parse_name_status(&changed) {
+        if !safe_rel(&change.path) {
+            continue;
+        }
+        let dest = worktree.join(&change.path);
+        if change.status == 'D' {
+            let _ = std::fs::remove_file(&dest);
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(tree.join(&change.path), &dest).with_context(|| format!("cannot copy {}", change.path))?;
+    }
+    Ok(())
+}
+
 /// What running a project's tests or installing its packages leaves in a worktree. A worker
 /// with a shell makes these; they are never its work, so they are never merged or counted.
 pub const ARTIFACTS: [&str; 15] = [

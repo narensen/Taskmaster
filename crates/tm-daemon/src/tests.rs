@@ -66,6 +66,8 @@ struct World {
     sandboxed: std::sync::atomic::AtomicBool,
     /// For each call: whether it was read-only, and the shell it was given.
     shells: Mutex<Vec<(bool, Option<tm_harness::ShellScope>)>>,
+    /// The fake keeps a builder's session open after its turn, like an ACP agent.
+    keeps: std::sync::atomic::AtomicBool,
     plans: AtomicUsize,
     a: AtomicUsize,
     b: AtomicUsize,
@@ -100,6 +102,22 @@ impl Harness for Fake {
 
     fn sandboxed_shell(&self) -> bool {
         self.0.sandboxed.load(Ordering::SeqCst)
+    }
+
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+        let id = task.brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()).map(str::to_string);
+        let cwd = task.cwd.clone();
+        let result = self.run(task, gate, events).await;
+        let keep = self.0.keeps.load(Ordering::SeqCst) && result.as_ref().is_ok_and(|s| s.ok);
+        match id.filter(|_| keep) {
+            Some(id) => (result, Some(Box::new(FakeSession { world: self.0.clone(), id, cwd }))),
+            None => (result, None),
+        }
     }
 
     async fn run(
@@ -156,6 +174,28 @@ impl Harness for Fake {
     }
 }
 
+/// A builder's session the fake kept open. A follow-up fixes the page the plain way.
+struct FakeSession {
+    world: Arc<World>,
+    id: String,
+    cwd: PathBuf,
+}
+
+#[async_trait]
+impl tm_harness::Session for FakeSession {
+    async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, _timeout: Duration) -> anyhow::Result<RunSummary> {
+        self.world.calls.lock().unwrap().push(format!("[follow-up {}] {text}", self.id));
+        std::fs::create_dir_all(self.cwd.join(format!("app/{}", self.id)))?;
+        std::fs::write(self.cwd.join(format!("app/{}/page.ts", self.id)), format!("export const page = \"{}\"; // fixed\n", self.id))?;
+        let _ = events.send(HarnessEvent::Text { text: "fixed".into() }).await;
+        Ok(RunSummary { ok: true, usage: Usage { input: 10, output: 5, cache_read: 90, cache_write: 0 }, cost_usd: Some(0.001), denied: 0, freed: None })
+    }
+
+    async fn close(self: Box<Self>) -> tm_harness::Freed {
+        tm_harness::Freed::default()
+    }
+}
+
 impl World {
     fn new(mode: Mode) -> Arc<Self> {
         Arc::new(World {
@@ -163,6 +203,7 @@ impl World {
             calls: Mutex::new(Vec::new()),
             sandboxed: std::sync::atomic::AtomicBool::new(false),
             shells: Mutex::new(Vec::new()),
+            keeps: std::sync::atomic::AtomicBool::new(false),
             plans: AtomicUsize::new(0),
             a: AtomicUsize::new(0),
             b: AtomicUsize::new(0),
@@ -1305,6 +1346,24 @@ async fn a_project_md_of_the_projects_own_is_never_overwritten() {
     let outcome = run(prompt_config(&tmp.0, &format!("Build a product. {}", "It has many parts. ".repeat(20)), true), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     assert_eq!(read(&tmp.0.join("PROJECT.md")), "# Ours\n");
+}
+
+#[tokio::test]
+async fn a_repair_goes_to_the_builders_open_session() {
+    let tmp = seeded("warm");
+    let world = World::new(Mode::CrossImport);
+    world.keeps.store(true, Ordering::SeqCst);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let fresh = calls.iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(fresh, 1, "the repair was not a fresh agent");
+    let follow = calls.iter().find(|c| c.starts_with("[follow-up a]")).expect("the repair went to a's open session");
+    assert!(follow.contains("The checks failed after your last turn") && follow.contains("RELEASE page:a"), "{follow}");
+    assert!(!follow.contains("--- Your task ---"), "a follow-up does not resend the whole brief");
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("fixed"), "the follow-up's fix was merged");
+    // The open worktree had b's files copied in; they were not taken as a's work.
+    assert!(log(&tmp.0).contains("taskmaster: repaired page a"));
 }
 
 #[tokio::test]

@@ -46,6 +46,8 @@ struct Answer {
     seconds: f64,
     /// Tool calls the gate refused, each as `tool target`: what the agent tried and could not do.
     refused: Vec<String>,
+    /// The agent's session, still open, when the call asked to keep it and the harness can.
+    kept: Option<Box<dyn tm_harness::Session>>,
 }
 
 /// Who a call is charged to in the ledger.
@@ -100,6 +102,8 @@ struct AgentRequest {
     shell: Option<ShellScope>,
     /// Fetches may reach the package indexes (see [`tm_harness::PACKAGE_INDEXES`]).
     fetch: bool,
+    /// Keep the agent's session open after its turn, for a repair to follow up in.
+    keep: bool,
 }
 
 /// When a planner has looked and thought long enough. It is stopped after `tools` tool
@@ -307,7 +311,20 @@ struct Driver {
     project_md: String,
     /// The next phase's planning call, started while the current phase builds.
     next_plan: Option<NextPlan>,
+    /// Builders whose sessions are still open, by agent (`page` or `page/unit`), oldest
+    /// first. A repair of that unit on the same tier is sent to it as a follow-up turn.
+    warm: VecDeque<(String, Warm)>,
 }
+
+/// A builder kept open after its turn, with the worktree it worked in.
+struct Warm {
+    session: Box<dyn tm_harness::Session>,
+    worktree: PathBuf,
+    tier: Tier,
+}
+
+/// Open builder sessions a run keeps at most; the oldest is closed first.
+const MAX_WARM: usize = 8;
 
 /// Why a plan reply was not accepted, and the plan in it as JSON when it had one, so the
 /// planner can be asked to repair it.
@@ -455,6 +472,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         no_shell: BTreeSet::new(),
         project_md: String::new(),
         next_plan: None,
+        warm: VecDeque::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -1198,6 +1216,10 @@ impl Driver {
                 Ok(Step::Continue)
             }
             Command::Finish { ok } => {
+                for (_, warm) in std::mem::take(&mut self.warm) {
+                    let _ = warm.session.close().await;
+                    self.drop_worktree(&warm.worktree);
+                }
                 if ok {
                     self.write_project_md("taskmaster: every phase landed")?;
                     self.checkpoint("done");
@@ -1266,16 +1288,39 @@ impl Driver {
             return Err(err);
         }
         let units = self.page(&page)?.work_units();
-        let mut prepared: Vec<(AgentRequest, PathBuf)> = Vec::new();
+        let mut prepared: Vec<(AgentRequest, PathBuf, Option<Warm>)> = Vec::new();
         let mut failure = None;
         for (index, unit) in units.iter().enumerate() {
             let label = if units.len() == 1 { format!("page-{page}") } else { format!("page-{page}-{}", unit.id) };
+            let key = if units.len() == 1 { page.clone() } else { format!("{page}/{}", unit.id) };
+            // A repair goes to the agent that built the unit, when its session is still open:
+            // it already has the task, the files and the provider's cache.
+            let warm = if errors.is_some() { self.take_warm(&key, tier) } else { None };
+            if let Some(warm) = warm {
+                let step = git::sync_worktree(&warm.worktree, &self.tree)
+                    .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()))
+                    .map(|mut request| {
+                        request.brief = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
+                        request
+                    });
+                match step {
+                    Ok(request) => {
+                        let worktree = warm.worktree.clone();
+                        prepared.push((request, worktree, Some(warm)));
+                        continue;
+                    }
+                    Err(err) => {
+                        eprintln!("taskmaster: the open session for {key} could not be reused ({err:#}); starting a fresh agent");
+                        self.drop_worktree(&warm.worktree);
+                    }
+                }
+            }
             let step = self.fresh_worktree(&label).and_then(|worktree| {
                 let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
                 if built.is_err() {
                     self.drop_worktree(&worktree);
                 }
-                built.map(|request| (request, worktree))
+                built.map(|request| (request, worktree, None))
             });
             match step {
                 Ok(done) => prepared.push(done),
@@ -1286,7 +1331,7 @@ impl Driver {
             }
         }
         if let Some(err) = failure {
-            for (_, worktree) in &prepared {
+            for (_, worktree, _) in &prepared {
                 self.drop_worktree(worktree);
             }
             self.pending.push_front(Command::SpawnWorker { page, tier, errors });
@@ -1300,7 +1345,7 @@ impl Driver {
         }
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
         self.batches.remove(&page);
-        for (index, (mut request, worktree)) in prepared.into_iter().enumerate() {
+        for (index, (mut request, worktree, warm)) in prepared.into_iter().enumerate() {
             // Each unit is its own agent: `page:<page>/<unit>` when the page is split.
             let (agent, unit) = if units.len() > 1 {
                 (format!("page:{page}/{}", units[index].id), Some(units[index].id.as_str()))
@@ -1308,7 +1353,7 @@ impl Driver {
                 (format!("page:{page}"), None)
             };
             self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
-            if units.len() == 1 {
+            if units.len() == 1 && warm.is_none() {
                 self.offer_browser(&page, &worktree, &mut request);
             }
             // Every builder and every repair gets run_code when Code Mode is on.
@@ -1320,9 +1365,16 @@ impl Driver {
             }
             let bill = request.bill(Role::builder(tier), Some(&page));
             let (page, slots) = (page.clone(), self.slots.clone());
+            if warm.is_some() {
+                eprintln!("taskmaster: sending the repair of {agent} to its open session");
+            }
             self.jobs.spawn(async move {
                 let permit = slots.acquire_owned().await.ok();
-                let result = ask(request).await.map(|answer| Product { answer, bill, worktree });
+                let asked = match warm {
+                    Some(warm) => follow(request, warm.session).await,
+                    None => ask(request).await,
+                };
+                let result = asked.map(|answer| Product { answer, bill, worktree });
                 // The agent is released; its slot goes to the next waiting unit at once.
                 drop(permit);
                 (page, index, result)
@@ -1465,6 +1517,7 @@ impl Driver {
             commit: None,
             shell: None,
             fetch: false,
+            keep: false,
         };
         self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
         let bill = request.bill(Role::Checker, Some(page));
@@ -1532,10 +1585,47 @@ impl Driver {
                 self.note_attempt(page, tier, errors.as_deref(), product, outcome);
             }
         }
-        for (_, product) in &products {
-            self.drop_worktree(&product.worktree);
+        let units = self.page(page).map(|p| p.work_units()).unwrap_or_default();
+        for (index, mut product) in products {
+            // A session the harness kept open stays warm, with its worktree, for a repair of
+            // this unit. A flagged or blocked unit is not coming back, so it is let go.
+            let back = matches!(outcome, Ok(WorkerOutcome::CheckFailed { .. } | WorkerOutcome::Passed));
+            match product.answer.kept.take() {
+                Some(session) if back => {
+                    let key = if units.len() > 1 { units.get(index).map_or(page.to_string(), |u| format!("{page}/{}", u.id)) } else { page.to_string() };
+                    self.keep_warm(key, Warm { session, worktree: product.worktree.clone(), tier });
+                }
+                _ => self.drop_worktree(&product.worktree),
+            }
         }
         outcome
+    }
+
+    /// Keep a builder's session open for its repair, closing the oldest past [`MAX_WARM`].
+    fn keep_warm(&mut self, key: String, warm: Warm) {
+        if let Some(at) = self.warm.iter().position(|(k, _)| *k == key)
+            && let Some((_, old)) = self.warm.remove(at)
+        {
+            self.drop_worktree(&old.worktree);
+        }
+        self.warm.push_back((key, warm));
+        while self.warm.len() > MAX_WARM {
+            if let Some((_, old)) = self.warm.pop_front() {
+                // Dropping the session stops the agent and everything it started.
+                self.drop_worktree(&old.worktree);
+            }
+        }
+    }
+
+    /// The warm session for a unit, when it ran on `tier`; one on another tier is closed.
+    fn take_warm(&mut self, key: &str, tier: Tier) -> Option<Warm> {
+        let at = self.warm.iter().position(|(k, _)| k == key)?;
+        let (_, warm) = self.warm.remove(at)?;
+        if warm.tier == tier {
+            return Some(warm);
+        }
+        self.drop_worktree(&warm.worktree);
+        None
     }
 
     /// Keep what this attempt did, so the next one on this page knows. A change that was
@@ -1586,7 +1676,12 @@ impl Driver {
         let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
         let mut seen = BTreeSet::new();
         for (index, product) in products {
-            let changes = git::worktree_changes(&product.worktree)?;
+            // A file the same as the run's tree is no change: a warm worktree holds what other
+            // units built since, and a rewrite of a file to what it already was is nothing.
+            let changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
+                .into_iter()
+                .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
+                .collect();
             for change in &changes {
                 if !git::safe_rel(&change.path) {
                     return Ok(failed(format!("refusing to merge `{}`", change.path)));
@@ -2364,6 +2459,7 @@ impl Driver {
             commit: None,
             shell,
             fetch: self.config.package_indexes,
+            keep: false,
         };
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
@@ -2462,6 +2558,7 @@ impl Driver {
             commit: None,
             shell,
             fetch: self.config.package_indexes,
+            keep: false,
         };
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
@@ -2678,6 +2775,7 @@ impl Driver {
             commit: None,
             shell,
             fetch: self.config.package_indexes,
+            keep: true,
         })
     }
 
@@ -2989,6 +3087,26 @@ impl Driver {
         (!test.is_empty()).then(|| format!("`{test}`"))
     }
 
+    /// What a warm session is told for a repair: it already has its task and its files, so
+    /// only the failure, the list to work down, and how to finish.
+    fn follow_up_brief(&self, page: &str, unit: usize, units: usize, errors: &str) -> String {
+        let agent = match self.page(page).ok().map(|p| p.work_units()).and_then(|u| u.get(unit).cloned()) {
+            Some(part) if units > 1 => format!("page:{page}/{}", part.id),
+            _ => format!("page:{page}"),
+        };
+        let mut brief = String::from(
+            "The checks failed after your last turn. Your worktree now also has what the other units built since. \
+             This is the output; fix what it shows in your own files and leave every other unit alone:\n",
+        );
+        brief.push_str(errors.trim_end());
+        brief.push('\n');
+        if let Ok(unit_plan) = self.page(page) {
+            brief.push_str(&self.todo(unit_plan, true));
+        }
+        brief.push_str(&format!("Then end your reply with the line `{RELEASE} {agent}`.\n"));
+        brief
+    }
+
     /// The short list a builder works down. It always ends with running the tests, when the
     /// agent can run anything at all.
     fn todo(&self, page: &PagePlan, repair: bool) -> String {
@@ -3080,6 +3198,7 @@ impl Driver {
             commit: None,
             shell: None,
             fetch: false,
+            keep: false,
         })
     }
 
@@ -3836,56 +3955,15 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
     unreachable!("the last attempt always returns")
 }
 
-/// The gate an agent's tool calls (and its run_code calls) are put to.
-fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
-    if request.read_only {
-        gate = gate.read_only();
-    }
-    if let Some(origin) = &request.browser {
-        gate = gate.with_browser(origin.clone());
-    }
-    if request.shell.is_some() && !request.read_only {
-        gate = gate.with_shell();
-    }
-    if request.fetch && !request.read_only {
-        gate = gate.with_fetch_hosts(&tm_harness::PACKAGE_INDEXES);
-    }
-    for dir in HARNESS_STATE_DIRS {
-        gate = gate.with_readable(format!("{home}/{dir}"));
-    }
-    // With a policy that asks, risky calls wait for a person; otherwise the gate stands alone.
-    match &request.feed {
-        Some(feed) => Arc::new(ApprovalGate::new(gate, feed.live.clone(), feed.run.clone(), feed.agent.clone())),
-        None => Arc::new(gate),
-    }
-}
-
-async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
-    let gate = gate_for(request);
-    let task = WorkerTask {
-        brief: request.brief.clone(),
-        cwd: request.cwd.clone(),
-        model: request.model.clone(),
-        effort: request.effort.clone(),
-        dictionary: request.dictionary.clone(),
-        timeout: request.timeout,
-        stall: request.stall,
-        read_only: request.read_only,
-        code_mode: request.code_mode,
-        shell: request.shell.clone().filter(|_| !request.read_only),
-    };
-    let feed = &request.feed;
-    if let Some(feed) = &feed {
-        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&task.brief, 4000) }));
-    }
-    let (tx, mut rx) = mpsc::channel(256);
-    let tee = feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    // What a commit budget watches: tool calls, whether the reply has begun, the thoughts.
-    let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
-    let watching = request.commit.is_some().then(|| watch.clone());
-    let collect = tokio::spawn(async move {
+/// Read an agent's events as they come: the text is the answer, everything goes to the
+/// run's transcript, refused calls are kept with what they asked for, and a commit budget's
+/// watcher sees the tool calls and thoughts.
+fn collect_events(
+    tee: Option<(Arc<Live>, String, serde_json::Value)>,
+    watching: Option<Arc<std::sync::Mutex<Watched>>>,
+    mut rx: mpsc::Receiver<HarnessEvent>,
+) -> tokio::task::JoinHandle<(String, Vec<String>)> {
+    tokio::spawn(async move {
         // The answer is only the text. Thoughts and tool calls go to the transcript.
         let mut text = String::new();
         // What each tool was last asked to do, so a refusal can say what was refused.
@@ -3951,9 +4029,119 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
                 }
         }
         (text, refused)
-    });
+    })
+}
+
+/// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
+/// transcript under the same agent, and the session stays open for the next repair.
+async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>) -> anyhow::Result<Answer> {
+    if let Some(feed) = &request.feed {
+        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&request.brief, 4000), "follow_up": true }));
+    }
+    let (tx, rx) = mpsc::channel(256);
+    let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
+    let collect = collect_events(tee, None, rx);
     let started = Instant::now();
+    let run = session.follow_up(request.brief.clone(), tx, request.timeout).await;
+    let (text, refused) = collect.await.unwrap_or_default();
+    if let Some(feed) = &request.feed {
+        let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64(), "follow_up": true });
+        match &run {
+            Ok(summary) => {
+                end["ok"] = serde_json::json!(summary.ok);
+                end["denied"] = serde_json::json!(summary.denied);
+                if summary.usage.total() > 0 {
+                    end["usage"] = serde_json::json!(summary.usage);
+                }
+            }
+            Err(err) => {
+                end["ok"] = serde_json::json!(false);
+                end["error"] = serde_json::json!(format!("{err:#}"));
+            }
+        }
+        feed.live.push(&feed.run, &feed.agent, "end", end);
+    }
+    let summary = match run {
+        Ok(summary) => summary,
+        Err(err) => {
+            if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                return Err(reported_limit(&request, hit).into());
+            }
+            return Err(err);
+        }
+    };
+    if let Some(hit) = reply::limit_of(&text) {
+        return Err(reported_limit(&request, hit).into());
+    }
+    Ok(Answer {
+        text,
+        ok: summary.ok,
+        usage: summary.usage,
+        cost_usd: summary.cost_usd,
+        seconds: started.elapsed().as_secs_f64(),
+        refused,
+        kept: summary.ok.then_some(session),
+    })
+}
+
+/// The gate an agent's tool calls (and its run_code calls) are put to.
+fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
+    if request.read_only {
+        gate = gate.read_only();
+    }
+    if let Some(origin) = &request.browser {
+        gate = gate.with_browser(origin.clone());
+    }
+    if request.shell.is_some() && !request.read_only {
+        gate = gate.with_shell();
+    }
+    if request.fetch && !request.read_only {
+        gate = gate.with_fetch_hosts(&tm_harness::PACKAGE_INDEXES);
+    }
+    for dir in HARNESS_STATE_DIRS {
+        gate = gate.with_readable(format!("{home}/{dir}"));
+    }
+    // With a policy that asks, risky calls wait for a person; otherwise the gate stands alone.
+    match &request.feed {
+        Some(feed) => Arc::new(ApprovalGate::new(gate, feed.live.clone(), feed.run.clone(), feed.agent.clone())),
+        None => Arc::new(gate),
+    }
+}
+
+async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
+    let gate = gate_for(request);
+    let task = WorkerTask {
+        brief: request.brief.clone(),
+        cwd: request.cwd.clone(),
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        dictionary: request.dictionary.clone(),
+        timeout: request.timeout,
+        stall: request.stall,
+        read_only: request.read_only,
+        code_mode: request.code_mode,
+        shell: request.shell.clone().filter(|_| !request.read_only),
+    };
+    let feed = &request.feed;
+    if let Some(feed) = &feed {
+        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&task.brief, 4000) }));
+    }
+    let (tx, rx) = mpsc::channel(256);
+    let tee = feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
+    // What a commit budget watches: tool calls, whether the reply has begun, the thoughts.
+    let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
+    let watching = request.commit.is_some().then(|| watch.clone());
+    let collect = collect_events(tee, watching, rx);
+    let started = Instant::now();
+    let mut kept = None;
     let run = match request.commit {
+        None if request.keep => {
+            let (run, session) = request.harness.run_kept(task, gate, tx).await;
+            kept = session;
+            run
+        }
         None => request.harness.run(task, gate, tx).await,
         Some(commit) => {
             let seen = watch.clone();
@@ -4022,6 +4210,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         cost_usd: summary.cost_usd,
         seconds: started.elapsed().as_secs_f64(),
         refused,
+        kept,
     })
 }
 

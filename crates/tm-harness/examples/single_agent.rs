@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         stall: None,
         read_only: false,
         code_mode: false,
+        shell: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<HarnessEvent>(1024);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

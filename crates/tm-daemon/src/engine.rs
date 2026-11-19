@@ -3097,6 +3097,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         stall: request.stall,
         read_only: request.read_only,
         code_mode: request.code_mode,
+        shell: None,
     };
     let feed = &request.feed;
     if let Some(feed) = &feed {

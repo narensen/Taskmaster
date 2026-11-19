@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate};
+pub use gate::{Decision, PermissionGate, PermissionRequest, ToolKind, WorktreeGate, host_of};
 pub use providers::{ModelChoice, ProviderReport, provider_report, provider_reports, require_model};
 
 /// Kills a spawned agent's whole process group when dropped, so a cancelled, timed-out or
@@ -149,11 +149,32 @@ pub fn harness(name: &str) -> anyhow::Result<Arc<dyn Harness>> {
 /// there are allowed, because an agent consults its own session files.
 pub const HARNESS_STATE_DIRS: [&str; 3] = [".gemini", ".grok", ".opencode"];
 
-/// Rules every worker is told first. Harnesses that end their turn on the first refused call
-/// need to know up front which tools do not exist.
-pub const WORKER_RULES: &str = "Rules: you have no shell. Never try to run commands; use only your \
-file reading and editing tools and the Dictionary tools. Work only inside the current directory. \
-If any call is refused, stop and state what was refused.\n\nTask: ";
+/// Rules for a worker with no shell (its harness cannot be sandboxed here). Harnesses that
+/// end their turn on the first refused call need to know up front which tools do not exist.
+pub const WORKER_RULES: &str = "Rules: you have no shell in this run, so do not try to run commands; use \
+your file reading and editing tools and the Dictionary tools. Work only inside the current directory. \
+If a call is refused, say which one in your reply and carry on without it.\n\nTask: ";
+
+/// Rules for a worker whose shell runs inside the sandbox.
+pub const SHELL_WORKER_RULES: &str = "Rules: you have a shell, confined to a sandbox. Only the current directory, \
+/tmp and $TASKMASTER_SCRATCH can be written; package indexes can be reached to install what the tests need \
+(for example `python3 -m venv $TASKMASTER_SCRATCH/venv`, then its pip). Work only inside the current directory. \
+Run the tests for your files before you say you are done, and fix what fails. Leave no server or watcher running \
+when you finish. If a call is refused, say which one in your reply and carry on without it.\n\nTask: ";
+
+/// What a worker's shell may write besides its worktree, and the environment it sees there.
+/// Only honoured by a harness that runs inside the sandbox ([`Harness::sandboxed_shell`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShellScope {
+    /// Writable directories: the agent's scratch and the run's package caches.
+    pub writable: Vec<PathBuf>,
+    /// Set for every command the agent runs, after the daemon's Python variables are removed.
+    pub env: Vec<(String, String)>,
+}
+
+/// Hosts a worker may fetch from when the package-index setting is on: what `pip`, `npm`
+/// and `cargo` need to install, and nothing else.
+pub const PACKAGE_INDEXES: [&str; 6] = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org", "crates.io", "static.crates.io", "index.crates.io"];
 
 /// Rules for agents that only read: reviewers and verifiers.
 pub const REVIEWER_RULES: &str = "Rules: you can only read files in the current directory. You have \
@@ -186,12 +207,20 @@ pub struct WorkerTask {
     pub read_only: bool,
     /// Use the harness's native code mode where it has one (Claude Code, interactive).
     pub code_mode: bool,
+    /// A sandboxed shell for a builder. `None` keeps the shell off.
+    pub shell: Option<ShellScope>,
 }
 
 impl WorkerTask {
     /// The brief with the standing rules for this kind of task in front of it.
     pub fn framed_brief(&self) -> String {
-        let rules = if self.read_only { REVIEWER_RULES } else { WORKER_RULES };
+        let rules = if self.read_only {
+            REVIEWER_RULES
+        } else if self.shell.is_some() {
+            SHELL_WORKER_RULES
+        } else {
+            WORKER_RULES
+        };
         format!("{rules}{}", self.brief)
     }
 }
@@ -263,6 +292,12 @@ pub struct RunSummary {
 #[async_trait]
 pub trait Harness: Send + Sync {
     fn id(&self) -> &'static str;
+
+    /// Whether a command this agent runs stays inside an OS sandbox confined to its worktree
+    /// and [`ShellScope`]. Only then is it given a shell.
+    fn sandboxed_shell(&self) -> bool {
+        false
+    }
 
     /// Run one task to completion, streaming events as they happen.
     async fn run(

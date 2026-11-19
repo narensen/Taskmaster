@@ -92,7 +92,7 @@ impl AcpHarness {
         };
         let binary = resolve_binary(&self.binary)?;
         let mut cmd = Command::new("bwrap");
-        cmd.args(sandbox.bwrap_args(&binary, &args, &task.cwd, task.read_only));
+        cmd.args(sandbox.bwrap_args_with(&binary, &args, &task.cwd, task.read_only, task.shell.as_ref()));
         Ok(cmd)
     }
 }
@@ -101,6 +101,10 @@ impl AcpHarness {
 impl Harness for AcpHarness {
     fn id(&self) -> &'static str {
         self.id
+    }
+
+    fn sandboxed_shell(&self) -> bool {
+        self.sandbox.is_some() && crate::sandbox::bwrap_usable()
     }
 
     async fn run(
@@ -561,6 +565,7 @@ mod tests {
             stall: None,
             read_only: true,
             code_mode: false,
+            shell: None,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
         task.effort = Some("low".into());
@@ -650,6 +655,7 @@ mod tests {
             stall: Some(std::time::Duration::from_millis(300)),
             read_only: true,
             code_mode: false,
+            shell: None,
         };
         let (tx, _rx) = mpsc::channel(8);
         let started = std::time::Instant::now();

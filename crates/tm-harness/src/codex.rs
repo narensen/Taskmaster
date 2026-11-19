@@ -40,6 +40,12 @@ impl Harness for Codex {
         "codex"
     }
 
+    /// Codex runs every command in its own `workspace-write` sandbox: writes stay in the
+    /// working directory and the network is off unless its config turns it on.
+    fn sandboxed_shell(&self) -> bool {
+        true
+    }
+
     async fn run(
         &self,
         task: WorkerTask,

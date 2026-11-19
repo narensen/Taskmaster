@@ -44,8 +44,9 @@ pub trait PermissionGate: Send + Sync {
     }
 }
 
-/// Confines a worker to its worktree: file access inside `root` only, no shell, and only
-/// the tools named in `allowed_tool_prefixes` (the Dictionary) beyond that.
+/// Confines a worker to its worktree: file access inside `root` only, a shell only when the
+/// agent runs inside the sandbox, fetches only from the hosts it is given, and only the tools
+/// named in `allowed_tool_prefixes` (the Dictionary) beyond that.
 #[derive(Debug, Clone)]
 pub struct WorktreeGate {
     root: PathBuf,
@@ -56,13 +57,33 @@ pub struct WorktreeGate {
     /// The one origin the browser tool may open (`http://127.0.0.1:<port>`). `None` refuses
     /// every browser call.
     browser: Option<String>,
+    /// Shell commands are allowed: the agent runs inside the sandbox, so they are confined.
+    shell: bool,
+    /// Hosts a fetch may reach, such as the package indexes.
+    fetch_hosts: Vec<String>,
 }
 
 impl WorktreeGate {
     pub fn new(root: impl Into<PathBuf>, allowed_tool_prefixes: Vec<String>) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root));
-        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new(), read_only: false, browser: None }
+        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new(), read_only: false, browser: None, shell: false, fetch_hosts: Vec::new() }
+    }
+
+    /// Allow shell commands. Give this only to an agent that runs inside the sandbox.
+    pub fn with_shell(mut self) -> Self {
+        self.shell = true;
+        self
+    }
+
+    /// Allow fetches from these hosts and their subdomains, and from nowhere else.
+    pub fn with_fetch_hosts(mut self, hosts: &[&str]) -> Self {
+        self.fetch_hosts = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+        self
+    }
+
+    pub fn allows_shell(&self) -> bool {
+        self.shell && !self.read_only
     }
 
     /// Refuse every edit, for reviewers and verifiers.
@@ -97,13 +118,20 @@ impl WorktreeGate {
             return None;
         }
         match request.kind {
+            ToolKind::Execute if self.allows_shell() => None,
             ToolKind::Execute => Some("runs a shell command"),
+            ToolKind::Fetch if self.fetch_allowed(request) => None,
             ToolKind::Fetch => Some("fetches from the network"),
             ToolKind::Edit if !request.paths.is_empty() && !request.paths.iter().all(|p| self.inside(p)) => {
                 Some("writes outside the worktree")
             }
             _ => None,
         }
+    }
+
+    fn fetch_allowed(&self, request: &PermissionRequest) -> bool {
+        let Some(host) = request.url.as_deref().and_then(host_of) else { return false };
+        self.fetch_hosts.iter().any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
     }
 
     /// The path relative to the worktree root, or `None` when it lies outside it.
@@ -156,6 +184,8 @@ impl PermissionGate for WorktreeGate {
             {
                 Decision::Allow
             }
+            ToolKind::Execute if self.allows_shell() => Decision::Allow,
+            ToolKind::Fetch if !self.read_only && self.fetch_allowed(request) => Decision::Allow,
             _ => Decision::Deny,
         }
     }
@@ -171,6 +201,17 @@ pub fn same_origin(origin: &str, url: &str) -> bool {
         Some(rest) => rest.is_empty() || rest.starts_with(['/', '?', '#']),
         None => false,
     }
+}
+
+/// The host of an `http` or `https` address, lower-cased, without a port or credentials.
+/// `None` for anything else.
+pub fn host_of(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // `user:pass@host` names `host`; a lookalike such as `pypi.org@evil.test` is `evil.test`.
+    let host = authority.rsplit('@').next()?;
+    let host = if host.starts_with('[') { host.split(']').next()?.trim_start_matches('[') } else { host.split(':').next()? };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// Resolve `.` and `..` without touching the filesystem.
@@ -237,6 +278,34 @@ mod tests {
         assert_eq!(g.decide(&request("dict__cite", ToolKind::Dictionary, &[])), Decision::Allow);
         let strict = WorktreeGate::new("/nonexistent/tm/work-a", vec![]);
         assert_eq!(strict.decide(&request("other__tool", ToolKind::Other, &[])), Decision::Deny);
+    }
+
+    #[test]
+    fn a_sandboxed_worker_runs_commands_and_fetches_only_from_package_indexes() {
+        let fetch = |url: &str| PermissionRequest { tool: "web_fetch".into(), kind: ToolKind::Fetch, paths: vec![], command: None, url: Some(url.into()) };
+        let g = gate().with_shell().with_fetch_hosts(&crate::PACKAGE_INDEXES);
+        assert_eq!(g.decide(&request("run_command", ToolKind::Execute, &[])), Decision::Allow);
+        assert!(g.risk(&request("run_command", ToolKind::Execute, &[])).is_none(), "nothing to ask a person");
+        assert_eq!(g.decide(&fetch("https://pypi.org/pypi/pydantic/json")), Decision::Allow);
+        assert_eq!(g.decide(&fetch("https://files.pythonhosted.org/packages/x.whl")), Decision::Allow);
+        assert_eq!(g.decide(&fetch("https://example.com/")), Decision::Deny);
+        assert_eq!(g.decide(&fetch("https://pypi.org@evil.test/")), Decision::Deny);
+        assert_eq!(g.decide(&fetch("https://pypi.org.evil.test/")), Decision::Deny);
+        assert_eq!(g.decide(&fetch("file:///etc/passwd")), Decision::Deny);
+        // Without the sandbox there is no shell, and a reviewer never gets one.
+        assert_eq!(gate().decide(&request("run_command", ToolKind::Execute, &[])), Decision::Deny);
+        assert_eq!(gate().with_shell().read_only().decide(&request("run_command", ToolKind::Execute, &[])), Decision::Deny);
+        assert_eq!(gate().with_fetch_hosts(&crate::PACKAGE_INDEXES).read_only().decide(&fetch("https://pypi.org/")), Decision::Deny);
+        // Writes outside the worktree stay refused with a shell.
+        assert_eq!(g.decide(&request("write_file", ToolKind::Edit, &["/etc/hosts"])), Decision::Deny);
+    }
+
+    #[test]
+    fn a_hosts_name_is_read_without_port_or_credentials() {
+        assert_eq!(host_of("https://PyPI.org:443/simple").as_deref(), Some("pypi.org"));
+        assert_eq!(host_of("http://u:p@registry.npmjs.org/x").as_deref(), Some("registry.npmjs.org"));
+        assert_eq!(host_of("ftp://pypi.org/"), None);
+        assert_eq!(host_of("pypi.org"), None);
     }
 
     #[test]

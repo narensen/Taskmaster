@@ -98,7 +98,7 @@ test("the files panel opens a file in a tab with its path, and finds in it", asy
   await expect(page.getByTestId("preview")).toContainText("# e2e");
   await page.getByTestId("preview").click();
   await page.keyboard.press("Control+f");
-  await page.keyboard.type("e2e");
+  await page.getByLabel("Find in this file").fill("e2e");
   await expect(page.locator(".findbar-count")).toHaveText("1 of 1");
 });
 

@@ -47,7 +47,9 @@ jobs:
           mkdir "$name"
           cp target/release/tm-daemon target/release/tm-review target/release/tm-commons README.md config.example.json "$name/"
           cp -R deploy "$name/deploy"
-          # Serve it with `tm-daemon serve <project> --web web`, or copy it to ~/.local/share/taskmaster/web.
+          # install.sh copies web/ to ~/.local/share/taskmaster/web, so serve finds it without --web.
+          cp scripts/install-release.sh "$name/install.sh"
+          chmod +x "$name/install.sh"
           cp -R web/dist "$name/web"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

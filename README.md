@@ -37,7 +37,7 @@ It drives the coding CLIs you already use: Claude Code, Codex, Grok Build, Antig
 | --- | --- |
 | Ubuntu, Debian | `.deb` from [Releases](https://github.com/narensen/Taskmaster/releases/latest), then `sudo apt install ./Taskmaster_*_amd64.deb` |
 | Any Linux | `.AppImage` from [Releases](https://github.com/narensen/Taskmaster/releases/latest) |
-| Linux server | `taskmaster-*-x86_64-linux.tar.gz`: the daemon, the review tool and the built app |
+| Linux server | `taskmaster-*-x86_64-linux.tar.gz`, then `./install.sh` inside it. The app is copied to `~/.local/share/taskmaster/web`, so `tm-daemon serve <project>` finds it without `--web`. |
 | macOS, from source | `scripts/install.sh` (needs `cargo` and `git`) |
 
 Then install and sign in to at least one provider. `tm-daemon providers` prints the commands for each one.

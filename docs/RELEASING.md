@@ -11,7 +11,7 @@ git push origin v0.2.0
 | Job | What it publishes |
 | --- | --- |
 | `release` | Creates the GitHub release with generated notes. Edit the notes afterwards if you like: the app's Updates panel and the public Releases page show them. |
-| `linux` | `taskmaster-<tag>-x86_64-linux.tar.gz` and its `.sha256`: tm-daemon, tm-review, tm-commons and the built web app, for servers and headless use. |
+| `linux` | `taskmaster-<tag>-x86_64-linux.tar.gz` and its `.sha256`: tm-daemon, tm-review, tm-commons, the built web app, and `install.sh`. That script copies the app to `~/.local/share/taskmaster/web`, so `tm-daemon serve` finds it without `--web`. |
 | `desktop` | The desktop app: `.dmg` and `.app.tar.gz` for Apple silicon and Intel Macs, `.AppImage` and `.deb` for Linux, `.msi` and `-setup.exe` for Windows, each with a `.sig` signature, and `latest.json`, the manifest the in-app updater reads. |
 | `checksums` | `SHA256SUMS.txt` covering every file in the release. |
 

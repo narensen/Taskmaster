@@ -67,7 +67,7 @@ function useShot(run: RunSummary): { shot: string | null | undefined; prompt: st
   return { shot, prompt };
 }
 
-function RunCard({ run, index }: { run: RunSummary; group?: string; index: number }) {
+function RunCard({ run, index, folder }: { run: RunSummary; group?: string; index: number; folder: string | null }) {
   const { shot, prompt } = useShot(run);
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
@@ -98,7 +98,8 @@ function RunCard({ run, index }: { run: RunSummary; group?: string; index: numbe
           <img className="frame shot" src={shot} alt={`Latest page of ${run.id}`} />
         ) : (
           <div className="frame typed" data-testid="typed-frame">
-            <div className="typed-line">{prompt ?? (prompt === null ? "A run from a plan file" : " ")}</div>
+            <div className="typed-line">{folder || run.id}</div>
+            {prompt && <div className="typed-sub clip">{prompt}</div>}
             <div className="typed-phase">{phaseLabel(run)}</div>
           </div>
         )}
@@ -214,12 +215,14 @@ function ShowAll({
   list,
   daemons,
   archived,
+  folder,
 }: {
   open: boolean;
   onClose: () => void;
   list: { run: RunSummary; group: string }[];
   daemons: { url: string; token: string | null; pinned: boolean }[];
   archived: number;
+  folder: string | null;
 }) {
   const p = usePrefs();
   const box = useRef<HTMLDivElement>(null);
@@ -271,7 +274,7 @@ function ShowAll({
           ) : (
             <div className="gallery">
               {runs.map(({ run, group }, i) => (
-                <RunCard key={run.id} run={run} group={group} index={i} />
+                <RunCard key={run.id} run={run} group={group} index={i} folder={folder} />
               ))}
               {others.map((d, i) => (
                 <DaemonCard key={d.url} {...d} index={i} />
@@ -290,16 +293,6 @@ function ShowAll({
       </div>
     </div>
   );
-}
-
-function slugify(text: string): string {
-  const slug = text
-    .toLowerCase()
-    .replace(/['"]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
-  return slug;
 }
 
 function accessLabel(mode?: ApprovalMode) {
@@ -341,7 +334,6 @@ export function Gallery() {
   const [allOpen, setAllOpen] = useState(false);
   const [mode, setMode] = useState<"this" | "new">("this");
   const [newName, setNewName] = useState("");
-  const [nameTouched, setNameTouched] = useState(false);
   const action = useAction();
 
   useEffect(() => {
@@ -382,8 +374,8 @@ export function Gallery() {
       const { roles, models: chosen } = toRequest(choice);
       const parallel = resolvePages(pages, max ?? 32);
       if (mode === "new") {
-        const name = newName.trim() || slugify(prompt);
-        if (!name) throw new Error("Name the project first.");
+        const name = newName.trim();
+        if (!name) throw new Error("Name the folder first.");
         const created = await api.createProject({ name, prompt, roles, models: chosen, parallel });
         if (!created.id) throw new Error("The project was created, but the first run did not start.");
         void afterStart(choice, settings.data, true);
@@ -442,10 +434,7 @@ export function Gallery() {
             <input
               data-testid="new-project-name"
               value={newName}
-              onChange={(e) => {
-                setNameTouched(true);
-                setNewName(e.target.value);
-              }}
+              onChange={(e) => setNewName(e.target.value)}
               placeholder="a folder name"
               spellCheck={false}
               autoComplete="off"
@@ -461,9 +450,6 @@ export function Gallery() {
           ref={composer}
           bus
           placeholder="Tell the master what to plan. @ files, $ skills, / commands"
-          onChange={(m) => {
-            if (mode === "new" && !nameTouched) setNewName(slugify(m.text));
-          }}
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
@@ -580,7 +566,7 @@ export function Gallery() {
             onKeyDown={onStripKey}
           >
             {list.map(({ run, group }, i) => (
-              <RunCard key={run.id} run={run} group={group} index={i} />
+              <RunCard key={run.id} run={run} group={group} index={i} folder={name} />
             ))}
             {daemons.map((d, i) => (
               <DaemonCard key={d.url} {...d} index={list.length + i} />
@@ -599,7 +585,7 @@ export function Gallery() {
       ) : null}
       </div>
 
-      <ShowAll open={allOpen} onClose={() => setAllOpen(false)} list={list} daemons={daemons} archived={archived} />
+      <ShowAll open={allOpen} onClose={() => setAllOpen(false)} list={list} daemons={daemons} archived={archived} folder={name} />
     </div>
   );
 }

@@ -16,7 +16,7 @@ export const SEATS: { id: Seat; label: string; hint: string; roles: RoleName[] }
   { id: "master", label: "Master", hint: "Plans the run and owns the shared files", roles: ["master"] },
   { id: "mid", label: "Mid", hint: "Picks up a page a worker could not finish", roles: ["mid"] },
   { id: "worker", label: "Worker", hint: "Builds each page, one agent per page", roles: ["worker"] },
-  { id: "checker", label: "Checker", hint: "Reviews the result and confirms each problem", roles: ["reviewer", "verifier"] },
+  { id: "checker", label: "Reviewer", hint: "Reviews the result, then confirms each problem it found", roles: ["reviewer", "verifier"] },
 ];
 
 export const ALL_ROLES: RoleName[] = ["master", "mid", "worker", "reviewer", "verifier"];

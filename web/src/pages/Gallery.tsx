@@ -5,19 +5,20 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
-import { api, callAt, type ApprovalMode, type RunSummary } from "../api";
+import { api, callAt, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { modelLabel } from "../components/ProviderPicker";
 import { ProviderLogo, providerName } from "../providers/logos";
 import { afterStart, problemWith, SEATS, seatChoice, toRequest, useChoice } from "../rolechoice";
 import { prefetchRun, useProviders, useSettings } from "../query";
+import { ProviderSetup, noneInstalled } from "../components/ProviderSetup";
 import { runStarted } from "../notify";
 import { EmptyRuns } from "../lazy";
 import { Loading } from "../ui";
 import { Link, navigate } from "../router";
 import { ExternalLink } from "../paths";
-import { isUnpriced, phaseLabel, tokens, usd } from "../format";
+import { approvalLabel, isUnpriced, phaseLabel, tokens, usd } from "../format";
 import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, prefs, setPrefs, usePrefs } from "../prefs";
 import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
@@ -297,12 +298,6 @@ function ShowAll({
   );
 }
 
-function accessLabel(mode?: ApprovalMode) {
-  if (mode === "never") return "Approvals off";
-  if (mode === "always") return "Ask on every call";
-  return "Ask on risky tools";
-}
-
 export function Gallery() {
   const { runs } = useRuns();
   const p = usePrefs();
@@ -315,7 +310,7 @@ export function Gallery() {
   const name = project ? project.split(/[/\\]/).filter(Boolean).pop() ?? project : null;
   const projectLabel = name ?? null;
   const branch = settings.data?.branch ?? null;
-  const access = accessLabel(settings.data?.approvals?.mode);
+  const access = approvalLabel(settings.data?.approvals?.mode);
   const { choice, setSeat, missing, fresh } = useChoice(settings.data);
   const [remember, setRemember] = useState(false);
   const [rolesOpen, setRolesOpen] = useState(false);
@@ -327,6 +322,8 @@ export function Gallery() {
   };
   const masterPick = seatChoice(choice, "master");
   const providerList = providers.data ?? [];
+  // First run with no coding CLI: a setup panel takes the place of the role picker.
+  const firstRun = noneInstalled(providers.data);
   const modelPill = masterPick ? `${providerList.find((x) => x.id === masterPick.harness)?.name ?? providerName(masterPick.harness)} · ${modelLabel(providerList, masterPick)}` : "Choose providers";
 
   const strip = useRef<HTMLDivElement>(null);
@@ -421,7 +418,7 @@ export function Gallery() {
   return (
     <div className="page wide gallery-page">
       <div className="home-above">
-        <h2 data-testid="home-heading">
+        <h1 data-testid="home-heading">
           {mode === "new" ? (
             "Start something new"
           ) : mode === "clone" ? (
@@ -429,7 +426,7 @@ export function Gallery() {
           ) : (
             <>Describe the next run{projectLabel ? <> for <span className="ask-project">{projectLabel}</span></> : null}</>
           )}
-        </h2>
+        </h1>
         <div className="home-mode" role="tablist" aria-label="Choose a project">
           <button
             type="button"
@@ -518,14 +515,14 @@ export function Gallery() {
             ? "Name the project, then tell the master what to build."
             : mode === "clone"
               ? "The clone sits next to this project. Paste the address without a token."
-              : "A master will plan it; workers take the pages."}
+              : "A master plans it, workers build the pages, and a different model checks the result."}
         </p>
       </div>
       <div className="home-composer">
         <Composer
           ref={composer}
           bus
-          placeholder="Tell the master what to plan. @ files, $ skills, / commands"
+          placeholder="Tell the master what to plan. @ files, # pull requests, $ skills, / commands"
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
@@ -575,7 +572,7 @@ export function Gallery() {
           </span>
         </div>
         <Problem error={action.error} />
-        {!rolesOpen && (missing.length > 0 || pages == null) && (
+        {!firstRun && !rolesOpen && (missing.length > 0 || pages == null) && (
           <p className="home-choose">
             <button type="button" className="link" onClick={() => setRolesOpen(true)}>
               {missing.length ? "Choose providers" : "Choose pages at once"}
@@ -585,6 +582,7 @@ export function Gallery() {
         )}
       </div>
       <div className="home-below">
+        {firstRun && <ProviderSetup providers={providerList} checking={providers.isFetching} />}
         <AnimatePresence initial={false}>
           {rolesOpen && (
             <motion.div

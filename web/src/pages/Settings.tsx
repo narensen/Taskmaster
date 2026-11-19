@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { APPROVAL_MODES, approvalLabel } from "../format";
 import { api, server, type ApprovalMode, setServer, setToken, type RoleName } from "../api";
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
@@ -365,7 +366,7 @@ export function Settings() {
           ))}
         </ul>
         <form
-          className="row gap wrap"
+          className="row gap wrap daemon-add"
           onSubmit={(e) => {
             e.preventDefault();
             const url = other.url.trim().replace(/\/+$/, "");
@@ -374,8 +375,8 @@ export function Settings() {
             setOther({ url: "", token: "" });
           }}
         >
-          <input className="grow" placeholder="Another daemon, http://100.x.y.z:8737" value={other.url} onChange={(e) => setOther({ ...other, url: e.target.value })} />
-          <input type="password" placeholder="its token (optional)" value={other.token} onChange={(e) => setOther({ ...other, token: e.target.value })} />
+          <input className="grow" aria-label="Another daemon's address" placeholder="Another daemon, http://100.x.y.z:8737" value={other.url} onChange={(e) => setOther({ ...other, url: e.target.value })} />
+          <input type="password" aria-label="Its token" placeholder="its token (optional)" value={other.token} onChange={(e) => setOther({ ...other, token: e.target.value })} />
           <button className="small">Add</button>
         </form>
       </Section>
@@ -520,13 +521,13 @@ export function Settings() {
       {policy && (
         <Section
           title="Tool approvals"
-          note="Risky tool calls (a shell command, a write outside the worktree) wait for you on the run page; no answer in time is a denial. Always asks before every call; never keeps the automatic gate only."
+          note="Risky tool calls (a shell command, a write outside the worktree) wait for you on the run page; no answer in time is a denial. Ask on every call stops before each one; Approvals off keeps only the automatic gate."
         >
           <div className="row gap wrap" data-testid="approval-policy">
             <div className="seg" role="radiogroup" aria-label="Approval mode">
-              {(["always", "risky", "never"] as const).map((m) => (
+              {APPROVAL_MODES.map((m) => (
                 <button key={m} role="radio" aria-checked={policy.mode === m} className={policy.mode === m ? "on" : ""} onClick={() => savePolicy({ ...policy, mode: m })}>
-                  {m}
+                  {approvalLabel(m)}
                 </button>
               ))}
             </div>

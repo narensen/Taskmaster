@@ -21,7 +21,7 @@ test("a fresh install chooses no provider and asks for each role", async ({ open
   await open("/runs/new");
   const deck = page.getByRole("region", { name: "Who plays each role" });
   await expect(deck).toContainText("only do this once");
-  for (const seat of ["Master", "Mid", "Worker", "Checker"]) {
+  for (const seat of ["Master", "Mid", "Worker", "Reviewer"]) {
     await expect(deck.getByRole("button", { name: `${seat} provider: not chosen` })).toBeVisible();
   }
   await expect(deck.getByText("Remember for this project")).toBeVisible();
@@ -40,7 +40,7 @@ test("pages at once is one click, and Max is what this machine runs", async ({ o
 test("a provider and model are picked in place, and the first run saves them", async ({ openFixture, page, daemon }) => {
   test.setTimeout(60_000);
   await openFixture("/runs/new");
-  for (const seat of ["Master", "Mid", "Worker", "Checker"]) {
+  for (const seat of ["Master", "Mid", "Worker", "Reviewer"]) {
     await page.getByRole("button", { name: new RegExp(`^${seat} provider`) }).click();
     const pop = page.locator(".prov-pop").last();
     await expect(pop).toBeVisible();

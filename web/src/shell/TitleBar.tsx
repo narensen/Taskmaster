@@ -3,7 +3,7 @@
 // window's drag area in the desktop app.
 
 import { useEffect, useState, type ReactNode } from "react";
-import { Command, Minus, Moon, Plus, Square, Copy, Sun, SquareTerminal, X, PanelLeft } from "lucide-react";
+import { Minus, Moon, Plus, Search, Square, Copy, Sun, SquareTerminal, X, PanelLeft } from "lucide-react";
 import { Link } from "../router";
 import { MOD, isDesktop, isMac, ownTitleBar, windowControls } from "../desktop";
 import { Tip } from "../components/Tip";
@@ -90,7 +90,7 @@ export function TitleBar({
       <div className="tb-actions">
         <Tip label="Search and commands" keys={`${MOD} K`}>
           <button type="button" className="tb-btn" aria-label="Search and commands" onClick={onPalette}>
-            <Command size={14} strokeWidth={1.75} />
+            <Search size={14} strokeWidth={1.75} />
           </button>
         </Tip>
         {extra}

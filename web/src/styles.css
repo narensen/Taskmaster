@@ -3990,3 +3990,45 @@ button.lane-diff { opacity: 0; }
 .settings-transfer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 /* A daemon with no terminal (Windows, for now) says so in the terminal's place. */
 .qterm-none { margin: 0; padding: 14px 16px; color: var(--muted); font-size: var(--fs-sm); max-width: 60ch; }
+/* Adding another daemon: the address keeps a usable width and the row wraps on a phone. */
+.daemon-add input.grow { flex: 1 1 240px; min-width: min(240px, 100%); }
+.daemon-add input[type="password"] { flex: 1 1 150px; min-width: min(150px, 100%); }
+/* A phone's title bar keeps the page name readable: the branch and the approval mode
+   (both also on Home and in Settings) step aside, and only the current crumb shows. */
+@media (max-width: 560px) {
+  .titlebar .git-chip, .titlebar .tb-mode, .titlebar .crumbs li.parent { display: none; }
+  .titlebar .crumbs li.here .crumb { max-width: 100%; }
+}
+/* On a phone the pinned preview is a slim bar until it is grown, so it does not cover the
+   transcript; grown, it takes the width of the screen. */
+@media (max-width: 560px) {
+  .stage { --sw: 200px; right: 8px; }
+  .stage:not(.grown) .stage-screen,
+  .stage:not(.grown) .stage-routes,
+  .stage:not(.grown) .stage-foot { display: none; }
+  .stage.grown { --sw: calc(100vw - 16px); }
+}
+/* Home's heading is the page's <h1>, the same size New run gives its own. */
+.home-above > h1 { text-align: center; font-size: 36px; letter-spacing: -0.045em; font-weight: 700; line-height: 1.12; margin: 0; }
+@media (max-width: 900px) { .home-above > h1 { font-size: var(--fs-2xl); } }
+/* A one-line composer (a note on a run) keeps its hint on one line. */
+.composer-bar .composer-input[data-empty="true"]::before { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* First run, no coding CLI installed: what to install, and where from. */
+.setup-first { display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: var(--r-lg); }
+.setup-first h2 { font-size: var(--fs-md); }
+.setup-first p { margin: 0; font-size: var(--fs-sm); max-width: 62ch; }
+.setup-first-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.setup-first-list li { display: grid; grid-template-columns: 9.5rem minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); }
+.setup-first-list li:first-child { border-top: 0; }
+.setup-first-name { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: var(--fs-sm); font-weight: 500; }
+.setup-first-cmd { color: var(--muted); font-family: var(--mono); font-size: 12px; min-width: 0; }
+.setup-first-acts { display: inline-flex; gap: 2px; }
+.setup-first-acts a.icon { display: inline-flex; padding: 4px; color: var(--muted); border-radius: var(--r-sm); }
+.setup-first-acts a.icon:hover { color: var(--ink); background: var(--bg-hover); }
+.setup-first-foot { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.setup-first-foot .ghost svg { vertical-align: -2px; }
+.spin-icon { animation: spin 0.9s linear infinite; }
+@media (max-width: 560px) {
+  .setup-first-list li { grid-template-columns: minmax(0, 1fr) auto; }
+  .setup-first-cmd { grid-column: 1 / -1; grid-row: 2; }
+}

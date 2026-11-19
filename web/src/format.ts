@@ -1,4 +1,13 @@
-import type { ChangeKind, Phase, RunEvent, PageState } from "./api";
+import type { ApprovalMode, ChangeKind, Phase, RunEvent, PageState } from "./api";
+
+/** The approval modes, most asking first, and the one name each has everywhere. */
+export const APPROVAL_MODES: ApprovalMode[] = ["always", "risky", "never"];
+
+export function approvalLabel(mode: ApprovalMode | undefined): string {
+  if (mode === "always") return "Ask on every call";
+  if (mode === "never") return "Approvals off";
+  return "Ask on risky tools";
+}
 
 export function usd(value: number): string {
   if (value === 0) return "$0";

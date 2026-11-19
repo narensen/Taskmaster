@@ -618,7 +618,7 @@ export function RunView({ id }: { id: string }) {
           bus
           pages={pages}
           agents={["master", "reviewer", "verifier", ...pages.map((p) => `worker:${p}`)]}
-          placeholder="A note for the master · @ file · # pull request · / commands"
+          placeholder="A note for the master. @ files, # pull requests, $ skills, / commands"
           onSend={(m) => void send(m)}
         />
       </div>

@@ -1,14 +1,12 @@
 // The run's token total, in the title bar, with the per-role split on hover.
-// The approval mode sits beside it: one word, changed in place.
+// The approval mode sits beside it, named as on Home and in Settings, changed in place.
 
 import { useState } from "react";
 import { api, type ApprovalMode, type Spend } from "../api";
-import { tokens } from "../format";
+import { APPROVAL_MODES, approvalLabel, tokens } from "../format";
 import { keys, queryClient, useSettings } from "../query";
 import { useRunChrome } from "../shell/runChrome";
 import { TokenLedger } from "./Tokens";
-
-const MODES: ApprovalMode[] = ["risky", "always", "never"];
 
 function roleName(key: string): string {
   if (key === "master") return "Master";
@@ -69,9 +67,9 @@ export function RunBar() {
         </div>
       </div>
       <select className="tb-mode" aria-label="Approval mode" value={shown} onChange={(e) => setMode(e.target.value as ApprovalMode)}>
-        {MODES.map((m) => (
+        {APPROVAL_MODES.map((m) => (
           <option key={m} value={m}>
-            {m}
+            {approvalLabel(m)}
           </option>
         ))}
       </select>

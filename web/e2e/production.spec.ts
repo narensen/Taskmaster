@@ -20,7 +20,7 @@ async function pickIfNeeded(page: Page) {
     if (await first.isVisible()) await first.click();
   }
   await expect(page.getByRole("radiogroup", { name: "Pages at once" })).toBeVisible();
-  for (const seat of ["Master", "Mid", "Worker", "Checker"]) {
+  for (const seat of ["Master", "Mid", "Worker", "Reviewer"]) {
     const button = page.getByRole("button", { name: new RegExp(`^${seat} provider`) });
     if (!(await button.isVisible())) continue;
     const label = (await button.getAttribute("aria-label")) ?? "";

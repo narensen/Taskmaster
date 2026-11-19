@@ -12,6 +12,7 @@ import { modelLabel } from "../components/ProviderPicker";
 import { afterStart, problemWith, SEATS, seatChoice, toRequest, useChoice } from "../rolechoice";
 import { prefs, setPrefs } from "../prefs";
 import { useProviders, useSettings } from "../query";
+import { ProviderSetup, noneInstalled } from "../components/ProviderSetup";
 import { runStarted } from "../notify";
 
 export function NewRun() {
@@ -82,11 +83,11 @@ export function NewRun() {
         <h1>
           Describe the next run{project ? <> for <span className="ask-project">{project}</span></> : null}
         </h1>
-        <p className="ask-sub muted">A master will plan it, then workers build the pages and a reviewer checks the result.</p>
+        <p className="ask-sub muted">A master plans it, workers build the pages, and a different model checks the result.</p>
         <Composer
           ref={composer}
           bus
-          placeholder="Tell the master what to plan. @ files, # pull requests, / commands"
+          placeholder="Tell the master what to plan. @ files, # pull requests, $ skills, / commands"
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
@@ -125,6 +126,7 @@ export function NewRun() {
           </span>
         </div>
         <Problem error={action.error} />
+        {noneInstalled(providers.data) && <ProviderSetup providers={list} checking={providers.isFetching} />}
         {advanced && (
           <section className="ask-advanced" aria-label="Roles and pages">
             <div className="row between">

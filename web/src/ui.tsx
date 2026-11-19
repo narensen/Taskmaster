@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { CircleAlert } from "lucide-react";
 import type { Tone } from "./format";
 
@@ -118,11 +118,22 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[], every?: numb
   const [loading, setLoading] = useState(true);
   const latest = useRef(load);
   latest.current = load;
+  // A poll that brings back the same data keeps the old value, so nothing re-renders for it.
+  const seen = useRef<string | null>(null);
 
   const reload = useCallback(async () => {
     try {
       const value = await latest.current();
-      setData(value);
+      let text: string | null = null;
+      try {
+        text = JSON.stringify(value) ?? null;
+      } catch {
+        text = null;
+      }
+      if (text === null || text !== seen.current) {
+        seen.current = text;
+        setData(value);
+      }
       setError(null);
     } catch (err) {
       setError(err);
@@ -142,7 +153,13 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[], every?: numb
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 
-  return { data, error, loading, reload, setData };
+  // A value set by hand is not what the server said, so the next load always lands.
+  const set = useCallback((value: SetStateAction<T | null>) => {
+    seen.current = null;
+    setData(value);
+  }, []);
+
+  return { data, error, loading, reload, setData: set };
 }
 
 /** Run an action once at a time, keeping its error. */

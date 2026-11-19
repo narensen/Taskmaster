@@ -22,7 +22,7 @@ import { DiffTab, type Scope } from "../run/Diff";
 import { Flow, FlowSkeleton, fileTarget } from "../run/Flow";
 import { LimitNotice } from "../run/LimitNotice";
 import { LivePreview } from "../run/LivePreview";
-import { surfaces, useRun } from "../run/model";
+import { useRun, useSurfaces } from "../run/model";
 import { Stage } from "../run/Stage";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
@@ -274,7 +274,8 @@ export function RunView({ id }: { id: string }) {
   );
 
   const shown = entries;
-  const list = useMemo(() => surfaces(detail, shown, ledger?.entries ?? []), [detail, shown, ledger]);
+  const ledgerEntries = useMemo(() => ledger?.entries ?? [], [ledger]);
+  const list = useSurfaces(detail, shown, ledgerEntries);
   const pages = detail?.plan?.pages.map((p) => p.id) ?? detail?.pages.map((p) => p.id) ?? [];
   const phase = detail?.phase;
 

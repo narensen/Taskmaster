@@ -1,7 +1,7 @@
 // A run as the control surface sees it: its log, its agents' transcript, its notes and its
 // ledger, followed live over the daemon's stream.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   follow,
@@ -83,133 +83,213 @@ export function surfaceOf(entry: LedgerEntry): string {
   return entry.role;
 }
 
+function blankSurface(id: string): Surface {
+  const raw = id.startsWith("page:") ? id.slice(5) : null;
+  const page = raw ? raw.split("/")[0]! : null;
+  const role = page ? "worker" : id;
+  return {
+    id,
+    title: raw ? `Worker · ${raw.replaceAll("/", " / ")}` : id[0]!.toUpperCase() + id.slice(1),
+    role,
+    page,
+    calls: [],
+    tag: null,
+    state: "waiting",
+    tokens: 0,
+    split: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    usage: false,
+    cost: 0,
+    calls_billed: 0,
+  };
+}
+
+/**
+ * Builds the agents' transcript from entries as they arrive, touching only what changed.
+ * A streamed fragment replaces the one item it extends and the call and agent it sits in;
+ * every other item, call and agent keeps its identity, so memoised rows do not re-render.
+ */
+export class SurfaceBuilder {
+  private seen = 0;
+  private first: AgentEntry | undefined;
+  private last: AgentEntry | undefined;
+  private byId = new Map<string, Surface>();
+  /** Where each call sits: its agent, and its index in that agent's calls. */
+  private where = new Map<string, { id: string; index: number }>();
+
+  /** Whether `entries` is the list this builder has read so far, with more on the end. */
+  continues(entries: AgentEntry[]): boolean {
+    if (this.seen === 0) return true;
+    return entries.length >= this.seen && entries[0] === this.first && entries[this.seen - 1] === this.last;
+  }
+
+  apply(entries: AgentEntry[]): this {
+    if (entries.length <= this.seen) return this;
+    const touched = new Set<string>();
+    const fresh = new Set<string>();
+    // A surface and a call are copied once per batch, the first time the batch touches them.
+    const surface = (id: string): Surface => {
+      let s = this.byId.get(id);
+      if (!s) {
+        s = blankSurface(id);
+        this.byId.set(id, s);
+        touched.add(id);
+        return s;
+      }
+      if (!touched.has(id)) {
+        s = { ...s, calls: s.calls.slice(), split: { ...s.split } };
+        this.byId.set(id, s);
+        touched.add(id);
+      }
+      return s;
+    };
+    const callOf = (s: Surface, key: string, e: AgentEntry): Call => {
+      const at = this.where.get(key);
+      if (!at) {
+        const call: Call = { call: e.agent.call ?? 0, tag: e.agent, items: [], at: e.at };
+        this.where.set(key, { id: s.id, index: s.calls.length });
+        s.calls.push(call);
+        fresh.add(key);
+        return call;
+      }
+      let call = s.calls[at.index]!;
+      if (!fresh.has(key)) {
+        call = { ...call, items: call.items.slice() };
+        s.calls[at.index] = call;
+        fresh.add(key);
+      }
+      return call;
+    };
+    const replace = <T extends Item>(call: Call, item: T, change: Partial<T>): T => {
+      const next = { ...item, ...change };
+      const i = call.items.lastIndexOf(item);
+      if (i >= 0) call.items[i] = next;
+      return next;
+    };
+    for (let n = this.seen; n < entries.length; n++) {
+      const e = entries[n]!;
+      const id = e.agent.id;
+      if (id === "runtime" || id === "person") continue;
+      const s = surface(id);
+      const call = callOf(s, `${e.agent.id}#${e.agent.call ?? 0}`, e);
+      s.tag = e.agent;
+      const last = call.items[call.items.length - 1];
+      switch (e.kind) {
+        case "start":
+          call.brief = e.brief;
+          break;
+        case "text":
+          if (last?.t === "text") replace(call, last, { text: last.text + (e.text ?? "") });
+          else call.items.push({ t: "text", text: e.text ?? "", at: e.at });
+          break;
+        case "thought":
+          if (last?.t === "thought") replace(call, last, { text: last.text + (e.text ?? "") });
+          else call.items.push({ t: "thought", text: e.text ?? "", at: e.at });
+          break;
+        case "tool_call":
+          call.items.push({ t: "tool", id: e.id, name: e.name ?? "tool", target: e.target ?? null, input: e.input, at: e.at });
+          break;
+        case "command":
+          call.items.push({ t: "tool", name: "command", target: e.command ?? null, at: e.at });
+          break;
+        case "output": {
+          const byTool = e.id ? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.id === e.id) : undefined;
+          const open = byTool ?? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.output === undefined && i.diff === undefined);
+          if (open) {
+            const change: Partial<ToolItem> = {};
+            if (e.text) change.output = mergeChunk(open.output, e.text);
+            if (e.diff) change.diff = mergeChunk(open.diff, e.diff);
+            replace(call, open, change);
+          } else if (e.text) call.items.push({ t: "text", text: e.text, at: e.at });
+          break;
+        }
+        case "preview":
+          call.items.push({ t: "tool", name: "browser", target: e.routes?.map((r) => r.route).join(" ") || e.step || null, at: e.at });
+          break;
+        case "permission": {
+          const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.allowed === undefined && i.name === (e.tool ?? e.name));
+          if (open) replace(call, open, { allowed: e.allowed });
+          else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed, at: e.at });
+          break;
+        }
+        case "stalled":
+          call.items.push({ t: "life", text: `Stalled waiting on its model; fresh agent ${e.restart ?? 1} started.`, at: e.at });
+          break;
+        case "released": {
+          const left = e.lingering ? `${e.lingering} still running` : "nothing left running";
+          const count = e.processes ?? 0;
+          call.items.push({ t: "life", text: `${e.asked ? "Reported done and asked to be released" : "Turn ended"}; released ${count} process${count === 1 ? "" : "es"}, ${left}.`, at: e.at });
+          break;
+        }
+        case "end":
+          call.end = e;
+          if (e.usage) {
+            s.usage = true;
+            s.tokens += e.usage.input + e.usage.output + e.usage.cache_read + e.usage.cache_write;
+            s.split.input += e.usage.input;
+            s.split.output += e.usage.output;
+            s.split.cache_read += e.usage.cache_read;
+            s.split.cache_write += e.usage.cache_write;
+          }
+          break;
+      }
+    }
+    this.seen = entries.length;
+    this.first = entries[0];
+    this.last = entries[entries.length - 1];
+    return this;
+  }
+
+  /** Every agent in plan order, with its cost and state. An unchanged agent is the same object as last time. */
+  snapshot(detail: RunDetail | null, ledger: LedgerEntry[]): Surface[] {
+    const planPages = detail?.plan?.pages ?? [];
+    const pages = planPages.length ? planPages.map((p) => p.id) : (detail?.pages.map((p) => p.id) ?? []);
+    // A page the plan split into units is one worker per unit, so six workers stay six blocks.
+    const workerIds = pages.flatMap((p) => {
+      const units = planPages.find((page) => page.id === p)?.units;
+      if (units && units.length > 1) return units.map((u) => `page:${p}/${u.id}`);
+      return [`page:${p}`];
+    });
+    const order = ["master", ...workerIds, "reviewer", "verifier"];
+    for (const id of order) if (!this.byId.has(id)) this.byId.set(id, blankSurface(id));
+    const cost = new Map<string, { usd: number; n: number }>();
+    for (const entry of ledger) {
+      const key = surfaceOf(entry);
+      const c = cost.get(key) ?? { usd: 0, n: 0 };
+      c.usd += entry.cost_usd ?? 0;
+      c.n += 1;
+      cost.set(key, c);
+    }
+    for (const [id, s] of this.byId) {
+      const c = cost.get(id) ?? { usd: 0, n: 0 };
+      const open = s.calls.some((call) => !call.end);
+      const failed = s.calls.length > 0 && s.calls[s.calls.length - 1]!.end?.ok === false;
+      let state: Surface["state"] = s.calls.length === 0 ? "waiting" : open ? "working" : failed ? "failed" : "done";
+      if (s.page && detail?.pages.find((p) => p.id === s.page)?.state === "failed") state = "failed";
+      if (s.cost !== c.usd || s.calls_billed !== c.n || s.state !== state) {
+        this.byId.set(id, { ...s, cost: c.usd, calls_billed: c.n, state });
+      }
+    }
+    const rank = (id: string) => {
+      const i = order.indexOf(id);
+      return i < 0 ? order.length : i;
+    };
+    return [...this.byId.values()].sort((a, b) => rank(a.id) - rank(b.id));
+  }
+}
+
 /** Group transcript entries into calls per agent. */
 export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[]): Surface[] {
-  const planPages = detail?.plan?.pages ?? [];
-  const pages = planPages.map((p) => p.id).length ? planPages.map((p) => p.id) : (detail?.pages.map((p) => p.id) ?? []);
-  // A page the plan split into units is one worker per unit, so six workers stay six blocks.
-  const workerIds = pages.flatMap((p) => {
-    const units = planPages.find((page) => page.id === p)?.units;
-    if (units && units.length > 1) return units.map((u) => `page:${p}/${u.id}`);
-    return [`page:${p}`];
-  });
-  const order = ["master", ...workerIds, "reviewer", "verifier"];
-  const byId = new Map<string, Surface>();
-  const make = (id: string): Surface => {
-    const raw = id.startsWith("page:") ? id.slice(5) : null;
-    const page = raw ? raw.split("/")[0]! : null;
-    const role = page ? "worker" : id;
-    return {
-      id,
-      title: raw ? `Worker · ${raw.replaceAll("/", " / ")}` : id[0]!.toUpperCase() + id.slice(1),
-      role,
-      page,
-      calls: [],
-      tag: null,
-      state: "waiting",
-      tokens: 0,
-      split: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-      usage: false,
-      cost: 0,
-      calls_billed: 0,
-    };
-  };
-  for (const id of order) byId.set(id, make(id));
-  const calls = new Map<string, Call>();
-  for (const e of entries) {
-    const id = e.agent.id;
-    if (id === "runtime" || id === "person") continue;
-    if (!byId.has(id)) byId.set(id, make(id));
-    const s = byId.get(id)!;
-    const key = `${e.agent.id}#${e.agent.call ?? 0}`;
-    let call = calls.get(key);
-    if (!call) {
-      call = { call: e.agent.call ?? 0, tag: e.agent, items: [], at: e.at };
-      calls.set(key, call);
-      s.calls.push(call);
-    }
-    s.tag = e.agent;
-    const last = call.items[call.items.length - 1];
-    switch (e.kind) {
-      case "start":
-        call.brief = e.brief;
-        break;
-      case "text":
-        if (last?.t === "text") last.text += e.text ?? "";
-        else call.items.push({ t: "text", text: e.text ?? "", at: e.at });
-        break;
-      case "thought":
-        if (last?.t === "thought") last.text += e.text ?? "";
-        else call.items.push({ t: "thought", text: e.text ?? "", at: e.at });
-        break;
-      case "tool_call":
-        call.items.push({ t: "tool", id: e.id, name: e.name ?? "tool", target: e.target ?? null, input: e.input, at: e.at });
-        break;
-      case "command":
-        call.items.push({ t: "tool", name: "command", target: e.command ?? null, at: e.at });
-        break;
-      case "output": {
-        const byId = e.id
-          ? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.id === e.id)
-          : undefined;
-        const open = byId ?? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.output === undefined && i.diff === undefined);
-        if (open) {
-          if (e.text) open.output = mergeChunk(open.output, e.text);
-          if (e.diff) open.diff = mergeChunk(open.diff, e.diff);
-        } else if (e.text) call.items.push({ t: "text", text: e.text, at: e.at });
-        break;
-      }
-      case "preview":
-        call.items.push({ t: "tool", name: "browser", target: e.routes?.map((r) => r.route).join(" ") || e.step || null, at: e.at });
-        break;
-      case "permission": {
-        const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.allowed === undefined && i.name === (e.tool ?? e.name));
-        if (open) open.allowed = e.allowed;
-        else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed, at: e.at });
-        break;
-      }
-      case "stalled":
-        call.items.push({ t: "life", text: `Stalled waiting on its model; fresh agent ${e.restart ?? 1} started.`, at: e.at });
-        break;
-      case "released": {
-        const left = e.lingering ? `${e.lingering} still running` : "nothing left running";
-        const n = e.processes ?? 0;
-        call.items.push({ t: "life", text: `${e.asked ? "Reported done and asked to be released" : "Turn ended"}; released ${n} process${n === 1 ? "" : "es"}, ${left}.`, at: e.at });
-        break;
-      }
-      case "end":
-        call.end = e;
-        if (e.usage) {
-          s.usage = true;
-          s.tokens += e.usage.input + e.usage.output + e.usage.cache_read + e.usage.cache_write;
-          s.split.input += e.usage.input;
-          s.split.output += e.usage.output;
-          s.split.cache_read += e.usage.cache_read;
-          s.split.cache_write += e.usage.cache_write;
-        }
-        break;
-    }
-  }
-  for (const entry of ledger) {
-    const s = byId.get(surfaceOf(entry));
-    if (!s) continue;
-    s.cost += entry.cost_usd ?? 0;
-    s.calls_billed += 1;
-  }
-  for (const s of byId.values()) {
-    const open = s.calls.some((c) => !c.end);
-    const failed = s.calls.length > 0 && s.calls[s.calls.length - 1]!.end?.ok === false;
-    s.state = s.calls.length === 0 ? "waiting" : open ? "working" : failed ? "failed" : "done";
-    if (s.page) {
-      const page = detail?.pages.find((p) => p.id === s.page);
-      if (page?.state === "failed") s.state = "failed";
-    }
-  }
-  const rank = (id: string) => {
-    const i = order.indexOf(id);
-    return i < 0 ? order.length : i;
-  };
-  return [...byId.values()].sort((a, b) => rank(a.id) - rank(b.id));
+  return new SurfaceBuilder().apply(entries).snapshot(detail, ledger);
+}
+
+/** [`surfaces`], kept up to date as entries stream in: only new entries are read. */
+export function useSurfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[]): Surface[] {
+  const builder = useRef<SurfaceBuilder | null>(null);
+  return useMemo(() => {
+    let b = builder.current;
+    if (!b || !b.continues(entries)) b = builder.current = new SurfaceBuilder();
+    return b.apply(entries).snapshot(detail, ledger);
+  }, [detail, entries, ledger]);
 }
 
 export interface RunData {
@@ -229,6 +309,9 @@ export interface RunData {
   /** Show a change at once, before the daemon confirms it; the next load reconciles. */
   patch: (change: Partial<RunDetail>) => void;
 }
+
+/** How often streamed transcript entries are drawn. */
+const FLUSH_MS = 90;
 
 export function useRun(id: string): RunData {
   // A run prefetched on hover opens with what was fetched, then catches up.
@@ -266,20 +349,31 @@ export function useRun(id: string): RunData {
     reloadNotes();
   }, [id, reloadNotes, setDetail]);
 
-  // Streamed entries are added once a frame, however fast they arrive.
+  // Streamed entries are added at most every FLUSH_MS, on an animation frame, however fast
+  // they arrive: three workers sending tokens become a few renders a second, not hundreds.
   const pending = useRef<AgentEntry[]>([]);
   const frame = useRef(0);
+  const timer = useRef(0);
   const push = useCallback((entry: AgentEntry) => {
     pending.current.push(entry);
-    if (frame.current) return;
-    frame.current = requestAnimationFrame(() => {
-      frame.current = 0;
-      const batch = pending.current;
-      pending.current = [];
-      setEntries((all) => all.concat(batch));
-    });
+    if (frame.current || timer.current) return;
+    timer.current = window.setTimeout(() => {
+      timer.current = 0;
+      frame.current = requestAnimationFrame(() => {
+        frame.current = 0;
+        const batch = pending.current;
+        pending.current = [];
+        setEntries((all) => all.concat(batch));
+      });
+    }, FLUSH_MS);
   }, []);
-  useEffect(() => () => cancelAnimationFrame(frame.current), []);
+  useEffect(
+    () => () => {
+      cancelAnimationFrame(frame.current);
+      window.clearTimeout(timer.current);
+    },
+    [],
+  );
 
   const catchUp = useCallback(async () => {
     // While the stream is open it delivers the entries itself.

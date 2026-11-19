@@ -4034,3 +4034,18 @@ button.lane-diff { opacity: 0; }
 }
 /* The open call's clock beside an agent's state. */
 .flow-since { color: var(--muted); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+
+/* v0.1.5: long transcripts stay cheap. A row off screen skips style, layout and paint until it is
+   scrolled to, and an agent's older rows fold behind one button. */
+.flow [data-agent-text] > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 28px;
+}
+.flow-earlier {
+  display: block;
+  margin: 2px 0 10px;
+  color: var(--muted);
+}
+.flow-earlier:hover {
+  color: var(--ink);
+}

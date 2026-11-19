@@ -1,0 +1,33 @@
+name: Bug
+description: Something Taskmaster did that it should not have done.
+title: ""
+labels: []
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The screen or the command, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: Include the role, the provider, and whether the run was resumed.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The version shown in Settings.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: The last lines from Settings, Logs. Remove tokens before pasting.
+    validations:
+      required: false

@@ -1,0 +1,19 @@
+name: Change
+description: A behaviour Taskmaster does not have yet.
+title: ""
+labels: []
+body:
+  - type: textarea
+    id: job
+    attributes:
+      label: The job
+      description: Who is doing it, and what they can do when this exists.
+    validations:
+      required: true
+  - type: textarea
+    id: out
+    attributes:
+      label: Out of scope
+      description: What this change should leave alone.
+    validations:
+      required: false

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: A security report
+    url: https://github.com/narensen/Taskmaster/security
+    about: Use this for a token leak, an auth bypass, or a sandbox escape. Do not file those as a normal issue.

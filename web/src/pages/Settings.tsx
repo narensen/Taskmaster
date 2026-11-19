@@ -10,6 +10,7 @@ import { useProviders, useSettings, queryClient, keys as qk } from "../query";
 import { allowNotifications, tick } from "../notify";
 import { SHORTCUTS } from "../shell/Shortcuts";
 import type { RoleDefault } from "../prefs";
+import { Hosts } from "../settings/Hosts";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { appVersion, checkForUpdate, installUpdate, isDesktop, type AvailableUpdate } from "../desktop";
@@ -134,7 +135,6 @@ export function Settings() {
   const p = usePrefs();
   const health = useLoad(api.health, []);
   const daemon = useLoad(api.settings, []);
-  const gh = useLoad(api.gh, []);
   const { list: editorList, fallback } = useEditors();
   const [address, setAddress] = useState(server());
   const [other, setOther] = useState({ url: "", token: "" });
@@ -435,21 +435,12 @@ export function Settings() {
         </form>
       </Section>
 
-      <Section title="Source control" note="Draft pull request uses gh on the project machine, as this account.">
-        <div className="row between gap wrap">
-          <div data-testid="gh">
-            {gh.loading && !gh.data
-              ? "Asking gh…"
-              : gh.data?.account
-                ? `GitHub: ${gh.data.account}`
-                : gh.data?.installed
-                  ? "gh is installed but not signed in"
-                  : "gh is not installed on the project machine"}
-          </div>
-          <button className="ghost small" onClick={() => void gh.reload()}>
-            Rescan
-          </button>
-        </div>
+      <Section
+        id="source-control"
+        title="Source control"
+        note="Connect a git host to create a repository and push this project. A signed-in gh or glab is used on its own. Otherwise paste a token. Tokens stay on this machine. Draft pull request still uses gh."
+      >
+        <Hosts />
       </Section>
 
       <Section title="Motion" note="The system's reduced-motion setting always wins.">

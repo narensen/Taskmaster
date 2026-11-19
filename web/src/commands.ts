@@ -39,11 +39,28 @@ export function useRunContext(): RunContext | null {
   );
 }
 
+let cloneOnOpen = false;
+
+/** Home reads this once and opens the clone form. */
+export function consumeCloneRequest(): boolean {
+  const pending = cloneOnOpen;
+  cloneOnOpen = false;
+  return pending;
+}
+
+/** Open Home on the clone form, from the command palette or anywhere else. */
+export function requestClone() {
+  cloneOnOpen = true;
+  window.dispatchEvent(new Event("taskmaster-clone"));
+  navigate("/");
+}
+
 export function commands(ctx: RunContext | null = runContext): Command[] {
   const go = (id: string, label: string, to: string): Command => ({ id, label, group: "Go", run: () => navigate(to) });
   const list: Command[] = [
     go("new-run", "New run", "/runs/new"),
     go("gallery", "Gallery", "/"),
+    { id: "clone", label: "Clone a repository", group: "Go", hint: "GitHub, GitLab, or any git address", run: requestClone },
     go("dictionary", "Dictionary", "/dictionary"),
     go("errorography", "Errorography", "/errorography"),
     go("reviews", "Reviews", "/reviews"),

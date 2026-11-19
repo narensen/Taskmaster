@@ -36,6 +36,15 @@
 //! GET  /api/projects              the workspace's git repositories, the open one first
 //! POST /api/projects              {name, prompt?, ...} a new project, and its first run
 //! POST /api/projects/open         {path} open another repository of the workspace
+//!
+//! GET  /api/hosts                 GitHub, GitLab, Gitea and Bitbucket, and who is signed in
+//! POST /api/hosts                 {kind, token, base?, user?} check a token, then keep it
+//! DELETE /api/hosts/{id}          forget a saved token (a CLI sign-in stays)
+//! POST /api/hosts/{id}/repos      {name, private?, push?} create a repository and push
+//! GET  /api/git                   branch, dirty state, remotes
+//! POST /api/git/remote            {name, url}
+//! POST /api/git/push              {remote?, branch?}
+//! POST /api/git/clone             {url, name?} into the workspace, without switching to it
 //! ```
 //!
 //! Installing, updating and signing in to harness CLIs is in `api/setup.rs`, and the
@@ -89,12 +98,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
 mod desk;
+mod hosts;
 mod setup;
 mod skills;
 mod terms;
 
+pub(crate) use desk::redact;
+
 #[cfg(test)]
-pub(crate) use desk::{Style, choose_editor, redact, sensitive};
+pub(crate) use desk::{Style, choose_editor, sensitive};
 
 use crate::auth::Auth;
 use crate::live::Live;
@@ -329,6 +341,13 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/skills/{name}/import", post(skills::import))
         .route("/api/gh", get(desk::gh_status))
         .route("/api/gh/pr/{number}", get(desk::gh_pr))
+        .route("/api/hosts", get(hosts::list).post(hosts::connect))
+        .route("/api/hosts/{id}", axum::routing::delete(hosts::forget))
+        .route("/api/hosts/{id}/repos", post(hosts::create_repo))
+        .route("/api/git", get(hosts::git_state))
+        .route("/api/git/remote", post(hosts::set_remote))
+        .route("/api/git/push", post(hosts::push))
+        .route("/api/git/clone", post(hosts::clone))
         .route("/api/setup", get(setup::overview))
         .route("/api/setup/providers/{id}/{action}", post(setup::provider_action))
         .route("/api/setup/runtimes/{id}/install", post(setup::runtime_install))

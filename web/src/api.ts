@@ -518,6 +518,30 @@ export interface GhStatus {
   error?: string;
 }
 
+export interface HostConnection {
+  id: string;
+  kind: string;
+  name: string;
+  base: string;
+  account: string | null;
+  connected: boolean;
+  via: "cli" | "token" | null;
+  error?: string | null;
+}
+
+export interface GitRemote {
+  name: string;
+  url: string;
+}
+
+export interface GitState {
+  repo: boolean;
+  branch: string | null;
+  detached: boolean;
+  dirty: boolean;
+  remotes: GitRemote[];
+}
+
 export interface GrepHit {
   path: string;
   line: number;
@@ -585,7 +609,7 @@ export async function callAt<T>(base: string, bearer: string | null, path: strin
   return (await response.json()) as T;
 }
 
-async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   const bearer = token();
   if (bearer) headers.authorization = `Bearer ${bearer}`;
@@ -722,6 +746,15 @@ export const api = {
   importSkill: (name: string) => call<Skill>("POST", `/api/skills/${enc(name)}/import`, {}),
   gh: () => call<GhStatus>("GET", "/api/gh"),
   ghPr: (n: number) => call<{ number: number; title: string; url: string; state: string }>("GET", `/api/gh/pr/${n}`),
+  hosts: () => call<{ hosts: HostConnection[] }>("GET", "/api/hosts").then((r) => r.hosts),
+  connectHost: (body: { kind: string; token: string; base?: string; user?: string }) => call<HostConnection>("POST", "/api/hosts", body),
+  forgetHost: (id: string) => call<{ ok: boolean }>("DELETE", `/api/hosts/${enc(id)}`),
+  createHostRepo: (id: string, body: { name: string; private?: boolean; push?: boolean }) =>
+    call<{ clone_url: string | null; html_url: string; pushed: boolean }>("POST", `/api/hosts/${enc(id)}/repos`, body),
+  git: () => call<GitState>("GET", "/api/git"),
+  setRemote: (body: { name: string; url: string }) => call<GitState>("POST", "/api/git/remote", body),
+  pushGit: (body?: { remote?: string; branch?: string }) => call<{ remote: string; branch: string }>("POST", "/api/git/push", body ?? {}),
+  cloneRepo: (body: { url: string; name?: string }) => call<{ path: string; name: string }>("POST", "/api/git/clone", body),
 
   reviews: () => call<{ reviews: ReviewSummary[] }>("GET", "/api/reviews").then((r) => r.reviews),
   review: (id: string) => call<ReviewJob>("GET", `/api/reviews/${enc(id)}`),

@@ -3939,3 +3939,45 @@ button.lane-diff { opacity: 0; }
   .stage { --sw: 240px; }
   .stage.grown { --sw: 420px; }
 }
+.git-chip {
+  margin-left: 10px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  flex: none;
+}
+.host-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.host-block:first-child { border-top: 0; padding-top: 0; }
+.host-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.host-fields input:not([type="checkbox"]) { min-width: 140px; flex: 1; }
+.host-fields .check { flex: none; }
+.host-remotes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.home-clone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 10px auto 0;
+  width: min(420px, 100%);
+}
+.home-clone input { width: 100%; min-height: 28px; height: 28px; padding: 0 8px; font-size: var(--fs-sm); }
+.home-clone .small { align-self: center; }

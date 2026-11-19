@@ -22,7 +22,9 @@ import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, prefs, setPrefs, usePrefs } from "../prefs";
 import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
+import { consumeCloneRequest } from "../commands";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
+import { openProject } from "../palette";
 import { Problem, useAction, useLoad } from "../ui";
 
 /** A name the View Transitions API accepts for a run, shared by its card and its page. */
@@ -332,12 +334,25 @@ export function Gallery() {
   const composer = useRef<ComposerHandle>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [allOpen, setAllOpen] = useState(false);
-  const [mode, setMode] = useState<"this" | "new">("this");
+  const [mode, setMode] = useState<"this" | "new" | "clone">("this");
   const [newName, setNewName] = useState("");
+  const [cloneUrl, setCloneUrl] = useState("");
+  const [cloneName, setCloneName] = useState("");
   const action = useAction();
+  const cloneAction = useAction();
 
   useEffect(() => {
     composer.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const open = () => {
+      consumeCloneRequest();
+      setMode("clone");
+    };
+    if (consumeCloneRequest()) setMode("clone");
+    window.addEventListener("taskmaster-clone", open);
+    return () => window.removeEventListener("taskmaster-clone", open);
   }, []);
 
   useEffect(() => {
@@ -392,12 +407,25 @@ export function Gallery() {
     });
   };
 
+  const clone = () => {
+    void cloneAction.run("clone", async () => {
+      const url = cloneUrl.trim();
+      if (!url) throw new Error("Paste a git address first.");
+      const made = await api.cloneRepo({ url, name: cloneName.trim() || undefined });
+      setCloneUrl("");
+      setCloneName("");
+      openProject(made.path, made.name);
+    });
+  };
+
   return (
     <div className="page wide gallery-page">
       <div className="home-above">
         <h2 data-testid="home-heading">
           {mode === "new" ? (
             "Start something new"
+          ) : mode === "clone" ? (
+            "Clone a repository"
           ) : (
             <>Describe the next run{projectLabel ? <> for <span className="ask-project">{projectLabel}</span></> : null}</>
           )}
@@ -427,7 +455,51 @@ export function Gallery() {
           >
             New project
           </button>
+          <span className="home-mode-sep" aria-hidden>
+            ·
+          </span>
+          <button
+            type="button"
+            role="tab"
+            data-testid="project-mode-clone"
+            className={mode === "clone" ? "on" : ""}
+            aria-selected={mode === "clone"}
+            onClick={() => setMode("clone")}
+          >
+            Clone
+          </button>
         </div>
+        {mode === "clone" && (
+          <form
+            className="home-clone"
+            data-testid="clone-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              clone();
+            }}
+          >
+            <input
+              aria-label="Git address"
+              placeholder="https://… or git@…"
+              value={cloneUrl}
+              onChange={(e) => setCloneUrl(e.target.value)}
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <input
+              aria-label="Folder name"
+              placeholder="folder name, optional"
+              value={cloneName}
+              onChange={(e) => setCloneName(e.target.value)}
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <button type="submit" className="small" disabled={cloneAction.busy !== null}>
+              {cloneAction.busy ? "Cloning…" : "Clone"}
+            </button>
+            <Problem error={cloneAction.error} />
+          </form>
+        )}
         {mode === "new" && (
           <label className="home-name">
             <span>Name</span>
@@ -442,7 +514,11 @@ export function Gallery() {
           </label>
         )}
         <p className="ask-sub">
-          {mode === "new" ? "Name the project, then tell the master what to build." : "A master will plan it; workers take the pages."}
+          {mode === "new"
+            ? "Name the project, then tell the master what to build."
+            : mode === "clone"
+              ? "The clone sits next to this project. Paste the address without a token."
+              : "A master will plan it; workers take the pages."}
         </p>
       </div>
       <div className="home-composer">

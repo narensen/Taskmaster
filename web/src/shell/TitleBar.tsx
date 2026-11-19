@@ -8,6 +8,7 @@ import { Link } from "../router";
 import { MOD, isDesktop, isMac, ownTitleBar, windowControls } from "../desktop";
 import { Tip } from "../components/Tip";
 import { setPrefs, usePrefs } from "../prefs";
+import { GitChip } from "./GitChip";
 
 export interface Crumb {
   label: string;
@@ -84,6 +85,7 @@ export function TitleBar({
           })}
         </ol>
       </nav>
+      <GitChip />
       <div className="tb-fill" {...drag} />
       <div className="tb-actions">
         <Tip label="Search and commands" keys={`${MOD} K`}>

@@ -77,6 +77,7 @@ pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {
         ".taskmaster/pairing.json",
         ".taskmaster/devices.json",
         ".taskmaster/config.json",
+        ".taskmaster/hosts.json",
         ".taskmaster/taskmaster.db*",
         ".taskmaster/reviews/jobs/",
     ] {
@@ -315,5 +316,162 @@ pub fn init_repo(path: &Path, from: Option<&Path>) -> anyhow::Result<()> {
     git(path, &["commit", "--allow-empty", "-q", "-m", "Start of the project."])?;
     let _ = ensure_exclude(path);
     Ok(())
+}
+
+/// A remote address this daemon will store. An `https` address with a user or token in it
+/// is refused, so a secret is never written into git config.
+pub fn check_remote_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() || url.len() > 300 || url.chars().any(|c| c.is_whitespace() || c.is_control()) || url.contains(['?', '#', '\\']) {
+        return Err("a remote address is one line, up to 300 characters, with no query or spaces".into());
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        if host.is_empty() || host.contains('@') {
+            return Err("paste the address without a token in it".into());
+        }
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        if rest.is_empty() {
+            return Err("that is not a git address".into());
+        }
+        return Ok(());
+    }
+    if url.starts_with("git@") && url.contains(':') {
+        return Ok(());
+    }
+    Err("a remote address starts with https://, ssh://, or git@".into())
+}
+
+pub fn check_remote_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with(['.', '-'])
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err("a remote name uses letters, digits, `.`, `_` and `-`".into());
+    }
+    Ok(())
+}
+
+/// A branch name that can be given to `git push` without being read as a flag.
+pub fn check_branch_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 128
+        || name.starts_with('-')
+        || name.ends_with(['/', '.'])
+        || name.contains("..")
+        || name.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\@".contains(c))
+    {
+        return Err("that is not a branch name".into());
+    }
+    Ok(())
+}
+
+/// `origin` and the rest, as `(name, url)`.
+pub fn remotes(repo: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let text = git(repo, &["remote", "-v"])?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else { continue };
+        if parts.next() == Some("(push)") || !out.iter().any(|(have, _)| have == name) {
+            if let Some(slot) = out.iter_mut().find(|(have, _)| have == name) {
+                slot.1 = url.to_string();
+            } else {
+                out.push((name.to_string(), url.to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn dirty(repo: &Path) -> bool {
+    git(repo, &["status", "--porcelain"]).ok().is_some_and(|text| !text.trim().is_empty())
+}
+
+/// Add `name` at `url`, or leave it when it already points there.
+pub fn ensure_remote(repo: &Path, name: &str, url: &str) -> anyhow::Result<()> {
+    match remotes(repo)?.into_iter().find(|(have, _)| have == name) {
+        Some((_, current)) if current == url => Ok(()),
+        Some((_, current)) => bail!("remote `{name}` already points at {current}"),
+        None => {
+            git(repo, &["remote", "add", name, url])?;
+            Ok(())
+        }
+    }
+}
+
+/// Push `branch` to `remote`. `basic` is sent as one request header for this push
+/// and is not written into the repository.
+pub fn push(repo: &Path, remote: &str, branch: &str, basic: Option<&str>) -> anyhow::Result<()> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo);
+    if let Some(header) = basic {
+        command.arg("-c").arg(format!("http.extraHeader=Authorization: Basic {header}"));
+    }
+    command.args(["push", "-u", remote, branch]).stdin(std::process::Stdio::null());
+    let out = command.output().context("failed to run git")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = match basic {
+            Some(secret) => err.replace(secret, "***"),
+            None => err.into_owned(),
+        };
+        bail!("git push failed: {}", err.trim());
+    }
+    Ok(())
+}
+
+/// Clone `url` into `dest`. `basic` is a one-shot request header, not stored.
+pub fn clone_repo(url: &str, dest: &Path, basic: Option<&str>) -> anyhow::Result<()> {
+    let mut command = Command::new("git");
+    if let Some(header) = basic {
+        command.arg("-c").arg(format!("http.extraHeader=Authorization: Basic {header}"));
+    }
+    command.args(["clone", "--quiet", url]).arg(dest).stdin(std::process::Stdio::null());
+    let out = command.output().context("failed to run git")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = match basic {
+            Some(secret) => err.replace(secret, "***"),
+            None => err.into_owned(),
+        };
+        bail!("git clone failed: {}", err.trim());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_remote_is_added_once_and_a_token_in_the_address_is_refused() {
+        let root = std::env::temp_dir().join(format!("tm-git-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&root).status().unwrap();
+        git(&root, &["config", "user.name", "Test"]).unwrap();
+        git(&root, &["config", "user.email", "test@example.com"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-q", "-m", "start"]).unwrap();
+        assert!(!dirty(&root));
+        std::fs::write(root.join("note.txt"), "hi").unwrap();
+        assert!(dirty(&root));
+        ensure_remote(&root, "origin", "https://github.com/ada/shop.git").unwrap();
+        ensure_remote(&root, "origin", "https://github.com/ada/shop.git").unwrap();
+        let err = ensure_remote(&root, "origin", "https://gitlab.com/ada/shop.git").unwrap_err().to_string();
+        assert!(err.contains("already points"), "{err}");
+        assert!(!err.contains("secret"));
+        assert_eq!(remotes(&root).unwrap(), vec![("origin".into(), "https://github.com/ada/shop.git".into())]);
+        assert!(check_remote_url("https://user:secret@github.com/ada/shop.git").is_err());
+        assert!(check_remote_url("git@github.com:ada/shop.git").is_ok());
+        assert!(check_remote_url("ssh://git@github.com/ada/shop.git").is_ok());
+        assert!(check_remote_url("http://github.com/ada/shop.git").is_err());
+        assert!(check_branch_name("-main").is_err());
+        assert!(check_remote_name(".origin").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 

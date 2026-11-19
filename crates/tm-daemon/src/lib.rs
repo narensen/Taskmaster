@@ -25,6 +25,7 @@ mod checks;
 mod engine;
 mod eval;
 mod git;
+mod hosts;
 pub mod jobs;
 pub mod live;
 pub mod preview;

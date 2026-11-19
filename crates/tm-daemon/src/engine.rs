@@ -201,6 +201,12 @@ struct Driver {
     trees: Vec<PathBuf>,
     parallel: usize,
     live: Arc<Live>,
+    /// Instructions the master wrote after reading a person's notes. Every later worker
+    /// brief includes them. Empty until the master has read such a note.
+    handed: String,
+    /// The master's decision for the page note on this repair only. Cleared once the
+    /// briefs for that spawn are written.
+    repair_decision: String,
     /// The plan came from the small planning pass: first builds run at low reasoning effort.
     small: bool,
     /// Each page's preview and tab for the browser tool. `None` without Chrome.
@@ -333,6 +339,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         trees: Vec::new(),
         parallel,
         live,
+        handed: String::new(),
+        repair_decision: String::new(),
         small: false,
         browsers,
         code,
@@ -364,7 +372,7 @@ impl Driver {
                 continue;
             }
             if next_spawn {
-                self.start_spawn()?;
+                self.start_spawn().await?;
                 continue;
             }
             if let Some(cmd) = self.pending.pop_front() {
@@ -750,7 +758,7 @@ impl Driver {
         Ok(Step::Continue)
     }
 
-    fn start_spawn(&mut self) -> anyhow::Result<()> {
+    async fn start_spawn(&mut self) -> anyhow::Result<()> {
         let Some(Command::SpawnWorker { page, tier, errors }) = self.pending.pop_front() else {
             bail!("expected a worker spawn");
         };
@@ -768,10 +776,16 @@ impl Driver {
             self.push_event(Event::WorkerFinished { page, outcome: WorkerOutcome::Passed })?;
             return Ok(());
         }
-        if errors.is_none() && self.citations_fresh(&page)? {
+        let repair = errors.is_some();
+        if !repair && self.citations_fresh(&page)? && !self.live.has_pending_where(&self.id, |note| note.to == "master" || note.to == "workers") {
             eprintln!("taskmaster: {page} citations are unchanged");
             self.push_event(Event::PageFresh { page })?;
             return Ok(());
+        }
+        if let Err(err) = self.read_notes_before_workers(&page, repair).await {
+            self.pending.push_front(Command::SpawnWorker { page, tier, errors });
+            let _ = self.persist();
+            return Err(err);
         }
         let units = self.page(&page)?.work_units();
         let mut prepared: Vec<(AgentRequest, PathBuf)> = Vec::new();
@@ -1284,7 +1298,7 @@ impl Driver {
         let worktree = self.fresh_worktree("review")?;
         let sem = Arc::new(Semaphore::new(self.parallel.max(1)));
         let mut set = JoinSet::new();
-        let reviewer_notes = self.live.take_notes(&self.id, &["reviewer"]);
+        let reviewer_notes = self.decision_for(|note| note.to == "reviewer").await?;
         for scope in scopes {
             let key = scope.key.clone();
             let brief = self.with_notes(review_brief(&scope), &reviewer_notes);
@@ -1344,7 +1358,7 @@ impl Driver {
         let worktree = self.fresh_worktree("verify")?;
         let sem = Arc::new(Semaphore::new(self.parallel.max(1)));
         let mut set = JoinSet::new();
-        let verifier_notes = self.live.take_notes(&self.id, &["verifier"]);
+        let verifier_notes = self.decision_for(|note| note.to == "verifier").await?;
         for finding in findings {
             let brief = self.with_notes(verify_brief(&finding), &verifier_notes);
             let mut request = self.read_request(
@@ -1892,13 +1906,18 @@ impl Driver {
     }
 
     fn worker_request(&mut self, page: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, cwd: PathBuf) -> anyhow::Result<AgentRequest> {
-        // A note queued to this page is fix text: it rides on the next repair, and only
-        // then. A note to every worker goes into each brief.
-        let target = format!("page:{page}");
-        let wanted: Vec<&str> = if errors.is_some() { vec![target.as_str(), "workers"] } else { vec!["workers"] };
-        let notes = self.live.take_notes(&self.id, &wanted);
+        // A person's notes never land here raw. The master has already read them and
+        // written `handed`, which every worker follows.
         let owned = self.owned_files(page, unit, units, &cwd);
-        let mut brief = self.with_notes(self.worker_brief(page, unit, units, tier, errors, &owned)?, &notes);
+        let mut brief = self.worker_brief(page, unit, units, tier, errors, &owned)?;
+        if !self.handed.is_empty() {
+            brief.push_str("\nThe master decided, after reading the person's notes. Follow it:\n");
+            brief.push_str(&self.handed);
+        }
+        if !self.repair_decision.is_empty() {
+            brief.push_str("\nThe master decided this for the repair. Follow it:\n");
+            brief.push_str(&self.repair_decision);
+        }
         brief.push_str(&self.deliver_skills(page, &cwd));
         let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
         Ok(AgentRequest {
@@ -2216,6 +2235,66 @@ impl Driver {
         });
         request.feed = Some(Feed { live: self.live.clone(), run: self.id.clone(), agent: tag });
         request.stall = Some(if self.small { SMALL_STALL } else { STALL });
+    }
+
+    /// Notes addressed to the master or to every worker. The master reads them and the
+    /// decision stays on later worker briefs. A note addressed to this page is read only
+    /// on a repair, and only that repair's briefs carry it.
+    async fn read_notes_before_workers(&mut self, page: &str, repair: bool) -> anyhow::Result<()> {
+        self.repair_decision.clear();
+        if let Some(text) = self.consult(|note| note.to == "master" || note.to == "workers").await? {
+            if !self.handed.is_empty() {
+                self.handed.push('\n');
+            }
+            self.handed.push_str(text.trim());
+            self.handed.push('\n');
+        }
+        if !repair {
+            return Ok(());
+        }
+        let page_key = format!("page:{page}");
+        let page_unit = format!("page:{page}/");
+        if let Some(text) = self.consult(|note| note.to == page_key || note.to.starts_with(&page_unit)).await? {
+            self.repair_decision = text;
+        }
+        Ok(())
+    }
+
+    /// The master reads matching notes. The returned lines are what the next agent follows.
+    async fn decision_for(&mut self, pred: impl Fn(&crate::live::Note) -> bool) -> anyhow::Result<Vec<String>> {
+        Ok(self.consult(pred).await?.into_iter().collect())
+    }
+
+    /// One master turn over the notes `pred` selects. Nothing is asked when there are none.
+    async fn consult(&mut self, pred: impl Fn(&crate::live::Note) -> bool) -> anyhow::Result<Option<String>> {
+        let notes = self.live.take_fresh_where(&self.id, pred);
+        if notes.is_empty() {
+            return Ok(None);
+        }
+        let mut brief = String::from(
+            "Read these notes and decide what the agents should do next. Reply in plain text. Do not edit files.\n\n",
+        );
+        for note in &notes {
+            brief.push_str(&format!("- to {}: {}\n", note.to, note.text.trim()));
+        }
+        let worktree = self.fresh_worktree("notes")?;
+        let mut request = self.read_request(
+            &worktree,
+            brief,
+            self.harnesses.master.clone(),
+            self.config.models.master.clone(),
+            &self.master_token.clone(),
+        )?;
+        self.tag(&mut request, "master", "master", None, None);
+        let bill = request.bill(Role::Master, None);
+        let asked = ask(request).await;
+        self.drop_worktree(&worktree);
+        let answer = asked?;
+        self.charge(&bill, &answer)?;
+        if !answer.ok {
+            bail!("the master did not finish reading the notes");
+        }
+        Ok(Some(answer.text))
     }
 
     /// A brief with the notes a person queued for this agent.

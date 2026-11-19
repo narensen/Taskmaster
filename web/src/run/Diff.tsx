@@ -184,14 +184,11 @@ export function DiffTab({
   const submit = async () => {
     if (!comment || !comment.text.trim()) return;
     const to = owner(comment.file);
-    if (!to) {
-      toast("No page owns this file, so there is no worker to send the comment to", comment.file);
-      return;
-    }
+    const where = to ? `On page ${to}, ` : "";
     try {
-      await api.addNote(run, `page:${to}`, `Comment on ${comment.file}:${comment.line}: ${comment.text.trim()}`);
+      await api.addNote(run, "master", `${where}Comment on ${comment.file}:${comment.line}: ${comment.text.trim()}`);
       setQueued((q) => [...q, comment]);
-      toast(`Queued to the ${to} worker`, "It is fix text on that page's next repair.");
+      toast("Sent to the master", "The master reads it before any worker does.");
       setComment(null);
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err));

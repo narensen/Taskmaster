@@ -8,9 +8,9 @@
 //! another process sees the same entries.
 //!
 //! Notes are the record `runs/<run>/notes.json`. A note is addressed to `master`,
-//! `workers` (every worker brief written after it), `page:<id>` (that page's next repair),
-//! `reviewer` or `verifier`. The engine writes a note into the next brief for its agent and
-//! marks it delivered; the person can edit or remove it until then.
+//! `workers`, `page:<id>`, `reviewer` or `verifier`. The master reads every undelivered
+//! note before any other agent does, and the engine marks it delivered then. The person
+//! can edit or remove it until then.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -168,6 +168,31 @@ impl Live {
         }
         self.save_notes(run, &notes)?;
         Ok(true)
+    }
+
+    /// Undelivered notes matching `pred`, marked delivered. A note is read once.
+    pub fn take_fresh_where(&self, run: &str, pred: impl Fn(&Note) -> bool) -> Vec<Note> {
+        let _guard = self.write.lock().unwrap();
+        let mut notes = self.notes(run);
+        let mut out = Vec::new();
+        let mut changed = false;
+        for note in notes.iter_mut() {
+            if note.delivered || !pred(note) {
+                continue;
+            }
+            note.delivered = true;
+            changed = true;
+            out.push(note.clone());
+        }
+        if changed {
+            let _ = self.save_notes(run, &notes);
+        }
+        out
+    }
+
+    /// True when an undelivered note matches `pred`.
+    pub fn has_pending_where(&self, run: &str, pred: impl Fn(&Note) -> bool) -> bool {
+        self.notes(run).iter().any(|note| !note.delivered && pred(note))
     }
 
     /// The undelivered notes for `to`, marked delivered. `workers` notes are kept for

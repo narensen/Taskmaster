@@ -153,6 +153,10 @@ impl World {
         if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             return Ok(Script::text(&self.plan_reply()));
         }
+        if brief.contains("Read these notes and decide what the agents should do next.") {
+            let echoed: String = brief.lines().filter(|line| line.starts_with("- to ")).map(|line| format!("{line}\n")).collect();
+            return Ok(Script::text(&format!("Follow the notes.\n{echoed}")));
+        }
         if let Mode::Units(barrier) = &self.mode
             && let Some(unit) = brief.split("You are unit `").nth(1).and_then(|rest| rest.split('`').next())
         {
@@ -1692,7 +1696,7 @@ mod http {
     }
 
     #[tokio::test]
-    async fn agents_stream_their_text_thoughts_and_tool_calls_and_notes_reach_the_next_repair() {
+    async fn a_follow_up_note_produces_a_master_step_before_any_worker_step() {
         let tmp = repo("api-agents");
         let world = World::new(Mode::Learn);
         let (_server, mut client, code) = server(&tmp, &world).await;
@@ -1717,6 +1721,9 @@ mod http {
         assert!(builds.len() >= 2, "{builds:?}");
         assert!(!builds[0].contains("keep the header") && builds[0].contains("use tabs"), "{}", builds[0]);
         assert!(builds[1].contains("keep the header") && builds[1].contains("use tabs"), "{}", builds[1]);
+        let master_note = briefs.iter().position(|brief| brief.contains("Read these notes and decide")).expect("the master reads the note");
+        let first_worker = briefs.iter().position(|brief| brief.contains("Build page `a`")).expect("a worker builds");
+        assert!(master_note < first_worker, "a follow-up note produces a master step before any worker step");
         assert_eq!(builds.iter().filter(|brief| brief.contains("keep the header")).count(), 1);
         let (_, notes) = client.get("/api/runs/talk/notes").await;
         assert!(notes["notes"].as_array().unwrap().iter().all(|note| note["delivered"] == true), "{notes}");
@@ -1731,6 +1738,9 @@ mod http {
         assert!(entries.iter().any(|e| e["kind"] == "permission" && e["allowed"] == true));
         let end = entries.iter().find(|e| e["kind"] == "end").unwrap();
         assert_eq!(end["usage"]["input"], 100);
+        let master_step = entries.iter().position(|e| e["kind"] == "start" && e["agent"]["id"] == "master").expect("master step");
+        let worker_step = entries.iter().position(|e| e["kind"] == "start" && e["agent"]["id"] == "page:a").expect("worker step");
+        assert!(master_step < worker_step, "the master step is recorded before any worker step");
         let start = entries.iter().find(|e| e["kind"] == "start" && e["agent"]["id"] == "page:a").unwrap();
         assert_eq!(start["agent"]["owned_glob"], "app/a/**");
         assert_eq!(start["agent"]["role"], "worker");

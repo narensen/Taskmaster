@@ -900,7 +900,7 @@ fn waiting(run: &Run) -> Result<(), ApiError> {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ApproveBody {
-    /// A note for every worker that builds after this.
+    /// A note the master reads before any worker starts.
     note: Option<String>,
 }
 
@@ -911,7 +911,7 @@ async fn approve_run(
 ) -> Reply {
     waiting(&app.known(&id)?)?;
     if let Some(note) = body.and_then(|Json(body)| body.note).filter(|text| !text.trim().is_empty()) {
-        app.live.add_note(&id, "workers", note.trim())?;
+        app.live.add_note(&id, "master", note.trim())?;
     }
     app.start(&id, app.request_for(&id)?, Decision::Approve)?;
     accepted(json!({ "id": id }))

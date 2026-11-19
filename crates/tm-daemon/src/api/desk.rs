@@ -5,7 +5,7 @@
 //! ```text
 //! GET  /api/runs/{id}/agents      ?after=<n> -> {next, entries}: text, thoughts, tool calls, commands
 //! GET  /api/runs/{id}/notes       notes queued for the run's agents
-//! POST /api/runs/{id}/notes       {to, text}: to is master, workers, page:<id>, reviewer or verifier
+//! POST /api/runs/{id}/notes       {to, text}: the master reads it before any worker, reviewer or verifier
 //! POST /api/runs/{id}/notes/{note}  {text} changes a note not yet delivered; {} removes it
 //! POST /api/runs/{id}/terminal    {command}: run it in the project as the daemon's user
 //! GET  /api/runs/{id}/diff        ?scope=run|page&page=<id>

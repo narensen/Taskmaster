@@ -71,7 +71,10 @@ impl Harness for Scripted {
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let brief = task.brief.clone();
-        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
+        // A prompt that says so stops before any plan, so the UI can show a typed limit.
+        if brief.contains("USAGE LIMIT") {
+            say(&events, text("You've hit your usage limit. Resets 6:30 PM.")).await;
+        } else if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
             say(&events, thought("The request names three pages. I will look for a theme in the Dictionary first.")).await;
             tool(&events, "Read", json!({ "file_path": "README.md" }), true).await;
             tool(&events, "dictionary__search", json!({ "query": "theme" }), true).await;

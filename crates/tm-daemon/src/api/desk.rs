@@ -18,7 +18,11 @@
 //! GET  /api/settings              where this daemon keeps things, the roles the person chose,
 //!                                 and what this machine can run at once (`machine.max_parallel`)
 //! POST /api/settings              {approvals?: always|risky|never, approval_timeout_secs?, editor?,
-//!                                 roles?: {role: harness | ""}, models?, checker?, code_mode?}
+//!                                 roles?: {role: harness | ""}, models?, checker?, code_mode?, telemetry?}
+//! GET  /api/settings/export       the settings file, with tokens removed
+//! POST /api/settings/import       {settings: {...}} replace the saved choices
+//! POST /api/settings/reset        forget role, editor, approval, checker, code mode and telemetry choices
+//! GET  /api/logs                  the daemon log: path and the last lines
 //! GET  /api/editors               the editors this machine can launch, and the default
 //! POST /api/open                  {path, line?, column?, editor?, reveal?}
 //! POST /api/paths                 {paths: [..]} -> {paths: {raw: full path or null}}
@@ -46,7 +50,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tm_core::{RunPhase, valid_key};
 
-use super::{App, Reply, accepted, fail, ok};
+use super::{ApiError, App, Reply, accepted, fail, ok};
 
 const PERSON: &str = "person";
 /// How long a command typed into the terminal may run.
@@ -927,6 +931,8 @@ pub struct SettingsBody {
     checker: Option<bool>,
     /// Code Mode on or off.
     code_mode: Option<bool>,
+    /// Anonymous counts. Off until set.
+    telemetry: Option<bool>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -986,6 +992,9 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
     }
     if let Some(on) = body.checker {
         save_setting(&app.project(), "checker", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(on) = body.telemetry {
+        save_setting(&app.project(), "telemetry", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if !changes.is_empty() {
         save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1062,11 +1071,102 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "models": role_defaults.models,
         "checker": { "enabled": role_defaults.checker.enabled },
         "code_mode": { "enabled": role_defaults.code_mode.enabled },
+        "telemetry": { "enabled": role_defaults.telemetry.enabled },
         "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "machine": machine(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+const SETTING_KEYS: &[&str] = &[
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry",
+];
+
+/// Tokens are not part of an export. Host connections live in another file and stay there.
+fn redact_export(value: &mut Value) {
+    let Some(commons) = value.get_mut("commons").and_then(Value::as_object_mut) else { return };
+    if commons.get("token").and_then(Value::as_str).is_some_and(|token| !token.is_empty()) {
+        commons.insert("token".into(), json!(""));
+    }
+}
+
+pub async fn export_settings(State(app): State<Arc<App>>) -> Reply {
+    let file = settings_file(&app.project());
+    let mut value = std::fs::read_to_string(&file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_else(|| json!({}));
+    if !value.is_object() {
+        value = json!({});
+    }
+    redact_export(&mut value);
+    ok(json!({
+        "settings": value,
+        "note": "Tokens are left out. Host connections are kept in their own file and are not here.",
+    }))
+}
+
+pub async fn import_settings(State(app): State<Arc<App>>, Json(body): Json<Value>) -> Reply {
+    let incoming = body.get("settings").cloned().unwrap_or(body);
+    let Some(object) = incoming.as_object() else {
+        return Err(fail(StatusCode::BAD_REQUEST, "settings import is a JSON object"));
+    };
+    for key in object.keys() {
+        if !SETTING_KEYS.contains(&key.as_str()) {
+            return Err(fail(StatusCode::BAD_REQUEST, format!("`{key}` is not a settings field")));
+        }
+    }
+    if let Some(mode) = object.get("approvals").and_then(|v| v.get("mode")).and_then(|v| v.as_str())
+        && crate::approvals::Mode::parse(mode).is_none()
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, "approvals.mode is always, risky or never"));
+    }
+    if let Some(roles) = object.get("roles").and_then(Value::as_object) {
+        for (role, value) in roles {
+            if !crate::Roles::NAMES.contains(&role.as_str()) {
+                return Err(fail(StatusCode::BAD_REQUEST, format!("`{role}` is not a role")));
+            }
+            let id = value.as_str().unwrap_or("").trim();
+            if !id.is_empty() && !tm_harness::HARNESSES.contains(&id) {
+                return Err(fail(StatusCode::BAD_REQUEST, format!("unknown harness `{id}`")));
+            }
+        }
+    }
+    for (key, value) in object {
+        set_setting(&app.project(), key, value.clone()).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    apply_live_settings(&app)?;
+    settings(State(app)).await
+}
+
+pub async fn reset_settings(State(app): State<Arc<App>>) -> Reply {
+    let project = app.project();
+    let defaults = [
+        ("roles", json!({})),
+        ("models", json!({})),
+        ("editor", json!("")),
+        ("approvals", json!({ "mode": "never", "timeout_secs": 600 })),
+        ("checker", json!({ "enabled": false })),
+        ("code_mode", json!({ "enabled": false })),
+        ("telemetry", json!({ "enabled": false })),
+    ];
+    for (key, value) in defaults {
+        set_setting(&project, key, value).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    apply_live_settings(&app)?;
+    crate::log::note("settings reset");
+    settings(State(app)).await
+}
+
+fn apply_live_settings(app: &App) -> Result<(), ApiError> {
+    let loaded = crate::settings::Settings::load(&app.project()).unwrap_or_default();
+    let policy = loaded.approval_policy().map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    app.live.approvals.set_policy(policy);
+    *app.editor.lock().unwrap() = loaded.editor;
+    Ok(())
+}
+
+pub async fn logs(State(_app): State<Arc<App>>) -> Reply {
+    let (path, lines) = crate::log::tail(200);
+    ok(json!({ "path": path, "lines": lines }))
 }
 
 /// What this machine can run at once. Every worker is a local agent CLI with its own
@@ -1090,6 +1190,18 @@ fn free_memory_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_export_drops_a_commons_token() {
+        let mut value = json!({
+            "commons": { "token": "secret-token", "remote": "https://commons.example" },
+            "roles": { "master": "grok" }
+        });
+        redact_export(&mut value);
+        assert_eq!(value["commons"]["token"], "");
+        assert_eq!(value["commons"]["remote"], "https://commons.example");
+        assert_eq!(value["roles"]["master"], "grok");
+    }
 
     #[test]
     fn editors_open_at_the_line_and_column() {

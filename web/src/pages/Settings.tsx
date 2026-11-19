@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, server, type ApprovalMode, setServer, setToken, type RoleName } from "../api";
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
@@ -94,6 +94,105 @@ function Updates() {
   );
 }
 
+function Logs() {
+  const logs = useLoad(api.logs, []);
+  return (
+    <Section id="logs" title="Logs" note="The daemon writes here. A terminal you started it from shows the same lines.">
+      <div className="row gap wrap">
+        <span className="muted small break">{logs.data?.path ?? "No log file yet."}</span>
+        <button type="button" className="ghost small" onClick={() => void logs.reload()}>
+          Refresh
+        </button>
+      </div>
+      <pre className="log-view" data-testid="daemon-log">
+        {logs.data?.lines.length ? logs.data.lines.join("\n") : "Nothing written yet."}
+      </pre>
+      <Problem error={logs.error} onRetry={() => void logs.reload()} />
+    </Section>
+  );
+}
+
+function SettingsFile({ onImported }: { onImported: (next: Awaited<ReturnType<typeof api.settings>>) => void }) {
+  const file = useRef<HTMLInputElement>(null);
+  const [armed, setArmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const download = async () => {
+    setError(null);
+    try {
+      const exported = await api.exportSettings();
+      const blob = new Blob([JSON.stringify(exported.settings, null, 2) + "\n"], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "taskmaster-settings.json";
+      link.click();
+      URL.revokeObjectURL(url);
+      toast("Settings exported", exported.note);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+  const read = async (list: FileList | null) => {
+    const picked = list?.[0];
+    if (!picked) return;
+    setError(null);
+    try {
+      const text = await picked.text();
+      const parsed = JSON.parse(text) as unknown;
+      const body = parsed && typeof parsed === "object" && "settings" in parsed ? (parsed as { settings: unknown }).settings : parsed;
+      onImported(await api.importSettings(body));
+      toast("Settings imported", "Tokens in the file were not required. Host connections stay in their own file.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+  const reset = async () => {
+    if (!armed) {
+      setArmed(true);
+      return;
+    }
+    setError(null);
+    try {
+      onImported(await api.resetSettings());
+      setArmed(false);
+      toast("Choices reset", "The git project is still here.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+  return (
+    <Section
+      id="settings-file"
+      title="Settings file"
+      note="Export leaves tokens out. Host connections are kept in their own file and are not in this one. Reset forgets role, editor, approval, checker, code mode, and telemetry choices. It does not delete the git project."
+    >
+      <div className="settings-transfer" data-testid="settings-transfer">
+        <button type="button" className="small" onClick={() => void download()}>
+          Export
+        </button>
+        <button type="button" className="small" onClick={() => file.current?.click()}>
+          Import
+        </button>
+        <input
+          ref={file}
+          type="file"
+          accept="application/json,.json"
+          className="sr-only"
+          aria-label="Settings file to import"
+          onChange={(e) => {
+            void read(e.target.files);
+            e.target.value = "";
+          }}
+        />
+        <button type="button" className="ghost small" onClick={() => void reset()}>
+          {armed ? "Click again to reset" : "Reset choices"}
+        </button>
+      </div>
+      {error && <div className="error-line small">{error}</div>}
+    </Section>
+  );
+}
+
 function Section({ id, title, children, note }: { id?: string; title: string; children: React.ReactNode; note?: string }) {
   return (
     <section className="settings-section" id={id ?? slug(title)} aria-labelledby={`h-${id ?? slug(title)}`}>
@@ -110,8 +209,8 @@ function Section({ id, title, children, note }: { id?: string; title: string; ch
 
 const TOC: { group: string; items: [string, string][] }[] = [
   { group: "Connection", items: [["account", "Account"], ["daemon-address", "Daemon address"], ["project-path", "Project path"], ["commons", "Commons"]] },
-  { group: "Agents", items: [["providers-for-each-role", "Providers for each role"], ["tool-approvals", "Tool approvals"]] },
-  { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"]] },
+  { group: "Agents", items: [["providers-for-each-role", "Providers for each role"], ["telemetry", "Telemetry"], ["tool-approvals", "Tool approvals"]] },
+  { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"], ["logs", "Logs"], ["settings-file", "Settings file"]] },
   { group: "Appearance", items: [["motion", "Motion"], ["density", "Density"], ["theme", "Theme"]] },
   { group: "Alerts", items: [["notifications", "Notifications"], ["sound", "Sound"]] },
   { group: "Help", items: [["keybindings", "Keybindings"]] },
@@ -389,6 +488,34 @@ export function Settings() {
           </label>
         </Section>
       )}
+
+      {daemon.data && (
+        <Section
+          id="telemetry"
+          title="Telemetry"
+          note="Off until you turn it on. When it is on, the daemon records a count in its log. It sends that count only if TASKMASTER_TELEMETRY_URL is an https address you set. Prompts, paths, and tokens are never included. With no address, nothing leaves this machine."
+        >
+          <label className="row gap" data-testid="telemetry-setting">
+            <Switch
+              on={daemon.data.telemetry?.enabled ?? false}
+              label="Send anonymous counts"
+              onChange={(on) =>
+                void api.setTelemetry(on).then(
+                  (next) => {
+                    daemon.setData(next);
+                    toast(on ? "Anonymous counts are on" : "Anonymous counts are off");
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span>{daemon.data.telemetry?.enabled ? "On. Nothing is sent until an https collector is configured." : "Off"}</span>
+          </label>
+        </Section>
+      )}
+
+      <Logs />
+      <SettingsFile onImported={(next) => daemon.setData(next)} />
 
       {policy && (
         <Section

@@ -44,6 +44,13 @@ export function ProviderPicker({
   useEffect(() => {
     if (open) setBrowse(value?.harness ?? providers.find((p) => p.installed)?.id ?? null);
   }, [open, value?.harness, providers]);
+  // A resize while the menu is open moves the anchor. Close it rather than let it jump.
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener("resize", close);
+    return () => window.removeEventListener("resize", close);
+  }, [open]);
   const current = providers.find((p) => p.id === browse);
   const chosen = value ? providers.find((p) => p.id === value.harness) : undefined;
   const name = value ? (chosen?.name ?? providerName(value.harness)) : null;
@@ -55,7 +62,7 @@ export function ProviderPicker({
   };
 
   return (
-    <Popover.Root open={open} onOpenChange={setOpen}>
+    <Popover.Root open={open} onOpenChange={setOpen} modal={false}>
       <Popover.Trigger asChild>
         <button type="button" className={`prov-trigger ${value ? "" : "unset"} ${compact ? "compact" : ""}`} aria-label={`${label}: ${name ? `${name}, ${modelLabel(providers, value)}` : "not chosen"}`}>
           <ProviderLogo id={value?.harness} size={compact ? 13 : 14} />
@@ -74,11 +81,11 @@ export function ProviderPicker({
       </Popover.Trigger>
       {open && (
           <Popover.Portal>
-            <Popover.Content asChild sideOffset={6} align="start" collisionPadding={12}>
+            <Popover.Content asChild sideOffset={6} align="start" collisionPadding={12} sticky="always" hideWhenDetached>
               <motion.div
                 className="pop prov-pop"
-                initial={on ? { opacity: 0, y: -4, scale: 0.98 } : false}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
+                initial={on ? { opacity: 0 } : false}
+                animate={{ opacity: 1 }}
                 transition={{ duration: dur.fast, ease: bezier.out }}
               >
                 <div className="prov-cols">

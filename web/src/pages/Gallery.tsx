@@ -480,7 +480,7 @@ export function Gallery() {
           >
             <input
               aria-label="Git address"
-              placeholder="https://… or git@…"
+              placeholder="https://…, git@…, or a folder"
               value={cloneUrl}
               onChange={(e) => setCloneUrl(e.target.value)}
               spellCheck={false}

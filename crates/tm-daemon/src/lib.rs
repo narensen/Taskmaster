@@ -26,6 +26,7 @@ mod engine;
 mod eval;
 mod git;
 mod hosts;
+mod log;
 pub mod jobs;
 pub mod live;
 pub mod preview;
@@ -41,6 +42,7 @@ pub mod skills;
 pub mod sqlite;
 pub mod store;
 pub mod template;
+mod telemetry;
 mod time;
 
 #[cfg(test)]

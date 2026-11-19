@@ -341,7 +341,11 @@ pub fn check_remote_url(url: &str) -> Result<(), String> {
     if url.starts_with("git@") && url.contains(':') {
         return Ok(());
     }
-    Err("a remote address starts with https://, ssh://, or git@".into())
+    // A folder on this machine. The daemon already reads the disk it is running on.
+    if url.starts_with('/') && !url.contains("..") && is_repo(Path::new(url)) {
+        return Ok(());
+    }
+    Err("a remote address starts with https://, ssh://, or git@, or is a folder on this machine".into())
 }
 
 pub fn check_remote_name(name: &str) -> Result<(), String> {
@@ -469,6 +473,9 @@ mod tests {
         assert!(check_remote_url("git@github.com:ada/shop.git").is_ok());
         assert!(check_remote_url("ssh://git@github.com/ada/shop.git").is_ok());
         assert!(check_remote_url("http://github.com/ada/shop.git").is_err());
+        let local = root.canonicalize().unwrap();
+        assert!(check_remote_url(&local.display().to_string()).is_ok());
+        assert!(check_remote_url("/tmp").is_err());
         assert!(check_branch_name("-main").is_err());
         assert!(check_remote_name(".origin").is_err());
         let _ = std::fs::remove_dir_all(&root);

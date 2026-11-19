@@ -470,6 +470,7 @@ export interface DaemonSettings {
   approvals?: { mode: ApprovalMode; timeout_secs: number };
   checker?: { enabled: boolean };
   code_mode?: { enabled: boolean };
+  telemetry?: { enabled: boolean };
 }
 
 export type ApprovalMode = "always" | "risky" | "never";
@@ -731,6 +732,11 @@ export const api = {
   setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
   setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
   setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
+  setTelemetry: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { telemetry: enabled }),
+  logs: () => call<{ path: string | null; lines: string[] }>("GET", "/api/logs"),
+  exportSettings: () => call<{ settings: Record<string, unknown>; note: string }>("GET", "/api/settings/export"),
+  importSettings: (settings: unknown) => call<DaemonSettings>("POST", "/api/settings/import", { settings }),
+  resetSettings: () => call<DaemonSettings>("POST", "/api/settings/reset", {}),
   preview: (id: string) => call<PreviewView>("GET", `/api/runs/${enc(id)}/preview`),
   startPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview`, {}),
   stopPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview/stop`, {}),

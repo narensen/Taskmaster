@@ -20,5 +20,8 @@
   "editor": "",
   "preview": {
     "command": ""
+  },
+  "telemetry": {
+    "enabled": false
   }
 }

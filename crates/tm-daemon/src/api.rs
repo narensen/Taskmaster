@@ -179,6 +179,7 @@ pub struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        crate::log::note("shutting down");
         for active in self.app.active.lock().unwrap().values() {
             let _ = active.cancel.send(true);
         }
@@ -279,7 +280,9 @@ impl Server {
                 })
                 .await;
         });
-        Ok(Server { url: format!("http://{addr}/"), shutdown: Some(tx), task: Some(task), app })
+        let url = format!("http://{addr}/");
+        crate::log::note(&format!("serving {url}"));
+        Ok(Server { url, shutdown: Some(tx), task: Some(task), app })
     }
 }
 
@@ -321,6 +324,10 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/approvals", get(desk::approvals))
         .route("/api/approvals/{id}/{decision}", post(desk::decide))
         .route("/api/settings", get(desk::settings).post(desk::update_settings))
+        .route("/api/settings/export", get(desk::export_settings))
+        .route("/api/settings/import", post(desk::import_settings))
+        .route("/api/settings/reset", post(desk::reset_settings))
+        .route("/api/logs", get(desk::logs))
         .route("/api/editors", get(desk::editors))
         .route("/api/open", post(desk::open))
         .route("/api/paths", post(desk::paths))
@@ -686,7 +693,10 @@ impl App {
             let result = drive(config, harnesses).await;
             if let Err(err) = &result {
                 eprintln!("taskmaster: run {id}: {err:#}");
+                let line = format!("{err:#}").lines().next().unwrap_or("run failed").chars().take(200).collect::<String>();
+                crate::log::note(&format!("run {id}: {line}"));
             }
+            crate::telemetry::record(&app.project(), if result.is_ok() { "run_finished" } else { "run_failed" });
             app.record_outcome(&id, result);
             app.active.lock().unwrap().remove(&id);
             // A note can land in the moment the driver stops. Pick it up once the run is idle.

@@ -37,6 +37,14 @@ pub struct Settings {
     pub models: crate::Models,
     pub checker: CheckerSettings,
     pub code_mode: CodeModeSettings,
+    /// Off until a person turns it on. See `telemetry.rs`.
+    pub telemetry: TelemetrySettings,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TelemetrySettings {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

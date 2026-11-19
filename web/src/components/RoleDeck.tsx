@@ -2,12 +2,22 @@
 // run starts. A quiet switch keeps the choice for the project.
 
 import { AnimatePresence, motion } from "motion/react";
-import type { Provider } from "../api";
+import { useEffect, useState } from "react";
+import { api, type Provider, type ProviderStatus } from "../api";
 import { RoleMark } from "../marks";
 import { SEATS, problemWith, seatChoice, type Choice, type Seat } from "../rolechoice";
 import type { RoleDefault } from "../prefs";
 import { bezier, dur } from "../motion";
 import { ProviderPicker } from "./ProviderPicker";
+
+function harnessLine(provider: ProviderStatus): string {
+  if (!provider.installed) return `${provider.name} is not installed.`;
+  if (provider.signed_in === true) {
+    return provider.account ? `${provider.name} is installed and signed in as ${provider.account}.` : `${provider.name} is installed and signed in.`;
+  }
+  if (provider.signed_in === false) return `${provider.name} is installed and not signed in.`;
+  return `${provider.name} is installed.`;
+}
 
 export function RoleDeck({
   choice,
@@ -28,6 +38,22 @@ export function RoleDeck({
   fresh?: boolean;
   missing: Seat[];
 }) {
+  const [harness, setHarness] = useState<ProviderStatus[] | null>(null);
+  useEffect(() => {
+    if (!fresh) return;
+    let gone = false;
+    api.setup().then(
+      (report) => {
+        if (!gone) setHarness(report.providers);
+      },
+      () => {
+        if (!gone) setHarness([]);
+      },
+    );
+    return () => {
+      gone = true;
+    };
+  }, [fresh]);
   return (
     <section className="role-deck" aria-label="Who plays each role">
       <AnimatePresence initial={false}>
@@ -43,6 +69,13 @@ export function RoleDeck({
           </motion.p>
         )}
       </AnimatePresence>
+      {fresh && harness && harness.length > 0 && (
+        <ul className="deck-harness" data-testid="harness-state">
+          {harness.map((provider) => (
+            <li key={provider.id}>{harnessLine(provider)}</li>
+          ))}
+        </ul>
+      )}
       <div className="deck-grid">
         {SEATS.map((seat) => {
           const pick = seatChoice(choice, seat.id);

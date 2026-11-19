@@ -14,10 +14,20 @@ use serde_json::{Value, json};
 
 use crate::store::LocalStore;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Grant {
     pub run: String,
     pub page: String,
+    /// The part of a split page this token belongs to; empty for the whole page. Citations
+    /// stay the page's; tools that keep state per agent (Code Mode) key on it.
+    pub unit: String,
+}
+
+impl Grant {
+    /// The agent this token belongs to: `page`, or `page/unit` for a part of a split page.
+    pub fn agent(&self) -> String {
+        if self.unit.is_empty() { self.page.clone() } else { format!("{}/{}", self.page, self.unit) }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,7 +272,7 @@ mod tests {
         let store = LocalStore::open(dir).unwrap();
         store.publish("greeting_contract", EntryKind::Hint, "greeting", "export const G = 1;", "x").unwrap();
         let state = McpState::new(store);
-        state.grant("tok-a", Grant { run: "r1".into(), page: "dashboard".into() });
+        state.grant("tok-a", Grant { run: "r1".into(), page: "dashboard".into(), unit: String::new() });
         let app = router(state.clone());
         (state, app)
     }
@@ -349,7 +359,7 @@ mod tests {
         theme.stats = Some(tm_core::EntryStats { reuses: 0, pass_rate: 1.0, passes: 0, fails: 0 });
         commons.put(&theme).unwrap();
         let state = McpState::with_commons(local, commons);
-        state.grant("tok-a", Grant { run: "r1".into(), page: "dashboard".into() });
+        state.grant("tok-a", Grant { run: "r1".into(), page: "dashboard".into(), unit: String::new() });
         let app = router(state.clone());
         let search = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "search", "arguments": { "query": "color" } } });

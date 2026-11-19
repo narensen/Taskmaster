@@ -1182,6 +1182,50 @@ async fn the_master_repairs_a_failure_no_unit_owns_and_the_run_passes() {
 }
 
 #[tokio::test]
+async fn every_worker_brief_opens_with_the_same_shared_prefix() {
+    let tmp = repo("prefix");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"]), ("b", &["greet"])]), true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let brief = |id: &str| calls.iter().find(|c| c.contains(&format!("Build page `{id}`"))).cloned().unwrap();
+    let (a, b) = (brief("a"), brief("b"));
+    let cut = |text: &str| text.split("--- Your task ---").next().unwrap().to_string();
+    assert_eq!(cut(&a), cut(&b), "the shared part is identical, so the provider's cache can serve it");
+    assert!(cut(&a).contains("export type Id = string;"), "the contracts are in it, in full");
+    assert!(!cut(&a).contains("Build page"), "nothing unit-specific is in it");
+    assert!(a.contains("Work down this list:"));
+}
+
+#[test]
+fn only_commons_entries_that_bear_on_the_request_reach_the_planner() {
+    let entry = |key: &str, summary: &str, content: &str, tier: DictTier| tm_core::DictionaryEntry {
+        key: key.into(),
+        tier,
+        kind: EntryKind::Hint,
+        summary: summary.into(),
+        content: content.into(),
+        hash: String::new(),
+        stack: String::new(),
+        stats: None,
+    };
+    let todo = || vec![
+        entry("todo-schema", "todo items in localStorage", "Todos persist in localStorage under the key todos.", DictTier::Commons),
+        entry("todo-dom", "todo list markup", "ul#todo-list with one li per todo item", DictTier::Commons),
+        entry("project-note", "this project's own note", "anything", DictTier::Local),
+    ];
+    let keys = |found: Vec<tm_core::DictionaryEntry>| found.into_iter().map(|e| e.key).collect::<Vec<_>>();
+    // A document database has nothing to do with a todo app: only the project's own entry.
+    let db = "Build tinydb, a small document database in Python with tables, queries and a JSON storage file.";
+    assert_eq!(keys(crate::engine::relevant_entries(db, todo())), vec!["project-note"]);
+    // A todo app gets them, and an entry named by its key always comes.
+    let app = "A todo list page: add todo items, tick them done, and keep them in localStorage.";
+    let found = keys(crate::engine::relevant_entries(app, todo()));
+    assert!(found.contains(&"todo-schema".to_string()) && found.contains(&"todo-dom".to_string()), "{found:?}");
+    assert!(keys(crate::engine::relevant_entries("Use the todo-dom entry.", todo())).contains(&"todo-dom".to_string()));
+}
+
+#[tokio::test]
 async fn an_empty_balance_is_a_typed_limit_and_the_run_resumes() {
     let tmp = seeded("broke");
     let world = World::new(Mode::Broke);

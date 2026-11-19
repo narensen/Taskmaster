@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
             "export const GREETING = 'taskmaster-spike-7Q';", "next@15")?;
     }
     let state = McpState::new(store);
-    state.grant(token, Grant { run: "demo".into(), page: "demo".into() });
+    state.grant(token, Grant { run: "demo".into(), page: "demo".into(), unit: String::new() });
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     let s = state.clone();
     tokio::spawn(async move {

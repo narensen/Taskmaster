@@ -618,8 +618,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.html"), PAGE).unwrap();
         let browsers = PageBrowsers::new(chrome, dir.clone());
-        let mine = Grant { run: "r".into(), page: "pantry".into() };
-        let other = Grant { run: "r".into(), page: "elsewhere".into() };
+        let mine = Grant { run: "r".into(), page: "pantry".into(), unit: String::new() };
+        let other = Grant { run: "r".into(), page: "elsewhere".into(), unit: String::new() };
         let origin = browsers.attach("pantry", &dir).unwrap();
         assert!(browsers.attached("pantry"));
         assert_eq!(browsers.tools(&mine).len(), 5);

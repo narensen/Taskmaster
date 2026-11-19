@@ -300,6 +300,9 @@ struct Driver {
     ui_sent: BTreeSet<(PageId, String)>,
     /// Harnesses already reported as having no shell in this run.
     no_shell: BTreeSet<String>,
+    /// PROJECT.md as it stands: the sketch and what each finished phase landed. Every
+    /// builder's shared prefix carries it.
+    project_md: String,
 }
 
 impl Drop for Driver {
@@ -386,9 +389,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         };
         Arc::new(Live::new(store))
     });
-    mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into() });
-    mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into() });
-    mcp.grant(&master_token, Grant { run: run_id, page: "master".into() });
+    mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
+    mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into(), unit: String::new() });
+    mcp.grant(&master_token, Grant { run: run_id, page: "master".into(), unit: String::new() });
 
     let mut driver = Driver {
         config,
@@ -431,6 +434,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         checked: BTreeSet::new(),
         ui_sent: BTreeSet::new(),
         no_shell: BTreeSet::new(),
+        project_md: String::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -542,7 +546,7 @@ impl Driver {
                 &token,
             )?;
             self.small = self.small_pass(prompt);
-            let fresh = self.fresh_project()?;
+            let fresh = self.fresh_project(prompt)?;
             if self.small || fresh {
                 // Every stored entry is in the brief, so the master needs no tools.
                 request.dictionary = None;
@@ -627,8 +631,8 @@ impl Driver {
 
     /// An empty project whose stored Dictionary entries all fit in the brief: there is
     /// nothing a planner could find with tools that it is not already given.
-    fn fresh_project(&self) -> anyhow::Result<bool> {
-        Ok(self.existing_files() == 0 && self.entry_listing()?.len() < ENTRIES_LISTED)
+    fn fresh_project(&self, prompt: &str) -> anyhow::Result<bool> {
+        Ok(self.existing_files() == 0 && self.entry_listing(prompt)?.len() < ENTRIES_LISTED)
     }
 
     /// A Python contract at the project root cannot be imported by tests under `tests/`
@@ -673,11 +677,14 @@ impl Driver {
         crate::small::is_small_prompt(prompt, self.existing_files())
     }
 
-    /// Stored Dictionary entries, one formatted item each, for a planning brief.
-    fn entry_listing(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self
-            .catalog()?
-            .search("")?
+    /// Stored Dictionary entries that bear on this request, one formatted item each, for a
+    /// planning brief. This project's own entries are always listed. A Commons entry is
+    /// listed only when it shares at least two words with the request, best match first,
+    /// so a todo app's entries never reach the plan of a database.
+    fn entry_listing(&self, prompt: &str) -> anyhow::Result<Vec<String>> {
+        let entries = self.catalog()?.search("")?;
+        let wanted = relevant_entries(prompt, entries);
+        Ok(wanted
             .iter()
             .map(|entry| {
                 let place = match entry.tier {
@@ -748,7 +755,7 @@ impl Driver {
     fn planner_brief_inner(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
         if self.small_pass(prompt) {
             let template = self.template.as_ref().map(|t| t.brief()).unwrap_or_default();
-            let mut brief = crate::small::small_brief(prompt, &self.entry_listing()?, &template, self.parallel);
+            let mut brief = crate::small::small_brief(prompt, &self.entry_listing(prompt)?, &template, self.parallel);
             if !errors.is_empty() {
                 brief.push_str("\nThe last plan was rejected:\n");
                 for error in errors {
@@ -758,7 +765,7 @@ impl Driver {
             }
             return Ok(brief);
         }
-        let look = if self.fresh_project()? {
+        let look = if self.fresh_project(prompt)? {
             "The project is empty and every Dictionary entry already stored is listed below, so you need no tools: \
              do not call any, and plan from this brief alone."
         } else {
@@ -771,7 +778,7 @@ impl Driver {
              If you include an existing key, its content must match exactly.\n\n\
              Dictionary entries already stored:\n"
         );
-        let found = self.entry_listing()?;
+        let found = self.entry_listing(prompt)?;
         if found.is_empty() {
             brief.push_str("- none\n");
         }
@@ -997,8 +1004,10 @@ impl Driver {
             self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
             if units.len() == 1 {
                 self.offer_browser(&page, &worktree, &mut request);
-                self.offer_code(&page, &worktree, &mut request);
             }
+            // Every builder and every repair gets run_code when Code Mode is on.
+            let scope = if units.len() > 1 { format!("{page}/{}", units[index].id) } else { page.clone() };
+            self.offer_code(&scope, &worktree, &mut request);
             request.code_mode = self.config.code_mode;
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
                 feed.agent["unit"] = serde_json::json!(unit);
@@ -1032,7 +1041,7 @@ impl Driver {
             browsers.detach(&page);
         }
         if let Some(code) = &self.code {
-            code.detach(&page);
+            code.detach_page(&page);
         }
         let product = match result {
             Ok(product) => product,
@@ -2256,16 +2265,17 @@ impl Driver {
         // written `handed`, which every worker follows.
         let owned = self.owned_files(page, unit, units, &cwd);
         let mut brief = self.worker_brief(page, unit, units, tier, errors, &owned)?;
-        if !self.handed.is_empty() {
-            brief.push_str("\nThe master decided, after reading the person's notes. Follow it:\n");
-            brief.push_str(&self.handed);
-        }
         if !self.repair_decision.is_empty() {
             brief.push_str("\nThe master decided this for the repair. Follow it:\n");
             brief.push_str(&self.repair_decision);
         }
         brief.push_str(&self.deliver_skills(page, &cwd));
-        let token = self.tokens.get(page).cloned().context("no dictionary token for this page")?;
+        let token = if units > 1 {
+            let unit_id = self.page(page)?.work_units().get(unit).map(|u| u.id.clone()).unwrap_or_default();
+            self.unit_token(page, &unit_id)?
+        } else {
+            self.tokens.get(page).cloned().context("no dictionary token for this page")?
+        };
         let harness = self.harness_for(tier);
         let label = if units > 1 { format!("{page}-{unit}") } else { page.to_string() };
         let shell = self.shell_for(&harness, &label);
@@ -2355,12 +2365,8 @@ impl Driver {
     /// Give the agent `run_code` over its worktree, through the gate its own tools face.
     fn offer_code(&self, page: &str, cwd: &Path, request: &mut AgentRequest) {
         let Some(code) = &self.code else { return };
+        // How to use it is in the shared prefix (CODE_MODE_GUIDE), the same for every worker.
         code.attach(page, cwd, gate_for(request), request.shell.clone());
-        request.brief.push_str(
-            "\nYou have run_code: one call runs a short async JavaScript program with read, write, edit, grep, ls, check, sh and browser. \
-             Prefer one run_code call that does several steps (read what you need, write your files, then `return await check()`) \
-             over many single tool calls. Keep your replies short: the files are the work.\n",
-        );
     }
 
     /// A project a browser can show: one with a package.json, an HTML start page, or plan
@@ -2416,21 +2422,64 @@ impl Driver {
         files.into_iter().filter(|f| matcher.is_match(f) && !locked.contains(f)).take(40).collect()
     }
 
-    /// One agent's whole context: its task, the files it owns, the contracts and Dictionary
-    /// entries it uses, in full, and when it is done. Nothing else from the repository.
+    /// The opening every builder of this run shares, word for word: the project, the locked
+    /// contracts in full and in a fixed order, the design, Code Mode, and the master's
+    /// decisions. Providers cache a prompt's leading text, so keeping this identical across
+    /// workers and repairs is what makes their cache hit. Nothing unit-specific goes here.
+    fn shared_prefix(&self) -> anyhow::Result<String> {
+        let plan = self.plan()?;
+        let mut out = format!("Shared context for every agent of this run (a {} project); your own task follows it.\n", plan.kind.id());
+        if !self.project_md.is_empty() {
+            out.push_str("\nPROJECT.md, the plan of the whole project:\n");
+            out.push_str(self.project_md.trim_end());
+            out.push('\n');
+        }
+        let mut contracts: Vec<&tm_core::ContractFile> = plan.contracts.iter().collect();
+        contracts.sort_by(|a, b| a.path.cmp(&b.path));
+        if contracts.is_empty() {
+            out.push_str("\nLocked contracts: none.\n");
+        } else if contracts.iter().map(|c| c.content.len()).sum::<usize>() <= CONTRACTS_INLINE {
+            out.push_str("\nLocked contracts, already in the tree and given here in full, so there is no need to read them. Never edit them:\n");
+            for c in &contracts {
+                out.push_str(&format!("- `{}`:\n```\n{}\n```\n", c.path, c.content.trim_end()));
+            }
+        } else {
+            out.push_str("\nLocked contracts, already in the tree. Read the ones you use; never edit them:\n");
+            for c in &contracts {
+                out.push_str(&format!("- `{}`\n", c.path));
+            }
+        }
+        let design = if plan.has_ui() { plan.design.trim() } else { "" };
+        if !design.is_empty() {
+            out.push_str(&format!(
+                "\nDesign spec for every unit shown in a browser. Follow it exactly; do not invent another look:\n{design}\n"
+            ));
+            out.push_str(crate::small::QUALITY_BARS);
+        }
+        out.push_str(
+            "\nFor every unit: write only the files your task gives you; a write anywhere else is discarded and fails the unit. \
+             Paths are from the project root. If a Dictionary entry is wrong, stop and reply with \
+             {\"flag\":{\"key\":\"...\",\"issue\":\"...\"}} instead of working around it.\n",
+        );
+        if self.code.is_some() {
+            out.push_str(CODE_MODE_GUIDE);
+        }
+        if !self.handed.is_empty() {
+            out.push_str("\nThe master decided this after reading the person's notes. Follow it:\n");
+            out.push_str(self.handed.trim_end());
+            out.push('\n');
+        }
+        out.push_str("\n--- Your task ---\n");
+        Ok(out)
+    }
+
+    /// One agent's whole context: the shared prefix, then its own task, the files it owns,
+    /// the Dictionary entries it cites, what failed last time, and when it is done.
     fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String]) -> anyhow::Result<String> {
         let page = self.page(page_id)?.clone();
         let contracts = &self.plan()?.contracts;
-        let cites = if page.cites.is_empty() { "none".to_string() } else { page.cites.join(", ") };
-        // Contracts are locked and short; giving them in full saves a read per file.
         let inline = contracts.iter().map(|c| c.content.len()).sum::<usize>() <= CONTRACTS_INLINE;
-        let contract_list = if contracts.is_empty() {
-            "- none\n".to_string()
-        } else if inline {
-            contracts.iter().map(|c| format!("- `{}` (locked, do not edit):\n```\n{}\n```\n", c.path, c.content.trim_end())).collect()
-        } else {
-            contracts.iter().map(|c| format!("- `{}`\n", c.path)).collect()
-        };
+        let cites = if page.cites.is_empty() { "none".to_string() } else { page.cites.join(", ") };
         let split = if units > 1 { page.work_units().get(unit).cloned() } else { None };
         let ui = self.plan()?.is_ui(&page);
         // A page of a web app opens at a route; a module of anything else has none.
@@ -2439,24 +2488,15 @@ impl Driver {
         } else {
             format!("Build unit `{}` of this {} project.", page.id, self.plan()?.kind.id())
         };
-        let relative = if ui {
-            "File paths in this brief and in Dictionary entries are from the project root; a link or import inside a file \
-             is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n"
-        } else {
-            "File paths in this brief and in Dictionary entries are from the project root.\n"
-        };
-        let mut brief = format!(
-            "{opening}\n\
-             You may create or edit only files matching `{glob}`. Files outside it are discarded and the unit fails its check.\n\
-             Cite only these Dictionary keys, and follow them: {cites}.\n\
-             Contracts{given} in the tree:\n{contract_list}\n\
-             {body}\n\
-             {relative}\
-             If a Dictionary entry is wrong, stop and reply with {{\"flag\":{{\"key\":\"...\",\"issue\":\"...\"}}}} and do not edit other units.\n",
+        let mut brief = self.shared_prefix()?;
+        brief.push_str(&format!(
+            "{opening}\nYou may create or edit only files matching `{glob}`.\nCite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
             glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
-            body = page.brief,
-            given = if inline && !contracts.is_empty() { ", given in full and already" } else { " already" },
-        );
+            body = page.brief.trim_end(),
+        ));
+        if ui {
+            brief.push_str("A link or import inside a file is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n");
+        }
         if owned.is_empty() {
             brief.push_str("None of your files exist yet: create them.\n");
         } else {
@@ -2464,7 +2504,7 @@ impl Driver {
         }
         if let Some(mine) = &split {
             brief.push_str(&format!(
-                "\nThis page is split across {units} parallel workers who each own different files. You are unit `{}`: build only {}. {}\n",
+                "\nThis unit is split across {units} parallel workers who each own different files. You are unit `{}`: build only {}. {}\n",
                 mine.id, mine.owned_glob, mine.brief
             ));
             for other in page.work_units().iter().filter(|u| u.id != mine.id) {
@@ -2473,7 +2513,7 @@ impl Driver {
             brief.push_str("Rely only on the locked contracts and Dictionary entries to line up with them; do not write their files.\n");
         }
         if let Some(errors) = errors {
-            brief.push_str("\nChecks failed last time. Fix these and leave every other page alone:\n");
+            brief.push_str("\nChecks failed last time. This is their output; fix what it shows and leave every other unit alone:\n");
             brief.push_str(errors);
             brief.push('\n');
             brief.push_str(&self.handoff(page_id, tier)?);
@@ -2501,24 +2541,15 @@ impl Driver {
         // would only be more to read.
         let suggest = !self.small && split.is_none();
         if suggest {
-            brief.push_str("\nSearch the Commons before inventing a new contract.\n");
-        }
-        let query = format!("{} {}", page.brief, page.cites.join(" "));
-        let mut shown = 0;
-        for entry in catalog.search(&query)?.into_iter().filter(|_| suggest) {
-            if entry.tier != DictTier::Commons || page.cites.iter().any(|key| key == &entry.key) {
-                continue;
+            let query = format!("{} {}", page.brief, page.cites.join(" "));
+            let found: Vec<tm_core::DictionaryEntry> = catalog.search(&query)?.into_iter().filter(|e| e.tier == DictTier::Commons && !page.cites.contains(&e.key)).collect();
+            let found = relevant_entries(&query, found);
+            if !found.is_empty() {
+                brief.push_str("\nSearch the Commons before inventing a new contract. Entries that may fit:\n");
             }
-            if shown == 5 {
-                break;
+            for entry in found.iter().take(5) {
+                brief.push_str(&format!("\nCommons `{key}`: {summary}\n{content}\n", key = entry.key, summary = entry.summary, content = entry.content));
             }
-            shown += 1;
-            brief.push_str(&format!(
-                "\nCommons `{key}`: {summary}\n{content}\n",
-                key = entry.key,
-                summary = entry.summary,
-                content = entry.content,
-            ));
         }
         for key in &page.cites {
             match catalog.resolve(key)? {
@@ -2541,36 +2572,63 @@ impl Driver {
             // Each lookup is another model turn; the entries are already here.
             brief.push_str("\nThe cited entries above are complete: do not look them up again with the Dictionary tools.\n");
         }
-        let design = if ui { self.plan()?.design.trim().to_string() } else { String::new() };
-        if !design.is_empty() {
-            brief.push_str(&format!(
-                "\nDesign spec, shared by every agent of this run. Follow it exactly; do not invent another look:\n{design}\n"
-            ));
-            brief.push_str(crate::small::QUALITY_BARS);
-        }
         let done = split.as_ref().map_or(page.done.as_str(), |u| u.done.as_str()).trim();
         let done = if done.is_empty() { tm_core::DEFAULT_DONE } else { done }.trim_end_matches('.');
-        if design.is_empty() {
-            brief.push_str(&format!("\nYou are done when: {done}.\n"));
-        } else {
+        let design = ui && !self.plan()?.design.trim().is_empty();
+        if design {
             brief.push_str(&format!("\nYou are done when: {done}, and your files meet the design spec and the quality bars.\n"));
+        } else {
+            brief.push_str(&format!("\nYou are done when: {done}.\n"));
         }
+        brief.push_str(&self.todo(&page, errors.is_some()));
         let agent = match &split {
             Some(mine) => format!("page:{}/{}", page.id, mine.id),
             None => format!("page:{}", page.id),
         };
         brief.push_str(&format!(
             "Then stop: end your reply with the line `{RELEASE} {agent}` to report done and ask Taskmaster to release \
-             you and anything you started. Start no background processes.\n"
+             you and anything you started. Leave nothing running.\n"
         ));
         brief.push_str(if errors.is_some() {
-            "This brief is your whole context. Read only the files you own that you are fixing; do not list or search the directory.\n"
+            "Read only the files you own that you are fixing, and what the failure output names; do not list or search the whole directory.\n"
         } else if inline || contracts.is_empty() {
             "This brief is your whole context: do not list, search or read other files. Write your files directly.\n"
         } else {
             "This brief is your whole context: read only the contracts you use, do not list or search the directory, then write your files.\n"
         });
         Ok(brief)
+    }
+
+    /// The command the current phase's tests run with, when the sketch named one.
+    fn phase_test(&self) -> Option<String> {
+        None
+    }
+
+    /// The short list a builder works down. It always ends with running the tests, when the
+    /// agent can run anything at all.
+    fn todo(&self, page: &PagePlan, repair: bool) -> String {
+        let can_run = self.config.worker_shell && (self.harnesses.worker.sandboxed_shell() || self.code.is_some());
+        let test = self.phase_test().unwrap_or_else(|| "the project's tests for your files".into());
+        let mut steps: Vec<String> = Vec::new();
+        if repair {
+            steps.push("read the failure output above and the files it names".into());
+            steps.push("fix the cause in your own files".into());
+        } else {
+            steps.push(format!("write your files for `{}`", page.id));
+            if !self.plan().is_ok_and(|p| p.is_ui(page)) {
+                steps.push("write tests for them, beside the project's other tests, unless another unit owns the tests".into());
+            }
+        }
+        if can_run {
+            steps.push(format!("run {test}, and fix what fails until they pass"));
+        } else {
+            steps.push("check your files against the contracts and the done line once more, since you cannot run them".into());
+        }
+        let mut out = String::from("\nWork down this list:\n");
+        for (i, step) in steps.iter().enumerate() {
+            out.push_str(&format!("{}. {step}\n", i + 1));
+        }
+        out
     }
 
     /// What earlier attempts at this page did, for the one taking over.
@@ -2753,10 +2811,23 @@ impl Driver {
                 continue;
             }
             let token = fresh_token()?;
-            self.mcp.grant(&token, Grant { run: self.config.run_id.clone(), page: page.clone() });
+            self.mcp.grant(&token, Grant { run: self.config.run_id.clone(), page: page.clone(), unit: String::new() });
             self.tokens.insert(page, token);
         }
         Ok(())
+    }
+
+    /// A Dictionary token for one part of a split page. Its citations are the page's, and
+    /// its Code Mode scope is its own.
+    fn unit_token(&mut self, page: &str, unit: &str) -> anyhow::Result<String> {
+        let key = format!("{page}/{unit}");
+        if let Some(token) = self.tokens.get(&key) {
+            return Ok(token.clone());
+        }
+        let token = fresh_token()?;
+        self.mcp.grant(&token, Grant { run: self.config.run_id.clone(), page: page.to_string(), unit: unit.to_string() });
+        self.tokens.insert(key, token.clone());
+        Ok(token)
     }
 
     /// Record one agent call in the run's ledger.
@@ -3232,6 +3303,44 @@ impl Driver {
     }
 }
 
+/// Words of a request worth matching an entry on: lower case, four letters or more, and
+/// not the glue every request has.
+fn request_words(text: &str) -> BTreeSet<String> {
+    const COMMON: [&str; 24] = [
+        "with", "that", "this", "from", "have", "will", "into", "each", "make", "build", "should", "must", "when", "then",
+        "page", "pages", "file", "files", "using", "use", "uses", "also", "only", "test",
+    ];
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|w| w.len() >= 4 && !COMMON.contains(&w.as_str()))
+        .collect()
+}
+
+/// This project's entries, then the Commons entries the request names or shares two or more
+/// words with, best match first, at most eight of them.
+pub(crate) fn relevant_entries(prompt: &str, entries: Vec<tm_core::DictionaryEntry>) -> Vec<tm_core::DictionaryEntry> {
+    let asked = request_words(prompt);
+    let mut local = Vec::new();
+    let mut shared: Vec<(usize, tm_core::DictionaryEntry)> = Vec::new();
+    for entry in entries {
+        if entry.tier == DictTier::Local {
+            local.push(entry);
+            continue;
+        }
+        let head: String = entry.content.chars().take(600).collect();
+        let said = request_words(&format!("{} {} {}", entry.key.replace(['-', '_'], " "), entry.summary, head));
+        // An entry the request names by its key is always wanted.
+        let named = prompt.to_ascii_lowercase().split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')).any(|w| w == entry.key.to_ascii_lowercase());
+        let score = asked.intersection(&said).count() + if named { 2 } else { 0 };
+        if score >= 2 {
+            shared.push((score, entry));
+        }
+    }
+    shared.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.key.cmp(&b.1.key)));
+    local.extend(shared.into_iter().take(8).map(|(_, e)| e));
+    local
+}
+
 /// The agents a plan starts, one line each: who, what files, what to do, when it is done.
 fn agent_lines(plan: &Plan) -> String {
     let agents = plan.agents();
@@ -3280,7 +3389,14 @@ fn failed(errors: impl Into<String>) -> WorkerOutcome {
 const RELEASE: &str = "RELEASE";
 
 /// Contracts up to this many bytes in total are given in full in each worker's brief.
-const CONTRACTS_INLINE: usize = 12_000;
+const CONTRACTS_INLINE: usize = 24_000;
+
+/// How a worker with Code Mode is told to work, in the shared prefix.
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, grep, ls, \
+sh, test, check and browser. Batch your work into a few scripts rather than many single tool calls: one script loads what \
+you need with readMany and writes your files, and every script that changes code ends with `return await test()`, which \
+runs the project's tests and returns the failures. Fix what it reports in the next script. Keep your replies short: the \
+files are the work.\n";
 
 /// A model normally starts answering a small, low-effort brief within half a minute; a
 /// minute of silence with no tool running means the provider has queued the request.

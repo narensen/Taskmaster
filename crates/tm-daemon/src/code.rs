@@ -113,13 +113,15 @@ impl CodeTools {
         self.scopes.lock().unwrap().insert(page.to_string(), Arc::new(Scope { cwd: cwd.to_path_buf(), gate, shell }));
     }
 
-    pub fn detach(&self, page: &str) {
-        self.scopes.lock().unwrap().remove(page);
+    /// Drop the scope of a page and of every part of it (`page/unit`).
+    pub fn detach_page(&self, page: &str) {
+        let prefix = format!("{page}/");
+        self.scopes.lock().unwrap().retain(|key, _| key != page && !key.starts_with(&prefix));
     }
 
     /// Run `code` for `grant`'s page. The text is what the agent reads back.
     pub async fn run(&self, grant: &Grant, code: &str) -> anyhow::Result<String> {
-        let scope = self.scopes.lock().unwrap().get(&grant.page).cloned().context("this agent has no worktree to run code in")?;
+        let scope = self.scopes.lock().unwrap().get(&grant.agent()).cloned().context("this agent has no worktree to run code in")?;
         let scratch = std::env::temp_dir().join(format!("tm-code-{}-{}", std::process::id(), crate::secret::random_hex(6)?));
         std::fs::create_dir_all(&scratch)?;
         let script = scratch.join("run.js");
@@ -368,7 +370,7 @@ fn bwrap_works() -> bool {
 #[async_trait::async_trait]
 impl Extension for CodeTools {
     fn tools(&self, grant: &Grant) -> Vec<Value> {
-        if !self.scopes.lock().unwrap().contains_key(&grant.page) {
+        if !self.scopes.lock().unwrap().contains_key(&grant.agent()) {
             return Vec::new();
         }
         vec![json!({
@@ -428,7 +430,7 @@ mod tests {
     }
 
     fn grant() -> Grant {
-        Grant { run: "r".into(), page: "home".into() }
+        Grant { run: "r".into(), page: "home".into(), unit: String::new() }
     }
 
     #[tokio::test]
@@ -474,9 +476,9 @@ mod tests {
         let text = tools.run(&grant(), r#"return await edit("app/twice.txt", "x", "y");"#).await.unwrap();
         assert!(text.contains("occurs 2 times"), "{text}");
         // A page with no worktree has no tool.
-        assert!(tools.tools(&Grant { run: "r".into(), page: "other".into() }).is_empty());
+        assert!(tools.tools(&Grant { run: "r".into(), page: "other".into(), unit: String::new() }).is_empty());
         assert_eq!(tools.tools(&grant()).len(), 1);
-        tools.detach("home");
+        tools.detach_page("home");
         assert!(tools.run(&grant(), "return 1").await.is_err());
         std::fs::remove_dir_all(dir).ok();
     }

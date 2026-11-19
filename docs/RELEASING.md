@@ -17,6 +17,14 @@ git push origin v0.2.0
 
 The version in the app comes from the tag (`v0.2.0` becomes `0.2.0`).
 
+## Dry run
+
+Run the workflow by hand (Actions > release > Run workflow) without pushing a tag. It builds
+every desktop target the same way a real release does and keeps them as workflow artifacts for a
+few days, but publishes nothing: no tag, no release, no `latest.json`. Choose the version and
+the targets (all, mac, linux, windows). This is how a macOS or Windows fix is checked before a
+tag is cut, and nothing is published until a `v*` tag is pushed.
+
 ## Secrets
 
 Set these under Settings, Secrets and variables, Actions. None of them are ever committed.
@@ -60,9 +68,14 @@ tm-daemon and restarts.
 
 ## What is not finished
 
-- **Windows.** tm-daemon uses POSIX process groups, PTYs and `/proc`, so it does not build for
-  Windows yet. The Windows job runs on every release so the gap stays visible, but it is
-  allowed to fail and does not block the other platforms.
+- **macOS and Windows signing.** Without the Apple or Windows certificates the installers are
+  still built: macOS is ad-hoc signed (Gatekeeper warns on first open) and Windows gates the
+  terminal off with a clear message instead of a ConPTY backend (SmartScreen warns until a
+  certificate is added). Add `APPLE_CERTIFICATE` / `WINDOWS_CERTIFICATE` and the other secrets
+  above to sign for real.
+- The desktop shell (`desktop/src-tauri`) is outside the Cargo workspace, because it needs
+  the system webview to compile. It is built only by this workflow. Locally, with the
+  [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) installed, build it with:
 - The desktop shell (`desktop/src-tauri`) is outside the Cargo workspace, because it needs
   the system webview to compile. It is built only by this workflow. Locally, with the
   [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) installed, build it with:

@@ -1,6 +1,6 @@
 // A run is one transcript: you, then the master, then each worker. A side panel holds
 // files, the diff, the preview and the terminal. Tokens and the approval mode live in
-// the title bar.
+// the title bar. A small screen in the corner shows the app this run is building.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GitBranch, GitMerge } from "lucide-react";
@@ -22,6 +22,7 @@ import { DiffTab, type Scope } from "../run/Diff";
 import { Flow, FlowSkeleton, fileTarget } from "../run/Flow";
 import { LivePreview } from "../run/LivePreview";
 import { surfaces, useRun } from "../run/model";
+import { Stage } from "../run/Stage";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
 import { morphName } from "./Gallery";
@@ -469,7 +470,7 @@ export function RunView({ id }: { id: string }) {
 
   const main = (
     <div className="run-main">
-      <div className="run-scroll">
+      <div className="run-scroll with-stage">
         <div className="flow-top" style={{ viewTransitionName: morphName(id) } as React.CSSProperties}>
           <span className="flow-phase">{phaseLabel(detail)}</span>
           {detail.merged && detail.merge_commit ? (
@@ -601,6 +602,7 @@ export function RunView({ id }: { id: string }) {
           </section>
         )}
       </div>
+      <Stage id={id} detail={detail} entries={entries} />
       <div className="composer-bar">
         <Composer
           ref={composer}

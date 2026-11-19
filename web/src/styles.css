@@ -3813,3 +3813,129 @@ button.lane-diff { opacity: 0; }
   .flow-plan-row .muted:nth-child(2) { display: none; }
   .flow-by { display: none; }
 }
+
+/* Folder name leads a card that has no screenshot. The prompt sits under it. */
+.typed-sub {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 1.35;
+  letter-spacing: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.home-strip .typed-sub { display: none; }
+
+/* The run's picture of the app, pinned above the note composer. */
+.run-main { position: relative; }
+.run-scroll.with-stage { padding-bottom: var(--stage-pad, 230px); }
+.stage {
+  --sw: 280px;
+  position: absolute;
+  right: 16px;
+  z-index: 6;
+  width: var(--sw);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow: hidden;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-2);
+}
+.stage.grown { --sw: 520px; }
+.stage-bar, .stage-routes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 6px 0 8px;
+  border-bottom: 1px solid var(--line);
+}
+.stage-routes { overflow-x: auto; height: 24px; padding-right: 8px; }
+.stage-routes button {
+  flex: none;
+  height: 18px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--r-sm, 4px);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.stage-routes button.on { color: var(--ink); background: var(--bg-hover); }
+.stage-route { font-size: 11px; color: var(--ink); min-width: 0; }
+.stage-status {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.stage-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.stage-ico:hover { color: var(--ink); background: var(--bg-hover); }
+.stage-screen {
+  display: block;
+  width: 100%;
+  height: calc(var(--sw) * 800 / 1280);
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  background: var(--bg-sunken);
+  cursor: pointer;
+  position: relative;
+}
+.stage-screen iframe,
+.stage-screen img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1280px;
+  height: 800px;
+  border: 0;
+  transform: scale(calc(var(--sw) / 1280));
+  transform-origin: top left;
+  pointer-events: none;
+  background: #fff;
+}
+.stage-screen img { object-fit: cover; object-position: top; }
+.stage-empty {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+  height: 100%;
+  padding: 10px;
+  text-align: left;
+}
+.stage-empty-route { color: var(--ink); font-size: var(--fs-sm); }
+.stage-caption, .stage-foot {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.stage-foot {
+  padding: 4px 8px 6px;
+  border-top: 1px solid var(--line);
+}
+@media (max-height: 760px) {
+  .stage { --sw: 240px; }
+  .stage.grown { --sw: 420px; }
+}

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
@@ -113,32 +114,96 @@ impl Harness for AcpHarness {
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let mut command = self.command(&task)?;
-        let (mut child, group) = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
-            .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary))?;
+        let (result, kept) = self.start(task, gate, events, false).await;
+        debug_assert!(kept.is_none());
+        result
+    }
+
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        self.start(task, gate, events, true).await
+    }
+}
+
+impl AcpHarness {
+    /// Start the agent and run the first turn. With `keep`, a turn that finished leaves the
+    /// agent running with its session open, for follow-up turns.
+    async fn start(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+        keep: bool,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        let mut command = match self.command(&task) {
+            Ok(command) => command,
+            Err(err) => return (Err(err), None),
+        };
+        let spawned = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
+            .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary));
+        let (mut child, group) = match spawned {
+            Ok(spawned) => spawned,
+            Err(err) => return (Err(err), None),
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return (Err(anyhow!("the agent's input and output were not captured")), None);
+        };
         let mut session = Session {
-            stdin: child.stdin.take().context("agent stdin was not captured")?,
-            lines: BufReader::new(child.stdout.take().context("agent stdout was not captured")?)
-                .lines(),
+            stdin,
+            lines: BufReader::new(stdout).lines(),
             next_id: 0,
-            dictionary_prefix: task
-                .dictionary
-                .as_ref()
-                .map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
+            dictionary_prefix: task.dictionary.as_ref().map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
             gate,
             events,
             denied: 0,
             stall: task.stall,
             tools: BTreeSet::new(),
+            id: None,
         };
         let timeout = task.timeout;
         let result = match tokio::time::timeout(timeout, session.drive(task)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
         };
+        if keep && result.as_ref().is_ok_and(|summary| summary.ok) && session.id.is_some() {
+            let kept = Kept { session, child, group: Some(group), harness: self.id };
+            return (result, Some(Box::new(kept)));
+        }
         // The turn is over, finished or not: free the agent and everything it started.
         drop(session);
-        crate::released(result, group.release(&mut child).await)
+        (crate::released(result, group.release(&mut child).await), None)
+    }
+}
+
+/// An ACP agent left running after its turn, with its session open.
+struct Kept {
+    session: Session,
+    child: tokio::process::Child,
+    group: Option<crate::GroupGuard>,
+    harness: &'static str,
+}
+
+#[async_trait]
+impl crate::Session for Kept {
+    async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary> {
+        self.session.events = events;
+        self.session.denied = 0;
+        let turn = self.session.prompt(text);
+        match tokio::time::timeout(timeout, turn).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.harness)),
+        }
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Freed {
+        match self.group.take() {
+            Some(group) => group.release(&mut self.child).await,
+            None => crate::Freed::default(),
+        }
     }
 }
 
@@ -163,6 +228,8 @@ struct Session {
     stall: Option<std::time::Duration>,
     /// Tool calls started and not yet finished. A running tool may be silent for a long time.
     tools: BTreeSet<String>,
+    /// The ACP session, once `session/new` answered.
+    id: Option<String>,
 }
 
 impl Session {
@@ -209,9 +276,16 @@ impl Session {
             self.call(method, params).await.with_context(|| format!("could not select model `{model}`"))?;
         }
 
+        self.id = Some(session_id);
+        self.prompt(task.framed_brief()).await
+    }
+
+    /// One turn in the open session.
+    async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
+        let session_id = self.id.clone().context("the session is not open")?;
         let prompt = json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": task.framed_brief() }],
+            "prompt": [{ "type": "text", "text": text }],
         });
         let result = self.call("session/prompt", prompt).await?;
         Ok(RunSummary {
@@ -662,6 +736,43 @@ mod tests {
         let err = harness.run(task, Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![])), tx).await.unwrap_err();
         assert!(err.downcast_ref::<Stalled>().is_some(), "{err:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_kept_session_takes_a_follow_up_turn_and_closes() {
+        let say = |id: u32, text: &str| format!(
+            r#"echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}}}}}}'; echo '{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"end_turn"}}}}'"#
+        );
+        let script = format!(
+            r#"read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'; read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'; read l; {}; read l; case "$l" in *again*) {};; esac; sleep 30"#,
+            say(3, "first"),
+            say(4, "second")
+        );
+        let harness = AcpHarness { id: "fake", binary: "sh".into(), args: vec!["-c".into(), script], sandbox: None, mcp_tool_prefix: "{server}__", effort_flag: None };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![]));
+        let (tx, mut rx) = mpsc::channel(32);
+        let (first, kept) = harness.run_kept(task, gate, tx).await;
+        assert!(first.unwrap().ok);
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "first".into() }));
+        let mut kept = kept.expect("the session stays open after a finished turn");
+        let (tx, mut rx) = mpsc::channel(32);
+        let second = kept.follow_up("try again".into(), tx, std::time::Duration::from_secs(10)).await.unwrap();
+        assert!(second.ok);
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "second".into() }));
+        let freed = kept.close().await;
+        assert!(freed.processes >= 1 && freed.lingering == 0, "{freed:?}");
     }
 
     #[test]

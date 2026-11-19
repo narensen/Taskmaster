@@ -289,9 +289,31 @@ pub struct RunSummary {
     pub freed: Option<Freed>,
 }
 
+/// A session kept open after its first turn, so a repair can be sent to the same agent as
+/// a follow-up turn: it keeps everything it read and did, and the provider's prompt cache.
+#[async_trait]
+pub trait Session: Send {
+    /// Send one more turn. Events go to `events` until the turn ends.
+    async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary>;
+
+    /// End the session and free the agent and everything it started.
+    async fn close(self: Box<Self>) -> Freed;
+}
+
 #[async_trait]
 pub trait Harness: Send + Sync {
     fn id(&self) -> &'static str;
+
+    /// [`Harness::run`], keeping the session open afterwards when the harness can. `None`
+    /// when it cannot: the agent was released as usual.
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
+        (self.run(task, gate, events).await, None)
+    }
 
     /// Whether a command this agent runs stays inside an OS sandbox confined to its worktree
     /// and [`ShellScope`]. Only then is it given a shell.

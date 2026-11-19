@@ -100,6 +100,13 @@ impl Harness for Scripted {
             say(&events, thought(&format!("Page `{id}` owns app/{id}/**. I read the contract first."))).await;
             tool(&events, "Read", json!({ "file_path": "contracts/types.ts" }), true).await;
             tool(&events, "Bash", json!({ "command": "npm test" }), false).await;
+            // `FIXTURE_STREAM=<n>` streams n thought and n text fragments, a few words each, the
+            // way a real harness sends its tokens, so the run view can be profiled under load.
+            let fragments: usize = std::env::var("FIXTURE_STREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            for i in 0..fragments {
+                say(&events, thought(&format!("weighing step {i} of `{id}`, "))).await;
+                say(&events, text(&format!("line {i}: checked app/{id}/page.tsx:{} and moved on. ", i % 40 + 1))).await;
+            }
             // A page whose brief says it asks the person waits on two risky calls (see the plan).
             if brief.contains("(asks the person)") && !brief.contains("You are unit `styles`") {
                 let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("npm install left-pad".into()), url: None };

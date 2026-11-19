@@ -160,6 +160,7 @@ mod tests {
             done: String::new(),
             units: vec![],
             skills: vec![],
+            phase: 0,
         };
         Plan {
             kind: Default::default(),
@@ -167,6 +168,7 @@ mod tests {
             pages: vec![page("dashboard", &["auth", "nav"]), page("settings", &["auth"])],
             estimate: Estimate { tokens: 0, usd: 0.0 },
             design: String::new(),
+            phases: vec![],
         }
     }
 

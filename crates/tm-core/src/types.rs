@@ -99,6 +99,36 @@ impl ProjectKind {
     }
 }
 
+/// One phase of the rough sketch a run starts from (PROJECT.md). Only the first phase is
+/// planned in detail up front; each later one is planned once the phases before it have
+/// locked their interfaces.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PhaseSketch {
+    /// A short slug, such as `storage`.
+    pub id: String,
+    pub goal: String,
+    /// Modules or files this phase delivers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivers: Vec<String>,
+    /// Its public interfaces, as signatures only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub interfaces: String,
+    /// The command that runs this phase's tests.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub test: String,
+    /// `results` when this phase needs what the one before it built, not only its locked
+    /// interfaces; it is then planned after that phase passes instead of while it builds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub needs: String,
+}
+
+impl PhaseSketch {
+    /// Whether this phase can be planned while the one before it is still building.
+    pub fn overlaps(&self) -> bool {
+        !self.needs.trim().eq_ignore_ascii_case("results")
+    }
+}
+
 /// One unit of a plan: a page of a web app, or a module of anything else. One agent builds
 /// it, or several when it is split into parts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -129,6 +159,13 @@ pub struct PagePlan {
     /// agents find each one's SKILL.md in their worktree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// The phase of the sketch this unit belongs to, from 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub phase: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// One worker's share of a page: a disjoint set of files and what to build in them.
@@ -283,6 +320,10 @@ pub struct Plan {
     /// The units. Planners write the key as `units`; records keep `pages`.
     #[serde(alias = "units")]
     pub pages: Vec<PagePlan>,
+    /// The rough sketch, when the run is built a phase at a time. Empty for a small job,
+    /// which is one phase planned whole.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<PhaseSketch>,
     pub estimate: Estimate,
     /// The planner's design spec, shared by every agent: palette, type, spacing, component
     /// look, empty state, responsive layout and accessibility rules.
@@ -383,6 +424,7 @@ mod unit_tests {
             done: String::new(),
             units,
             skills: vec![],
+            phase: 0,
         }
     }
 
@@ -390,7 +432,7 @@ mod unit_tests {
     fn a_plan_lists_one_agent_per_unit() {
         let mut units = vec![unit("ui", "app/index.html"), unit("js", "app/main.js")];
         units[1].done = "adding a todo shows it".into();
-        let plan = Plan { kind: Default::default(), contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 }, design: String::new() };
+        let plan = Plan { kind: Default::default(), contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 }, design: String::new(), phases: vec![] };
         let agents = plan.agents();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["page:todo/ui", "page:todo/js", "page:todo"]);

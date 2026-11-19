@@ -698,6 +698,7 @@ mod tests {
             done: String::new(),
             units: vec![],
             skills: vec![],
+            phase: 0,
         };
         Owners::from_plan(&Plan {
             kind: Default::default(),
@@ -705,6 +706,7 @@ mod tests {
             pages: vec![page("book", "app/books/**"), page("cart", "app/cart/**")],
             estimate: Estimate { tokens: 0, usd: 0.0 },
             design: String::new(),
+            phases: vec![],
         })
         .unwrap()
     }

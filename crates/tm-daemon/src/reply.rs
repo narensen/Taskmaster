@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, Plan, ProjectKind};
+use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, PhaseSketch, Plan, ProjectKind};
 
 #[derive(Deserialize)]
 struct RawPlan {
@@ -20,6 +20,26 @@ struct RawPlan {
     dictionary: Vec<RawEntry>,
     #[serde(default)]
     design: Value,
+    #[serde(default)]
+    phases: Vec<Value>,
+}
+
+/// A phase of the sketch as a planner wrote it: lists or text are both read, and a phase
+/// with no goal is dropped rather than failing the plan.
+fn phase_of(value: &Value, index: usize) -> Option<PhaseSketch> {
+    let text = |key: &str| match &value[key] {
+        Value::String(s) => s.trim().to_string(),
+        Value::Array(items) => items.iter().filter_map(|i| i.as_str().map(str::trim).map(str::to_string)).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    };
+    let goal = [text("goal"), text("summary"), text("title")].into_iter().find(|t| !t.is_empty())?;
+    let id = [text("id"), text("name")].into_iter().find(|t| !t.is_empty()).unwrap_or_else(|| format!("phase-{}", index + 1));
+    let delivers = match &value["delivers"] {
+        Value::Array(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        Value::String(s) => s.split([',', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    Some(PhaseSketch { id, goal, delivers, interfaces: text("interfaces"), test: text("test"), needs: text("needs") })
 }
 
 /// A dictionary item as a planner wrote it. An unknown `kind` is read as a hint rather than
@@ -158,7 +178,10 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     let design = design_text(&raw.design);
     let kind = plan_kind(raw.kind.as_deref(), &raw.pages, &raw.contracts, &design);
     let dictionary = raw.dictionary.into_iter().map(RawEntry::entry).collect();
-    Ok((Plan { kind, contracts: raw.contracts, pages: raw.pages, estimate, design }, dictionary))
+    let phases: Vec<PhaseSketch> = raw.phases.iter().enumerate().filter_map(|(i, v)| phase_of(v, i)).collect();
+    // One phase is not a sketch: the plan is the whole job.
+    let phases = if phases.len() >= 2 { phases } else { Vec::new() };
+    Ok((Plan { kind, contracts: raw.contracts, pages: raw.pages, estimate, design, phases }, dictionary))
 }
 
 pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {
@@ -461,6 +484,23 @@ mod tests {
         assert_eq!(parse_plan("{\"pages\":[{\"id\":\"a\",\"route\":\"/a\",\"owned_glob\":\"app/a/**\",\"brief\":\"x\"}]}").unwrap().0.kind, ProjectKind::Web);
         assert_eq!(parse_plan("{\"units\":[{\"id\":\"db\",\"owned_glob\":\"tinydb/**\",\"brief\":\"x\"}]}").unwrap().0.kind, ProjectKind::Library);
         assert_eq!(parse_plan("{\"kind\":\"api\",\"units\":[]}").unwrap().0.kind, ProjectKind::Server);
+    }
+
+    #[test]
+    fn reads_the_sketch_of_phases_loosely() {
+        let text = r#"{"kind":"server","phases":[
+            {"id":"protocol","goal":"RESP encode and decode","delivers":["toyredis/protocol.py"],"interfaces":["def encode(v) -> bytes"],"test":"python -m pytest tests/test_protocol.py"},
+            {"name":"server","summary":"The TCP server","delivers":"toyredis/server.py, tests/test_server.py","needs":"results"},
+            {"id":"nothing"}],
+            "units":[{"id":"protocol","owned_glob":"toyredis/protocol.py","brief":"x"}]}"#;
+        let (plan, _) = parse_plan(text).unwrap();
+        assert_eq!(plan.phases.len(), 2, "a phase with no goal is dropped");
+        assert_eq!(plan.phases[0].interfaces, "def encode(v) -> bytes");
+        assert_eq!(plan.phases[1].id, "server");
+        assert_eq!(plan.phases[1].delivers, vec!["toyredis/server.py", "tests/test_server.py"]);
+        assert!(plan.phases[0].overlaps() && !plan.phases[1].overlaps());
+        let (single, _) = parse_plan(r#"{"phases":[{"id":"all","goal":"everything"}],"units":[]}"#).unwrap();
+        assert!(single.phases.is_empty(), "one phase is the whole job");
     }
 
     #[test]

@@ -55,6 +55,8 @@ enum Mode {
     Broke,
     /// Every build tries `poetry lock` in a shell, is refused, and changes nothing.
     Refused,
+    /// The plan sketches two phases: `a` now, `b` once `a`'s interfaces are locked.
+    Phased,
 }
 
 struct World {
@@ -188,8 +190,11 @@ impl World {
         let skills = std::fs::read_dir(task.cwd.join(".taskmaster/skills")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>().join(",")).unwrap_or_default();
         let how = format!("\n[effort={}][dictionary={}][skills={skills}]", task.effort.as_deref().unwrap_or("default"), task.dictionary.is_some());
         self.calls.lock().unwrap().push(format!("{brief}{how}"));
-        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
+        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") || brief.contains("Repair this plan.") {
             return Ok(Script::text(&self.plan_reply()));
+        }
+        if brief.contains("Plan phase 2 of 2") {
+            return Ok(Script::text(r#"{"contracts":[],"units":[{"id":"b","route":"/b","owned_glob":"app/b/**","cites":[],"brief":"Implement b on top of a."}],"dictionary":[]}"#));
         }
         if brief.contains("Read these notes and decide what the agents should do next.") {
             let echoed: String = brief.lines().filter(|line| line.starts_with("- to ")).map(|line| format!("{line}\n")).collect();
@@ -275,6 +280,11 @@ impl World {
             Mode::PlanBad => {
                 r#"{"contracts":[],"pages":[],"estimate":{"tokens":0,"usd":0},"dictionary":[]}"#.into()
             }
+            Mode::Phased => format!(
+                r#"{{"kind":"web","phases":[{{"id":"core","goal":"the shared core","test":"npm test"}},{{"id":"rest","goal":"the rest on top of it"}}],
+                "contracts":[{{"path":"contracts/types.ts","content":"export type Id = string;\n"}}],
+                "units":[{{"id":"a","route":"/a","owned_glob":"app/a/**","cites":["greet"],"brief":"Implement a."}}],"dictionary":[{greet}]}}"#
+            ),
             _ => plan_json("greet", greet),
         }
     }
@@ -390,10 +400,12 @@ fn plan(pages: &[(&str, &[&str])]) -> Plan {
                 done: String::new(),
                 units: vec![],
                 skills: vec![],
+                phase: 0,
             })
             .collect(),
         estimate: Estimate { tokens: 10, usd: 0.01 },
         design: String::new(),
+        phases: vec![],
     }
 }
 
@@ -805,7 +817,7 @@ fn planner_calls(world: &World) -> Vec<String> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|call| call.contains("Plan this product and lock its contracts.") || call.contains("Plan this small product quickly."))
+        .filter(|call| call.contains("Plan this product and lock its contracts.") || call.contains("Plan this small product quickly.") || call.contains("Repair this plan."))
         .cloned()
         .collect()
 }
@@ -881,6 +893,9 @@ async fn a_rejected_plan_is_asked_once_more() {
     let calls = planner_calls(&world);
     assert_eq!(calls.len(), 2);
     assert!(calls[1].contains("no dictionary entry"), "{}", calls[1]);
+    // The second call repairs the first plan: it carries that plan and needs no tools.
+    assert!(calls[1].contains("Repair this plan.") && calls[1].contains("\"units\""), "{}", calls[1]);
+    assert!(calls[1].contains("[effort=low][dictionary=false]"), "{}", calls[1]);
     let store = LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();
     assert!(store.get("greet").unwrap().is_some());
 }
@@ -936,7 +951,8 @@ async fn a_prompt_that_never_plans_fails() {
     let world = World::new(Mode::PlanBad);
     let err = run(prompt_config(&tmp.0, "Build page a.", true), &world).await.unwrap_err();
     assert!(err.to_string().contains("no units"), "{err}");
-    assert_eq!(world.plans.load(Ordering::SeqCst), 2);
+    // The first plan, then two repairs of it, then the run gives up.
+    assert_eq!(world.plans.load(Ordering::SeqCst), 3);
     assert!(!tmp.0.join("contracts/types.ts").exists());
 }
 
@@ -1251,6 +1267,44 @@ async fn a_refused_shell_with_no_changes_is_not_retried_and_says_why() {
     let row: serde_json::Value = ledger.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|r| r["page"] == "a").unwrap();
     assert_eq!(row["ok"], true);
     assert_eq!(row["refused"], serde_json::json!(["Bash poetry lock"]));
+}
+
+#[tokio::test]
+async fn a_sketched_run_builds_phase_by_phase_and_keeps_project_md() {
+    let tmp = seeded("phased");
+    let world = World::new(Mode::Phased);
+    let outcome = run(prompt_config(&tmp.0, &format!("Build a product with a shared core and pages on top. {}", "It has many parts. ".repeat(20)), true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let first = calls.iter().find(|c| c.contains("Plan this product")).unwrap();
+    assert!(first.contains("`phases`") && first.contains("Sketch first"), "the first planner is asked for a sketch");
+    let phase = calls.iter().find(|c| c.contains("Plan phase 2 of 2")).expect("the second phase was planned on its own");
+    assert!(phase.contains("PROJECT.md") && phase.contains("`a` owns `app/a/**`"), "{phase}");
+    // Phase two's unit was built after phase one's, never before.
+    let a = calls.iter().position(|c| c.contains("Build page `a`")).unwrap();
+    let b = calls.iter().position(|c| c.contains("Build page `b`")).unwrap();
+    assert!(a < b);
+    assert!(calls[b].contains("PROJECT.md, the plan of the whole project"), "workers share the sketch");
+    assert!(calls[a].contains("run `npm test`") || calls[a].contains("check your files"), "{}", calls[a]);
+    let md = read(&tmp.0.join("PROJECT.md"));
+    assert!(md.contains("1. `core` (done)") && md.contains("2. `rest` (done)"), "{md}");
+    assert!(md.contains("### Phase 1: `core`") && md.contains("`app/a/page.ts`") && md.contains("`app/b/page.ts`"), "{md}");
+    assert!(tmp.0.join("app/b/page.ts").is_file());
+    // Each finished phase is a checkpoint the run can roll back to.
+    assert!(!git_out(&tmp.0, &["for-each-ref", "refs/taskmaster/current/phase-1"]).trim().is_empty());
+    assert!(log(&tmp.0).contains("taskmaster: phase 1 landed"));
+}
+
+#[tokio::test]
+async fn a_project_md_of_the_projects_own_is_never_overwritten() {
+    let tmp = repo("own-md");
+    std::fs::write(tmp.0.join("PROJECT.md"), "# Ours\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "ours"]);
+    let world = World::new(Mode::Phased);
+    let outcome = run(prompt_config(&tmp.0, &format!("Build a product. {}", "It has many parts. ".repeat(20)), true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(read(&tmp.0.join("PROJECT.md")), "# Ours\n");
 }
 
 #[tokio::test]

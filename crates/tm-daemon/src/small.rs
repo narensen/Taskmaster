@@ -89,6 +89,56 @@ pub const PLAN_EXAMPLES: &str = concat!(
     "A Python contract sits inside the package the tests import (for example `tinydb/contract.py`), never loose at the project root.\n",
 );
 
+/// How the first planning call sketches a job bigger than a small one: the phases in rough,
+/// and only the first in detail. Later phases are planned while earlier ones build.
+pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A job of more than about five files gets `phases`: \
+2-6 phases in build order, each {\"id\",\"goal\",\"delivers\":[paths],\"interfaces\":\"signatures only, no bodies\",\"test\":\"the command \
+that runs this phase's tests\",\"needs\":\"interfaces\" or \"results\"}. `needs` is `results` only when a phase cannot be planned \
+until the one before it has been built and tested. With `phases`, `units` and `contracts` cover the first phase only; each later phase \
+is planned, with its own units, once the phases before it have locked their interfaces. A small job (a dependency upgrade, a fix, \
+or fewer than about five files) has no `phases`: plan it whole with one or two units. Scale the units to the work: one per \
+independent module and its tests, never more than the parallel workers.\n";
+
+/// The brief that plans one later phase of a sketched run.
+pub fn phase_brief(number: usize, total: usize, phase: &tm_core::PhaseSketch, project_md: &str, planned: &str, slots: usize) -> String {
+    let mut brief = format!(
+        "Plan phase {number} of {total} of this project: `{id}`, {goal}. Do not call any tools: everything you need is below.\n\n\
+         PROJECT.md:\n{project_md}\n\nUnits already planned (do not reuse their ids or own their files):\n{planned}\n\
+         Reply with one JSON object for this phase only: {{\"contracts\":[new interface files only],\"units\":[...],\"dictionary\":[]}}. \
+         The locked contracts of earlier phases stand; add a contract only for an interface this phase shares between its own units. \
+         Each unit owns its module and its tests, and its `done` names the command that runs them",
+        id = phase.id,
+        goal = phase.goal.trim_end_matches('.'),
+    );
+    if !phase.test.is_empty() {
+        brief.push_str(&format!(" (this phase's tests run with `{}`)", phase.test));
+    }
+    brief.push_str(".\n");
+    brief.push_str(&tm_core::rules_text());
+    brief.push_str(&units_rule(slots));
+    brief.push_str(DECIDE_RULE);
+    brief
+}
+
+/// The brief that repairs a rejected plan instead of planning again from nothing: the plan,
+/// the reasons, and the rules. The planner changes only what the reasons name.
+pub fn repair_brief(prompt: &str, plan_json: &str, errors: &[String]) -> String {
+    let mut brief = String::from(
+        "Repair this plan. It was rejected for the reasons below. Change only what the reasons name, keep everything else \
+         exactly as it is, and reply with the whole corrected JSON object and nothing else. Do not call any tools.\n\nThe request it plans:\n",
+    );
+    brief.push_str(prompt.trim());
+    brief.push_str("\n\nWhy it was rejected:\n");
+    for error in errors {
+        brief.push_str(&format!("- {error}\n"));
+    }
+    brief.push_str("\nThe plan:\n");
+    brief.push_str(plan_json);
+    brief.push_str("\n\n");
+    brief.push_str(&tm_core::rules_text());
+    brief
+}
+
 /// What the plan reply looks like and what it is checked against, for both planning briefs.
 pub fn plan_shape() -> String {
     format!("{PLAN_EXAMPLES}{}", tm_core::rules_text())

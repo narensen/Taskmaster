@@ -55,10 +55,12 @@ pub(crate) fn test_plan(pages: &[(&str, &str)]) -> Plan {
                 done: String::new(),
                 units: vec![],
                 skills: vec![],
+                phase: 0,
             })
             .collect(),
         estimate: Estimate { tokens: 0, usd: 0.0 },
         design: String::new(),
+        phases: vec![],
     }
 }
 

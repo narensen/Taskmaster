@@ -305,10 +305,27 @@ struct Driver {
     /// PROJECT.md as it stands: the sketch and what each finished phase landed. Every
     /// builder's shared prefix carries it.
     project_md: String,
+    /// The next phase's planning call, started while the current phase builds.
+    next_plan: Option<NextPlan>,
+}
+
+/// Why a plan reply was not accepted, and the plan in it as JSON when it had one, so the
+/// planner can be asked to repair it.
+type Rejected = (Vec<String>, Option<String>);
+
+/// A later phase being planned in the background.
+struct NextPlan {
+    phase: usize,
+    handle: tokio::task::JoinHandle<anyhow::Result<Answer>>,
+    bill: Bill,
+    cwd: PathBuf,
 }
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        if let Some(next) = self.next_plan.take() {
+            next.handle.abort();
+        }
         for path in std::mem::take(&mut self.trees) {
             let _ = git::remove_worktree(&self.project, &path);
             let _ = fs::remove_dir_all(&path);
@@ -437,6 +454,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         ui_sent: BTreeSet::new(),
         no_shell: BTreeSet::new(),
         project_md: String::new(),
+        next_plan: None,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -530,105 +548,375 @@ impl Driver {
         }
     }
 
-    /// Ask the master harness for a plan. One rejection is sent back with the reasons.
+    /// Ask the master harness for a plan. A rejected plan is sent back with the reasons to be
+    /// repaired, a short call with no tools, instead of being planned again from nothing.
     /// Dictionary entries are published before the plan is recorded.
     async fn draft_plan(&mut self, prompt: &str) -> anyhow::Result<Plan> {
-        let mut errors = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut rejected: Option<String> = None;
         let master_notes = self.live.take_notes(&self.id, &["master"]);
-        for attempt in 1..=2 {
-            let brief = self.with_notes(self.planner_brief(prompt, &errors)?, &master_notes);
-            let cwd = self.planner_dir()?;
-            let scratch = cwd != self.tree;
-            let token = self.master_token.clone();
-            let mut request = self.read_request(
-                &cwd,
-                brief.clone(),
-                self.harnesses.master.clone(),
-                self.config.models.master.clone(),
-                &token,
-            )?;
-            self.small = self.small_pass(prompt);
-            let fresh = self.fresh_project(prompt)?;
-            if self.small || fresh {
-                // Every stored entry is in the brief, so the master needs no tools.
-                request.dictionary = None;
-            }
-            request.effort = if self.small {
-                Some(crate::small::SMALL_EFFORT.to_string())
-            } else if fresh {
-                Some(FRESH_EFFORT.to_string())
-            } else {
-                None
+        let mut full_calls = 0;
+        for attempt in 1..=PLAN_ATTEMPTS {
+            let answer = match rejected.take() {
+                Some(json) => {
+                    eprintln!("taskmaster: asking the planner to repair the plan");
+                    self.ask_repair(prompt, &json, &errors).await?
+                }
+                None if full_calls < 2 => {
+                    full_calls += 1;
+                    self.ask_planner(prompt, &errors, &master_notes).await?
+                }
+                None => break,
             };
-            request.commit = Some(self.commit_budget(self.small || fresh));
-            self.tag(&mut request, "master", "planner", None, None);
-            let bill = request.bill(Role::Planner, None);
-            let mut asked = ask(request).await;
-            // Looked or thought too long: one more turn, with no tools, to write it down.
-            let stopped = asked.as_ref().err().and_then(|err| err.downcast_ref::<Overrun>()).map(|over| (over.why.clone(), over.notes.clone()));
-            if let Some((why, notes)) = stopped {
-                eprintln!("taskmaster: the planner was stopped ({why}); asking it to write the plan now");
-                let mut quick = self.read_request(
-                    &cwd,
-                    commit_brief(&brief, &why, &notes),
-                    self.harnesses.master.clone(),
-                    self.config.models.master.clone(),
-                    &token,
-                )?;
-                quick.dictionary = None;
-                quick.effort = Some(crate::small::SMALL_EFFORT.to_string());
-                self.tag(&mut quick, "master", "planner", None, None);
-                asked = ask(quick).await;
-            }
-            if scratch {
-                self.drop_worktree(&cwd);
-            }
-            let answer = asked?;
-            self.charge(&bill, &answer)?;
-            let (text, ok) = (answer.text, answer.ok);
-            if !ok {
+            if !answer.ok {
                 errors = vec!["the planner did not finish".into()];
             } else {
-                match reply::parse_plan(&text) {
-                    Ok((mut plan, mut drafts)) => {
-                        for note in tm_core::normalize_plan(&mut plan, &mut drafts) {
-                            eprintln!("taskmaster: plan fixed in place: {note}");
-                        }
-                        for note in self.importable_contracts(&mut plan) {
-                            eprintln!("taskmaster: plan fixed in place: {note}");
-                        }
-                        self.settle_skills(&mut plan, prompt);
+                match self.accept_plan(&answer.text, prompt, None) {
+                    Ok((plan, drafts)) => {
                         let existing = self.existing_content(&plan, &drafts)?;
-                        match check_plan(&plan, &drafts, &existing) {
-                            Ok(()) => {
-                                let published = self.publish_drafts(&drafts, &existing)?;
-                                self.records.save_plan(&self.id, &plan)?;
-                                eprintln!(
-                                    "taskmaster: planned {} {} ({}) and {} new dictionary entries",
-                                    plan.pages.len(),
-                                    if plan.has_ui() { "pages" } else { "units" },
-                                    plan.kind.id(),
-                                    published
-                                );
-                                for line in agent_lines(&plan).lines() {
-                                    eprintln!("taskmaster: {line}");
-                                }
-                                return Ok(plan);
-                            }
-                            Err(found) => errors = found,
+                        let published = self.publish_drafts(&drafts, &existing)?;
+                        self.records.save_plan(&self.id, &plan)?;
+                        eprintln!(
+                            "taskmaster: planned {} {} ({}) and {} new dictionary entries",
+                            plan.pages.len(),
+                            if plan.has_ui() { "pages" } else { "units" },
+                            plan.kind.id(),
+                            published
+                        );
+                        if !plan.phases.is_empty() {
+                            eprintln!("taskmaster: sketched {} phases; the first is planned in detail", plan.phases.len());
                         }
+                        for line in agent_lines(&plan).lines() {
+                            eprintln!("taskmaster: {line}");
+                        }
+                        return Ok(plan);
                     }
-                    Err(err) => errors = vec![format!("{err:#}")],
+                    Err((found, json)) => {
+                        errors = found;
+                        rejected = json;
+                    }
                 }
             }
-            if attempt == 1 {
-                eprintln!("taskmaster: plan rejected, asking once more. The reasons:");
+            if attempt < PLAN_ATTEMPTS {
+                eprintln!("taskmaster: plan rejected. The reasons:");
                 for error in &errors {
                     eprintln!("taskmaster:   - {error}");
                 }
             }
         }
         bail!("plan is not usable:\n{}", errors.join("\n"))
+    }
+
+    /// One full planning call, held to the commit budget.
+    async fn ask_planner(&mut self, prompt: &str, errors: &[String], notes: &[String]) -> anyhow::Result<Answer> {
+        let brief = self.with_notes(self.planner_brief(prompt, errors)?, notes);
+        let cwd = self.planner_dir()?;
+        let scratch = cwd != self.tree;
+        let token = self.master_token.clone();
+        let mut request = self.read_request(&cwd, brief.clone(), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+        self.small = self.small_pass(prompt);
+        let fresh = self.fresh_project(prompt)?;
+        if self.small || fresh {
+            // Every stored entry is in the brief, so the master needs no tools.
+            request.dictionary = None;
+        }
+        request.effort = if self.small {
+            Some(crate::small::SMALL_EFFORT.to_string())
+        } else if fresh {
+            Some(FRESH_EFFORT.to_string())
+        } else {
+            None
+        };
+        request.commit = Some(self.commit_budget(self.small || fresh));
+        self.tag(&mut request, "master", "planner", None, None);
+        let bill = request.bill(Role::Planner, None);
+        let mut asked = ask(request).await;
+        // Looked or thought too long: one more turn, with no tools, to write it down.
+        let stopped = asked.as_ref().err().and_then(|err| err.downcast_ref::<Overrun>()).map(|over| (over.why.clone(), over.notes.clone()));
+        if let Some((why, notes)) = stopped {
+            eprintln!("taskmaster: the planner was stopped ({why}); asking it to write the plan now");
+            let mut quick = self.read_request(&cwd, commit_brief(&brief, &why, &notes), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+            quick.dictionary = None;
+            quick.effort = Some(crate::small::SMALL_EFFORT.to_string());
+            self.tag(&mut quick, "master", "planner", None, None);
+            asked = ask(quick).await;
+        }
+        if scratch {
+            self.drop_worktree(&cwd);
+        }
+        let answer = asked?;
+        self.charge(&bill, &answer)?;
+        Ok(answer)
+    }
+
+    /// A short call, with no tools, that fixes a rejected plan in place.
+    async fn ask_repair(&mut self, prompt: &str, json: &str, errors: &[String]) -> anyhow::Result<Answer> {
+        let cwd = self.planner_dir()?;
+        let scratch = cwd != self.tree;
+        let token = self.master_token.clone();
+        let brief = crate::small::repair_brief(prompt, json, errors);
+        let mut request = self.read_request(&cwd, brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+        request.dictionary = None;
+        request.effort = Some(crate::small::SMALL_EFFORT.to_string());
+        request.commit = Some(self.commit_budget(true));
+        self.tag(&mut request, "master", "planner", None, None);
+        let bill = request.bill(Role::Planner, None);
+        let asked = ask(request).await;
+        if scratch {
+            self.drop_worktree(&cwd);
+        }
+        let answer = asked?;
+        self.charge(&bill, &answer)?;
+        Ok(answer)
+    }
+
+    /// Read a planner's reply, fix what has one fix, and check it. `base` is the plan so far
+    /// when this reply plans a later phase: its units are added to it and checked together.
+    /// A rejection comes with the reasons and, when the reply had a plan in it, that plan
+    /// as JSON for the repair call.
+    fn accept_plan(&self, text: &str, prompt: &str, base: Option<&Plan>) -> Result<(Plan, Vec<DraftEntry>), Rejected> {
+        let (mut plan, mut drafts) = match reply::parse_plan(text) {
+            Ok(parsed) => parsed,
+            Err(err) => return Err((vec![format!("{err:#}")], None)),
+        };
+        if let Some(base) = base {
+            // A later phase is part of the same project: same kind, same design, no sketch.
+            plan.kind = base.kind;
+            plan.design = base.design.clone();
+            plan.phases.clear();
+            plan.contracts.retain(|c| !base.contracts.iter().any(|have| have.path == c.path));
+        }
+        for note in tm_core::normalize_plan(&mut plan, &mut drafts) {
+            eprintln!("taskmaster: plan fixed in place: {note}");
+        }
+        for note in self.importable_contracts(&mut plan) {
+            eprintln!("taskmaster: plan fixed in place: {note}");
+        }
+        self.settle_skills(&mut plan, prompt);
+        let json = plan_json(&plan, &drafts);
+        let mut errors = Vec::new();
+        let checked = match base {
+            None => plan.clone(),
+            Some(base) => {
+                for page in &plan.pages {
+                    if base.pages.iter().any(|have| have.id == page.id) {
+                        errors.push(format!("unit id `{}` is already planned in an earlier phase; use a new id", page.id));
+                    }
+                }
+                let mut whole = base.clone();
+                whole.pages.extend(plan.pages.iter().filter(|p| !base.pages.iter().any(|have| have.id == p.id)).cloned());
+                whole.contracts.extend(plan.contracts.iter().cloned());
+                whole
+            }
+        };
+        let existing = match self.existing_content(&checked, &drafts) {
+            Ok(existing) => existing,
+            Err(err) => return Err((vec![format!("{err:#}")], Some(json))),
+        };
+        if let Err(found) = check_plan(&checked, &drafts, &existing) {
+            errors.extend(found);
+        }
+        if errors.is_empty() { Ok((plan, drafts)) } else { Err((errors, Some(json))) }
+    }
+
+    /// Start planning phase `phase` in the background, from the tree as it stands: the
+    /// earlier phases' interfaces are locked in it.
+    fn start_phase_plan(&mut self, phase: usize) -> anyhow::Result<()> {
+        let (request, cwd) = self.phase_request(phase)?;
+        let bill = request.bill(Role::Planner, None);
+        eprintln!("taskmaster: planning phase {} while phase {} builds", phase + 1, phase);
+        let handle = tokio::spawn(ask(request));
+        self.next_plan = Some(NextPlan { phase, handle, bill, cwd });
+        Ok(())
+    }
+
+    /// The planning call for one later phase.
+    fn phase_request(&mut self, phase: usize) -> anyhow::Result<(AgentRequest, PathBuf)> {
+        let plan = self.plan()?.clone();
+        let sketch = plan.phases.get(phase).cloned().context("no such phase in the sketch")?;
+        let planned: String = plan.pages.iter().map(|p| format!("- `{}` owns `{}`: {}\n", p.id, p.owned_glob, first_lines(&p.brief, 1))).collect();
+        let md = if self.project_md.is_empty() { self.render_project_md() } else { self.project_md.clone() };
+        let brief = crate::small::phase_brief(phase + 1, plan.phases.len(), &sketch, &md, &planned, self.parallel);
+        let cwd = self.planner_dir()?;
+        let token = self.master_token.clone();
+        let mut request = self.read_request(&cwd, brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+        request.dictionary = None;
+        request.effort = Some(FRESH_EFFORT.to_string());
+        request.commit = Some(self.commit_budget(true));
+        self.tag(&mut request, "master", "planner", None, None);
+        Ok((request, cwd))
+    }
+
+    /// The phase before `phase` passed: record what it landed in PROJECT.md, keep a
+    /// checkpoint of it, then add `phase`'s units, planned now or while it was building.
+    async fn next_phase(&mut self, phase: usize) -> anyhow::Result<()> {
+        eprintln!("taskmaster: phase {} passed", phase);
+        self.write_project_md(&format!("taskmaster: phase {phase} landed"))?;
+        self.checkpoint(&format!("phase-{phase}"));
+        let sketch = self.plan()?.phases.get(phase).cloned().context("no such phase in the sketch")?;
+        let goal = format!("Phase {} of the project: {}. {}", phase + 1, sketch.id, sketch.goal);
+        let mut answer = match self.next_plan.take() {
+            Some(next) if next.phase == phase => {
+                let asked = match next.handle.await {
+                    Ok(asked) => asked,
+                    Err(err) => Err(anyhow::anyhow!("the phase planner stopped: {err}")),
+                };
+                self.drop_worktree(&next.cwd);
+                let answer = asked?;
+                self.charge(&next.bill, &answer)?;
+                answer
+            }
+            other => {
+                if let Some(stale) = other {
+                    stale.handle.abort();
+                    self.drop_worktree(&stale.cwd);
+                }
+                eprintln!("taskmaster: planning phase {}", phase + 1);
+                let (request, cwd) = self.phase_request(phase)?;
+                let bill = request.bill(Role::Planner, None);
+                let asked = ask(request).await;
+                self.drop_worktree(&cwd);
+                let answer = asked?;
+                self.charge(&bill, &answer)?;
+                answer
+            }
+        };
+        let base = self.plan()?.clone();
+        let mut errors: Vec<String> = Vec::new();
+        for attempt in 1..=PLAN_ATTEMPTS {
+            if !answer.ok {
+                errors = vec!["the planner did not finish".into()];
+                break;
+            }
+            match self.accept_plan(&answer.text, &goal, Some(&base)) {
+                Ok((added, drafts)) => {
+                    let existing = self.existing_content(&added, &drafts)?;
+                    self.publish_drafts(&drafts, &existing)?;
+                    eprintln!("taskmaster: planned phase {} ({}): {} units", phase + 1, sketch.id, added.pages.len());
+                    for line in agent_lines(&added).lines() {
+                        eprintln!("taskmaster: {line}");
+                    }
+                    self.push_event(Event::PhaseAdded { plan: added })?;
+                    self.grant_pages()?;
+                    if let Some(plan) = &self.run.plan {
+                        self.records.save_plan(&self.id, plan)?;
+                    }
+                    return Ok(());
+                }
+                Err((found, json)) => {
+                    errors = found;
+                    let Some(json) = json.filter(|_| attempt < PLAN_ATTEMPTS) else { break };
+                    eprintln!("taskmaster: the plan for phase {} was rejected; asking for a repair:", phase + 1);
+                    for error in &errors {
+                        eprintln!("taskmaster:   - {error}");
+                    }
+                    answer = self.ask_repair(&goal, &json, &errors).await?;
+                }
+            }
+        }
+        bail!("phase {} could not be planned:\n{}", phase + 1, errors.join("\n"))
+    }
+
+    /// PROJECT.md for this run: the sketch, where each phase stands, and what each finished
+    /// phase landed. Taskmaster writes it from the plan and the change log, so it says what
+    /// actually happened.
+    fn render_project_md(&self) -> String {
+        let Some(plan) = &self.run.plan else { return String::new() };
+        if plan.phases.is_empty() {
+            return String::new();
+        }
+        let mut out = format!("{PROJECT_MARK}\n# Project\n\nA {} project, built one phase at a time.\n\n## Phases\n\n", plan.kind.id());
+        let finished = matches!(self.run.phase, RunPhase::Done);
+        for (i, phase) in plan.phases.iter().enumerate() {
+            let state = if i < self.run.phase_at || (i == self.run.phase_at && finished) {
+                "done"
+            } else if i == self.run.phase_at {
+                "building"
+            } else if self.run.next_phase == Some(i) || self.next_plan.as_ref().is_some_and(|n| n.phase == i) {
+                "planning"
+            } else {
+                "waiting"
+            };
+            out.push_str(&format!("{}. `{}` ({state}): {}\n", i + 1, phase.id, phase.goal.trim()));
+            if !phase.delivers.is_empty() {
+                out.push_str(&format!("   - Delivers: {}\n", phase.delivers.iter().map(|d| format!("`{d}`")).collect::<Vec<_>>().join(", ")));
+            }
+            if !phase.test.is_empty() {
+                out.push_str(&format!("   - Tests: `{}`\n", phase.test));
+            }
+            if !phase.interfaces.trim().is_empty() {
+                out.push_str("   - Interfaces:\n\n");
+                for line in phase.interfaces.trim().lines() {
+                    out.push_str(&format!("         {line}\n"));
+                }
+                out.push('\n');
+            }
+        }
+        let mut landed = String::new();
+        for (i, phase) in plan.phases.iter().enumerate().take(self.run.phase_at + 1) {
+            let mut lines = Vec::new();
+            for page in plan.pages.iter().filter(|p| p.phase == i) {
+                let mut files: Vec<String> = self
+                    .changes
+                    .iter()
+                    .filter(|c| matches!(c.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired) && c.page.as_deref() == Some(page.id.as_str()))
+                    .flat_map(|c| c.files.iter().cloned())
+                    .collect();
+                files.sort();
+                files.dedup();
+                if !files.is_empty() {
+                    lines.push(format!("- `{}`: {}\n", page.id, files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")));
+                }
+            }
+            if !lines.is_empty() {
+                landed.push_str(&format!("\n### Phase {}: `{}`\n\n", i + 1, phase.id));
+                landed.extend(lines);
+            }
+        }
+        if !landed.is_empty() {
+            out.push_str("\n## What landed\n");
+            out.push_str(&landed);
+        }
+        out
+    }
+
+    /// Where PROJECT.md goes: the project root, unless the project has a PROJECT.md of its
+    /// own, which is never overwritten.
+    fn project_md_path(&self) -> Option<PathBuf> {
+        let root = self.tree.join(PROJECT_FILE);
+        match fs::read_to_string(&root) {
+            Ok(text) if !text.starts_with(PROJECT_MARK) => None,
+            _ => Some(root),
+        }
+    }
+
+    /// Write PROJECT.md and commit it. A run with no sketch has none.
+    fn write_project_md(&mut self, message: &str) -> anyhow::Result<()> {
+        let md = self.render_project_md();
+        self.project_md = md.clone();
+        if md.is_empty() {
+            return Ok(());
+        }
+        let Some(path) = self.project_md_path() else { return Ok(()) };
+        fs::write(&path, &md)?;
+        if let Err(err) = git::commit_paths(&self.tree, message, &[PROJECT_FILE.to_string()]) {
+            eprintln!("taskmaster: PROJECT.md was written but not committed: {err:#}");
+        }
+        Ok(())
+    }
+
+    /// Keep the run's tree as it is now under `refs/taskmaster/<run>/<name>`, without
+    /// touching any working tree, so a later step can be rolled back to it.
+    fn checkpoint(&self, name: &str) -> Option<String> {
+        let head = git::head(&self.tree).ok()?;
+        let reference = format!("refs/taskmaster/{}/{name}", self.id);
+        match git::git(&self.tree, &["update-ref", &reference, &head]) {
+            Ok(_) => Some(reference),
+            Err(err) => {
+                eprintln!("taskmaster: checkpoint {name} was not kept: {err:#}");
+                None
+            }
+        }
     }
 
     /// An empty project whose stored Dictionary entries all fit in the brief: there is
@@ -804,6 +1092,7 @@ impl Driver {
              saying how it knows it is finished.\n",
         );
         brief.push_str(&crate::small::plan_shape());
+        brief.push_str(crate::small::PHASES_RULE);
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
@@ -871,6 +1160,17 @@ impl Driver {
             Command::LockContracts => {
                 self.lock()?;
                 self.persist()?;
+                // The next phase depends only on the interfaces just locked: plan it while
+                // this one builds.
+                let next = self.run.phase_at + 1;
+                let overlaps = self.plan()?.phases.get(next).is_some_and(|phase| phase.overlaps());
+                if overlaps && self.next_plan.is_none() {
+                    self.start_phase_plan(next)?;
+                }
+                Ok(Step::Continue)
+            }
+            Command::NextPhase { phase } => {
+                self.next_phase(phase).await?;
                 Ok(Step::Continue)
             }
             Command::SpawnWorker { .. } => bail!("a worker spawn was queued behind another command"),
@@ -898,6 +1198,10 @@ impl Driver {
                 Ok(Step::Continue)
             }
             Command::Finish { ok } => {
+                if ok {
+                    self.write_project_md("taskmaster: every phase landed")?;
+                    self.checkpoint("done");
+                }
                 self.settle_commons(ok)?;
                 self.deliver(ok);
                 self.write_status(ok)?;
@@ -1436,6 +1740,14 @@ impl Driver {
             keys,
             summary: format!("locked {} contract files for {} pages", plan.contracts.len(), plan.pages.len()),
         };
+        let md = self.render_project_md();
+        if !md.is_empty()
+            && let Some(path) = self.project_md_path()
+        {
+            fs::write(&path, &md)?;
+            files.push(PROJECT_FILE.to_string());
+        }
+        self.project_md = md;
         self.commit_entries(vec![entry], files, "taskmaster: lock contracts")?;
         eprintln!("taskmaster: locked contracts");
         Ok(())
@@ -1702,14 +2014,30 @@ impl Driver {
             timings.append(&mut ran.timings);
             // A failure no unit owns goes to the master, for as many repairs as the run has left.
             while ran.pages.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) && self.shared_repairs() < MAX_SHARED_REPAIRS {
+                let before = self.checkpoint(&format!("before-repair-{}", self.shared_repairs() + 1));
+                let repaired_before = self.changes.len();
                 if ran.shared.is_empty() {
                     let output = ran.unowned.clone().unwrap_or_default();
                     self.repair_unowned(&output).await?;
                 } else {
                     self.repair_shared(&ran.shared).await?;
                 }
+                let earlier = ran;
                 ran = self.runtime_checks(&owners, &routes, None).await?;
                 timings.append(&mut ran.timings);
+                // The repair broke units that were passing: put its files back as they were,
+                // keep the failure it was meant to fix, and let the next repair try again.
+                if !ran.pages.is_empty()
+                    && let Some(reference) = before
+                {
+                    let files: Vec<String> = self.changes[repaired_before..].iter().flat_map(|c| c.files.clone()).collect();
+                    let broke: Vec<String> = ran.pages.keys().cloned().collect();
+                    if !files.is_empty() {
+                        eprintln!("taskmaster: the repair broke {}; rolling its files back", broke.join(", "));
+                        self.rollback(&reference, &files, &format!("taskmaster: roll back a repair that broke {}", broke.join(", ")))?;
+                        ran = Ran { timings: Vec::new(), ..earlier };
+                    }
+                }
             }
             failing.extend(ran.pages);
             if failing.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) {
@@ -1968,6 +2296,33 @@ impl Driver {
 
     fn shared_repairs(&self) -> usize {
         self.changes.iter().filter(|entry| entry.kind == ChangeKind::SharedRepaired).count()
+    }
+
+    /// Put `files` back as they are at checkpoint `reference` (removing those it did not
+    /// have) and commit that. Only the run's own tree is touched, with plain file writes.
+    fn rollback(&mut self, reference: &str, files: &[String], message: &str) -> anyhow::Result<()> {
+        let mut paths = Vec::new();
+        for file in files.iter().filter(|f| git::safe_rel(f)) {
+            let dest = self.tree.join(file);
+            match git::git_bytes(&self.tree, &["show", &format!("{reference}:{file}")]) {
+                Ok(bytes) => {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&dest, bytes)?;
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&dest);
+                }
+            }
+            paths.push(file.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        if let Err(err) = git::commit_paths(&self.tree, message, &paths) {
+            eprintln!("taskmaster: the rollback was written but not committed: {err:#}");
+        }
+        Ok(())
     }
 
     /// The run's own Python environment for verify, made on first use and kept for the run.
@@ -2628,7 +2983,10 @@ impl Driver {
 
     /// The command the current phase's tests run with, when the sketch named one.
     fn phase_test(&self) -> Option<String> {
-        None
+        let plan = self.run.plan.as_ref()?;
+        let phase = plan.phases.get(self.run.phase_at)?;
+        let test = phase.test.trim();
+        (!test.is_empty()).then(|| format!("`{test}`"))
     }
 
     /// The short list a builder works down. It always ends with running the tests, when the
@@ -3075,6 +3433,10 @@ impl Driver {
     fn plan_summary(&self) -> String {
         let Some(plan) = &self.run.plan else { return "No plan is recorded.".into() };
         let mut out = String::from("Plan awaiting approval. Re-run with --yes to build it.\n");
+        for (i, phase) in plan.phases.iter().enumerate() {
+            let when = if i == 0 { "planned below" } else { "planned once the phase before it locks its interfaces" };
+            out.push_str(&format!("phase {}: {} - {} ({when})\n", i + 1, phase.id, phase.goal));
+        }
         for page in &plan.pages {
             let cites = if page.cites.is_empty() { "-".to_string() } else { page.cites.join(", ") };
             out.push_str(&format!("- {} {} owns `{}` cites {}\n", page.id, page.route, page.owned_glob, cites));
@@ -3419,6 +3781,15 @@ const RELEASE: &str = "RELEASE";
 /// Contracts up to this many bytes in total are given in full in each worker's brief.
 const CONTRACTS_INLINE: usize = 24_000;
 
+/// Taskmaster's sketch of a phased run, at the project root.
+const PROJECT_FILE: &str = "PROJECT.md";
+/// The first line of a PROJECT.md Taskmaster wrote. One without it is the project's own.
+const PROJECT_MARK: &str = "<!-- Written by Taskmaster from the run's sketch and change log. -->";
+
+/// Planning calls before a run gives up: the first plan, then repairs of it (or, when a
+/// reply had no plan in it at all, one more full plan).
+const PLAN_ATTEMPTS: usize = 3;
+
 /// How a worker with Code Mode is told to work, in the shared prefix.
 const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, grep, ls, \
 sh, test, check and browser. Batch your work into a few scripts rather than many single tool calls: one script loads what \
@@ -3686,6 +4057,20 @@ fn kind_name(kind: EntryKind) -> &'static str {
 }
 
 /// The settings fixed when the run first started. A resumed run keeps them.
+/// A plan as the planner writes it, for a repair call: `units`, not `pages`.
+fn plan_json(plan: &Plan, drafts: &[DraftEntry]) -> String {
+    let value = serde_json::json!({
+        "kind": plan.kind,
+        "design": plan.design,
+        "phases": plan.phases,
+        "contracts": plan.contracts,
+        "units": plan.pages,
+        "estimate": { "tokens": 0, "usd": 0 },
+        "dictionary": drafts,
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
 /// Whether a refused call (`tool target`) needed a shell or the network, which no later
 /// attempt in this run will be given.
 fn needs_capability(refused: &str) -> bool {

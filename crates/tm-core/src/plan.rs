@@ -466,6 +466,7 @@ mod tests {
                 PagePlan { route: "".into(), ui: Some(true), ..module("console", "web/**") },
             ],
             design: String::new(),
+            phases: vec![],
             estimate: Estimate { tokens: 0, usd: -3.0 },
             ..Default::default()
         };
@@ -539,6 +540,7 @@ mod tests {
             ],
             estimate: Estimate { tokens: 0, usd: -1.0 },
             design: "palette".into(),
+            phases: vec![],
         };
         let drafts = [DraftEntry { key: "theme".into(), kind: EntryKind::Hint, summary: " ".into(), content: "b".into(), stack: String::new() }, DraftEntry { key: "bad key".into(), kind: EntryKind::Hint, summary: "s".into(), content: "c".into(), stack: String::new() }];
         let found = rejections(&broken, &drafts, &existing);

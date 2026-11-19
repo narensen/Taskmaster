@@ -102,6 +102,8 @@ pub enum Event {
     VerifyFinished { failing: BTreeMap<PageId, String>, ok: bool },
     /// The page's citations still match the last build, so it was not rebuilt.
     PageFresh { page: PageId },
+    /// The next phase of the sketch was planned: its units and contracts join the plan.
+    PhaseAdded { plan: Plan },
     /// A note arrived after the run had finished. The master reads it, then the pages
     /// are built again.
     FollowUp,
@@ -122,6 +124,9 @@ pub enum Command {
     /// Have a second agent confirm each finding before any worker is asked to repair it.
     VerifyFindings { findings: Vec<Finding> },
     RunVerify,
+    /// The current phase passed its checks: record what it landed, then plan (or take the
+    /// plan already made for) phase `phase` and add it.
+    NextPhase { phase: usize },
     Finish { ok: bool },
 }
 
@@ -141,6 +146,12 @@ pub struct Run {
     /// [`MAX_FOCUSED_REPAIRS`] and then fails. Set by the executor from its configuration.
     #[serde(default)]
     pub focused: bool,
+    /// The phase of the sketch being built, from 0. A run with no sketch stays at 0.
+    #[serde(default)]
+    pub phase_at: usize,
+    /// Set while the next phase is being planned, after the current one passed.
+    #[serde(default)]
+    pub next_phase: Option<usize>,
 }
 
 impl Run {
@@ -155,6 +166,8 @@ impl Run {
             pending_findings: Vec::new(),
             max_parallel: max_parallel.max(1),
             focused: false,
+            phase_at: 0,
+            next_phase: None,
         }
     }
 
@@ -299,8 +312,41 @@ impl Run {
                 }
             }
             (RunPhase::Verifying, Event::VerifyFinished { ok: true, .. }) => {
-                self.phase = RunPhase::Done;
-                out.push(Command::Finish { ok: true });
+                let phases = self.plan.as_ref().map_or(0, |plan| plan.phases.len());
+                if self.phase_at + 1 < phases {
+                    // This phase is done; the next one is planned (or was, while this one
+                    // built) and joins the run.
+                    let next = self.phase_at + 1;
+                    self.phase = RunPhase::Building;
+                    self.next_phase = Some(next);
+                    out.push(Command::NextPhase { phase: next });
+                } else {
+                    self.phase = RunPhase::Done;
+                    out.push(Command::Finish { ok: true });
+                }
+            }
+            (RunPhase::Building, Event::PhaseAdded { plan: added }) if self.next_phase.is_some() => {
+                let next = self.next_phase.take().unwrap_or(self.phase_at + 1);
+                self.phase_at = next;
+                let Some(plan) = self.plan.as_mut() else { return out };
+                for mut page in added.pages {
+                    if self.pages.contains_key(&page.id) {
+                        continue;
+                    }
+                    page.phase = next;
+                    self.pages.insert(
+                        page.id.clone(),
+                        PageRun { state: PageState::Queued, tier: Tier::Worker, repairs: 0, stale: false, pending_errors: None },
+                    );
+                    plan.pages.push(page);
+                }
+                for contract in added.contracts {
+                    if !plan.contracts.iter().any(|c| c.path == contract.path) {
+                        plan.contracts.push(contract);
+                    }
+                }
+                out.push(Command::LockContracts);
+                self.settle(&mut out);
             }
             (RunPhase::Done | RunPhase::Failed, Event::FollowUp) => {
                 self.phase = RunPhase::Building;
@@ -395,8 +441,9 @@ impl Run {
     /// Start queued pages up to the parallel limit, then advance the phase if nothing is left.
     fn settle(&mut self, out: &mut Vec<Command>) {
         let mut running = self.count(PageState::Building);
+        // Units of a later phase wait for theirs; a repair of an earlier one may run.
         let order: Vec<PageId> = match &self.plan {
-            Some(plan) => plan.pages.iter().map(|p| p.id.clone()).collect(),
+            Some(plan) => plan.pages.iter().filter(|p| p.phase <= self.phase_at).map(|p| p.id.clone()).collect(),
             None => return,
         };
         for id in order {
@@ -460,10 +507,12 @@ mod tests {
                     done: String::new(),
                     units: vec![],
                     skills: vec![],
+                    phase: 0,
                 })
                 .collect(),
             estimate: Estimate { tokens: 0, usd: 0.0 },
             design: String::new(),
+            phases: vec![],
         }
     }
 
@@ -555,6 +604,30 @@ mod tests {
         }
         assert_eq!(seen, vec![Tier::Worker; MAX_FOCUSED_REPAIRS as usize], "same model, so no escalation");
         assert_eq!(run.phase, RunPhase::Failed);
+    }
+
+    #[test]
+    fn a_sketched_run_builds_one_phase_at_a_time() {
+        let mut first = plan(&[("protocol", &[])]);
+        first.phases = vec![
+            crate::types::PhaseSketch { id: "protocol".into(), goal: "parse".into(), ..Default::default() },
+            crate::types::PhaseSketch { id: "server".into(), goal: "serve".into(), ..Default::default() },
+        ];
+        let mut run = Run::new(4);
+        run.step(Event::PlanReady(first));
+        run.step(Event::PlanApproved);
+        assert_eq!(run.step(finished("protocol", WorkerOutcome::Passed)), vec![Command::RunVerify]);
+        // The first phase passed: the run asks for the next one instead of finishing.
+        let next = run.step(Event::VerifyFinished { ok: true, failing: BTreeMap::new() });
+        assert_eq!(next, vec![Command::NextPhase { phase: 1 }]);
+        assert_eq!((run.phase, run.next_phase), (RunPhase::Building, Some(1)));
+        let added = plan(&[("server", &[]), ("protocol", &[])]);
+        let cmds = run.step(Event::PhaseAdded { plan: added });
+        assert_eq!(cmds, vec![Command::LockContracts, spawn("server", Tier::Worker, None)], "a known id is not added twice");
+        assert_eq!(run.phase_at, 1);
+        assert_eq!(run.plan.as_ref().unwrap().pages.iter().find(|p| p.id == "server").unwrap().phase, 1);
+        assert_eq!(run.step(finished("server", WorkerOutcome::Passed)), vec![Command::RunVerify]);
+        assert_eq!(run.step(Event::VerifyFinished { ok: true, failing: BTreeMap::new() }), vec![Command::Finish { ok: true }]);
     }
 
     #[test]

@@ -6,6 +6,15 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
+/// [`git`], with the output as bytes: a file's content, which need not be text.
+pub fn git_bytes(repo: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let out = Command::new("git").arg("-C").arg(repo).args(args).output().context("failed to run git")?;
+    if !out.status.success() {
+        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
 pub fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")

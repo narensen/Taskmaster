@@ -2,26 +2,94 @@ name: release
 
 # A v* tag builds and publishes:
 #   - the Linux tarball for servers and headless use (tm-daemon, tm-review, tm-commons, the app);
-#   - the desktop app, signed, for macOS (.dmg, Apple silicon and Intel), Linux (.AppImage,
-#     .deb) and Windows (.msi, .exe), with the updater manifest latest.json;
+#   - the desktop app for macOS (.dmg and .app.tar.gz, Apple silicon and Intel), Linux
+#     (.AppImage, .deb) and Windows (.msi, -setup.exe), with the updater manifest latest.json;
 #   - SHA256SUMS.txt for every file in the release.
+#
+# Run it by hand (Actions > release > Run workflow) for a dry run: every target is built the
+# same way and kept as a workflow artifact for a few days, and nothing is published. No tag,
+# no release, no latest.json.
 #
 # Secrets (Settings > Secrets and variables > Actions). See docs/RELEASING.md.
 #   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD  updater signatures (required)
 #   TAURI_UPDATER_PUBKEY                                           the matching public key (required)
-#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
-#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID                         macOS signing and notarizing (optional)
-#   WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD               Windows code signing (optional)
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY
+#                                                                  macOS signing (optional; ad hoc without them)
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID                        notarizing (optional; needs the three above)
+#   WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD              Windows code signing (optional)
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version stamped into the dry-run build, numbers only (for example 0.1.3). Empty: 0.0.<run number>."
+        required: false
+        default: ""
+      targets:
+        description: Desktop targets to build
+        type: choice
+        default: all
+        options: [all, mac, linux, windows]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      # A case-insensitive checkout (macOS, Windows) keeps only one of two such paths.
+      - run: scripts/check-case.sh
+      - name: Version, publishing, and targets
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            version=${GITHUB_REF_NAME#v}
+            publish=true
+            targets=all
+          else
+            version=${INPUT_VERSION:-0.0.$RUN_NUMBER}
+            publish=false
+            targets=${INPUT_TARGETS:-all}
+          fi
+          # The Windows installer (WiX) takes numbers only.
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "version must look like 1.2.3, not $version" >&2; exit 1; }
+          matrix=$(TARGETS="$targets" node -e '
+            const all = [
+              { group: "mac", os: "macos-15", target: "aarch64-apple-darwin" },
+              { group: "mac", os: "macos-15-intel", target: "x86_64-apple-darwin" },
+              { group: "linux", os: "ubuntu-22.04", target: "x86_64-unknown-linux-gnu" },
+              { group: "windows", os: "windows-latest", target: "x86_64-pc-windows-msvc" },
+            ];
+            const want = process.env.TARGETS;
+            console.log(JSON.stringify({ include: all.filter((t) => want === "all" || t.group === want) }));
+          ')
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, publish $publish, targets $targets"
+
   release:
+    needs: preflight
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,8 +99,15 @@ jobs:
         run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "Taskmaster ${GITHUB_REF_NAME#v}" --generate-notes
 
   linux:
-    needs: release
-    runs-on: ubuntu-latest
+    needs: [preflight, release]
+    # A dry run skips `release`; the tarball is still built.
+    if: always() && needs.preflight.result == 'success' && needs.release.result != 'failure' && needs.release.result != 'cancelled'
+    # The oldest supported runner, so the binaries need glibc 2.35 and start on Ubuntu 22.04
+    # and Debian 12, not only on the newest releases.
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      PUBLISH: ${{ needs.preflight.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
@@ -43,41 +118,57 @@ jobs:
       - run: cd web && npm ci && npm run build
       - name: Package
         run: |
-          name="taskmaster-${GITHUB_REF_NAME}-x86_64-linux"
+          name="taskmaster-v${VERSION}-x86_64-linux"
           mkdir "$name"
           cp target/release/tm-daemon target/release/tm-review target/release/tm-commons README.md config.example.json "$name/"
           cp -R deploy "$name/deploy"
           # install.sh copies web/ to ~/.local/share/taskmaster/web, so serve finds it without --web.
           cp scripts/install-release.sh "$name/install.sh"
-          chmod +x "$name/install.sh"
+          cp scripts/uninstall-release.sh "$name/uninstall.sh"
+          chmod +x "$name/install.sh" "$name/uninstall.sh"
           cp -R web/dist "$name/web"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Install, serve, and uninstall from the tarball
+        run: |
+          tmp=$(mktemp -d)
+          tar -xzf taskmaster-v*-x86_64-linux.tar.gz -C "$tmp"
+          export HOME="$tmp/home" && unset XDG_DATA_HOME && mkdir -p "$HOME"
+          "$tmp"/taskmaster-*/install.sh
+          test -x "$HOME/.local/bin/tm-daemon" && test -f "$HOME/.local/share/taskmaster/web/index.html"
+          grep -q 'taskmaster' "$HOME/.profile"
+          mkdir "$tmp/project" && git -C "$tmp/project" init -q
+          "$HOME/.local/bin/tm-daemon" serve "$tmp/project" --bind 127.0.0.1:18737 > "$tmp/serve.log" 2>&1 &
+          pid=$!
+          for _ in $(seq 1 50); do curl -fs http://127.0.0.1:18737/ -o "$tmp/index.html" && break; sleep 0.2; done
+          kill "$pid"
+          grep -q 'id="root"' "$tmp/index.html" || { cat "$tmp/serve.log"; echo "serve did not find the app" >&2; exit 1; }
+          "$HOME/.local/share/taskmaster/uninstall.sh"
+          test ! -e "$HOME/.local/bin/tm-daemon" && test ! -e "$HOME/.local/share/taskmaster"
+          ! grep -q 'taskmaster' "$HOME/.profile"
       - name: Publish
+        if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" taskmaster-*.tar.gz taskmaster-*.sha256 --clobber
+      - name: Keep the dry-run tarball
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: taskmaster-*
+          retention-days: 5
 
   desktop:
-    needs: release
+    needs: [preflight, release]
+    if: always() && needs.preflight.result == 'success' && needs.release.result != 'failure' && needs.release.result != 'cancelled'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          # tm-daemon uses POSIX process groups, PTYs and /proc, so it does not build for
-          # Windows yet. The job runs so the gap is visible, and does not fail the release.
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            experimental: true
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental == true }}
     env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      PUBLISH: ${{ needs.preflight.outputs.publish }}
       HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
@@ -110,11 +201,50 @@ jobs:
             const fs = require("fs");
             const file = "desktop/src-tauri/tauri.conf.json";
             const conf = JSON.parse(fs.readFileSync(file, "utf8"));
-            conf.version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            conf.version = process.env.VERSION;
             if (!process.env.TAURI_UPDATER_PUBKEY) { console.error("TAURI_UPDATER_PUBKEY is not set"); process.exit(1); }
             conf.plugins.updater.pubkey = process.env.TAURI_UPDATER_PUBKEY;
             fs.writeFileSync(file, JSON.stringify(conf, null, 2));
           '
+      # Tauri treats a variable that is set but empty as given, and then tries to import an
+      # empty certificate. So the Apple variables are exported only when the secrets hold
+      # something. Without a certificate the app is signed ad hoc (tauri.conf.json has "-"),
+      # which runs once the quarantine flag is cleared.
+      - name: Apple signing, when its secrets are set
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          put() { printf '%s<<TM_EOF_%s\n%s\nTM_EOF_%s\n' "$1" "$1" "$2" "$1" >> "$GITHUB_ENV"; }
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            put APPLE_CERTIFICATE "$APPLE_CERTIFICATE"
+            put APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
+            put APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
+            node -e '
+              const fs = require("fs");
+              const file = "desktop/src-tauri/tauri.conf.json";
+              const conf = JSON.parse(fs.readFileSync(file, "utf8"));
+              conf.bundle.macOS = { ...conf.bundle.macOS, signingIdentity: process.env.APPLE_SIGNING_IDENTITY, hardenedRuntime: true };
+              fs.writeFileSync(file, JSON.stringify(conf, null, 2));
+            '
+            echo "signing with the Developer ID certificate"
+            if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+              put APPLE_ID "$APPLE_ID"
+              put APPLE_PASSWORD "$APPLE_PASSWORD"
+              put APPLE_TEAM_ID "$APPLE_TEAM_ID"
+              echo "and notarizing"
+            else
+              echo "not notarizing: APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID are not all set"
+            fi
+          else
+            echo "no Apple certificate: signing ad hoc"
+          fi
       - name: Windows signing certificate
         if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
         shell: pwsh
@@ -130,29 +260,49 @@ jobs:
           $conf = Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = "sha256"; timestampUrl = "http://timestamp.digicert.com" } -Force
           $conf | ConvertTo-Json -Depth 20 | Set-Content desktop/src-tauri/tauri.conf.json
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build, and publish on a tag
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: desktop/src-tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: Taskmaster ${{ github.ref_name }}
+          # Without a tag the action only builds: nothing is uploaded to a release.
+          tagName: ${{ env.PUBLISH == 'true' && github.ref_name || '' }}
+          releaseName: ${{ env.PUBLISH == 'true' && format('Taskmaster {0}', github.ref_name) || '' }}
           releaseDraft: false
-          includeUpdaterJson: true
+          includeUpdaterJson: ${{ env.PUBLISH == 'true' }}
           updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }}
+      - name: Check the macOS bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app=$(find "desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' | head -n 1)
+          test -n "$app" || { echo "no .app was built" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test -x "$app/Contents/MacOS/tm-daemon" || { echo "the sidecar is missing from the bundle" >&2; exit 1; }
+          test -f "$app/Contents/Resources/web/index.html" || { echo "the web app is missing from the bundle" >&2; exit 1; }
+          ls "desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/"*.dmg
+      - name: Keep the dry-run installers
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz*
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage*
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi*
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe*
+          if-no-files-found: error
+          retention-days: 5
 
   checksums:
-    needs: [linux, desktop]
-    if: always() && needs.linux.result == 'success'
+    needs: [preflight, linux, desktop]
+    if: always() && needs.preflight.outputs.publish == 'true' && needs.linux.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: SHA256SUMS.txt for every file in the release

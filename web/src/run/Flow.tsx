@@ -192,6 +192,53 @@ const ItemView = memo(function ItemView({ item, done, seconds, force }: { item: 
 /** Rows an agent draws before older ones fold behind a button. Keeps a long run's page small. */
 const ROWS_SHOWN = 120;
 
+type PhaseState = "done" | "checking" | "building" | "planning" | "waiting";
+
+/** Where each phase of the sketch stands, from the run's position in it. */
+function phaseStates(detail: RunDetail): PhaseState[] {
+  const phases = detail.plan?.phases ?? [];
+  const at = detail.phase_at ?? 0;
+  const finished = detail.phase === "done";
+  return phases.map((_, i) => {
+    if (i < at || (i === at && finished)) return "done";
+    if (i === at) return detail.phase === "verifying" ? "checking" : "building";
+    if (detail.next_phase === i) return "planning";
+    return "waiting";
+  });
+}
+
+/** The sketch as a vertical list: each phase with its state, the active one open with its units. */
+function PhaseList({ detail }: { detail: RunDetail }) {
+  const phases = detail.plan?.phases ?? [];
+  if (!phases.length) return null;
+  const states = phaseStates(detail);
+  const pages = detail.plan?.pages ?? [];
+  return (
+    <ol className="flow-phases" data-testid="phases" aria-label="Phases">
+      {phases.map((phase, i) => {
+        const open = states[i] === "building" || states[i] === "checking";
+        const units = pages.filter((p) => (p.phase ?? 0) === i);
+        return (
+          <li key={phase.id} className={`flow-phase ${states[i]}`} data-state={states[i]}>
+            <div className="flow-phase-line">
+              <span className="flow-phase-mark" aria-hidden>
+                {states[i] === "done" ? "✓" : open ? "●" : "○"}
+              </span>
+              <span className="mono">{phase.id}</span>
+              <span className="flow-state">{states[i]}</span>
+            </div>
+            <p className="flow-life">{phase.goal}</p>
+            {open && units.length > 0 && (
+              <p className="flow-life mono">{units.map((u) => u.id).join(" · ")}</p>
+            )}
+            {open && phase.test && <p className="flow-life mono">$ {phase.test}</p>}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 function PlanBlock({ plan }: { plan: Plan }) {
   return (
     <div className="flow-plan" data-testid="locked-plan">
@@ -420,7 +467,14 @@ export function Flow({
             detail={detail}
             focused={focus === surface.id}
             force={blown.has(surface.id)}
-            plan={surface.id === "master" && detail.plan ? <PlanBlock plan={detail.plan} /> : undefined}
+            plan={
+              surface.id === "master" && detail.plan ? (
+                <>
+                  <PlanBlock plan={detail.plan} />
+                  <PhaseList detail={detail} />
+                </>
+              ) : undefined
+            }
             ask={
               <>
                 {surface.id === "master" ? ask : null}

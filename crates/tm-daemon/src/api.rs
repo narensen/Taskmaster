@@ -641,6 +641,8 @@ impl App {
             "spent": totals(&self.records().ledger(id)?),
             "review_rounds": run.review_rounds,
             "amendments": run.amendments,
+            "phase_at": run.phase_at,
+            "next_phase": run.next_phase,
         }))
     }
 

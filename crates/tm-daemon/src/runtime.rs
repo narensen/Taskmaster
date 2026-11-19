@@ -27,6 +27,9 @@ use tokio::process::Command;
 /// Output kept from a failed step: the end, where the errors are.
 const KEEP: usize = 6000;
 
+/// The UI checks of one page may take this long.
+const AUDIT_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
     pub name: String,
@@ -241,6 +244,8 @@ pub fn is_built_next(tree: &Path) -> bool {
 pub struct Browsed {
     /// Errors per page, ready to hand to the page's owner.
     pub pages: BTreeMap<PageId, String>,
+    /// What the free UI checks found on each page (see `audit.rs`).
+    pub audits: BTreeMap<PageId, crate::audit::Audit>,
     pub screenshots: Vec<(PageId, Vec<u8>)>,
     /// What could not be checked, and why.
     pub notes: Vec<String>,
@@ -427,6 +432,16 @@ pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<
             browsed.screenshots.push((page.clone(), bytes));
         }
         let found = problems(&browser.events, &session, &url, dynamic);
+        // A page that loaded gets the UI checks; one that failed to has nothing to look at.
+        if found.iter().all(|p| !p.starts_with("the page answered") && !p.starts_with("the page did not load")) {
+            match tokio::time::timeout(AUDIT_TIMEOUT, crate::audit::audit(&mut browser, &session)).await {
+                Ok(Ok(audit)) => {
+                    browsed.audits.insert(page.clone(), audit);
+                }
+                Ok(Err(err)) => browsed.notes.push(format!("the UI checks of {path} did not finish: {err:#}")),
+                Err(_) => browsed.notes.push(format!("the UI checks of {path} took longer than {} seconds", AUDIT_TIMEOUT.as_secs())),
+            }
+        }
         if !found.is_empty() {
             let text = found.iter().map(|p| format!("In the browser at {path}: {p}")).collect::<Vec<_>>().join("\n");
             browsed.pages.insert(page.clone(), text);

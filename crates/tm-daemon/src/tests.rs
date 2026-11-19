@@ -49,6 +49,8 @@ enum Mode {
     Stall,
     /// Pages are UI files; the checker asks for one fix on page `a` and passes the rest.
     Checked,
+    /// The planner thinks, keeps calling tools, and never writes, until it is stopped.
+    Overthink,
 }
 
 struct World {
@@ -92,6 +94,17 @@ impl Harness for Fake {
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
+        let planning = task.brief.contains("Plan this product and lock its contracts.") || task.brief.contains("Plan this small product quickly.");
+        if matches!(self.0.mode, Mode::Overthink) && planning && !task.brief.contains("You were stopped because") {
+            self.0.calls.lock().unwrap().push(format!("{}\n[effort={}][dictionary={}]", task.brief, task.effort.as_deref().unwrap_or("default"), task.dictionary.is_some()));
+            let _ = events.send(HarnessEvent::Thought { text: "One page, a greeting card, cites greet.".into() }).await;
+            for n in 0..30 {
+                let input = serde_json::json!({ "path": format!("dir{n}") });
+                let _ = events.send(HarnessEvent::ToolCall { id: format!("look{n}"), name: "list_dir".into(), input }).await;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            anyhow::bail!("the planner was never stopped");
+        }
         let script = self.0.respond(&task).await?;
         // Thoughts and tool calls go to the transcript, never into the answer.
         let _ = events.send(HarnessEvent::Thought { text: "thinking".into() }).await;
@@ -796,6 +809,35 @@ async fn a_prompt_locks_the_plan_and_publishes_the_dictionary() {
     assert!(read(&run_directory(&tmp.0, "current").join("plan.json")).contains("\"a\""));
     let calls = world.calls.lock().unwrap().clone();
     assert!(calls.iter().any(|call| call.contains("Build page `a`") && call.contains("export const greet = \"hi\"")));
+}
+
+#[tokio::test]
+async fn a_planner_that_keeps_looking_is_stopped_and_writes_the_plan_from_its_notes() {
+    let tmp = repo("overthink");
+    git(&tmp.0, &["commit", "--allow-empty", "-q", "-m", "init"]);
+    let world = World::new(Mode::Overthink);
+    let outcome = run(prompt_config(&tmp.0, "Build page a with a greeting.", true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = planner_calls(&world);
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert!(calls[1].contains("You were stopped because it had made"), "{}", calls[1]);
+    assert!(calls[1].contains("Your notes so far:\nOne page, a greeting card, cites greet."), "{}", calls[1]);
+    assert!(calls[1].contains("[effort=low][dictionary=false]"), "{}", calls[1]);
+}
+
+#[tokio::test]
+async fn an_empty_project_is_planned_without_tools_and_told_to_decide() {
+    let tmp = repo("fresh");
+    git(&tmp.0, &["commit", "--allow-empty", "-q", "-m", "init"]);
+    let world = World::new(Mode::Plan);
+    // Long enough for the full planning pass rather than the small one.
+    let prompt = format!("Build page a with a greeting. {}", "It is a card with a title, a short line of text, and a button. ".repeat(5));
+    let outcome = run(prompt_config(&tmp.0, &prompt, true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let first = &planner_calls(&world)[0];
+    assert!(first.contains("Plan this product and lock its contracts."), "{first}");
+    assert!(first.contains("you need no tools") && first.contains("Decide quickly"), "{first}");
+    assert!(first.contains("[effort=medium][dictionary=false]"), "{first}");
 }
 
 #[tokio::test]

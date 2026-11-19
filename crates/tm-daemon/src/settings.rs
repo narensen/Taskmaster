@@ -39,6 +39,32 @@ pub struct Settings {
     pub code_mode: CodeModeSettings,
     /// Off until a person turns it on. See `telemetry.rs`.
     pub telemetry: TelemetrySettings,
+    /// How long one agent call may run.
+    pub agents: AgentSettings,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    /// Seconds one agent call may run before it is stopped. 0 means no limit.
+    pub timeout_secs: u64,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        AgentSettings { timeout_secs: DEFAULT_AGENT_SECS }
+    }
+}
+
+/// Ten minutes, the limit a fresh install has.
+pub const DEFAULT_AGENT_SECS: u64 = 600;
+
+/// What "no limit" becomes: long enough never to matter, short enough to add to a clock.
+pub const NO_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// The limit for `secs`, where 0 means none.
+pub fn agent_limit(secs: u64) -> std::time::Duration {
+    if secs == 0 { NO_LIMIT } else { std::time::Duration::from_secs(secs) }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -21,21 +21,33 @@ pub const SMALL_EFFORT: &str = "low";
 
 /// What the planner must say about the look and the accessibility of anything shown in a
 /// browser. Workers run at low effort: the precision has to come from the plan.
-pub const DESIGN_RULE: &str = "`design` is the one design spec every agent follows, written for a finished, polished product: \
-palette (hex for background, surface, border, text, muted text, accent, danger; text contrast at least 4.5:1), \
-type (font stack, base size, heading and small sizes), spacing scale, radius and shadow, component look \
-(buttons, inputs, list rows, checkbox, hover, `:focus-visible` ring, done and disabled states), the empty-state copy, \
-and responsive layout (max width, phone breakpoint, tap targets of 44px). Accessibility rules: \
+pub const DESIGN_RULE: &str = "`design` is the one design system every agent follows, written for a finished, polished product, \
+in short lines: palette (hex for background, surface, border, text, muted text, accent, danger; text contrast at least 4.5:1); \
+type scale (font stack, base 16px, h1, h2 and small sizes); spacing scale (for example 4/8/12/16/24/32px); radius and shadow; \
+form controls (inputs and buttons inherit the font and are at least 44px tall; checkboxes and radios 18-20px with `accent-color`, \
+never stretched by a rule for text inputs); hover, a visible `:focus-visible` ring, and done and disabled states; \
+headings (exactly one `<h1>` per page naming it, `<h2>` for sections); the empty state (its copy, shown only while a list is empty \
+and hidden as soon as it has an item; a `[hidden]` element must stay hidden even if a class sets `display`); \
+responsive layout (max width, works at 360px wide with no sideways scroll, tap targets of 44px). Accessibility rules: \
 `<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">`, a `<label>` or `aria-label` on every input \
-and checkbox (also ones made in script), `aria-label` on icon-only buttons, a visible focus ring, \
-`prefers-reduced-motion` respected. Robustness: storage and JSON parsing wrapped in try/catch. \
+and checkbox (also ones made in script), `aria-label` on icon-only buttons, `prefers-reduced-motion` respected. \
+Robustness: blank or whitespace-only input adds nothing; user text is shown with `textContent`, never `innerHTML`; \
+storage and JSON parsing are wrapped in try/catch and corrupted saved data falls back to empty. \
 Every `done` repeats the quality bars that apply to that agent's files. Use \"\" when nothing is shown in a browser.\n";
 
-/// Fixed quality bars every agent of a plan with a design spec is held to; the free checks
-/// test the first three.
-pub const QUALITY_BARS: &str = "Quality bars: every HTML page has the viewport meta tag and links its stylesheet; \
-every input, checkbox and icon-only button has a label or aria-label, including ones created in script; \
-focus is visible (`:focus-visible`); layout works at 360px wide; storage and JSON parsing never throw uncaught.\n";
+/// Fixed quality bars every agent of a plan with a design spec is held to. The free checks
+/// test each of them in a browser.
+pub const QUALITY_BARS: &str = "Quality bars, checked in a browser before the run is done: \
+exactly one `<h1>`; every input, checkbox and icon-only button has a label or aria-label, including ones made in script; \
+form controls use the design's sizes (no stretched or unstyled native checkbox, inputs and buttons inherit the font); \
+a visible `:focus-visible` style; no sideways scroll at 360px wide; the empty state is hidden once a list has items; \
+blank input adds nothing; user text is escaped (`textContent`); corrupted localStorage does not break the page.\n";
+
+/// How decisive a planner is told to be. A planner that works out every file in its head
+/// spends the whole time limit and never writes the plan.
+pub const DECIDE_RULE: &str = "Decide quickly: settle the pages, the shared contracts and the design system, then write the JSON at once. \
+Do not work out each file's code or every CSS rule in your head; the workers write those from the design system, and the free \
+checks catch what they miss. A plan written now beats a perfect plan that is never written.\n";
 
 /// The short planning brief. `entries` lists stored Dictionary entries, one per item, already
 /// formatted; they are given in full here, so the master needs no tools at all.
@@ -84,6 +96,7 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
          cited keys are listed above or in `dictionary`; briefs are non-empty.\n",
     );
     brief.push_str(DESIGN_RULE);
+    brief.push_str(DECIDE_RULE);
     brief.push_str(&units_rule(slots));
     if slots >= 2 {
         brief.push_str(
@@ -114,7 +127,8 @@ mod tests {
         assert!(brief.contains("Dictionary is empty"));
         assert!(brief.contains("Do not call any tools"));
         assert!(!brief.contains("Search the Dictionary"));
-        assert!(brief.len() < 2900, "{}", brief.len());
+        // The design system and the decide rule are most of it; keep it near a thousand tokens.
+        assert!(brief.len() < 3800, "{}", brief.len());
         assert!(brief.contains("`design`") && brief.contains("viewport"));
         let listed = small_brief("tiny todo", &["- `todo-dom` (commons, component_api): ids\nul#todo-list\n".into()], "", 3);
         assert!(!listed.contains("Dictionary is empty"));

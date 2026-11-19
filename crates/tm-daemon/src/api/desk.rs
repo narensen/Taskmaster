@@ -934,6 +934,8 @@ pub struct SettingsBody {
     code_mode: Option<bool>,
     /// Anonymous counts. Off until set.
     telemetry: Option<bool>,
+    /// Seconds one agent call may run; 0 is no limit.
+    agent_timeout_secs: Option<u64>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -996,6 +998,12 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
     }
     if let Some(on) = body.telemetry {
         save_setting(&app.project(), "telemetry", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(secs) = body.agent_timeout_secs {
+        if secs != 0 && !(60..=24 * 3600).contains(&secs) {
+            return Err(fail(StatusCode::BAD_REQUEST, "the agent time limit is 0 (no limit), or 60 to 86400 seconds"));
+        }
+        save_setting(&app.project(), "agents", json!({ "timeout_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if !changes.is_empty() {
         save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1073,6 +1081,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "checker": { "enabled": role_defaults.checker.enabled },
         "code_mode": { "enabled": role_defaults.code_mode.enabled },
         "telemetry": { "enabled": role_defaults.telemetry.enabled },
+        "agents": { "timeout_secs": role_defaults.agents.timeout_secs },
         "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "machine": machine(),
@@ -1081,7 +1090,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
 }
 
 const SETTING_KEYS: &[&str] = &[
-    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry",
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents",
 ];
 
 /// Tokens are not part of an export. Host connections live in another file and stay there.
@@ -1148,6 +1157,7 @@ pub async fn reset_settings(State(app): State<Arc<App>>) -> Reply {
         ("checker", json!({ "enabled": false })),
         ("code_mode", json!({ "enabled": false })),
         ("telemetry", json!({ "enabled": false })),
+        ("agents", json!({ "timeout_secs": crate::settings::DEFAULT_AGENT_SECS })),
     ];
     for (key, value) in defaults {
         set_setting(&project, key, value).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;

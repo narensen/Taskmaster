@@ -1,0 +1,2 @@
+A todo app with no build step: plain HTML, CSS and JavaScript in app/.
+Add a task with a text field and an Add button, mark it done with a checkbox, delete it, filter All, Active and Done, and show how many are left. Tasks are kept in localStorage. When there are no tasks, show a short empty-state message.

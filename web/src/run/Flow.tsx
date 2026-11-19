@@ -72,6 +72,30 @@ function statusWord(surface: Surface, phase: Phase | undefined): string {
   return "waiting";
 }
 
+/** How long the agent's open call has run, ticking each second, as `2:05`. */
+function Since({ at }: { at: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const secs = Math.max(0, Math.floor((now - Date.parse(at)) / 1000));
+  const text = secs >= 3600 ? `${Math.floor(secs / 3600)}:${String(Math.floor((secs % 3600) / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}` : `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+  return (
+    <span className="flow-since mono" aria-label={`running for ${text}`}>
+      {text}
+    </span>
+  );
+}
+
+/** While the master writes its plan, how many pages the reply has laid out so far. */
+function planSoFar(call: Call | undefined): number {
+  if (!call) return 0;
+  const text = call.items.map((item) => (item.t === "text" ? item.text : "")).join("");
+  const pages = text.indexOf('"pages"');
+  return pages < 0 ? 0 : (text.slice(pages).match(/"owned_glob"\s*:/g) ?? []).length;
+}
+
 function Think({ text, live, force }: { text: string; live: boolean; force: boolean }) {
   const [open, setOpen] = useState(live);
   useEffect(() => {
@@ -269,6 +293,10 @@ function AgentBlock({
     if (call.end?.error) rest.push({ item: { t: "life", text: call.end.error, at: call.end.at }, call, index: -1, key: `${ci}:err` });
   });
   const planning = master && detail.phase === "planning" && surface.state !== "done" && surface.state !== "failed";
+  // The open call, if one is running: its clock, and the plan's pages as they stream.
+  const open = surface.calls.length ? surface.calls[surface.calls.length - 1] : undefined;
+  const running = open && !open.end ? open : undefined;
+  const written = planning ? planSoFar(running) : 0;
   return (
     <section
       className={`flow-agent ${focused ? "focused" : ""}`}
@@ -280,6 +308,8 @@ function AgentBlock({
       <header className="flow-role">
         <h2>{surface.title}</h2>
         <span className="flow-state">{statusWord(surface, detail.phase)}</span>
+        {running && <Since at={running.at} />}
+        {written > 0 && <span className="flow-state">{written === 1 ? "1 page written" : `${written} pages written`}</span>}
         <span className="flow-by">{byline(surface, detail)}</span>
       </header>
       <div data-agent-text={surface.id}>

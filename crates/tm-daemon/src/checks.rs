@@ -13,8 +13,8 @@ use crate::{runtime, static_site};
 pub const STATIC_TIMEOUT: Duration = Duration::from_secs(60);
 /// The project's own build or test script may take this long, per step.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(180);
-/// Opening the start page in a headless browser may take this long.
-pub const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Opening the pages in a headless browser, with the UI checks on each, may take this long.
+pub const SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Check {

@@ -208,9 +208,32 @@ function Section({ id, title, children, note }: { id?: string; title: string; ch
   );
 }
 
+/** The agent time limits offered, with the one in the settings file if it is another. */
+function limitChoices(current: number): number[] {
+  const offered = [300, 600, 1200, 1800, 3600, 0];
+  return offered.includes(current) ? offered : [...offered.slice(0, -1), current, 0].sort((a, b) => (a === 0 ? 1 : b === 0 ? -1 : a - b));
+}
+
+function limitLabel(secs: number): string {
+  if (secs === 0) return "No limit";
+  if (secs % 3600 === 0) return secs === 3600 ? "1 hour" : `${secs / 3600} hours`;
+  if (secs % 60 === 0) return `${secs / 60} minutes`;
+  return `${secs} seconds`;
+}
+
 const TOC: { group: string; items: [string, string][] }[] = [
   { group: "Connection", items: [["account", "Account"], ["daemon-address", "Daemon address"], ["project-path", "Project path"], ["commons", "Commons"]] },
-  { group: "Agents", items: [["providers-for-each-role", "Providers for each role"], ["telemetry", "Telemetry"], ["tool-approvals", "Tool approvals"]] },
+  {
+    group: "Agents",
+    items: [
+      ["providers-for-each-role", "Providers for each role"],
+      ["time-limit", "Agent time limit"],
+      ["checker", "Mid-tier checker"],
+      ["code-mode", "Code Mode"],
+      ["telemetry", "Telemetry"],
+      ["tool-approvals", "Tool approvals"],
+    ],
+  },
   { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"], ["logs", "Logs"], ["settings-file", "Settings file"]] },
   { group: "Appearance", items: [["motion", "Motion"], ["density", "Density"], ["theme", "Theme"]] },
   { group: "Alerts", items: [["notifications", "Notifications"], ["sound", "Sound"]] },
@@ -249,7 +272,7 @@ export function Settings() {
     const secs = Number(next.timeout);
     if (!Number.isInteger(secs) || secs < 1 || secs > 86400) return;
     api.setApprovals({ approvals: next.mode, approval_timeout_secs: secs }).then(
-      () => toast("Tool approvals saved", `${next.mode}, ${secs}s`),
+      () => toast("Tool approvals saved", `${approvalLabel(next.mode)}, denied after ${secs}s`),
       (err) => toast("Tool approvals were not saved", err instanceof Error ? err.message : String(err)),
     );
   };
@@ -439,6 +462,38 @@ export function Settings() {
           ))}
         </ul>
       </Section>
+
+      {daemon.data && (
+        <Section
+          id="time-limit"
+          title="Agent time limit"
+          note="How long one agent call (a plan, a page, a review) may run before it is stopped. Whatever this is, a planner that has not started writing after a few minutes is asked to write its plan from what it has decided."
+        >
+          <label className="row gap small" data-testid="time-limit">
+            <span className="muted">Stop an agent after</span>
+            <select
+              aria-label="Agent time limit"
+              value={String(daemon.data.agents?.timeout_secs ?? 600)}
+              onChange={(e) => {
+                const secs = Number(e.target.value);
+                void api.setAgentTimeout(secs).then(
+                  (next) => {
+                    daemon.setData(next);
+                    toast("Agent time limit saved", secs === 0 ? "No limit for new runs" : `${limitLabel(secs)} for new runs`);
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                );
+              }}
+            >
+              {limitChoices(daemon.data.agents?.timeout_secs ?? 600).map((secs) => (
+                <option key={secs} value={secs}>
+                  {limitLabel(secs)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </Section>
+      )}
 
       {daemon.data && (
         <Section

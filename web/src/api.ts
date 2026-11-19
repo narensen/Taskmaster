@@ -473,6 +473,8 @@ export interface DaemonSettings {
   checker?: { enabled: boolean };
   code_mode?: { enabled: boolean };
   telemetry?: { enabled: boolean };
+  /** Seconds one agent call may run; 0 is no limit. */
+  agents?: { timeout_secs: number };
 }
 
 export type ApprovalMode = "always" | "risky" | "never";
@@ -735,6 +737,7 @@ export const api = {
   setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
   setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
   setTelemetry: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { telemetry: enabled }),
+  setAgentTimeout: (secs: number) => call<DaemonSettings>("POST", "/api/settings", { agent_timeout_secs: secs }),
   logs: () => call<{ path: string | null; lines: string[] }>("GET", "/api/logs"),
   exportSettings: () => call<{ settings: Record<string, unknown>; note: string }>("GET", "/api/settings/export"),
   importSettings: (settings: unknown) => call<DaemonSettings>("POST", "/api/settings/import", { settings }),

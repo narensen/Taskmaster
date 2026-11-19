@@ -665,6 +665,7 @@ impl App {
         let saved = crate::settings::Settings::load(&self.project()).unwrap_or_default();
         config.checker = saved.checker.enabled;
         config.code_mode = saved.code_mode.enabled;
+        config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
         config.run_id = id.to_string();
         config.plan = request.plan;
         config.prompt = request.prompt;
@@ -672,7 +673,7 @@ impl App {
         config.reject = matches!(decision, Decision::Reject);
         config.parallel = request.parallel.unwrap_or(config.parallel).max(1);
         if let Some(secs) = request.timeout_secs {
-            config.timeout = Duration::from_secs(secs.max(1));
+            config.timeout = crate::settings::agent_limit(secs);
         }
         config.models = request.models;
         config.template = request.template;

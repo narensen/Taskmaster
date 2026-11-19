@@ -4032,3 +4032,5 @@ button.lane-diff { opacity: 0; }
   .setup-first-list li { grid-template-columns: minmax(0, 1fr) auto; }
   .setup-first-cmd { grid-column: 1 / -1; grid-row: 2; }
 }
+/* The open call's clock beside an agent's state. */
+.flow-since { color: var(--muted); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }

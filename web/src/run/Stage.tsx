@@ -243,7 +243,10 @@ export function Stage({ id, detail, entries }: { id: string; detail: RunDetail; 
 
   const frameUrl = appServer(view, route);
   const shown = frameUrl ? "live" : img ? "shot" : doc ? "page" : null;
-  const status = shown ?? (detail.active || detail.phase === "planning" || detail.phase === "awaiting_approval" ? "building" : "idle");
+  // Before anything is built the screen says what the run is doing instead.
+  const status =
+    shown ??
+    (detail.phase === "planning" ? "planning" : detail.phase === "awaiting_approval" ? "waiting for approval" : detail.active ? "building" : "idle");
 
   return (
     <aside ref={root} className={`stage ${grown ? "grown" : ""}`} data-testid="stage" data-status={status} style={{ bottom: lift }}>

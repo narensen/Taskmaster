@@ -33,7 +33,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use anyhow::{Context, bail};
 
@@ -51,7 +50,8 @@ struct Args {
     /// Skip the project's build, its tests and the browser.
     no_runtime_checks: bool,
     parallel: usize,
-    timeout: u64,
+    /// Seconds per agent call; 0 is no limit. None takes the settings file's limit.
+    timeout: Option<u64>,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
     run_id: String,
@@ -133,7 +133,13 @@ async fn run() -> anyhow::Result<Outcome> {
     config.yes = args.yes;
     config.runtime_checks = !args.no_runtime_checks;
     config.parallel = args.parallel;
-    config.timeout = Duration::from_secs(args.timeout);
+    config.timeout = match args.timeout {
+        Some(secs) => tm_daemon::settings::agent_limit(secs),
+        None => {
+            let project = args.project.canonicalize().unwrap_or_else(|_| args.project.clone());
+            tm_daemon::settings::agent_limit(Settings::load(&project).map(|s| s.agents.timeout_secs).unwrap_or(tm_daemon::settings::DEFAULT_AGENT_SECS))
+        }
+    };
     config.dictionary = args.dictionary;
     config.commons = args.commons.clone().or_else(home_commons);
     config.run_id = args.run_id.clone();
@@ -343,7 +349,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         prompt_file: None,
         yes: false,
         parallel: 4,
-        timeout: 600,
+        timeout: None,
         dictionary: None,
         commons: None,
         run_id: "current".into(),
@@ -377,7 +383,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                 args.parallel = need(&mut argv, "--parallel", usage)?.parse().context("--parallel needs a number")?
             }
             "--timeout" => {
-                args.timeout = need(&mut argv, "--timeout", usage)?.parse().context("--timeout needs seconds")?
+                args.timeout = Some(need(&mut argv, "--timeout", usage)?.parse().context("--timeout needs seconds, or 0 for no limit")?)
             }
             "--dictionary" => args.dictionary = Some(need(&mut argv, "--dictionary", usage)?.into()),
             "--commons" => args.commons = Some(need(&mut argv, "--commons", usage)?.into()),

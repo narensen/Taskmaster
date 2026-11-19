@@ -18,6 +18,7 @@ pub mod api;
 pub mod approvals;
 pub mod auth;
 mod browser;
+pub mod audit;
 pub mod commons;
 mod checker;
 mod code;

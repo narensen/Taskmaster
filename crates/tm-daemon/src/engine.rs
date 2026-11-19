@@ -92,6 +92,78 @@ struct AgentRequest {
     browser: Option<String>,
     /// Ask the harness for its native code mode where it has one (Claude Code).
     code_mode: bool,
+    /// For a planner: when to stop looking and write. See [`Commit`].
+    commit: Option<Commit>,
+}
+
+/// When a planner has looked and thought long enough. It is stopped after `tools` tool
+/// calls, or once `after` has passed without a word of its reply, and is then asked once,
+/// with no tools, to write the plan from its own notes.
+#[derive(Debug, Clone, Copy)]
+struct Commit {
+    tools: usize,
+    after: Duration,
+}
+
+/// What [`ask_once`] watches for a [`Commit`] budget.
+#[derive(Default)]
+struct Watched {
+    tools: usize,
+    writing: bool,
+    thoughts: String,
+}
+
+/// The last `max` bytes of `text`, cut at a character boundary.
+fn tail_chars(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let start = (text.len() - max..text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
+    text[start..].to_string()
+}
+
+/// A planner stopped by its [`Commit`] budget: why, and the end of what it was thinking.
+#[derive(Debug)]
+struct Overrun {
+    why: String,
+    notes: String,
+}
+
+impl std::fmt::Display for Overrun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped: {}", self.why)
+    }
+}
+
+impl std::error::Error for Overrun {}
+
+/// The thoughts kept for an [`Overrun`]: enough to write the plan from.
+const OVERRUN_NOTES: usize = 12_000;
+
+/// Reasoning effort for planning an empty project on the full pass.
+const FRESH_EFFORT: &str = "medium";
+
+/// A planner must have begun its reply within this window: 40% of the agent time limit,
+/// kept between these two.
+const COMMIT_AFTER_MIN: Duration = Duration::from_secs(90);
+const COMMIT_AFTER_MAX: Duration = Duration::from_secs(240);
+
+/// How many stored entries a search for everything returns at most.
+const ENTRIES_LISTED: usize = 20;
+
+/// The second planning turn after an [`Overrun`]: the same brief, why it was stopped, and
+/// the planner's own notes, with the order to write the plan now.
+fn commit_brief(brief: &str, why: &str, notes: &str) -> String {
+    let mut out = format!(
+        "{brief}\nYou were stopped because {why}. Do not call any tools and do not deliberate further: \
+         reply now with the plan as one JSON object, from the decisions you already made.\n"
+    );
+    if !notes.trim().is_empty() {
+        out.push_str("\nYour notes so far:\n");
+        out.push_str(notes.trim());
+        out.push('\n');
+    }
+    out
 }
 
 struct Feed {
@@ -217,6 +289,8 @@ struct Driver {
     checks: JoinSet<CheckDone>,
     /// Pages already given to the checker: each is checked once.
     checked: BTreeSet<PageId>,
+    /// UI findings already sent to their page for one repair: (page, check).
+    ui_sent: BTreeSet<(PageId, String)>,
 }
 
 impl Drop for Driver {
@@ -346,6 +420,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         code,
         checks: JoinSet::new(),
         checked: BTreeSet::new(),
+        ui_sent: BTreeSet::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.grant_pages()?;
@@ -451,20 +526,44 @@ impl Driver {
             let token = self.master_token.clone();
             let mut request = self.read_request(
                 &cwd,
-                brief,
+                brief.clone(),
                 self.harnesses.master.clone(),
                 self.config.models.master.clone(),
                 &token,
             )?;
             self.small = self.small_pass(prompt);
-            if self.small {
-                // Every stored entry is in the brief, so the master answers in one turn.
+            let fresh = self.fresh_project()?;
+            if self.small || fresh {
+                // Every stored entry is in the brief, so the master needs no tools.
                 request.dictionary = None;
-                request.effort = Some(crate::small::SMALL_EFFORT.to_string());
             }
+            request.effort = if self.small {
+                Some(crate::small::SMALL_EFFORT.to_string())
+            } else if fresh {
+                Some(FRESH_EFFORT.to_string())
+            } else {
+                None
+            };
+            request.commit = Some(self.commit_budget(self.small || fresh));
             self.tag(&mut request, "master", "planner", None, None);
             let bill = request.bill(Role::Planner, None);
-            let asked = ask(request).await;
+            let mut asked = ask(request).await;
+            // Looked or thought too long: one more turn, with no tools, to write it down.
+            let stopped = asked.as_ref().err().and_then(|err| err.downcast_ref::<Overrun>()).map(|over| (over.why.clone(), over.notes.clone()));
+            if let Some((why, notes)) = stopped {
+                eprintln!("taskmaster: the planner was stopped ({why}); asking it to write the plan now");
+                let mut quick = self.read_request(
+                    &cwd,
+                    commit_brief(&brief, &why, &notes),
+                    self.harnesses.master.clone(),
+                    self.config.models.master.clone(),
+                    &token,
+                )?;
+                quick.dictionary = None;
+                quick.effort = Some(crate::small::SMALL_EFFORT.to_string());
+                self.tag(&mut quick, "master", "planner", None, None);
+                asked = ask(quick).await;
+            }
             if scratch {
                 self.drop_worktree(&cwd);
             }
@@ -503,6 +602,19 @@ impl Driver {
             }
         }
         bail!("plan is not usable:\n{}", errors.join("\n"))
+    }
+
+    /// An empty project whose stored Dictionary entries all fit in the brief: there is
+    /// nothing a planner could find with tools that it is not already given.
+    fn fresh_project(&self) -> anyhow::Result<bool> {
+        Ok(self.existing_files() == 0 && self.entry_listing()?.len() < ENTRIES_LISTED)
+    }
+
+    /// How long a planner may look and think before it must write. A fresh project gives
+    /// it nothing to look at, so a stray tool call or two is all it gets.
+    fn commit_budget(&self, fresh: bool) -> Commit {
+        let after = (self.config.timeout * 2 / 5).clamp(COMMIT_AFTER_MIN, COMMIT_AFTER_MAX);
+        Commit { tools: if fresh { 4 } else { 12 }, after }
     }
 
     /// Project files other than a README and dotfiles, at the top level.
@@ -608,10 +720,16 @@ impl Driver {
             }
             return Ok(brief);
         }
+        let look = if self.fresh_project()? {
+            "The project is empty and every Dictionary entry already stored is listed below, so you need no tools: \
+             do not call any, and plan from this brief alone."
+        } else {
+            "Search the Dictionary before inventing a key."
+        };
         let mut brief = format!(
             "Plan this product and lock its contracts.\n\n\
              Request:\n{prompt}\n\n\
-             Search the Dictionary before inventing a key. Cite an existing entry instead of rewriting it. \
+             {look} Cite an existing entry instead of rewriting it. \
              If you include an existing key, its content must match exactly.\n\n\
              Dictionary entries already stored:\n"
         );
@@ -622,7 +740,7 @@ impl Driver {
         for entry in &found {
             brief.push_str(entry);
         }
-        if found.len() == 20 {
+        if found.len() >= ENTRIES_LISTED {
             brief.push_str("Further entries may be stored. Search the Dictionary before adding a key.\n");
         }
         if let Some(template) = &self.template {
@@ -646,6 +764,7 @@ impl Driver {
              briefs and contents are non-empty.\n",
         );
         brief.push_str(crate::small::DESIGN_RULE);
+        brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
         if !errors.is_empty() {
             brief.push_str("\nThe last plan was rejected:\n");
@@ -991,6 +1110,7 @@ impl Driver {
             feed: None,
             browser: None,
             code_mode: false,
+            commit: None,
         };
         self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
         let bill = request.bill(Role::Checker, Some(page));
@@ -1646,6 +1766,11 @@ impl Driver {
                 for (page, problem) in &browsed.pages {
                     text.push(format!("{page}: {problem}"));
                 }
+                for (page, audit) in &browsed.audits {
+                    for finding in &audit.found {
+                        text.push(format!("{page}: {}", finding.text));
+                    }
+                }
                 let routes: Vec<_> = routes.iter().map(|(page, route)| serde_json::json!({ "page": page, "route": route })).collect();
                 self.terminal("preview", serde_json::json!({ "routes": routes, "shots": browsed.screenshots.len() }));
                 self.terminal("output", serde_json::json!({ "ok": browsed.pages.is_empty(), "text": text.join("\n") }));
@@ -1669,6 +1794,29 @@ impl Driver {
                     browsed.pages.len()
                 );
                 ran.pages = browsed.pages;
+                // A UI finding goes to its page once. If the repair did not fix it, it is a
+                // warning from then on, so a check that misreads a page cannot fail it.
+                for (page, audit) in &browsed.audits {
+                    let mut first = Vec::new();
+                    for finding in &audit.found {
+                        if self.ui_sent.insert((page.clone(), finding.check.clone())) {
+                            first.push(format!("In the browser: {}", finding.text));
+                        } else {
+                            eprintln!("taskmaster: {page} still has a UI problem after its repair, left as a warning: {}", finding.text);
+                        }
+                    }
+                    if !first.is_empty() {
+                        let errors = ran.pages.entry(page.clone()).or_default();
+                        if !errors.is_empty() {
+                            errors.push('\n');
+                        }
+                        errors.push_str(&first.join("\n"));
+                    }
+                }
+                let flagged: usize = browsed.audits.values().map(|a| a.found.len()).sum();
+                if flagged > 0 {
+                    eprintln!("taskmaster: the UI checks found {flagged} problem(s)");
+                }
             }
             Ok(None) => {}
             Err(err) => eprintln!("taskmaster: the browser check did not run: {err:#}"),
@@ -1739,6 +1887,7 @@ impl Driver {
             feed: None,
             browser: None,
             code_mode: false,
+            commit: None,
         };
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
@@ -1948,6 +2097,7 @@ impl Driver {
             feed: None,
             browser: None,
             code_mode: false,
+            commit: None,
         })
     }
 
@@ -2230,6 +2380,7 @@ impl Driver {
             feed: None,
             browser: None,
             code_mode: false,
+            commit: None,
         })
     }
 
@@ -2953,10 +3104,30 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     }
     let (tx, mut rx) = mpsc::channel(256);
     let tee = feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
+    // What a commit budget watches: tool calls, whether the reply has begun, the thoughts.
+    let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
+    let watching = request.commit.is_some().then(|| watch.clone());
     let collect = tokio::spawn(async move {
         // The answer is only the text. Thoughts and tool calls go to the transcript.
         let mut text = String::new();
         while let Some(event) = rx.recv().await {
+            if let Some(watch) = &watching {
+                let mut seen = watch.lock().unwrap();
+                match &event {
+                    HarnessEvent::ToolCall { .. } => seen.tools += 1,
+                    // The plan is a JSON object: its first brace is the reply beginning.
+                    HarnessEvent::Text { text: chunk } => seen.writing |= chunk.contains('{'),
+                    HarnessEvent::Thought { text: chunk } => {
+                        seen.thoughts.push_str(chunk);
+                        if seen.thoughts.len() > 2 * OVERRUN_NOTES {
+                            let cut = seen.thoughts.len() - OVERRUN_NOTES;
+                            let cut = (cut..seen.thoughts.len()).find(|&i| seen.thoughts.is_char_boundary(i)).unwrap_or(0);
+                            seen.thoughts.drain(..cut);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some((live, run, agent)) = &tee {
                 match &event {
                     HarnessEvent::Text { text: chunk } => live.push(run, agent, "text", serde_json::json!({ "text": chunk })),
@@ -2989,8 +3160,37 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         text
     });
     let started = Instant::now();
-    let run = request.harness.run(task, gate, tx).await;
+    let run = match request.commit {
+        None => request.harness.run(task, gate, tx).await,
+        Some(commit) => {
+            let seen = watch.clone();
+            let overrun = async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let seen = seen.lock().unwrap();
+                    if seen.tools > commit.tools {
+                        return format!("it had made {} tool calls", seen.tools);
+                    }
+                    if !seen.writing && started.elapsed() >= commit.after {
+                        return format!("it had not started the plan after {} seconds", commit.after.as_secs());
+                    }
+                }
+            };
+            // Dropping the harness's run stops the agent and everything it started.
+            tokio::select! {
+                run = request.harness.run(task, gate, tx) => run,
+                why = overrun => Err(anyhow::Error::new(Overrun { why, notes: String::new() })),
+            }
+        }
+    };
     let text = collect.await.unwrap_or_default();
+    let run = run.map_err(|err| match err.downcast::<Overrun>() {
+        Ok(over) => {
+            let notes = tail_chars(&watch.lock().unwrap().thoughts, OVERRUN_NOTES);
+            anyhow::Error::new(Overrun { notes, ..over })
+        }
+        Err(err) => err,
+    });
     if let Some(feed) = &feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64() });
         match &run {

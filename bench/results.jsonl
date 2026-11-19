@@ -2,3 +2,9 @@
 {"name": "tipjar", "label": "checker-on", "seconds": 527.3, "ok": true, "calls": 3, "input": 250506, "output": 98237, "cache_read": 2105062, "cache_write": 0, "cost_usd": 0}
 {"cache_read": 542467, "cache_write": 0, "calls": 1, "input": 74586, "ok": true, "output": 37291, "seconds": 323.9, "name": "tipjar", "label": "single agent (agy)", "files": 5}
 {"name": "tipjar", "label": "code-mode", "seconds": 404.1, "ok": true, "calls": 2, "input": 143950, "output": 97404, "cache_read": 1077324, "cache_write": 0, "cost_usd": 0}
+{"name": "todo", "label": "before-1", "seconds": 734.7, "ok": true, "plan_seconds": 557.0, "calls": 4, "input": 143184, "output": 63469, "cache_read": 90624, "cache_write": 0, "cost_usd": 0, "dir": "/tmp/tm-bench-pTsR7g", "score": null}
+{"name": "todo", "label": "before-2", "seconds": 600.0, "ok": false, "plan_seconds": 0, "calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0, "dir": "/tmp/tm-bench-cVky8o", "score": null}
+{"name": "todo", "label": "before-3", "seconds": 600.0, "ok": false, "plan_seconds": 0, "calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0, "dir": "/tmp/tm-bench-UuJ14y", "score": null}
+{"cache_read": 35584, "cache_write": 0, "calls": 1, "input": 22680, "ok": true, "output": 8242, "seconds": 88.5, "name": "todo", "label": "single agent (grok)", "files": 3, "dir": "/tmp/tm-bench-82olhQ", "score": null}
+{"cache_read": 57472, "cache_write": 0, "calls": 1, "input": 20230, "ok": true, "output": 5510, "seconds": 53.6, "name": "todo", "label": "single agent (grok)", "files": 3, "dir": "/tmp/tm-bench-ta2Eau", "score": null}
+{"name": "hexagon", "label": "before-1", "seconds": 600.1, "ok": false, "plan_seconds": 0, "calls": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0, "dir": "/tmp/tm-bench-tMm1Ew", "score": null}

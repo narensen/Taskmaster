@@ -1267,6 +1267,30 @@ async fn every_worker_brief_opens_with_the_same_shared_prefix() {
     assert!(a.contains("Work down this list:"));
 }
 
+#[tokio::test]
+async fn streamed_fragments_are_one_transcript_line_per_message() {
+    let tmp = repo("merge");
+    let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));
+    let agent = serde_json::json!({ "id": "unit:calc" });
+    let (tx, rx) = mpsc::channel(256);
+    let heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let collect = crate::engine::collect_events(Some((live.clone(), "r".into(), agent)), None, rx, heard);
+    for i in 0..50 {
+        tx.send(HarnessEvent::Thought { text: format!("t{i} ") }).await.unwrap();
+    }
+    tx.send(HarnessEvent::ToolCall { id: "1".into(), name: "read".into(), input: serde_json::json!({ "path": "a.py" }) }).await.unwrap();
+    for i in 0..50 {
+        tx.send(HarnessEvent::Text { text: format!("w{i} ") }).await.unwrap();
+    }
+    drop(tx);
+    let (text, _) = collect.await.unwrap();
+    assert!(text.starts_with("w0 w1 ") && text.ends_with("w49 "), "the answer keeps every fragment");
+    let (_, lines) = live.read("r", 0);
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["thought", "tool_call", "text"], "one line per message, not 101");
+    assert!(lines[0]["text"].as_str().unwrap().ends_with("t49 "));
+}
+
 #[test]
 fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
     use crate::engine::{cost_words, dollars};

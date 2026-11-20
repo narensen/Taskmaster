@@ -120,7 +120,7 @@ struct Commit {
 
 /// What [`ask_once`] watches for a [`Commit`] budget.
 #[derive(Default)]
-struct Watched {
+pub(crate) struct Watched {
     tools: usize,
     writing: bool,
     thoughts: String,
@@ -3998,7 +3998,7 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
 /// Read an agent's events as they come: the text is the answer, everything goes to the
 /// run's transcript, refused calls are kept with what they asked for, and a commit budget's
 /// watcher sees the tool calls and thoughts.
-fn collect_events(
+pub(crate) fn collect_events(
     tee: Option<(Arc<Live>, String, serde_json::Value)>,
     watching: Option<Arc<std::sync::Mutex<Watched>>>,
     mut rx: mpsc::Receiver<HarnessEvent>,
@@ -4010,7 +4010,26 @@ fn collect_events(
         // What each tool was last asked to do, so a refusal can say what was refused.
         let mut asked: HashMap<String, String> = HashMap::new();
         let mut refused: Vec<String> = Vec::new();
-        while let Some(event) = rx.recv().await {
+        // Text and thought fragments are written as one transcript line per message, or
+        // per [`MERGE_FOR`] of a long one, not one line per streamed fragment.
+        let mut merging: Option<(&'static str, String, Instant)> = None;
+        let flush = |merging: &mut Option<(&'static str, String, Instant)>| {
+            if let (Some((live, run, agent)), Some((kind, text, _))) = (&tee, merging.take()) {
+                live.push(run, agent, kind, serde_json::json!({ "text": text }));
+            }
+        };
+        loop {
+            let next = match &merging {
+                Some((_, _, since)) => match tokio::time::timeout(MERGE_FOR.saturating_sub(since.elapsed()), rx.recv()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        flush(&mut merging);
+                        continue;
+                    }
+                },
+                None => rx.recv().await,
+            };
+            let Some(event) = next else { break };
             *heard.lock().unwrap() = Instant::now();
             match &event {
                 HarnessEvent::ToolCall { name, input, .. } => {
@@ -4041,12 +4060,22 @@ fn collect_events(
                     _ => {}
                 }
             }
+            match &event {
+                HarnessEvent::Text { text: chunk } | HarnessEvent::Thought { text: chunk } => {
+                    let kind = if matches!(event, HarnessEvent::Text { .. }) { "text" } else { "thought" };
+                    match &mut merging {
+                        Some((have, text, _)) if *have == kind => text.push_str(chunk),
+                        _ => {
+                            flush(&mut merging);
+                            merging = Some((kind, chunk.clone(), Instant::now()));
+                        }
+                    }
+                }
+                _ => flush(&mut merging),
+            }
             if let Some((live, run, agent)) = &tee {
                 match &event {
-                    HarnessEvent::Text { text: chunk } => live.push(run, agent, "text", serde_json::json!({ "text": chunk })),
-                    HarnessEvent::Thought { text: chunk } => {
-                        live.push(run, agent, "thought", serde_json::json!({ "text": chunk }))
-                    }
+                    HarnessEvent::Text { .. } | HarnessEvent::Thought { .. } => {}
                     HarnessEvent::ToolCall { id, name, input } => live.push(
                         run,
                         agent,
@@ -4070,9 +4099,13 @@ fn collect_events(
                     text.push_str(&chunk);
                 }
         }
+        flush(&mut merging);
         (text, refused)
     })
 }
+
+/// The longest a streamed message is held before its text so far is written to the transcript.
+const MERGE_FOR: Duration = Duration::from_secs(1);
 
 /// How long an agent may send nothing before the log says so, and how often it says so again.
 const QUIET: Duration = Duration::from_secs(120);
@@ -4112,7 +4145,7 @@ fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop 
 /// transcript under the same agent, and the session stays open for the next repair.
 async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>) -> anyhow::Result<Answer> {
     if let Some(feed) = &request.feed {
-        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&request.brief, 4000), "follow_up": true }));
+        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": request.brief, "follow_up": true }));
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
@@ -4204,7 +4237,8 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     };
     let feed = &request.feed;
     if let Some(feed) = &feed {
-        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": clip(&task.brief, 4000) }));
+        // The whole brief: a rejected plan's reasons sit at its end.
+        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": task.brief }));
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));

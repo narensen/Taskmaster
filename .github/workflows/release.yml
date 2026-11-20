@@ -145,6 +145,7 @@ jobs:
           export HOME="$tmp/home" && unset XDG_DATA_HOME && mkdir -p "$HOME"
           "$tmp"/taskmaster-*/install.sh
           test -x "$HOME/.local/bin/tm-daemon" && test -f "$HOME/.local/share/taskmaster/web/index.html"
+          "$HOME/.local/bin/taskmaster" --version | grep -qx "tm-daemon $VERSION"
           grep -q 'taskmaster' "$HOME/.profile"
           mkdir "$tmp/project" && git -C "$tmp/project" init -q
           "$HOME/.local/bin/tm-daemon" serve "$tmp/project" --bind 127.0.0.1:18737 > "$tmp/serve.log" 2>&1 &
@@ -153,7 +154,7 @@ jobs:
           kill "$pid"
           grep -q 'id="root"' "$tmp/index.html" || { cat "$tmp/serve.log"; echo "serve did not find the app" >&2; exit 1; }
           "$HOME/.local/share/taskmaster/uninstall.sh"
-          test ! -e "$HOME/.local/bin/tm-daemon" && test ! -e "$HOME/.local/share/taskmaster"
+          test ! -e "$HOME/.local/bin/tm-daemon" && test ! -L "$HOME/.local/bin/taskmaster" && test ! -e "$HOME/.local/share/taskmaster"
           ! grep -q 'taskmaster' "$HOME/.profile"
       - name: Publish
         if: env.PUBLISH == 'true'

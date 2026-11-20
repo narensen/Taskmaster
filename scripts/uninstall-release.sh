@@ -40,15 +40,15 @@ rcs="$HOME/.profile $HOME/.bashrc $HOME/.zshrc"
 if [ -f "$manifest" ]; then
   while read -r kind path; do
     case $kind in
-      bin) if [ -e "$path" ]; then rm -f "$path"; echo "  removed  $path"; fi ;;
+      bin) if [ -e "$path" ] || [ -L "$path" ]; then rm -f "$path"; echo "  removed  $path"; fi ;;
       rc) case " $rcs " in *" $path "*) ;; *) rcs="$rcs $path" ;; esac ;;
     esac
   done < "$manifest"
 else
   # No list: an install from before uninstall.sh existed. Look in the usual place.
-  for bin in tm-daemon tm-review tm-commons; do
+  for bin in tm-daemon tm-review tm-commons taskmaster; do
     path="$HOME/.local/bin/$bin"
-    if [ -e "$path" ]; then rm -f "$path"; echo "  removed  $path"; fi
+    if [ -e "$path" ] || [ -L "$path" ]; then rm -f "$path"; echo "  removed  $path"; fi
   done
 fi
 for rc in $rcs; do unpath "$rc"; done

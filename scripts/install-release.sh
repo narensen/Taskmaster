@@ -45,6 +45,10 @@ for bin in tm-daemon tm-review tm-commons; do
   echo "bin $bindir/$bin" >> "$manifest.new"
   echo "  added    $bindir/$bin"
 done
+# `taskmaster` is tm-daemon by its product name: `taskmaster report`, `taskmaster serve .`.
+ln -sf tm-daemon "$bindir/taskmaster"
+echo "bin $bindir/taskmaster" >> "$manifest.new"
+echo "  added    $bindir/taskmaster (the same program as tm-daemon)"
 
 rm -rf "$web.new"
 cp -R "$here/web" "$web.new"
@@ -89,5 +93,5 @@ echo "Taskmaster is installed."
 if [ "$on_path" = no ] && [ "$touch_path" = yes ]; then
   echo "Open a new terminal, or run: export PATH=\"$bindir:\$PATH\""
 fi
-echo "Start it:   tm-daemon serve <project>      (the app is at http://127.0.0.1:8737)"
+echo "Start it:   taskmaster serve <project>     (the app is at http://127.0.0.1:8737)"
 echo "Remove it:  $data/uninstall.sh"

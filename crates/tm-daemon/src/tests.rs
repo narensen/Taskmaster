@@ -1268,6 +1268,26 @@ async fn every_worker_brief_opens_with_the_same_shared_prefix() {
 }
 
 #[tokio::test]
+async fn a_run_reports_its_stages_tokens_and_cost_from_its_own_records() {
+    let tmp = repo("report");
+    let world = World::new(Mode::Plan);
+    let outcome = run(prompt_config(&tmp.0, "Build page a with a greeting.", true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let report = crate::report::build(&Records::files(&tmp.0), "current").unwrap();
+    let names: Vec<&str> = report.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names.first(), Some(&"planning"));
+    assert!(names.contains(&"build page:a"), "{names:?}");
+    assert!(names.iter().any(|n| n.starts_with("verify")));
+    assert_eq!(report.stages[0].calls, 1);
+    assert_eq!(report.outcome, "finished");
+    assert_eq!(report.fresh, 240, "a planner call and a builder call, 120 each");
+    assert_eq!(report.cost, "$0.02 (2 priced by the provider)");
+    assert!(report.tool_calls >= 1 && report.run_code_calls == 0);
+    let text = crate::report::render(&report);
+    assert!(text.contains("| Stage | Time |") && text.contains("Planning share:") && text.contains("cache-hit ratio"), "{text}");
+}
+
+#[tokio::test]
 async fn streamed_fragments_are_one_transcript_line_per_message() {
     let tmp = repo("merge");
     let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));

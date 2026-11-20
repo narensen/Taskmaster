@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! tm-daemon providers [--harness <h>]
+//! tm-daemon report [<project>] [--run <id>] [--json]
 //! tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
 //!                 [--web <dir>]
 //! tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
@@ -107,6 +108,20 @@ async fn run() -> anyhow::Result<Outcome> {
         }
         Invocation::Serve(args) => {
             serve(args).await?;
+            return Ok(Outcome::Finished { ok: true });
+        }
+        Invocation::Report { project, run, json } => {
+            let project = project.canonicalize().with_context(|| format!("cannot open {}", project.display()))?;
+            let records = Settings::load(&project)?.records(&project)?;
+            if records.events(&run)?.is_empty() && records.ledger(&run)?.is_empty() {
+                bail!("there is no run `{run}` in {}", project.display());
+            }
+            let report = tm_daemon::report::build(&records, &run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", tm_daemon::report::render(&report));
+            }
             return Ok(Outcome::Finished { ok: true });
         }
         Invocation::Drive(args) => *args,
@@ -280,6 +295,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
 enum Invocation {
     Providers { harness: Option<String> },
+    /// `tm-daemon report [<project>] [--run <id>] [--json]`
+    Report { project: PathBuf, run: String, json: bool },
     Serve(ServeArgs),
     Drive(Box<Args>),
 }
@@ -288,6 +305,20 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
     let argv: Vec<String> = argv.into_iter().collect();
     if argv.first().is_some_and(|arg| arg == "providers") {
         return Ok(Invocation::Providers { harness: providers_harness(&argv[1..])? });
+    }
+    if argv.first().is_some_and(|arg| arg == "report") {
+        let usage = "usage: tm-daemon report [<project>] [--run <id>] [--json]";
+        let (mut project, mut run, mut json) = (PathBuf::from("."), "current".to_string(), false);
+        let mut rest = argv[1..].iter();
+        while let Some(arg) = rest.next() {
+            match arg.as_str() {
+                "--run" => run = rest.next().cloned().with_context(|| usage.to_string())?,
+                "--json" => json = true,
+                flag if flag.starts_with('-') => bail!("unknown option `{flag}`\n{usage}"),
+                path => project = PathBuf::from(path),
+            }
+        }
+        return Ok(Invocation::Report { project, run, json });
     }
     if argv.first().is_some_and(|arg| arg == "serve") {
         return Ok(Invocation::Serve(serve_args(&argv[1..])?));
@@ -495,10 +526,23 @@ mod args_tests {
     }
 
     #[test]
+    fn report_reads_a_project_and_a_run() {
+        match invocation_from(["report".into(), "proj".into(), "--run".into(), "r1".into(), "--json".into()]).unwrap() {
+            Invocation::Report { project, run, json } => assert_eq!((project, run.as_str(), json), (PathBuf::from("proj"), "r1", true)),
+            _ => panic!("report was not read as a report"),
+        }
+        match invocation_from(["report".to_string()]).unwrap() {
+            Invocation::Report { project, run, json } => assert_eq!((project, run.as_str(), json), (PathBuf::from("."), "current", false)),
+            _ => panic!("report was not read as a report"),
+        }
+        assert!(invocation_from(["report".into(), "--bogus".into()]).is_err());
+    }
+
+    #[test]
     fn providers_lists_models_without_a_project() {
         match invocation_from(["providers".to_string()]).unwrap() {
             Invocation::Providers { harness: None } => {}
-            Invocation::Drive(_) | Invocation::Serve(_) => panic!("providers was read as a project"),
+            Invocation::Drive(_) | Invocation::Serve(_) | Invocation::Report { .. } => panic!("providers was read as a project"),
             Invocation::Providers { harness: Some(name) } => panic!("unexpected filter {name}"),
         }
         match invocation_from(["providers".into(), "--harness".into(), "grok".into()]).unwrap() {

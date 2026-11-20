@@ -192,6 +192,11 @@ impl Records {
         self.store.list("runs")
     }
 
+    /// The agents' transcript of a run, one JSON value per line.
+    pub fn transcript(&self, run: &str) -> anyhow::Result<Vec<Value>> {
+        self.lines(&format!("runs/{run}/agents.jsonl"))
+    }
+
     pub fn events(&self, run: &str) -> anyhow::Result<Vec<Event>> {
         self.lines(&format!("runs/{run}/events.jsonl"))
     }

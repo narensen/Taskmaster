@@ -32,6 +32,7 @@ pub mod jobs;
 pub mod live;
 pub mod preview;
 pub mod reply;
+pub mod report;
 mod resume;
 mod runtime;
 mod secret;

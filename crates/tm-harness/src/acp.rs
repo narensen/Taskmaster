@@ -170,6 +170,9 @@ impl AcpHarness {
             Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
         };
         if keep && result.as_ref().is_ok_and(|summary| summary.ok) && session.id.is_some() {
+            // The caller reads this turn's events until their channel closes: the kept session
+            // must not hold its sender, or the turn never ends for the caller.
+            session.events = closed_sender();
             let kept = Kept { session, child, group: Some(group), harness: self.id };
             return (result, Some(Box::new(kept)));
         }
@@ -177,6 +180,11 @@ impl AcpHarness {
         drop(session);
         (crate::released(result, group.release(&mut child).await), None)
     }
+}
+
+/// A sender whose receiver is already gone: events sent to it go nowhere.
+fn closed_sender() -> mpsc::Sender<HarnessEvent> {
+    mpsc::channel(1).0
 }
 
 /// An ACP agent left running after its turn, with its session open.
@@ -193,10 +201,13 @@ impl crate::Session for Kept {
         self.session.events = events;
         self.session.denied = 0;
         let turn = self.session.prompt(text);
-        match tokio::time::timeout(timeout, turn).await {
+        let result = match tokio::time::timeout(timeout, turn).await {
             Ok(result) => result,
             Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.harness)),
-        }
+        };
+        // Let go of this turn's channel, so the caller's reader finishes.
+        self.session.events = closed_sender();
+        result
     }
 
     async fn close(mut self: Box<Self>) -> crate::Freed {
@@ -313,6 +324,7 @@ impl Session {
                 None => next.await,
             };
             let line = line?.ok_or_else(|| anyhow!("agent closed its output during `{method}`"))?;
+            trace("<", &line);
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg.get("method").is_some() {
                 self.incoming(msg).await?;
@@ -379,10 +391,21 @@ impl Session {
 
     async fn send(&mut self, msg: Value) -> anyhow::Result<()> {
         let mut line = msg.to_string();
+        trace(">", &line);
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+}
+
+/// With `TASKMASTER_ACP_TRACE=<file>`, every line to (`>`) and from (`<`) an ACP agent is
+/// appended to that file, for finding out why an agent stopped answering. Off by default.
+fn trace(way: &str, line: &str) {
+    let Some(path) = std::env::var_os("TASKMASTER_ACP_TRACE") else { return };
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{way} {line}");
     }
 }
 
@@ -766,11 +789,17 @@ mod tests {
         let (first, kept) = harness.run_kept(task, gate, tx).await;
         assert!(first.unwrap().ok);
         assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "first".into() }));
+        // The turn is over for the caller: its event channel closes even though the session
+        // stays open. (A kept sender here once hung every builder after its first turn.)
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(closed, Ok(None), "the kept session still held the turn's event sender");
         let mut kept = kept.expect("the session stays open after a finished turn");
         let (tx, mut rx) = mpsc::channel(32);
         let second = kept.follow_up("try again".into(), tx, std::time::Duration::from_secs(10)).await.unwrap();
         assert!(second.ok);
         assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "second".into() }));
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(closed, Ok(None), "a follow-up's channel closes when the turn ends");
         let freed = kept.close().await;
         assert!(freed.processes >= 1 && freed.lingering == 0, "{freed:?}");
     }

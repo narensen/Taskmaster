@@ -21,7 +21,7 @@ jobs:
     env:
       TM_COMMONS_TEST_DATABASE: postgres://tm:tm@localhost:5432/commons_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The version the code is written against, so a new lint does not fail an old commit.
       - run: rustup toolchain install 1.93.1 --profile minimal --component clippy && rustup default 1.93.1
       - uses: actions/cache@v4
@@ -41,7 +41,7 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # macOS and Windows checkouts are case-insensitive: two paths that differ only by
       # case collapse into one there and break the desktop build.
       - run: scripts/check-case.sh
@@ -62,7 +62,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
       - uses: actions/cache@v4
         with:
@@ -88,7 +88,7 @@ jobs:
   desktop:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libdbus-1-dev pkg-config patchelf
       - uses: actions/setup-node@v4

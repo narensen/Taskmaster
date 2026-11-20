@@ -48,7 +48,7 @@ jobs:
       publish: ${{ steps.plan.outputs.publish }}
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # A case-insensitive checkout (macOS, Windows) keeps only one of two such paths.
       - run: scripts/check-case.sh
       - name: Version, publishing, and targets
@@ -97,7 +97,7 @@ jobs:
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,7 +118,7 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       PUBLISH: ${{ needs.preflight.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
       - run: cargo build --release --locked -p tm-daemon -p tm-review -p tm-commons
       - uses: actions/setup-node@v4
@@ -181,7 +181,7 @@ jobs:
       PUBLISH: ${{ needs.preflight.outputs.publish }}
       HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.93.1 --profile minimal --target ${{ matrix.target }} && rustup default 1.93.1
         shell: bash
       - uses: actions/setup-node@v4

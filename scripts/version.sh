@@ -20,6 +20,10 @@ copies() {
     printf '%s %s\n' "$file" "$(node -p "require('./$file').version")"
   done
   printf 'web/package-lock.json %s\n' "$(node -p "const l=require('./web/package-lock.json'); l.version + (l.packages[''].version === l.version ? '' : ' (packages: ' + l.packages[''].version + ')')")"
+  # The desktop app's lock: itself, and the workspace crate it uses.
+  for crate in taskmaster-desktop tm-launcher; do
+    printf 'desktop/src-tauri/Cargo.lock:%s %s\n' "$crate" "$(awk -v name="$crate" '$0 == "name = \"" name "\"" {getline; gsub(/.*= *"|".*/, ""); print; exit}' desktop/src-tauri/Cargo.lock)"
+  done
   # Cargo.lock: every workspace crate.
   for crate in tm-core tm-daemon tm-harness tm-review tm-commons tm-dictionary tm-verify tm-token tm-launcher; do
     printf 'Cargo.lock:%s %s\n' "$crate" "$(awk -v name="$crate" '$0 == "name = \"" name "\"" {getline; gsub(/.*= *"|".*/, ""); print; exit}' Cargo.lock)"
@@ -64,7 +68,9 @@ case "${1:-}" in
     # The lockfiles name each workspace crate with its version.
     cargo metadata --format-version 1 >/dev/null
     if [ -f desktop/src-tauri/Cargo.lock ]; then
-      sed -i.bak "/^name = \"taskmaster-desktop\"$/{n; s/^version = \".*\"/version = \"$new\"/}" desktop/src-tauri/Cargo.lock && rm desktop/src-tauri/Cargo.lock.bak
+      for crate in taskmaster-desktop tm-launcher; do
+        sed -i.bak "/^name = \"$crate\"$/{n; s/^version = \".*\"/version = \"$new\"/}" desktop/src-tauri/Cargo.lock && rm desktop/src-tauri/Cargo.lock.bak
+      done
     fi
     "$0" check "$new"
     ;;

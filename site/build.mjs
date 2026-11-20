@@ -48,8 +48,32 @@ export function markdown(text) {
       .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, (_, pre, url) => `${pre}<a href="${url}">${url.replace(/^https:\/\/github\.com\//, "")}</a>`);
   const out = [];
   let list = false;
-  for (const raw of String(text ?? "").replace(/\r/g, "").split("\n")) {
-    const line = raw.trimEnd();
+  // A table: a `| a | b |` header row, a `|---|` rule, then rows. Cells are inline text.
+  let table = null;
+  const cells = (line) => line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
+  const endTable = () => {
+    if (!table) return;
+    const head = `<thead><tr>${table.head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead>`;
+    const body = table.rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("");
+    out.push(`<table>${head}<tbody>${body}</tbody></table>`);
+    table = null;
+  };
+  const lines = String(text ?? "").replace(/\r/g, "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trimEnd();
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      if (table) {
+        table.rows.push(cells(line));
+        continue;
+      }
+      if (/^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] ?? "")) {
+        if (list) out.push("</ul>"), (list = false);
+        table = { head: cells(line), rows: [] };
+        i++;
+        continue;
+      }
+    }
+    endTable();
     const item = /^\s*[-*] (.*)$/.exec(line);
     if (item) {
       if (!list) out.push("<ul>"), (list = true);
@@ -61,6 +85,7 @@ export function markdown(text) {
     if (heading) out.push(`<h${Math.min(4, heading[1].length + 2)}>${inline(heading[2])}</h${Math.min(4, heading[1].length + 2)}>`);
     else if (line.trim()) out.push(`<p>${inline(line)}</p>`);
   }
+  endTable();
   if (list) out.push("</ul>");
   return out.join("\n");
 }

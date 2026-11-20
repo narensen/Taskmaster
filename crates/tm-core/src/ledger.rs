@@ -73,6 +73,21 @@ pub struct LedgerEntry {
     pub seconds: f64,
     /// Whether the harness finished its turn.
     pub ok: bool,
+    /// Tool calls the gate refused in this call, each with what it asked for. A call can
+    /// finish its turn (`ok`) and still have had calls refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
+    /// The agent that made the call, as the transcript names it: `master`, `page:<id>`, or
+    /// `unit:<id>/<part>` for one part of a split unit. Older rows have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The part of a split unit the call built, when it was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Where `cost_usd` came from: `provider` when the harness reported it, `prices` when it
+    /// was worked out from the price table. Missing when there is no price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priced_by: Option<String>,
 }
 
 impl LedgerEntry {
@@ -132,8 +147,15 @@ pub struct Totals {
 }
 
 impl LedgerEntry {
-    /// Which agent this call was: the key of [`Totals::by_agent`].
+    /// Which agent this call was: the key of [`Totals::by_agent`]. A builder row names its
+    /// own agent, so the parts of a split unit are counted apart.
     pub fn agent(&self) -> String {
+        if let Some(agent) = self.agent.as_ref().filter(|a| !a.is_empty())
+            && matches!(self.role, Role::Worker | Role::Mid | Role::Master)
+            && self.page.is_some()
+        {
+            return agent.clone();
+        }
         match (&self.page, self.role) {
             (None, Role::Planner) => "master".to_string(),
             (None, role) => role.name().to_string(),
@@ -182,33 +204,87 @@ pub fn totals(entries: &[LedgerEntry]) -> Totals {
     out
 }
 
-/// What one build call and one review call are assumed to cost before this project has
-/// any history: fresh tokens, and dollars. They come from one small measured run.
-const DEFAULT_BUILD: (u64, f64) = (17_000, 0.0);
-const DEFAULT_REVIEW: (u64, f64) = (500, 0.05);
+/// Dollars per million tokens for one model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Prices {
+    pub input: f64,
+    /// Input served from the provider's cache. Missing means the same as `input`.
+    #[serde(default)]
+    pub cached_input: Option<f64>,
+    pub output: f64,
+}
 
-/// What building `pages` pages and running `reviews` reviewers should cost, from what
-/// such calls cost in `history`. Tokens are fresh tokens: cache reads are left out, as
-/// they are in the summary a run prints. One attempt per page is assumed, so repairs
-/// come on top. The second value is how many past calls the forecast rests on.
-pub fn forecast(history: &[LedgerEntry], pages: usize, reviews: usize) -> (Estimate, usize) {
-    let mean = |roles: &[Role], default: (u64, f64)| -> ((u64, f64), usize) {
-        let calls: Vec<&LedgerEntry> = history.iter().filter(|entry| roles.contains(&entry.role)).collect();
-        if calls.is_empty() {
-            return (default, 0);
-        }
-        let n = calls.len() as u64;
-        let tokens = calls.iter().map(|entry| entry.tokens() - entry.cache_read).sum::<u64>() / n;
-        let usd = calls.iter().filter_map(|entry| entry.cost_usd).sum::<f64>() / n as f64;
-        ((tokens, usd), calls.len())
+impl Prices {
+    /// What a call with these counts costs. Uncached input, cached input and output are
+    /// priced apart, as providers bill them.
+    pub fn cost(&self, input: u64, output: u64, cache_read: u64) -> f64 {
+        let per = |n: u64, price: f64| n as f64 * price / 1_000_000.0;
+        per(input, self.input) + per(cache_read, self.cached_input.unwrap_or(self.input)) + per(output, self.output)
+    }
+}
+
+/// What a plan asks for, as far as cost goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Shape {
+    /// Units planned so far (with a sketch, the first phase's).
+    pub units: usize,
+    /// Whether they are pages of a web app, which are smaller than modules with tests.
+    pub web: bool,
+    /// Phases in the sketch; 0 or 1 is a run planned whole.
+    pub phases: usize,
+    /// Bytes of locked contracts, which every builder carries in its prompt.
+    pub contract_bytes: usize,
+    /// A small job (a few files, planned by the short pass): its units are far smaller.
+    pub small: bool,
+}
+
+/// Fresh tokens and cache reads one unit's builder uses before this project has history,
+/// from the November 2026 benchmark runs: a module with its tests, and a web page.
+const DEFAULT_MODULE: (u64, u64) = (110_000, 330_000);
+const DEFAULT_PAGE: (u64, u64) = (40_000, 120_000);
+/// One unit of a small job, from the v0.1.5 smoke runs (a file and its test).
+const DEFAULT_SMALL: (u64, u64) = (20_000, 60_000);
+/// Planning one later phase of a sketch.
+const DEFAULT_PHASE_PLAN: (u64, u64) = (25_000, 50_000);
+/// Builder calls per unit: the first attempt and the repairs a unit needs on average.
+const CALLS_PER_UNIT: f64 = 1.3;
+/// Of a call's fresh tokens, the share that is output when only the total is known.
+const OUTPUT_SHARE: f64 = 0.1;
+
+/// What building a plan of `shape` should cost, from what build calls cost in `history`,
+/// or from defaults sized to the plan when there is none. Fresh tokens and cache reads are
+/// estimated apart; dollars come from past priced calls, else from `prices`, else stay
+/// unpriced. Later phases of a sketch are assumed to be as big as the first. The second
+/// value is how many past calls the forecast rests on.
+pub fn forecast(history: &[LedgerEntry], shape: &Shape, prices: Option<Prices>) -> (Estimate, usize) {
+    let builds: Vec<&LedgerEntry> = history.iter().filter(|e| matches!(e.role, Role::Worker | Role::Mid | Role::Master) && e.page.is_some()).collect();
+    let phases = shape.phases.max(1);
+    let units = shape.units.max(1) * phases;
+    let calls = units as f64 * CALLS_PER_UNIT;
+    let (per_fresh, per_cached) = if builds.is_empty() {
+        let (fresh, cached) = if shape.small { DEFAULT_SMALL } else if shape.web { DEFAULT_PAGE } else { DEFAULT_MODULE };
+        (fresh as f64 / CALLS_PER_UNIT, cached as f64 / CALLS_PER_UNIT)
+    } else {
+        let n = builds.len() as f64;
+        (builds.iter().map(|e| (e.input + e.output) as f64).sum::<f64>() / n, builds.iter().map(|e| e.cache_read as f64).sum::<f64>() / n)
     };
-    let (build, built) = mean(&[Role::Worker, Role::Mid, Role::Master], DEFAULT_BUILD);
-    let (review, reviewed) = mean(&[Role::Reviewer, Role::Security, Role::Verifier], DEFAULT_REVIEW);
-    let estimate = Estimate {
-        tokens: build.0 * pages as u64 + review.0 * reviews as u64,
-        usd: build.1 * pages as f64 + review.1 * reviews as f64,
+    // Every builder carries the contracts in its prompt; after the first, from the cache.
+    let contracts = (shape.contract_bytes / 4) as f64 * calls;
+    let later = phases.saturating_sub(1) as f64;
+    let fresh = per_fresh * calls + DEFAULT_PHASE_PLAN.0 as f64 * later;
+    let cached = per_cached * calls + contracts + DEFAULT_PHASE_PLAN.1 as f64 * later;
+    let priced: Vec<f64> = builds.iter().filter_map(|e| e.cost_usd).collect();
+    let (usd, priced) = if !priced.is_empty() {
+        let per_token = priced.iter().sum::<f64>()
+            / builds.iter().filter(|e| e.cost_usd.is_some()).map(|e| (e.input + e.output + e.cache_read).max(1) as f64).sum::<f64>();
+        (per_token * (fresh + cached), true)
+    } else if let Some(prices) = prices {
+        let output = (fresh * OUTPUT_SHARE) as u64;
+        (prices.cost(fresh as u64 - output, output, cached as u64), true)
+    } else {
+        (0.0, false)
     };
-    (estimate, built + reviewed)
+    (Estimate { tokens: fresh as u64, usd, cache_read: cached as u64, priced }, builds.len())
 }
 
 #[cfg(test)]
@@ -229,6 +305,10 @@ mod tests {
             cost_usd: cost,
             seconds: 1.5,
             ok: true,
+            refused: Vec::new(),
+            agent: None,
+            unit: None,
+            priced_by: None,
         }
     }
 
@@ -285,15 +365,47 @@ mod tests {
     }
 
     #[test]
-    fn a_forecast_uses_what_past_calls_cost_and_leaves_cache_reads_out() {
-        let (fresh, basis) = forecast(&[], 3, 2);
-        assert_eq!((fresh.tokens, basis), (3 * 17_000 + 2 * 500, 0));
+    fn a_forecast_is_sized_to_the_plan_and_counts_cache_reads_apart() {
+        let module = Shape { units: 1, web: false, phases: 0, contract_bytes: 0, small: false };
+        let (one, basis) = forecast(&[], &module, None);
+        assert_eq!(basis, 0);
+        assert!((100_000..=120_000).contains(&one.tokens), "{one:?}");
+        assert!(one.cache_read > one.tokens && !one.priced && one.usd == 0.0);
+        // Three units, a sketch of two phases and 8 KB of contracts cost more, in both counts.
+        let big = Shape { units: 3, web: false, phases: 2, contract_bytes: 8_000, small: false };
+        let (more, _) = forecast(&[], &big, None);
+        assert!(more.tokens > 6 * one.tokens && more.cache_read > 6 * one.cache_read, "{more:?}");
+        // A web page is smaller than a module with its tests, and a small job smaller still.
+        let (page, _) = forecast(&[], &Shape { web: true, ..module }, None);
+        assert!(page.tokens < one.tokens);
+        let (small, _) = forecast(&[], &Shape { small: true, ..module }, None);
+        assert!(small.tokens < page.tokens && small.tokens >= 15_000, "{small:?}");
+        // With prices, the estimate is in dollars: uncached, cached and output apart.
+        let grok = Prices { input: 2.0, cached_input: Some(0.5), output: 6.0 };
+        let (priced, _) = forecast(&[], &module, Some(grok));
+        assert!(priced.priced && priced.usd > 0.1, "{priced:?}");
+        assert!((grok.cost(1_000_000, 0, 1_000_000) - 2.5).abs() < 1e-9);
+        // History wins over defaults: what past build calls used, fresh and cached, and paid.
         let mut build = entry(Role::Worker, "agy", 9_000, 1_000, Some(0.02));
-        build.cache_read = 400_000;
-        let review = entry(Role::Reviewer, "claude", 100, 300, Some(0.04));
-        let (seen, basis) = forecast(&[build.clone(), build, review], 3, 2);
-        assert_eq!(seen.tokens, 3 * 10_000 + 2 * 400);
-        assert!((seen.usd - (3.0 * 0.02 + 2.0 * 0.04)).abs() < 1e-9);
-        assert_eq!(basis, 3);
+        build.page = Some("a".into());
+        build.cache_read = 40_000;
+        let (seen, basis) = forecast(&[build.clone(), build], &module, None);
+        assert_eq!(basis, 2);
+        assert_eq!(seen.tokens, 13_000);
+        assert_eq!(seen.cache_read, 52_000);
+        assert!(seen.priced && (seen.usd - 0.026).abs() < 1e-6, "{seen:?}");
+    }
+
+    #[test]
+    fn the_parts_of_a_split_unit_are_counted_apart() {
+        let mut list = entry(Role::Worker, "grok", 10, 1, None);
+        list.page = Some("books".into());
+        list.agent = Some("unit:books/list".into());
+        list.unit = Some("list".into());
+        let mut styles = list.clone();
+        styles.agent = Some("unit:books/styles".into());
+        styles.unit = Some("styles".into());
+        let sum = totals(&[list, styles]);
+        assert_eq!(sum.by_agent.keys().collect::<Vec<_>>(), ["unit:books/list", "unit:books/styles"]);
     }
 }

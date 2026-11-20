@@ -104,6 +104,10 @@ test("a new project is a git repository", async ({ openFixture, page, daemon }) 
     execFileSync("git", ["-C", created.project, "rev-parse", "--is-inside-work-tree"]);
     const id = new URL(page.url()).pathname.split("/").pop()!;
     await fetch(`${fixture.url}/api/runs/${id}/cancel`, { method: "POST", headers: auth(fixture.token) });
+    // The project can only be switched back once the cancelled run has stopped.
+    await expect
+      .poll(async () => ((await (await fetch(`${fixture.url}/api/runs/${id}`, { headers: auth(fixture.token) })).json()) as { active: boolean }).active, { timeout: 20_000 })
+      .toBe(false);
   } finally {
     await restore(fixture.url, fixture.token, before.project);
   }

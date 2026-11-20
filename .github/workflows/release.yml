@@ -70,6 +70,11 @@ jobs:
           fi
           # The Windows installer (WiX) takes numbers only.
           echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "version must look like 1.2.3, not $version" >&2; exit 1; }
+          # A tag must match what the repository says, or the binaries would report another
+          # version than the release. A dry run only checks that the copies agree.
+          if [ "$EVENT" = push ]; then scripts/version.sh check "$version"; else scripts/version.sh check; fi
+          # A release goes out with its CHANGELOG.md section as its notes, so it must have one.
+          if [ "$EVENT" = push ]; then scripts/release-notes.sh "$version" > /dev/null; fi
           matrix=$(TARGETS="$targets" node -e '
             const all = [
               { group: "mac", os: "macos-15", target: "aarch64-apple-darwin" },
@@ -96,7 +101,11 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "Taskmaster ${GITHUB_REF_NAME#v}" --generate-notes
+        # The notes are the version's section of CHANGELOG.md; the app's Updates panel and the
+        # site's Releases page show them.
+        run: |
+          scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "Taskmaster ${GITHUB_REF_NAME#v}" --notes-file notes.md
 
   linux:
     needs: [preflight, release]
@@ -136,6 +145,7 @@ jobs:
           export HOME="$tmp/home" && unset XDG_DATA_HOME && mkdir -p "$HOME"
           "$tmp"/taskmaster-*/install.sh
           test -x "$HOME/.local/bin/tm-daemon" && test -f "$HOME/.local/share/taskmaster/web/index.html"
+          "$HOME/.local/bin/taskmaster" --version | grep -qx "tm-daemon $VERSION"
           grep -q 'taskmaster' "$HOME/.profile"
           mkdir "$tmp/project" && git -C "$tmp/project" init -q
           "$HOME/.local/bin/tm-daemon" serve "$tmp/project" --bind 127.0.0.1:18737 > "$tmp/serve.log" 2>&1 &
@@ -144,7 +154,7 @@ jobs:
           kill "$pid"
           grep -q 'id="root"' "$tmp/index.html" || { cat "$tmp/serve.log"; echo "serve did not find the app" >&2; exit 1; }
           "$HOME/.local/share/taskmaster/uninstall.sh"
-          test ! -e "$HOME/.local/bin/tm-daemon" && test ! -e "$HOME/.local/share/taskmaster"
+          test ! -e "$HOME/.local/bin/tm-daemon" && test ! -L "$HOME/.local/bin/taskmaster" && test ! -e "$HOME/.local/share/taskmaster"
           ! grep -q 'taskmaster' "$HOME/.profile"
       - name: Publish
         if: env.PUBLISH == 'true'
@@ -188,7 +198,10 @@ jobs:
         run: |
           cargo build --release --locked -p tm-daemon --target ${{ matrix.target }}
           ext=""; [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
-          cp "target/${{ matrix.target }}/release/tm-daemon$ext" "desktop/src-tauri/binaries/tm-daemon-${{ matrix.target }}$ext"
+          dest="desktop/src-tauri/binaries/tm-daemon-${{ matrix.target }}$ext"
+          cp "target/${{ matrix.target }}/release/tm-daemon$ext" "$dest"
+          # cp onto an existing file keeps that file's mode; the bundles copy the sidecar's mode.
+          chmod 755 "$dest"
       - name: Icons from assets/icon.png
         run: npx --yes @tauri-apps/cli@2 icon assets/icon.png -o desktop/src-tauri/icons
         shell: bash
@@ -285,6 +298,18 @@ jobs:
           test -x "$app/Contents/MacOS/tm-daemon" || { echo "the sidecar is missing from the bundle" >&2; exit 1; }
           test -f "$app/Contents/Resources/web/index.html" || { echo "the web app is missing from the bundle" >&2; exit 1; }
           ls "desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/"*.dmg
+      - name: Check the Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bundle="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          deb=$(ls "$bundle"/deb/*.deb | head -n 1)
+          dpkg-deb -c "$deb" | grep -E '^-rwxr-xr-x .* (\./)?usr/bin/tm-daemon$' || { echo "tm-daemon is missing from the .deb, or not executable" >&2; exit 1; }
+          dpkg-deb -c "$deb" | grep -Eq ' (\./)?usr/lib/Taskmaster/web/index\.html$' || { echo "the web app is missing from the .deb" >&2; exit 1; }
+          dpkg-deb -f "$deb" Version | grep -qx "$VERSION"
+          tmp=$(mktemp -d) && dpkg-deb -x "$deb" "$tmp"
+          "$tmp/usr/bin/tm-daemon" --version | grep -qx "tm-daemon $VERSION"
+          ls "$bundle"/appimage/*.AppImage
       - name: Keep the dry-run installers
         if: env.PUBLISH != 'true'
         uses: actions/upload-artifact@v4

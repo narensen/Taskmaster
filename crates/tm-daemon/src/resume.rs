@@ -46,6 +46,7 @@ fn still_needed(run: &Run, cmd: &Command) -> bool {
         Command::RunReview { .. } => run.phase == RunPhase::Reviewing && run.pending_findings.is_empty(),
         Command::VerifyFindings { .. } => run.phase == RunPhase::Reviewing && !run.pending_findings.is_empty(),
         Command::RunVerify => run.phase == RunPhase::Verifying,
+        Command::NextPhase { phase } => run.phase == RunPhase::Building && run.next_phase == Some(*phase),
         Command::Finish { .. } => matches!(run.phase, RunPhase::Done | RunPhase::Failed),
     }
 }
@@ -56,7 +57,11 @@ fn implied(run: &Run, events: &[Event], changes: &[ChangeEntry]) -> anyhow::Resu
         RunPhase::Planning => {}
         RunPhase::AwaitingApproval => out.push(Command::RequestApproval),
         RunPhase::Building => {
-            if !changes.iter().any(|c| c.kind == ChangeKind::ContractsLocked) {
+            if let Some(phase) = run.next_phase {
+                out.push(Command::NextPhase { phase });
+            }
+            // Each phase locks its contracts once: phase N needs N + 1 locks.
+            if changes.iter().filter(|c| c.kind == ChangeKind::ContractsLocked).count() <= run.phase_at {
                 out.push(Command::LockContracts);
             }
             let Some(plan) = &run.plan else { return Ok(out) };
@@ -101,6 +106,7 @@ fn covers(cmds: &[Command], cmd: &Command) -> bool {
         (Command::RunReview { .. }, Command::RunReview { .. }) => true,
         (Command::VerifyFindings { .. }, Command::VerifyFindings { .. }) => true,
         (Command::RunVerify, Command::RunVerify) => true,
+        (Command::NextPhase { .. }, Command::NextPhase { .. }) => true,
         (Command::Finish { .. }, Command::Finish { .. }) => true,
         _ => false,
     })
@@ -115,6 +121,7 @@ fn rank(run: &Run, cmd: &Command) -> (u8, usize) {
         Command::RunReview { .. } => (4, 0),
         Command::VerifyFindings { .. } => (5, 0),
         Command::RunVerify => (6, 0),
+        Command::NextPhase { .. } => (6, 1),
         Command::Finish { .. } => (7, 0),
     }
 }
@@ -194,22 +201,26 @@ mod tests {
 
     fn plan(pages: &[(&str, &[&str])]) -> Plan {
         Plan {
+            kind: Default::default(),
             contracts: vec![],
             pages: pages
                 .iter()
                 .map(|(id, cites)| PagePlan {
                     id: (*id).into(),
                     route: format!("/{id}"),
+                    ui: None,
                     owned_glob: format!("app/{id}/**"),
                     cites: cites.iter().map(|c| (*c).to_string()).collect(),
                     brief: String::new(),
                     done: String::new(),
                     units: vec![],
                     skills: vec![],
+                    phase: 0,
                 })
                 .collect(),
-            estimate: Estimate { tokens: 0, usd: 0.0 },
+            estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
             design: String::new(),
+            phases: vec![],
         }
     }
 

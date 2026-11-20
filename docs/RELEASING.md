@@ -1,16 +1,22 @@
 # Releasing Taskmaster
 
-Push a tag that starts with `v`, and `.github/workflows/release.yml` builds and publishes
-everything:
+Set the version, write its notes, then push a tag that starts with `v`, and
+`.github/workflows/release.yml` builds and publishes everything:
 
 ```bash
+scripts/version.sh set 0.2.0      # Cargo.toml is the one source; every copy follows
+# add a "## 0.2.0" section to CHANGELOG.md: it becomes the release notes
+git commit -am "Version 0.2.0"
 git tag v0.2.0
 git push origin v0.2.0
 ```
 
+The release stops before building anything when the tag and `scripts/version.sh check` disagree,
+or when CHANGELOG.md has no section for the version.
+
 | Job | What it publishes |
 | --- | --- |
-| `release` | Creates the GitHub release with generated notes. Edit the notes afterwards if you like: the app's Updates panel and the public Releases page show them. |
+| `release` | Creates the GitHub release with the version's CHANGELOG.md section as its notes (`scripts/release-notes.sh`). The app's Updates panel and the public Releases page show them. |
 | `linux` | `taskmaster-<tag>-x86_64-linux.tar.gz` and its `.sha256`: tm-daemon, tm-review, tm-commons, the built web app, and `install.sh`. That script copies the app to `~/.local/share/taskmaster/web`, so `tm-daemon serve` finds it without `--web`. |
 | `desktop` | The desktop app: `.dmg` and `.app.tar.gz` for Apple silicon and Intel Macs, `.AppImage` and `.deb` for Linux, `.msi` and `-setup.exe` for Windows, each with a `.sig` signature, and `latest.json`, the manifest the in-app updater reads. |
 | `checksums` | `SHA256SUMS.txt` covering every file in the release. |
@@ -73,9 +79,6 @@ tm-daemon and restarts.
   terminal off with a clear message instead of a ConPTY backend (SmartScreen warns until a
   certificate is added). Add `APPLE_CERTIFICATE` / `WINDOWS_CERTIFICATE` and the other secrets
   above to sign for real.
-- The desktop shell (`desktop/src-tauri`) is outside the Cargo workspace, because it needs
-  the system webview to compile. It is built only by this workflow. Locally, with the
-  [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) installed, build it with:
 - The desktop shell (`desktop/src-tauri`) is outside the Cargo workspace, because it needs
   the system webview to compile. It is built only by this workflow. Locally, with the
   [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) installed, build it with:

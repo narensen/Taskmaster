@@ -51,11 +51,23 @@ enum Mode {
     Checked,
     /// The planner thinks, keeps calling tools, and never writes, until it is stopped.
     Overthink,
+    /// Page `a`'s first build fails because the account has no balance left (HTTP 402).
+    Broke,
+    /// Every build tries `poetry lock` in a shell, is refused, and changes nothing.
+    Refused,
+    /// The plan sketches two phases: `a` now, `b` once `a`'s interfaces are locked.
+    Phased,
 }
 
 struct World {
     mode: Mode,
     calls: Mutex<Vec<String>>,
+    /// The fake says its agents run inside the sandbox, so builders get a shell.
+    sandboxed: std::sync::atomic::AtomicBool,
+    /// For each call: whether it was read-only, and the shell it was given.
+    shells: Mutex<Vec<(bool, Option<tm_harness::ShellScope>)>>,
+    /// The fake keeps a builder's session open after its turn, like an ACP agent.
+    keeps: std::sync::atomic::AtomicBool,
     plans: AtomicUsize,
     a: AtomicUsize,
     b: AtomicUsize,
@@ -88,6 +100,26 @@ impl Harness for Fake {
         "fake"
     }
 
+    fn sandboxed_shell(&self) -> bool {
+        self.0.sandboxed.load(Ordering::SeqCst)
+    }
+
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+        let id = task.brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()).map(str::to_string);
+        let cwd = task.cwd.clone();
+        let result = self.run(task, gate, events).await;
+        let keep = self.0.keeps.load(Ordering::SeqCst) && result.as_ref().is_ok_and(|s| s.ok);
+        match id.filter(|_| keep) {
+            Some(id) => (result, Some(Box::new(FakeSession { world: self.0.clone(), id, cwd }))),
+            None => (result, None),
+        }
+    }
+
     async fn run(
         &self,
         task: WorkerTask,
@@ -104,6 +136,12 @@ impl Harness for Fake {
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
             anyhow::bail!("the planner was never stopped");
+        }
+        self.0.shells.lock().unwrap().push((task.read_only, task.shell.clone()));
+        if matches!(self.0.mode, Mode::Refused) && task.brief.contains("Build page `") {
+            let input = serde_json::json!({ "command": "poetry lock" });
+            let _ = events.send(HarnessEvent::ToolCall { id: "sh1".into(), name: "Bash".into(), input }).await;
+            let _ = events.send(HarnessEvent::PermissionDecided { tool: "Bash".into(), allowed: false }).await;
         }
         let script = self.0.respond(&task).await?;
         // Thoughts and tool calls go to the transcript, never into the answer.
@@ -136,11 +174,36 @@ impl Harness for Fake {
     }
 }
 
+/// A builder's session the fake kept open. A follow-up fixes the page the plain way.
+struct FakeSession {
+    world: Arc<World>,
+    id: String,
+    cwd: PathBuf,
+}
+
+#[async_trait]
+impl tm_harness::Session for FakeSession {
+    async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, _timeout: Duration) -> anyhow::Result<RunSummary> {
+        self.world.calls.lock().unwrap().push(format!("[follow-up {}] {text}", self.id));
+        std::fs::create_dir_all(self.cwd.join(format!("app/{}", self.id)))?;
+        std::fs::write(self.cwd.join(format!("app/{}/page.ts", self.id)), format!("export const page = \"{}\"; // fixed\n", self.id))?;
+        let _ = events.send(HarnessEvent::Text { text: "fixed".into() }).await;
+        Ok(RunSummary { ok: true, usage: Usage { input: 10, output: 5, cache_read: 90, cache_write: 0 }, cost_usd: Some(0.001), denied: 0, freed: None })
+    }
+
+    async fn close(self: Box<Self>) -> tm_harness::Freed {
+        tm_harness::Freed::default()
+    }
+}
+
 impl World {
     fn new(mode: Mode) -> Arc<Self> {
         Arc::new(World {
             mode,
             calls: Mutex::new(Vec::new()),
+            sandboxed: std::sync::atomic::AtomicBool::new(false),
+            shells: Mutex::new(Vec::new()),
+            keeps: std::sync::atomic::AtomicBool::new(false),
             plans: AtomicUsize::new(0),
             a: AtomicUsize::new(0),
             b: AtomicUsize::new(0),
@@ -168,8 +231,11 @@ impl World {
         let skills = std::fs::read_dir(task.cwd.join(".taskmaster/skills")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>().join(",")).unwrap_or_default();
         let how = format!("\n[effort={}][dictionary={}][skills={skills}]", task.effort.as_deref().unwrap_or("default"), task.dictionary.is_some());
         self.calls.lock().unwrap().push(format!("{brief}{how}"));
-        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") {
+        if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") || brief.contains("Repair this plan.") {
             return Ok(Script::text(&self.plan_reply()));
+        }
+        if brief.contains("Plan phase 2 of 2") {
+            return Ok(Script::text(r#"{"contracts":[],"units":[{"id":"b","route":"/b","owned_glob":"app/b/**","cites":[],"brief":"Implement b on top of a."}],"dictionary":[]}"#));
         }
         if brief.contains("Read these notes and decide what the agents should do next.") {
             let echoed: String = brief.lines().filter(|line| line.starts_with("- to ")).map(|line| format!("{line}\n")).collect();
@@ -184,7 +250,10 @@ impl World {
             let (path, body) = if unit == "markup" { ("app/a/index.html", "<h1>a</h1>\n") } else { ("app/a/main.js", "console.log(1);\n") };
             return Ok(Script { text: format!("done\nRELEASE page:a/{unit}"), files: vec![(path.into(), Some(body.into()))] });
         }
-        if let Some(id) = brief.split("Build page `").nth(1).and_then(|rest| rest.split('`').next()) {
+        if let Some(id) = brief.split("Build page `").nth(1).or_else(|| brief.split("Build unit `").nth(1)).and_then(|rest| rest.split('`').next()) {
+            if matches!(self.mode, Mode::Broke) && id == "a" && self.a.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!(r#"`session/prompt` failed: {{"code":-32603,"message":"API error (status 402 Payment Required): Grok Build usage balance exhausted"}}"#);
+            }
             if matches!(self.mode, Mode::Stall) && id == "a" && self.a.load(Ordering::SeqCst) == 0 {
                 assert!(task.stall.is_some(), "a worker runs with a stall limit");
                 self.a.fetch_add(1, Ordering::SeqCst);
@@ -206,6 +275,10 @@ impl World {
         if brief.contains("Decide whether it is real") {
             let real = matches!(self.mode, Mode::ConfirmFinding);
             return Ok(Script::text(if real { "{\"real\": true}" } else { "{\"real\": false}" }));
+        }
+        if brief.contains("the output names no file any unit owns") {
+            // The master's fix: a file the project's build looks for.
+            return Ok(Script { text: "fixed".into(), files: vec![("fixed.txt".into(), Some("ok\n".into()))] });
         }
         if brief.contains("Shared files this run wrote fail the project's checks") {
             if matches!(self.mode, Mode::Nothing) {
@@ -248,6 +321,11 @@ impl World {
             Mode::PlanBad => {
                 r#"{"contracts":[],"pages":[],"estimate":{"tokens":0,"usd":0},"dictionary":[]}"#.into()
             }
+            Mode::Phased => format!(
+                r#"{{"kind":"web","phases":[{{"id":"core","goal":"the shared core","test":"npm test"}},{{"id":"rest","goal":"the rest on top of it"}}],
+                "contracts":[{{"path":"contracts/types.ts","content":"export type Id = string;\n"}}],
+                "units":[{{"id":"a","route":"/a","owned_glob":"app/a/**","cites":["greet"],"brief":"Implement a."}}],"dictionary":[{greet}]}}"#
+            ),
             _ => plan_json("greet", greet),
         }
     }
@@ -300,7 +378,7 @@ impl World {
             }
             Mode::CrossImport if id == "a" => Ok(Script::page(id, "export const a = 2;\n")),
             Mode::ConfirmFinding if id == "a" && n >= 1 => Ok(Script::page(id, "export const a = 2;\n")),
-            Mode::Nothing => Ok(Script::text("I made no edits to this page.")),
+            Mode::Nothing | Mode::Refused => Ok(Script::text("I made no edits to this page.")),
             Mode::Learn if id == "a" && n < 3 => Ok(Script::text("no files yet")),
             Mode::Learn if id == "a" => Ok(Script {
                 text: "Read the route param before rendering the header.".into(),
@@ -349,22 +427,26 @@ fn plan_json(cite: &str, entry: &str) -> String {
 
 fn plan(pages: &[(&str, &[&str])]) -> Plan {
     Plan {
+        kind: Default::default(),
         contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into() }],
         pages: pages
             .iter()
             .map(|(id, cites)| PagePlan {
                 id: (*id).into(),
                 route: format!("/{id}"),
+                ui: None,
                 owned_glob: format!("app/{id}/**"),
                 cites: cites.iter().map(|c| (*c).to_string()).collect(),
                 brief: format!("Implement {id}."),
                 done: String::new(),
                 units: vec![],
                 skills: vec![],
+                phase: 0,
             })
             .collect(),
-        estimate: Estimate { tokens: 10, usd: 0.01 },
+        estimate: Estimate { tokens: 10, usd: 0.01, ..Default::default() },
         design: String::new(),
+        phases: vec![],
     }
 }
 
@@ -689,11 +771,14 @@ async fn mistakes_stay_with_the_model_that_made_them() {
     );
     Records::files(&tmp.0).save_book(&book).unwrap();
     let world = World::new(Mode::Learn);
-    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
+    // A different master model, so there is a ladder: a page that keeps failing climbs it.
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1);
+    cfg.models.master = Some("stronger".into());
+    let outcome = run(cfg, &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     let calls = world.calls.lock().unwrap().clone();
     let page_b = calls.iter().find(|call| call.contains("Build page `b`")).expect("page b ran");
-    assert!(page_b.contains("worker produced no changes under its owned files"));
+    assert!(page_b.contains("changed none of your files"), "{page_b}");
     assert!(page_b.contains("Read the route param before rendering the header."));
     assert!(!calls.iter().any(|call| call.contains("claude-only mistake")));
     let saved = Records::files(&tmp.0).book().unwrap();
@@ -773,7 +858,7 @@ fn planner_calls(world: &World) -> Vec<String> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|call| call.contains("Plan this product and lock its contracts.") || call.contains("Plan this small product quickly."))
+        .filter(|call| call.contains("Plan this product and lock its contracts.") || call.contains("Plan this small product quickly.") || call.contains("Repair this plan."))
         .cloned()
         .collect()
 }
@@ -849,6 +934,9 @@ async fn a_rejected_plan_is_asked_once_more() {
     let calls = planner_calls(&world);
     assert_eq!(calls.len(), 2);
     assert!(calls[1].contains("no dictionary entry"), "{}", calls[1]);
+    // The second call repairs the first plan: it carries that plan and needs no tools.
+    assert!(calls[1].contains("Repair this plan.") && calls[1].contains("\"units\""), "{}", calls[1]);
+    assert!(calls[1].contains("[effort=low][dictionary=false]"), "{}", calls[1]);
     let store = LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();
     assert!(store.get("greet").unwrap().is_some());
 }
@@ -903,8 +991,9 @@ async fn a_prompt_that_never_plans_fails() {
     let tmp = repo("plan-bad");
     let world = World::new(Mode::PlanBad);
     let err = run(prompt_config(&tmp.0, "Build page a.", true), &world).await.unwrap_err();
-    assert!(err.to_string().contains("no pages"), "{err}");
-    assert_eq!(world.plans.load(Ordering::SeqCst), 2);
+    assert!(err.to_string().contains("no units"), "{err}");
+    // The first plan, then two repairs of it, then the run gives up.
+    assert_eq!(world.plans.load(Ordering::SeqCst), 3);
     assert!(!tmp.0.join("contracts/types.ts").exists());
 }
 
@@ -951,8 +1040,11 @@ async fn every_agent_call_is_charged_to_the_run() {
     assert_eq!(status["spent"]["calls"], entries.len());
     assert_eq!(status["spent"]["tokens"], entries.len() * 120);
     assert_eq!(status["spent"]["unpriced_calls"], 0);
-    // One page and no review, priced from defaults because nothing ran here before.
-    assert_eq!(status["estimate"]["tokens"], 17_000);
+    // One web page and no review, sized from the plan because nothing ran here before,
+    // with the cache reads counted apart.
+    assert_eq!(status["estimate"]["tokens"], 40_000);
+    // (plus the contract every builder carries in its prompt)
+    assert!((120_000..120_100).contains(&status["estimate"]["cache_read"].as_u64().unwrap()), "{status}");
 }
 
 #[tokio::test]
@@ -1130,13 +1222,326 @@ async fn a_failing_build_goes_back_to_the_page_its_output_names() {
 }
 
 #[tokio::test]
-async fn a_build_failure_in_no_file_of_this_run_costs_nothing() {
+async fn a_failure_no_unit_owns_goes_to_the_master_and_is_never_merged() {
     let Some(tmp) = buildable("build-elsewhere", "lib/legacy.ts:3:1 something old is broken", "false") else { return };
     let world = World::new(Mode::Write);
     let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    // It still fails after the master's repairs: the run fails, and the exit code says so.
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    let calls = world.calls.lock().unwrap().clone();
+    let repairs: Vec<&String> = calls.iter().filter(|call| call.contains("the output names no file any unit owns")).collect();
+    assert_eq!(repairs.len(), 2, "the master gets every repair the run has");
+    assert!(repairs[0].contains("something old is broken"), "{}", repairs[0]);
+    // Nothing was merged: the project is as it was, and the work stays on the run's branch.
+    assert!(!tmp.0.join("app/a/page.ts").exists());
+    assert!(!tmp.0.join("fixed.txt").exists());
+    assert!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).contains("taskmaster/current"));
+    let status = Records::files(&tmp.0).status("current").unwrap().unwrap();
+    assert_eq!(status["ok"], false);
+    assert_ne!(status["merged"], true);
+}
+
+#[tokio::test]
+async fn the_master_repairs_a_failure_no_unit_owns_and_the_run_passes() {
+    let Some(tmp) = buildable("build-unowned-fixed", "the build needs fixed.txt", "test -f fixed.txt") else { return };
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(read(&tmp.0.join("fixed.txt")), "ok\n", "the master's fix was merged with the run");
+    assert!(log(&tmp.0).contains("taskmaster: repair a failure no unit owns"));
+}
+
+#[tokio::test]
+async fn every_worker_brief_opens_with_the_same_shared_prefix() {
+    let tmp = repo("prefix");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"]), ("b", &["greet"])]), true, 2), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     let calls = world.calls.lock().unwrap().clone();
-    assert!(!calls.iter().any(|call| call.contains("failed:")), "nobody was asked to fix it");
+    let brief = |id: &str| calls.iter().find(|c| c.contains(&format!("Build page `{id}`"))).cloned().unwrap();
+    let (a, b) = (brief("a"), brief("b"));
+    let cut = |text: &str| text.split("--- Your task ---").next().unwrap().to_string();
+    assert_eq!(cut(&a), cut(&b), "the shared part is identical, so the provider's cache can serve it");
+    assert!(cut(&a).contains("export type Id = string;"), "the contracts are in it, in full");
+    assert!(!cut(&a).contains("Build page"), "nothing unit-specific is in it");
+    assert!(a.contains("Work down this list:"));
+}
+
+#[tokio::test]
+async fn a_run_reports_its_stages_tokens_and_cost_from_its_own_records() {
+    let tmp = repo("report");
+    let world = World::new(Mode::Plan);
+    let outcome = run(prompt_config(&tmp.0, "Build page a with a greeting.", true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let report = crate::report::build(&Records::files(&tmp.0), "current").unwrap();
+    let names: Vec<&str> = report.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names.first(), Some(&"planning"));
+    assert!(names.contains(&"build page:a"), "{names:?}");
+    assert!(names.iter().any(|n| n.starts_with("verify")));
+    assert_eq!(report.stages[0].calls, 1);
+    assert_eq!(report.outcome, "finished");
+    assert_eq!(report.fresh, 240, "a planner call and a builder call, 120 each");
+    assert_eq!(report.cost, "$0.02 (2 priced by the provider)");
+    assert!(report.tool_calls >= 1 && report.run_code_calls == 0);
+    let text = crate::report::render(&report);
+    assert!(text.contains("| Stage | Time |") && text.contains("Planning share:") && text.contains("cache-hit ratio"), "{text}");
+}
+
+#[tokio::test]
+async fn streamed_fragments_are_one_transcript_line_per_message() {
+    let tmp = repo("merge");
+    let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));
+    let agent = serde_json::json!({ "id": "unit:calc" });
+    let (tx, rx) = mpsc::channel(256);
+    let heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let collect = crate::engine::collect_events(Some((live.clone(), "r".into(), agent)), None, rx, heard);
+    for i in 0..50 {
+        tx.send(HarnessEvent::Thought { text: format!("t{i} ") }).await.unwrap();
+    }
+    tx.send(HarnessEvent::ToolCall { id: "1".into(), name: "read".into(), input: serde_json::json!({ "path": "a.py" }) }).await.unwrap();
+    for i in 0..50 {
+        tx.send(HarnessEvent::Text { text: format!("w{i} ") }).await.unwrap();
+    }
+    drop(tx);
+    let (text, _) = collect.await.unwrap();
+    assert!(text.starts_with("w0 w1 ") && text.ends_with("w49 "), "the answer keeps every fragment");
+    let (_, lines) = live.read("r", 0);
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["thought", "tool_call", "text"], "one line per message, not 101");
+    assert!(lines[0]["text"].as_str().unwrap().ends_with("t49 "));
+}
+
+#[test]
+fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
+    use crate::engine::{cost_words, dollars};
+    use tm_core::{LedgerEntry, Role};
+    let call = |cost: Option<f64>, by: Option<&str>| LedgerEntry {
+        at: String::new(),
+        role: Role::Worker,
+        page: Some("a".into()),
+        harness: "grok-build".into(),
+        model: None,
+        input: 1000,
+        output: 100,
+        cache_read: 0,
+        cache_write: 0,
+        cost_usd: cost,
+        seconds: 1.0,
+        ok: true,
+        refused: vec![],
+        agent: None,
+        unit: None,
+        priced_by: by.map(str::to_string),
+    };
+    assert!(cost_words(&[call(None, None)]).starts_with("unpriced"), "no price is not $0.00");
+    assert!(cost_words(&[call(Some(0.0), Some("provider"))]).contains("charged nothing (a free model)"));
+    let mixed = cost_words(&[call(Some(0.5), Some("provider")), call(Some(0.25), Some("prices")), call(None, None)]);
+    assert_eq!(mixed, "$0.75 (1 priced by the provider, 1 from the price table, 1 unpriced)");
+    assert!(dollars(&tm_core::Estimate { tokens: 1, ..Default::default() }).starts_with("unpriced"));
+    assert_eq!(dollars(&tm_core::Estimate { tokens: 1, usd: 1.234, priced: true, ..Default::default() }), "$1.23");
+    // Grok reports no price, so the built-in table prices it as the benchmark's grader does.
+    let grok = crate::settings::built_in_prices()["grok-build"];
+    assert!((grok.cost(1_000_000, 1_000_000, 1_000_000) - 8.5).abs() < 1e-9);
+}
+
+#[test]
+fn a_silent_agent_gets_a_heartbeat_line_every_two_minutes() {
+    use crate::engine::beat_due;
+    let s = Duration::from_secs;
+    assert!(!beat_due(s(60), None), "a minute of thinking is not news");
+    assert!(beat_due(s(120), None), "two minutes of nothing is");
+    assert!(!beat_due(s(150), Some((s(30), false))), "said 30s ago, about this same silence");
+    assert!(beat_due(s(250), Some((s(130), false))), "and again two minutes later");
+    assert!(beat_due(s(125), Some((s(200), true))), "a new silence after the agent spoke is reported anew");
+}
+
+#[test]
+fn only_commons_entries_that_bear_on_the_request_reach_the_planner() {
+    let entry = |key: &str, summary: &str, content: &str, tier: DictTier| tm_core::DictionaryEntry {
+        key: key.into(),
+        tier,
+        kind: EntryKind::Hint,
+        summary: summary.into(),
+        content: content.into(),
+        hash: String::new(),
+        stack: String::new(),
+        stats: None,
+    };
+    let todo = || vec![
+        entry("todo-schema", "todo items in localStorage", "Todos persist in localStorage under the key todos.", DictTier::Commons),
+        entry("todo-dom", "todo list markup", "ul#todo-list with one li per todo item", DictTier::Commons),
+        entry("project-note", "this project's own note", "anything", DictTier::Local),
+    ];
+    let keys = |found: Vec<tm_core::DictionaryEntry>| found.into_iter().map(|e| e.key).collect::<Vec<_>>();
+    // A document database has nothing to do with a todo app: only the project's own entry.
+    let db = "Build tinydb, a small document database in Python with tables, queries and a JSON storage file.";
+    assert_eq!(keys(crate::engine::relevant_entries(db, todo())), vec!["project-note"]);
+    // A todo app gets them, and an entry named by its key always comes.
+    let app = "A todo list page: add todo items, tick them done, and keep them in localStorage.";
+    let found = keys(crate::engine::relevant_entries(app, todo()));
+    assert!(found.contains(&"todo-schema".to_string()) && found.contains(&"todo-dom".to_string()), "{found:?}");
+    assert!(keys(crate::engine::relevant_entries("Use the todo-dom entry.", todo())).contains(&"todo-dom".to_string()));
+}
+
+#[tokio::test]
+async fn a_refused_shell_with_no_changes_is_not_retried_and_says_why() {
+    let tmp = seeded("refused");
+    let world = World::new(Mode::Refused);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    let builds = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(builds, 1, "the same refusal would meet every retry, so there is none");
+    let attempts = Records::files(&tmp.0).attempts("current", "a").unwrap();
+    let failure = attempts.last().and_then(|a| a.failure.clone()).unwrap_or_default();
+    assert!(failure.contains("Bash poetry lock") && failure.contains("sandbox.shell"), "{failure}");
+    // The ledger keeps what was refused beside whether the turn finished.
+    let ledger = read(&run_directory(&tmp.0, "current").join("ledger.jsonl"));
+    let row: serde_json::Value = ledger.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|r| r["page"] == "a").unwrap();
+    assert_eq!(row["ok"], true);
+    assert_eq!(row["refused"], serde_json::json!(["Bash poetry lock"]));
+}
+
+#[tokio::test]
+async fn a_sketched_run_builds_phase_by_phase_and_keeps_project_md() {
+    let tmp = seeded("phased");
+    let world = World::new(Mode::Phased);
+    let outcome = run(prompt_config(&tmp.0, &format!("Build a product with a shared core and pages on top. {}", "It has many parts. ".repeat(20)), true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let first = calls.iter().find(|c| c.contains("Plan this product")).unwrap();
+    assert!(first.contains("`phases`") && first.contains("Sketch first"), "the first planner is asked for a sketch");
+    let phase = calls.iter().find(|c| c.contains("Plan phase 2 of 2")).expect("the second phase was planned on its own");
+    assert!(phase.contains("PROJECT.md") && phase.contains("`a` owns `app/a/**`"), "{phase}");
+    // Phase two's unit was built after phase one's, never before.
+    let a = calls.iter().position(|c| c.contains("Build page `a`")).unwrap();
+    let b = calls.iter().position(|c| c.contains("Build page `b`")).unwrap();
+    assert!(a < b);
+    assert!(calls[b].contains("PROJECT.md, the plan of the whole project"), "workers share the sketch");
+    assert!(calls[a].contains("run `npm test`") || calls[a].contains("check your files"), "{}", calls[a]);
+    let md = read(&tmp.0.join("PROJECT.md"));
+    assert!(md.contains("1. `core` (done)") && md.contains("2. `rest` (done)"), "{md}");
+    assert!(md.contains("### Phase 1: `core`") && md.contains("`app/a/page.ts`") && md.contains("`app/b/page.ts`"), "{md}");
+    assert!(tmp.0.join("app/b/page.ts").is_file());
+    // Each finished phase is a checkpoint the run can roll back to.
+    assert!(!git_out(&tmp.0, &["for-each-ref", "refs/taskmaster/current/phase-1"]).trim().is_empty());
+    assert!(log(&tmp.0).contains("taskmaster: phase 1 landed"));
+}
+
+#[tokio::test]
+async fn a_project_md_of_the_projects_own_is_never_overwritten() {
+    let tmp = repo("own-md");
+    std::fs::write(tmp.0.join("PROJECT.md"), "# Ours\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "ours"]);
+    let world = World::new(Mode::Phased);
+    let outcome = run(prompt_config(&tmp.0, &format!("Build a product. {}", "It has many parts. ".repeat(20)), true), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(read(&tmp.0.join("PROJECT.md")), "# Ours\n");
+}
+
+#[tokio::test]
+async fn a_repair_goes_to_the_builders_open_session() {
+    let tmp = seeded("warm");
+    let world = World::new(Mode::CrossImport);
+    world.keeps.store(true, Ordering::SeqCst);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let fresh = calls.iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(fresh, 1, "the repair was not a fresh agent");
+    let follow = calls.iter().find(|c| c.starts_with("[follow-up a]")).expect("the repair went to a's open session");
+    assert!(follow.contains("The checks failed after your last turn") && follow.contains("RELEASE page:a"), "{follow}");
+    assert!(!follow.contains("--- Your task ---"), "a follow-up does not resend the whole brief");
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("fixed"), "the follow-up's fix was merged");
+    // The open worktree had b's files copied in; they were not taken as a's work.
+    assert!(log(&tmp.0).contains("taskmaster: repaired page a"));
+}
+
+#[tokio::test]
+async fn an_empty_balance_is_a_typed_limit_and_the_run_resumes() {
+    let tmp = seeded("broke");
+    let world = World::new(Mode::Broke);
+    let err = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap_err();
+    let limit = err.downcast_ref::<crate::reply::ReportedLimit>().expect("a typed limit, not a raw error");
+    assert!(limit.sentence().contains("no usage balance left"), "{}", limit.sentence());
+    assert!(!limit.sentence().contains("-32603"), "the raw reply stays out of the sentence");
+    // Nothing was thrown away: the same command picks the run up where it stopped.
+    let again = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &again).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));
+    assert!(again.calls.lock().unwrap().iter().all(|c| !c.contains("Plan this")), "it was not planned again");
+}
+
+#[tokio::test]
+async fn a_library_plan_builds_modules_with_no_route_and_no_browser() {
+    let tmp = seeded("library");
+    let world = World::new(Mode::Write);
+    let mut planned = plan(&[("a", &[]), ("b", &[])]);
+    planned.kind = tm_core::ProjectKind::Library;
+    for page in &mut planned.pages {
+        page.route.clear();
+    }
+    let outcome = run(config(&tmp.0, planned, true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    let builds: Vec<&String> = calls.iter().filter(|c| c.contains("Build unit `")).collect();
+    assert_eq!(builds.len(), 2, "{calls:#?}");
+    assert!(builds.iter().all(|b| !b.contains("for route") && !b.contains("app/index.html") && !b.contains("Design spec")));
+    let transcript = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
+    assert!(!transcript.contains("browser check"), "nothing is opened in a browser");
+    // A module is a unit everywhere: its agent, its release line, the ledger and the log.
+    assert!(transcript.contains("\"id\":\"unit:a\"") && !transcript.contains("\"id\":\"page:a\""));
+    assert!(builds.iter().all(|b| b.contains("`RELEASE unit:")), "{builds:#?}");
+    let ledger = read(&run_directory(&tmp.0, "current").join("ledger.jsonl"));
+    assert!(ledger.contains("\"agent\":\"unit:a\"") && ledger.contains("\"agent\":\"unit:b\""), "{ledger}");
+    assert!(log(&tmp.0).contains("taskmaster: built unit a"));
+}
+
+#[tokio::test]
+async fn a_sandboxed_builder_gets_a_shell_and_a_reviewer_never_does() {
+    let tmp = seeded("shell");
+    let world = World::new(Mode::Write);
+    world.sandboxed.store(true, Ordering::SeqCst);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let shells = world.shells.lock().unwrap().clone();
+    let builder = shells.iter().find(|(read_only, shell)| !read_only && shell.is_some()).map(|(_, s)| s.clone().unwrap()).expect("the builder had a shell");
+    let scratch = builder.env.iter().find(|(k, _)| k == "TASKMASTER_SCRATCH").map(|(_, v)| PathBuf::from(v)).unwrap();
+    assert!(scratch.starts_with(run_directory(&tmp.0, "current")), "{scratch:?}");
+    assert!(builder.writable.contains(&scratch));
+    assert!(builder.env.iter().any(|(k, v)| k == "PYTHONDONTWRITEBYTECODE" && v == "1"));
+    assert!(shells.iter().filter(|(read_only, _)| *read_only).all(|(_, shell)| shell.is_none()), "readers get no shell");
+    let calls = world.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|c| c.contains("Build page `a`")));
+
+    // Off in the settings, or a harness the sandbox cannot hold: no shell for anyone.
+    let tmp = seeded("no-shell");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(world.shells.lock().unwrap().iter().all(|(_, shell)| shell.is_none()));
+    let tmp = seeded("shell-off");
+    let world = World::new(Mode::Write);
+    world.sandboxed.store(true, Ordering::SeqCst);
+    let mut cfg = config(&tmp.0, plan(&[("a", &["greet"])]), true, 1);
+    cfg.worker_shell = false;
+    run(cfg, &world).await.unwrap();
+    assert!(world.shells.lock().unwrap().iter().all(|(_, shell)| shell.is_none()));
+}
+
+#[tokio::test]
+async fn a_unit_whose_files_are_already_right_is_done_not_failed() {
+    let tmp = seeded("already");
+    std::fs::create_dir_all(tmp.0.join("app/a")).unwrap();
+    std::fs::write(tmp.0.join("app/a/page.ts"), "export const page = \"a\";\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "a exists"]);
+    let world = World::new(Mode::Nothing);
+    let outcome = run(config(&tmp.0, plan(&[("a", &["greet"])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let builds = world.calls.lock().unwrap().iter().filter(|c| c.contains("Build page `a`")).count();
+    assert_eq!(builds, 1, "no repair or escalation for a unit that was already done");
 }
 
 #[tokio::test]
@@ -1233,10 +1638,12 @@ async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
     let mut second = config(&tmp.0, plan(&[("b", &[]), ("c", &[])]), true, 1);
     second.run_id = "two".into();
     assert_eq!(run(second, &world).await.unwrap(), Outcome::Finished { ok: true });
-    // Every fake call is 120 tokens and one cent: two pages, and no review.
+    // Every fake call is 120 tokens and one cent: two pages at 1.3 calls each, no review.
     let status = Records::files(&tmp.0).status("two").unwrap().unwrap();
-    assert_eq!(status["estimate"]["tokens"], 2 * 120);
-    assert!((status["estimate"]["usd"].as_f64().unwrap() - 0.02).abs() < 1e-9);
+    assert_eq!(status["estimate"]["tokens"], 312);
+    // A cent per 120 tokens, over the fresh tokens and the contract read from the cache.
+    assert!((0.026..0.03).contains(&status["estimate"]["usd"].as_f64().unwrap()), "{status}");
+    assert_eq!(status["estimate"]["priced"], true);
     assert_eq!(status["spent"]["fresh"], 2 * 120);
 }
 
@@ -1682,7 +2089,7 @@ mod http {
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
         assert_eq!(done["cancelled"], false);
-        assert_eq!(done["estimate"]["tokens"], 2 * 17_000);
+        assert_eq!(done["estimate"]["tokens"], 2 * 40_000);
         let calls = done["spent"]["calls"].as_u64().unwrap();
         assert!(calls >= 2 && done["spent"]["tokens"] == calls * 120, "{done}");
         assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);
@@ -1745,7 +2152,8 @@ mod http {
     #[tokio::test]
     async fn a_follow_up_note_produces_a_master_step_before_any_worker_step() {
         let tmp = repo("api-agents");
-        let world = World::new(Mode::Learn);
+        // The first attempt writes outside its files and fails; the repair passes.
+        let world = World::new(Mode::Outside);
         let (_server, mut client, code) = server(&tmp, &world).await;
         let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
         client.token = Some(paired["token"].as_str().unwrap().to_string());
@@ -2034,7 +2442,7 @@ mod http {
         let (_, made) = client.post("/api/runs", json!({ "id": "bad", "prompt": "Build page a." })).await;
         assert_eq!(made["id"], "bad");
         let run = client.settled("bad", "planning").await;
-        assert!(run["error"].as_str().unwrap().contains("no pages"), "{run}");
+        assert!(run["error"].as_str().unwrap().contains("no units"), "{run}");
         let (_, listed) = client.get("/api/runs").await;
         assert_eq!(listed["runs"][0]["id"], "bad");
     }

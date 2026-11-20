@@ -92,7 +92,7 @@ cd web && npm ci && npm run build
 tm-daemon serve . --web web/dist         # http://127.0.0.1:8737, pair with the printed code
 ```
 
-`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, and 2 when the plan is waiting for `--yes`.
+`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, 2 when the plan is waiting for `--yes`, and 3 when a provider stopped it (a usage limit, no balance left, a sign-in); run the same command again to resume. `--timeout 0` lets an agent call run with no time limit.
 
 ## Architecture
 
@@ -140,7 +140,7 @@ tm-daemon . --yes
 
 The first `tm-daemon` command records the plan and exits 2. The second approves that recorded plan and builds it. Pass `--yes` on the first command to approve immediately.
 
-A rejected plan is sent back to the planner once, with the errors. An existing Dictionary entry may be cited. Different content for the same key is refused.
+A rejected plan is repaired, not planned again: a short call with no tools gets the plan and the reasons and changes only what they name, up to two times. A reply with no plan in it at all is planned once more. An existing Dictionary entry may be cited. Different content for the same key is refused.
 
 When the run finishes clean, its branch is merged into whatever the project has checked out and then deleted. A run that fails stays on its branch, and so does one git cannot merge cleanly; either way the project is left as it was. A repository with no commit yet has nothing to branch from, so its first run builds in place.
 
@@ -172,7 +172,7 @@ The harnesses are `claude`, `agy`, `grok`, `codex`, and `opencode`.
 
 ## The brakes
 
-A page that fails its checks is sent back with the errors. It gets two repairs on the worker, then two on the mid model, then two on the master. After that, the page fails. A Dictionary entry can be amended once in a run. Review runs for two rounds, and the round after the last one goes straight to verification.
+A page that fails its checks is sent back with the errors: the failing output itself, the calls the gate refused with what they asked for, and, when the attempt changed nothing, that it changed nothing and its last words. It gets two repairs on the worker, then two on the mid model, then two on the master. After that, the page fails. When worker, mid and master are the same harness and model, climbing the ladder would only repeat the attempt, so there is none: two focused repairs, then the page fails. An attempt that changed nothing after a shell command or a fetch was refused is not retried at all: the same refusal would meet every retry, so the page fails at once and says what it needed. A Dictionary entry can be amended once in a run. Review runs for two rounds, and the round after the last one goes straight to verification.
 
 The reviewer and the verifier are different harnesses, so one model does not grade its own page. Findings the verifier rejects are dropped. A write outside the page's glob fails the attempt, including a write to a locked contract. Up to four pages build at once. `--parallel` changes that for a new run. A resumed run keeps the parallelism it started with.
 
@@ -180,7 +180,9 @@ The reviewer and the verifier are different harnesses, so one model does not gra
 
 Before a run finishes, the files it built are typechecked and linted with tools the project already has: `tsc` from `node_modules`, eslint when it is configured, clippy for Rust, ruff for Python. Only errors count. A type error, a compile error, or a lint rule the project set to `error` goes back to the page that owns the file, and into that model's Errorography. Style warnings do not. An error in a shared file the run wrote, a contract or a template file, goes to the master, which may edit those files and nothing else. It gets two such repairs in a run; if the file still fails, the run fails. An error in a file the run did not write was there before, so it is printed and left alone. Taskmaster installs nothing here.
 
-When the types are clean, the project is run. Its own `build` and `test` scripts run through the package manager its lockfile names (npm, pnpm, yarn or bun). A Rust project gets `cargo test`, and a Python project with a test directory gets `pytest`. Each failure goes back to the page whose file or route the output names. A failure that names a shared file the run wrote goes to the master. One that names neither is printed and costs nothing.
+When the types are clean, the project is run. Its own `build` and `test` scripts run through the package manager its lockfile names (npm, pnpm, yarn or bun). A Rust project gets `cargo test`. Any Python tests (a `tests/` directory, or `test_*.py` files) are run with pytest through the project's own runner when it has one (`poetry run`, `uv run`, `hatch run`), or else from pip. Either way they run in a venv the run makes for itself, `.taskmaster/runs/<id>/venv`, with the project and its dev or test extras (or its `requirements*.txt`) installed, and with `VIRTUAL_ENV`, `PYTHONPATH`, `CONDA_*` and any other venv on `PATH` stripped from the environment. The venv is kept for the rest of the run and refilled only when a dependency file changes.
+
+Each failure goes back to the page whose file or route the output names. A failure that names a shared file the run wrote goes to the master. A failure that names neither also goes to the master, with its output, and the master may change any file to fix it. The run gets two such repairs; if the checks still fail after them, the run fails: it exits 1, and its branch is kept and not merged. A failing check never passes in silence. A project that has tests whose tests could not be run at all is not verified either: the run prints `verify: nothing ran` and fails.
 
 A Next.js app that built is then started and opened in headless Chrome, one page per route, over the DevTools protocol. A dynamic segment such as `[id]` gets a sample value, and its 404 is not counted against it. The page gets back:
 - an error status;
@@ -188,7 +190,27 @@ A Next.js app that built is then started and opened in headless Chrome, one page
 - a `console.error`;
 - a resource that failed to load.
 
-A screenshot of each page is kept, and the app shows it next to the page. Chrome is found on `PATH`, or at `$TASKMASTER_CHROME`. `--no-runtime-checks` skips all of this.
+A screenshot of each page is kept, and the app shows it next to the page. Chrome is found on `PATH`, or at `$TASKMASTER_CHROME`. Only units a browser shows are opened: a plan for a library, a command-line tool, a server or a migration has no routes, no design system and no browser check. `--no-runtime-checks` skips all of this.
+
+## What a plan is
+
+A plan names its `kind`: `web`, `library`, `cli`, `server` or `migration`. Its `units` are the pieces of work, each one agent (or several, when it is split into `parts`) owning one glob. Only a unit a browser shows (every unit of a `web` plan, or one marked `"ui": true`) has a `route`, and only a plan with such a unit has a `design`. Contracts are interfaces that more than one unit imports, never implementations: signatures, types, constants and schemas with stub bodies, at most 120 lines each and 400 in all, and never a file a unit owns. The planner is shown the same list of rules the plan is checked against, and a field with one sensible fix (a route on a module, a design on a library, a path written `./x`) is fixed in place rather than sending the plan back. A unit whose files are already right and whose agent changes nothing is done, not failed.
+
+## Phases and PROJECT.md
+
+A job bigger than a small one is sketched first. The first planning call returns 2-6 phases in build order, each with its goal, the files it delivers, its interfaces as signatures only, and the command that runs its tests, and plans only the first phase in detail. Small jobs (a dependency upgrade, a fix, or fewer than about five files) are one phase with one or two units, as before.
+
+One phase builds at a time. When it passes the project's checks, Taskmaster writes what it landed into `PROJECT.md` at the project root (from the change log, so it records what actually happened), keeps a checkpoint of the run's branch under `refs/taskmaster/<run>/phase-<n>`, and adds the next phase's units. A phase that needs only the interfaces before it is planned while that phase builds, so its workers start as soon as it passes. A project that has a `PROJECT.md` of its own keeps it; Taskmaster's is then not written. The run view lists the phases under the master, each with its state.
+
+Every builder's brief opens with the same text, word for word: the project kind, `PROJECT.md`, the locked contracts in full in path order, the design for web units, and the shared rules. Its own task follows. Providers cache a prompt's leading text, so that shared part is served from their cache. The task ends with a short list to work down, which ends with running the tests. A planner lists only this project's Dictionary entries and the Commons entries the request names or shares two words with.
+
+## Repairs go back to the same agent
+
+A builder's session is kept open after its turn when its harness can (`agy`, `grok` and `opencode`), up to eight at a time. When that unit comes back for repair on the same tier, the failure is sent to it as a follow-up turn: it still has its task, its files and the provider's cache. Its worktree first gets every file the run's tree changed since, and a file left the same as the tree is never counted as the unit's work. If a repair by the master breaks units that had passed, its files are put back as they were at the checkpoint taken just before it.
+
+## A worker's shell
+
+A builder whose harness runs inside the sandbox (bubblewrap for `agy`, `grok` and `opencode`, Codex's own sandbox for `codex`) gets a shell. The whole filesystem is read-only to it except its worktree, `/tmp`, an empty home, its own scratch directory and the run's package caches under `.taskmaster/runs/<id>/`; toolchains under the home directory (`~/.local/bin`, `~/.cargo/bin`, `~/.rustup` and the like) are mounted read-only so they still run. It is told to run the tests for its files before it says it is done. Fetch tools reach only the package indexes (PyPI, npm and crates.io). Test caches, `__pycache__`, venvs and `node_modules` it leaves behind are never counted as its work. Where bubblewrap cannot run, or for Claude Code, workers have no shell, and the run log says so once. Settings, under Worker sandbox, turns either off (`sandbox.shell` and `sandbox.package_indexes` in the settings file). A plan that is not a web app names its agents `unit:<id>` rather than `page:<id>`.
 
 ## Handing over
 
@@ -196,21 +218,13 @@ Each attempt at a page is kept in `.taskmaster/runs/<id>/attempts/<page>.jsonl`:
 
 ## What a run cost
 
-Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the page, the harness, the model, the tokens, the seconds, and the price when the harness reports one. The estimate is not the planner's guess. It is worked out from what build and review calls cost in this project's earlier runs, or from defaults on a first run. The last line a run prints is the total next to that estimate. Cache reads are shown apart from the rest: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. `status.json` has the same totals split by role and by model.
+Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the unit and the agent (each part of a split unit apart), the harness, the model, the tokens, the seconds, the tool calls the gate refused, and the price with where it came from. A price the harness reports is used: over ACP, the reply's cost or what the session's running cost grew by. Otherwise the call is priced from the price table, by model and then by harness: `prices` in the settings file, dollars per million tokens for `input`, `cached_input` and `output`. Grok's are built in ($2, $0.50 and $6). A call with neither is "unpriced", never `$0.00`; a free model that reports no charge says so.
 
-Claude Code reports a price. A harness that does not, such as Antigravity, still has its tokens counted, and the dollar total says how many calls it leaves out.
+The estimate is not the planner's guess. On a first run it is sized from the plan: each unit, a module with its tests or a web page, the repairs a unit needs on average, every later phase of a sketch, and the contracts every builder carries. After that it is worked out from what build calls cost in this project's earlier runs. Cache reads are estimated and shown apart from fresh tokens: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. The last line a run prints is the total next to that estimate. `status.json` has the same totals split by role, model and agent.
 
-## Dictionary and Commons
+`tm-daemon report [<project>] [--run <id>]` prints where a run's time went, from its own records: planning, each unit's build with its repairs, the project's checks, idle time and the total, then the planning share, tokens, the cache-hit ratio, the cost, and the tool and `run_code` calls. `--json` prints it as JSON, and `--append <file>` adds it as one line to a results file such as `bench/results.jsonl`.
 
-The Dictionary is an immutable, content-addressed store. Pages cite keys. They do not invent a second copy of a contract in the brief.
-
-The project store is `.taskmaster/dictionary`. The Commons defaults to `~/.taskmaster/commons`, and workers search it before adding a new entry. A page that passes promotes its new local entries into the Commons. During a run the store is served on `127.0.0.1` with a bearer token for that run. The tools are cite, index, and search.
-
-## What survives the model
-
-**Errorography.** Each model has its own book in `.taskmaster/errorography.json`. The same mistake, three times for that model, is handed back on its next attempt, with a fix when one was learned.
-
-**Citations.** `.taskmaster/citations.json` stores the Dictionary hash each page was built against. A later run skips a page whose cited hashes still match. A page is recorded only once its run is merged, so a run left on its branch does not make the next one skip anything.
+The run's log says when an agent has sent nothing for two minutes (`calc: no output for 120s`), and again every two minutes while it stays quiet. `TASKMASTER_ACP_TRACE=<file>` writes every line to and from an ACP agent (`agy`, `grok`, `opencode`) to that file. The transcript, `agents.jsonl`, keeps each brief whole and one line per streamed message.
 
 **The event log.** `.taskmaster/runs/<id>/events.jsonl` is the run. Replaying it rebuilds the state. The default id is `current`.
 
@@ -220,7 +234,7 @@ Both are off until you switch them on in Settings (or `checker.enabled` and `cod
 
 The **checker** gives a page that just passed its own checks one read-only call on the mid role's model, but only when the page changes UI files, is large, or needed a stronger tier. It reads `diff.patch`, a screenshot of the page as the worker left it, the brief, the done line and the worker's last words, and answers `pass` or up to five fixes. Those fixes join the verify step's errors, so the page is repaired the usual way. Each page is checked once, the check runs beside the rest of the build, and verification waits at most 20 seconds for a check still running.
 
-**Code Mode** gives each worker `run_code`: an async JavaScript body with `read`, `write`, `edit`, `grep`, `ls`, `sh`, `check` and `browser`, run in Node with its permission model on (no files, processes or workers of its own) and, under bubblewrap, no network. Every call goes to the same permission gate as the worker's own tools. Claude Code workers instead run Claude Code's native code mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`) in an interactive session on a terminal.
+**Code Mode** gives every worker and every repair `run_code`: an async JavaScript body with `read`, `readMany`, `write`, `edit`, `grep`, `ls`, `sh`, `test`, `check` and `browser`, run in Node with its permission model on (no files, processes or workers of its own) and, under bubblewrap, no network. `test()` runs the project's own tests in the worker's sandbox and returns `{ok, failed, output}`; `sh()` and `test()` run only inside the sandbox. Workers are told to batch their reads, edits and checks into a few scripts that each end with `return await test()`. A script may run 600 seconds and one `sh()` or `test()` call 300; `code_mode.script_secs` and `code_mode.sh_secs` change that. Every call goes to the same permission gate as the worker's own tools. Claude Code workers instead run Claude Code's native code mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`) in an interactive session on a terminal.
 
 `scripts/bench.sh` builds one locked plan under different settings, and runs a single-agent baseline, writing each result to `bench/results.jsonl`.
 
@@ -364,7 +378,7 @@ tm-review <repo | url> [--base <rev>] [--head <rev>] [--pr <n>] [--dirty]
           [--reviewer-model <m>] [--verifier-model <m>] [--install-lints] [--keep]
 ```
 
-`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, and 2 when the plan is waiting for `--yes`.
+`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, 2 when the plan is waiting for `--yes`, and 3 when a provider stopped it (a usage limit, no balance left, a sign-in); run the same command again to resume. `--timeout 0` lets an agent call run with no time limit.
 
 Commits the daemon makes need `user.name` and `user.email` on that repository. Taskmaster does not write git config.
 

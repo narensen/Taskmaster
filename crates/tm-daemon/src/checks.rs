@@ -87,7 +87,7 @@ pub fn select(tree: &Path, changed: &[String]) -> Vec<Check> {
     if has(changed, &["py"]) && on_path("ruff") {
         out.push(Check::Ruff);
     }
-    for step in runtime::steps(tree) {
+    for step in runtime::steps(tree, &tree.join(".taskmaster/venv")) {
         match step.name.as_str() {
             "build" => out.push(Check::Build),
             "test" => out.push(Check::Test),

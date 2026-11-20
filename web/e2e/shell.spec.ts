@@ -39,6 +39,13 @@ test("pages at once is one click, and Max is what this machine runs", async ({ o
 
 test("a provider and model are picked in place, and the first run saves them", async ({ openFixture, page, daemon }) => {
   test.setTimeout(60_000);
+  // Start from nothing chosen, whatever an earlier spec saved for the fixture's project.
+  const none = { master: "", mid: "", worker: "", reviewer: "", verifier: "" };
+  await fetch(`${daemon.fixture!.url}/api/settings`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${daemon.fixture!.token}` },
+    body: JSON.stringify({ roles: none }),
+  });
   await openFixture("/runs/new");
   for (const seat of ["Master", "Mid", "Worker", "Reviewer"]) {
     await page.getByRole("button", { name: new RegExp(`^${seat} provider`) }).click();

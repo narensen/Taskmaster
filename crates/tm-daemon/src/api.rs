@@ -581,7 +581,7 @@ impl App {
         if events.is_empty() && self.records().request(id)?.is_none() {
             return Ok(None);
         }
-        Ok(Some(Run::replay(self.parallel(id), events)))
+        Ok(Some(Run::replay_with(self.parallel(id), self.focused(id), events)))
     }
 
     /// Replay with the parallelism the run was built with, as the engine does: with 1, a
@@ -589,6 +589,10 @@ impl App {
     /// the run looks stuck in building.
     fn parallel(&self, id: &str) -> usize {
         self.records().meta(id).ok().flatten().map(|meta| meta.parallel.max(1)).unwrap_or(1)
+    }
+
+    fn focused(&self, id: &str) -> bool {
+        self.records().meta(id).ok().flatten().is_some_and(|meta| meta.focused)
     }
 
     fn known(&self, id: &str) -> Result<Run, ApiError> {
@@ -637,6 +641,8 @@ impl App {
             "spent": totals(&self.records().ledger(id)?),
             "review_rounds": run.review_rounds,
             "amendments": run.amendments,
+            "phase_at": run.phase_at,
+            "next_phase": run.next_phase,
         }))
     }
 
@@ -665,6 +671,11 @@ impl App {
         let saved = crate::settings::Settings::load(&self.project()).unwrap_or_default();
         config.checker = saved.checker.enabled;
         config.code_mode = saved.code_mode.enabled;
+        config.code_script_secs = saved.code_mode.script_secs;
+        config.code_sh_secs = saved.code_mode.sh_secs;
+        config.worker_shell = saved.sandbox.shell;
+        config.package_indexes = saved.sandbox.package_indexes;
+        config.prices = crate::settings::price_table(&saved);
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
         config.run_id = id.to_string();
         config.plan = request.plan;
@@ -928,7 +939,7 @@ async fn run_stream(
                 }
                 feed.seen = events.len();
             } else if !active {
-                let phase = Run::replay(feed.app.parallel(&feed.id), events).phase;
+                let phase = Run::replay_with(feed.app.parallel(&feed.id), feed.app.focused(&feed.id), events).phase;
                 feed.ready.push_back(SseEvent::default().event("idle").data(json!({ "phase": phase }).to_string()));
                 feed.over = true;
             } else {

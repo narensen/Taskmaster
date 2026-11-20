@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! tm-daemon providers [--harness <h>]
+//! tm-daemon report [<project>] [--run <id>] [--json]
 //! tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
 //!                 [--web <dir>]
 //! tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
@@ -25,6 +26,10 @@
 //! printed; nothing is built until a later run passes `--yes`. A run resumes from
 //! `.taskmaster/runs/<id>/`. `--eval` runs the plan again with one model and writes
 //! `.taskmaster/evals/<id>.json`. A prompt is planned once and reused for the baseline.
+//! `--timeout 0` lets an agent call run with no time limit. The exit code is 0 when the
+//! run finishes clean, 1 when it fails, 2 when the plan waits for `--yes`, and 3 when a
+//! provider stopped it (a usage limit, no balance left, a sign-in): run the same command
+//! again to resume.
 //! `--pair` serves the API and the phone page on this machine's Tailscale address for as
 //! long as the run lasts. `serve` keeps the API up with no run of its own: a frontend
 //! starts, approves and cancels runs through it. It listens on `127.0.0.1:8737` unless
@@ -77,6 +82,16 @@ fn main() -> ExitCode {
         Ok(Outcome::Finished { ok: true }) => ExitCode::SUCCESS,
         Ok(Outcome::Finished { ok: false }) => ExitCode::from(1),
         Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => ExitCode::from(2),
+        // A provider stopped the run (a usage limit, no balance, a sign-in): the run is kept
+        // where it stopped, and the same command picks it up again.
+        Err(err) if err.downcast_ref::<tm_daemon::reply::ReportedLimit>().is_some() => {
+            eprintln!("taskmaster: {err:#}");
+            eprintln!(
+                "taskmaster: the run is kept where it stopped. Run the same command again to resume it, \
+                 or pass a different --master/--mid/--worker/--reviewer/--verifier to switch the provider."
+            );
+            ExitCode::from(3)
+        }
         Err(err) => {
             eprintln!("taskmaster: {err:#}");
             ExitCode::from(1)
@@ -93,6 +108,37 @@ async fn run() -> anyhow::Result<Outcome> {
         }
         Invocation::Serve(args) => {
             serve(args).await?;
+            return Ok(Outcome::Finished { ok: true });
+        }
+        Invocation::Version => {
+            println!("tm-daemon {}", env!("CARGO_PKG_VERSION"));
+            return Ok(Outcome::Finished { ok: true });
+        }
+        Invocation::Help => {
+            println!("{USAGE}");
+            return Ok(Outcome::Finished { ok: true });
+        }
+        Invocation::Report { project, run, json, append } => {
+            let project = project.canonicalize().with_context(|| format!("cannot open {}", project.display()))?;
+            let records = Settings::load(&project)?.records(&project)?;
+            if records.events(&run)?.is_empty() && records.ledger(&run)?.is_empty() {
+                bail!("there is no run `{run}` in {}", project.display());
+            }
+            let report = tm_daemon::report::build(&records, &run)?;
+            // One line per run, for a benchmark's results file (bench/results.jsonl).
+            if let Some(file) = &append {
+                use std::io::Write;
+                let mut line = serde_json::to_value(&report)?;
+                line["project"] = serde_json::json!(project.display().to_string());
+                line["at"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+                let mut out = std::fs::OpenOptions::new().create(true).append(true).open(file).with_context(|| format!("cannot open {}", file.display()))?;
+                writeln!(out, "{}", serde_json::to_string(&line)?)?;
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", tm_daemon::report::render(&report));
+            }
             return Ok(Outcome::Finished { ok: true });
         }
         Invocation::Drive(args) => *args,
@@ -149,6 +195,11 @@ async fn run() -> anyhow::Result<Outcome> {
     config.store = settings.store(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone()))?;
     config.checker = settings.checker.enabled;
     config.code_mode = settings.code_mode.enabled;
+    config.code_script_secs = settings.code_mode.script_secs;
+    config.code_sh_secs = settings.code_mode.sh_secs;
+    config.worker_shell = settings.sandbox.shell;
+    config.package_indexes = settings.sandbox.package_indexes;
+    config.prices = tm_daemon::settings::price_table(&settings);
     config.remote = settings.remote();
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;
@@ -235,14 +286,32 @@ async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Serv
     Ok(server)
 }
 
-/// Where `scripts/install.sh` puts the built frontend.
+/// Where the built frontend is when `--web` is not given: `$TASKMASTER_WEB`, where the
+/// install scripts put it, or where an installer put it beside this program.
 fn installed_web() -> Option<PathBuf> {
     let from_env = std::env::var_os("TASKMASTER_WEB").map(PathBuf::from);
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
     let installed = data.map(|dir| dir.join("taskmaster/web"));
-    [from_env, installed].into_iter().flatten().find(|dir| dir.join("index.html").is_file())
+    let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let bundled = exe.as_deref().map(bundled_web).unwrap_or_default();
+    [from_env, installed].into_iter().flatten().chain(bundled).find(|dir| dir.join("index.html").is_file())
+}
+
+/// Where the desktop installers put the frontend, relative to `tm-daemon` itself: the .deb
+/// and the AppImage (`usr/bin/tm-daemon`, `usr/lib/Taskmaster/web`), a macOS app
+/// (`Contents/MacOS`, `Contents/Resources/web`), and a folder with `web/` beside the program.
+fn bundled_web(exe: &std::path::Path) -> Vec<PathBuf> {
+    let Some(dir) = exe.parent() else { return Vec::new() };
+    let mut out = vec![dir.join("web")];
+    if let Some(up) = dir.parent() {
+        out.push(up.join("lib/Taskmaster/web"));
+        out.push(up.join("lib/taskmaster/web"));
+        out.push(up.join("share/taskmaster/web"));
+        out.push(up.join("Resources/web"));
+    }
+    out
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -261,6 +330,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
 enum Invocation {
     Providers { harness: Option<String> },
+    Version,
+    Help,
+    /// `tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]`
+    Report { project: PathBuf, run: String, json: bool, append: Option<PathBuf> },
     Serve(ServeArgs),
     Drive(Box<Args>),
 }
@@ -269,6 +342,27 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
     let argv: Vec<String> = argv.into_iter().collect();
     if argv.first().is_some_and(|arg| arg == "providers") {
         return Ok(Invocation::Providers { harness: providers_harness(&argv[1..])? });
+    }
+    if argv.first().is_some_and(|arg| arg == "--version" || arg == "-V") {
+        return Ok(Invocation::Version);
+    }
+    if argv.first().is_some_and(|arg| arg == "--help" || arg == "-h" || arg == "help") {
+        return Ok(Invocation::Help);
+    }
+    if argv.first().is_some_and(|arg| arg == "report") {
+        let usage = "usage: tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]";
+        let (mut project, mut run, mut json, mut append) = (PathBuf::from("."), "current".to_string(), false, None);
+        let mut rest = argv[1..].iter();
+        while let Some(arg) = rest.next() {
+            match arg.as_str() {
+                "--run" => run = rest.next().cloned().with_context(|| usage.to_string())?,
+                "--json" => json = true,
+                "--append" => append = Some(PathBuf::from(rest.next().cloned().with_context(|| usage.to_string())?)),
+                flag if flag.starts_with('-') => bail!("unknown option `{flag}`\n{usage}"),
+                path => project = PathBuf::from(path),
+            }
+        }
+        return Ok(Invocation::Report { project, run, json, append });
     }
     if argv.first().is_some_and(|arg| arg == "serve") {
         return Ok(Invocation::Serve(serve_args(&argv[1..])?));
@@ -326,17 +420,22 @@ async fn print_providers(harness: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `tm-daemon --help` prints, and what a wrong command line is answered with.
+const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
+                     tm-daemon serve <project> [--bind <addr>] [--tailscale] [--web <dir>]\n       \
+                     tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]\n       \
+                     tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] \
+                     [--yes] [--worker <h>] [--mid <h>] [--master <h>] [--reviewer <h>] \
+                     [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
+                     [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
+                     [--timeout <secs, 0 for none>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
+                     [--template <next | dir>] [--no-runtime-checks] \
+                     [--eval] [--baseline <h>] [--pair]\n       \
+                     tm-daemon --version\n\
+                     harnesses: claude, agy, grok, codex, opencode";
+
 fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
-    let usage = "usage: tm-daemon providers [--harness <h>]\n       \
-                 tm-daemon serve <project> [--bind <addr>] [--tailscale]\n       \
-                 tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] \
-                 [--yes] [--worker <h>] [--mid <h>] [--master <h>] [--reviewer <h>] \
-                 [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
-                 [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
-                 [--timeout <secs>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
-                 [--template <next | dir>] [--no-runtime-checks] \
-                 [--eval] [--baseline <h>] [--pair]\n\
-                 harnesses: claude, agy, grok, codex, opencode";
+    let usage = USAGE;
     let mut argv = argv.into_iter();
     let project = argv.next().context(usage)?;
     if project.starts_with('-') {
@@ -445,6 +544,12 @@ mod args_tests {
         assert!(rejected("proj --prompt hi --prompt-file p.txt").contains("only one"));
         assert!(rejected("proj --eval").contains("--eval needs"));
         assert!(parse("proj --prompt-file brief.txt").unwrap().prompt_file.is_some());
+        // The benchmark's own invocation: 0 is no limit.
+        let bench = parse("proj --prompt-file F --yes --worker grok --mid grok --master grok --reviewer grok --verifier grok --parallel 3 --timeout 0").unwrap();
+        assert_eq!(bench.timeout, Some(0));
+        assert_eq!(bench.parallel, 3);
+        assert!(bench.yes);
+        assert_eq!(tm_daemon::settings::agent_limit(0), tm_daemon::settings::NO_LIMIT);
     }
 
     #[test]
@@ -470,10 +575,46 @@ mod args_tests {
     }
 
     #[test]
+    fn the_installers_web_app_is_found_beside_the_program() {
+        let deb = bundled_web(std::path::Path::new("/usr/bin/tm-daemon"));
+        assert!(deb.contains(&PathBuf::from("/usr/lib/Taskmaster/web")));
+        let mac = bundled_web(std::path::Path::new("/Applications/Taskmaster.app/Contents/MacOS/tm-daemon"));
+        assert!(mac.contains(&PathBuf::from("/Applications/Taskmaster.app/Contents/Resources/web")));
+        let tarball = bundled_web(std::path::Path::new("/opt/taskmaster/tm-daemon"));
+        assert_eq!(tarball[0], PathBuf::from("/opt/taskmaster/web"));
+    }
+
+    #[test]
+    fn version_and_help_are_answered_without_a_project() {
+        assert!(matches!(invocation_from(["--version".to_string()]).unwrap(), Invocation::Version));
+        assert!(matches!(invocation_from(["-h".to_string()]).unwrap(), Invocation::Help));
+        assert!(USAGE.contains("tm-daemon report") && USAGE.contains("0 for none"));
+    }
+
+    #[test]
+    fn report_reads_a_project_and_a_run() {
+        match invocation_from(["report".into(), "proj".into(), "--run".into(), "r1".into(), "--json".into()]).unwrap() {
+            Invocation::Report { project, run, json, append } => {
+                assert_eq!((project, run.as_str(), json, append), (PathBuf::from("proj"), "r1", true, None));
+            }
+            _ => panic!("report was not read as a report"),
+        }
+        match invocation_from(["report".to_string()]).unwrap() {
+            Invocation::Report { project, run, json, append } => {
+                assert_eq!((project, run.as_str(), json, append), (PathBuf::from("."), "current", false, None));
+            }
+            _ => panic!("report was not read as a report"),
+        }
+        assert!(invocation_from(["report".into(), "--bogus".into()]).is_err());
+    }
+
+    #[test]
     fn providers_lists_models_without_a_project() {
         match invocation_from(["providers".to_string()]).unwrap() {
             Invocation::Providers { harness: None } => {}
-            Invocation::Drive(_) | Invocation::Serve(_) => panic!("providers was read as a project"),
+            Invocation::Drive(_) | Invocation::Serve(_) | Invocation::Report { .. } | Invocation::Version | Invocation::Help => {
+                panic!("providers was read as a project")
+            }
             Invocation::Providers { harness: Some(name) } => panic!("unexpected filter {name}"),
         }
         match invocation_from(["providers".into(), "--harness".into(), "grok".into()]).unwrap() {

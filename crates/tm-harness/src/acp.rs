@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
@@ -92,7 +93,7 @@ impl AcpHarness {
         };
         let binary = resolve_binary(&self.binary)?;
         let mut cmd = Command::new("bwrap");
-        cmd.args(sandbox.bwrap_args(&binary, &args, &task.cwd, task.read_only));
+        cmd.args(sandbox.bwrap_args_with(&binary, &args, &task.cwd, task.read_only, task.shell.as_ref()));
         Ok(cmd)
     }
 }
@@ -103,38 +104,118 @@ impl Harness for AcpHarness {
         self.id
     }
 
+    fn sandboxed_shell(&self) -> bool {
+        self.sandbox.is_some() && crate::sandbox::bwrap_usable()
+    }
+
     async fn run(
         &self,
         task: WorkerTask,
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let mut command = self.command(&task)?;
-        let (mut child, group) = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
-            .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary))?;
+        let (result, kept) = self.start(task, gate, events, false).await;
+        debug_assert!(kept.is_none());
+        result
+    }
+
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        self.start(task, gate, events, true).await
+    }
+}
+
+impl AcpHarness {
+    /// Start the agent and run the first turn. With `keep`, a turn that finished leaves the
+    /// agent running with its session open, for follow-up turns.
+    async fn start(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+        keep: bool,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        let mut command = match self.command(&task) {
+            Ok(command) => command,
+            Err(err) => return (Err(err), None),
+        };
+        let spawned = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
+            .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary));
+        let (mut child, group) = match spawned {
+            Ok(spawned) => spawned,
+            Err(err) => return (Err(err), None),
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return (Err(anyhow!("the agent's input and output were not captured")), None);
+        };
         let mut session = Session {
-            stdin: child.stdin.take().context("agent stdin was not captured")?,
-            lines: BufReader::new(child.stdout.take().context("agent stdout was not captured")?)
-                .lines(),
+            stdin,
+            lines: BufReader::new(stdout).lines(),
             next_id: 0,
-            dictionary_prefix: task
-                .dictionary
-                .as_ref()
-                .map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
+            dictionary_prefix: task.dictionary.as_ref().map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
             gate,
             events,
             denied: 0,
             stall: task.stall,
             tools: BTreeSet::new(),
+            id: None,
+            cost: None,
         };
         let timeout = task.timeout;
         let result = match tokio::time::timeout(timeout, session.drive(task)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
         };
+        if keep && result.as_ref().is_ok_and(|summary| summary.ok) && session.id.is_some() {
+            // The caller reads this turn's events until their channel closes: the kept session
+            // must not hold its sender, or the turn never ends for the caller.
+            session.events = closed_sender();
+            let kept = Kept { session, child, group: Some(group), harness: self.id };
+            return (result, Some(Box::new(kept)));
+        }
         // The turn is over, finished or not: free the agent and everything it started.
         drop(session);
-        crate::released(result, group.release(&mut child).await)
+        (crate::released(result, group.release(&mut child).await), None)
+    }
+}
+
+/// A sender whose receiver is already gone: events sent to it go nowhere.
+fn closed_sender() -> mpsc::Sender<HarnessEvent> {
+    mpsc::channel(1).0
+}
+
+/// An ACP agent left running after its turn, with its session open.
+struct Kept {
+    session: Session,
+    child: tokio::process::Child,
+    group: Option<crate::GroupGuard>,
+    harness: &'static str,
+}
+
+#[async_trait]
+impl crate::Session for Kept {
+    async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary> {
+        self.session.events = events;
+        self.session.denied = 0;
+        let turn = self.session.prompt(text);
+        let result = match tokio::time::timeout(timeout, turn).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.harness)),
+        };
+        // Let go of this turn's channel, so the caller's reader finishes.
+        self.session.events = closed_sender();
+        result
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Freed {
+        match self.group.take() {
+            Some(group) => group.release(&mut self.child).await,
+            None => crate::Freed::default(),
+        }
     }
 }
 
@@ -159,6 +240,10 @@ struct Session {
     stall: Option<std::time::Duration>,
     /// Tool calls started and not yet finished. A running tool may be silent for a long time.
     tools: BTreeSet<String>,
+    /// The ACP session, once `session/new` answered.
+    id: Option<String>,
+    /// The session's running cost, from the agent's `usage_update` events, when it sends one.
+    cost: Option<f64>,
 }
 
 impl Session {
@@ -205,15 +290,25 @@ impl Session {
             self.call(method, params).await.with_context(|| format!("could not select model `{model}`"))?;
         }
 
+        self.id = Some(session_id);
+        self.prompt(task.framed_brief()).await
+    }
+
+    /// One turn in the open session.
+    async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
+        let session_id = self.id.clone().context("the session is not open")?;
         let prompt = json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": task.framed_brief() }],
+            "prompt": [{ "type": "text", "text": text }],
         });
+        let before = self.cost;
         let result = self.call("session/prompt", prompt).await?;
+        // The reply's own price if it has one, else what the running cost grew by this turn.
+        let cost = read_cost(&result).or_else(|| self.cost.map(|now| (now - before.unwrap_or(0.0)).max(0.0)));
         Ok(RunSummary {
             ok: result["stopReason"] == "end_turn",
             usage: read_usage(&result),
-            cost_usd: None,
+            cost_usd: cost,
             denied: self.denied,
             freed: None,
         })
@@ -235,6 +330,7 @@ impl Session {
                 None => next.await,
             };
             let line = line?.ok_or_else(|| anyhow!("agent closed its output during `{method}`"))?;
+            trace("<", &line);
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg.get("method").is_some() {
                 self.incoming(msg).await?;
@@ -252,6 +348,9 @@ impl Session {
         match msg["method"].as_str() {
             Some("session/update") => {
                 track_tool(&mut self.tools, &params["update"]);
+                if let Some(cost) = running_cost(&params["update"]) {
+                    self.cost = Some(cost);
+                }
                 for event in update_events(&params["update"]) {
                     let _ = self.events.send(event).await;
                 }
@@ -301,10 +400,21 @@ impl Session {
 
     async fn send(&mut self, msg: Value) -> anyhow::Result<()> {
         let mut line = msg.to_string();
+        trace(">", &line);
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+}
+
+/// With `TASKMASTER_ACP_TRACE=<file>`, every line to (`>`) and from (`<`) an ACP agent is
+/// appended to that file, for finding out why an agent stopped answering. Off by default.
+fn trace(way: &str, line: &str) {
+    let Some(path) = std::env::var_os("TASKMASTER_ACP_TRACE") else { return };
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{way} {line}");
     }
 }
 
@@ -487,6 +597,24 @@ fn read_usage(result: &Value) -> Usage {
     Usage { input, output, cache_read, cache_write: count(&["cachedWriteTokens", "cacheCreationTokens"]) }
 }
 
+/// A session's running cost from a `usage_update` (opencode: `{"cost":{"amount":0.12,"currency":"USD"}}`).
+/// Only US dollars are read.
+fn running_cost(update: &Value) -> Option<f64> {
+    if update["sessionUpdate"] != "usage_update" {
+        return None;
+    }
+    let cost = &update["cost"];
+    let currency = cost["currency"].as_str().unwrap_or("USD");
+    currency.eq_ignore_ascii_case("usd").then(|| cost["amount"].as_f64()).flatten()
+}
+
+/// A price a prompt reply carries, wherever the harness put it.
+fn read_cost(result: &Value) -> Option<f64> {
+    let places = [&result["usage"], &result["_meta"]["usage"], &result["_meta"], result];
+    let keys = ["costUsd", "cost_usd", "totalCostUsd", "total_cost_usd"];
+    places.iter().find_map(|place| keys.iter().find_map(|key| place[*key].as_f64()))
+}
+
 /// The tool being called. Antigravity gives a `name`; Grok Build puts an MCP tool's name in
 /// its input and a built-in's name in its metadata; the title is the last resort.
 fn tool_name(tool_call: &Value) -> String {
@@ -561,6 +689,7 @@ mod tests {
             stall: None,
             read_only: true,
             code_mode: false,
+            shell: None,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
         task.effort = Some("low".into());
@@ -616,6 +745,18 @@ mod tests {
     }
 
     #[test]
+    fn a_price_is_read_from_the_reply_or_from_the_running_cost() {
+        assert_eq!(read_cost(&json!({ "stopReason": "end_turn", "_meta": { "usage": { "costUsd": 0.42 } } })), Some(0.42));
+        assert_eq!(read_cost(&json!({ "stopReason": "end_turn", "total_cost_usd": 0.98 })), Some(0.98));
+        assert_eq!(read_cost(&json!({ "stopReason": "end_turn", "usage": { "inputTokens": 5 } })), None);
+        // Recorded from opencode 2.3.0 with a free model.
+        let free = json!({ "sessionUpdate": "usage_update", "used": 7863, "size": 200000, "cost": { "amount": 0, "currency": "USD" } });
+        assert_eq!(running_cost(&free), Some(0.0));
+        assert_eq!(running_cost(&json!({ "sessionUpdate": "usage_update", "cost": { "amount": 3, "currency": "EUR" } })), None);
+        assert_eq!(running_cost(&json!({ "sessionUpdate": "agent_message_chunk" })), None);
+    }
+
+    #[test]
     fn usage_is_read_from_either_place_without_double_counting_cache() {
         // Antigravity: top-level usage, input excludes cached tokens.
         let agy = json!({ "usage": { "inputTokens": 46413, "outputTokens": 2879,
@@ -650,12 +791,56 @@ mod tests {
             stall: Some(std::time::Duration::from_millis(300)),
             read_only: true,
             code_mode: false,
+            shell: None,
         };
         let (tx, _rx) = mpsc::channel(8);
         let started = std::time::Instant::now();
         let err = harness.run(task, Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![])), tx).await.unwrap_err();
         assert!(err.downcast_ref::<Stalled>().is_some(), "{err:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_kept_session_takes_a_follow_up_turn_and_closes() {
+        let say = |id: u32, text: &str| format!(
+            r#"echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}}}}}}'; echo '{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"end_turn"}}}}'"#
+        );
+        let script = format!(
+            r#"read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'; read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'; read l; {}; read l; case "$l" in *again*) {};; esac; sleep 30"#,
+            say(3, "first"),
+            say(4, "second")
+        );
+        let harness = AcpHarness { id: "fake", binary: "sh".into(), args: vec!["-c".into(), script], sandbox: None, mcp_tool_prefix: "{server}__", effort_flag: None };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![]));
+        let (tx, mut rx) = mpsc::channel(32);
+        let (first, kept) = harness.run_kept(task, gate, tx).await;
+        assert!(first.unwrap().ok);
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "first".into() }));
+        // The turn is over for the caller: its event channel closes even though the session
+        // stays open. (A kept sender here once hung every builder after its first turn.)
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(closed, Ok(None), "the kept session still held the turn's event sender");
+        let mut kept = kept.expect("the session stays open after a finished turn");
+        let (tx, mut rx) = mpsc::channel(32);
+        let second = kept.follow_up("try again".into(), tx, std::time::Duration::from_secs(10)).await.unwrap();
+        assert!(second.ok);
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "second".into() }));
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(closed, Ok(None), "a follow-up's channel closes when the turn ends");
+        let freed = kept.close().await;
+        assert!(freed.processes >= 1 && freed.lingering == 0, "{freed:?}");
     }
 
     #[test]

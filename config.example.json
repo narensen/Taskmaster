@@ -23,5 +23,14 @@
   },
   "telemetry": {
     "enabled": false
+  },
+  "code_mode": {
+    "enabled": false,
+    "script_secs": 600,
+    "sh_secs": 300
+  },
+  "sandbox": {
+    "shell": true,
+    "package_indexes": true
   }
 }

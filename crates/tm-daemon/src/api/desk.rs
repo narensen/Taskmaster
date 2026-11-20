@@ -192,7 +192,7 @@ pub struct NoteBody {
 }
 
 pub fn valid_recipient(to: &str) -> bool {
-    matches!(to, "master" | "workers" | "reviewer" | "verifier") || to.strip_prefix("page:").is_some_and(valid_key)
+    matches!(to, "master" | "workers" | "reviewer" | "verifier") || to.strip_prefix("page:").or_else(|| to.strip_prefix("unit:")).is_some_and(valid_key)
 }
 
 pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>, Json(body): Json<NoteBody>) -> Reply {
@@ -932,10 +932,18 @@ pub struct SettingsBody {
     checker: Option<bool>,
     /// Code Mode on or off.
     code_mode: Option<bool>,
+    /// The workers' sandbox: `{shell?, package_indexes?}`.
+    sandbox: Option<SandboxBody>,
     /// Anonymous counts. Off until set.
     telemetry: Option<bool>,
     /// Seconds one agent call may run; 0 is no limit.
     agent_timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct SandboxBody {
+    shell: Option<bool>,
+    package_indexes: Option<bool>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -989,6 +997,16 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         set_setting(&app.project(), "roles", Value::Object(roles))
             .and_then(|()| save_setting(&app.project(), "models", json!(saved.models)))
             .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(sandbox) = &body.sandbox {
+        let mut changes = serde_json::Map::new();
+        if let Some(on) = sandbox.shell {
+            changes.insert("shell".into(), json!(on));
+        }
+        if let Some(on) = sandbox.package_indexes {
+            changes.insert("package_indexes".into(), json!(on));
+        }
+        save_setting(&app.project(), "sandbox", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if let Some(on) = body.code_mode {
         save_setting(&app.project(), "code_mode", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1080,6 +1098,12 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "models": role_defaults.models,
         "checker": { "enabled": role_defaults.checker.enabled },
         "code_mode": { "enabled": role_defaults.code_mode.enabled },
+        "sandbox": {
+            "shell": role_defaults.sandbox.shell,
+            "package_indexes": role_defaults.sandbox.package_indexes,
+            // Whether this machine can give a worker a sandboxed shell at all.
+            "available": tm_harness::sandbox::bwrap_usable(),
+        },
         "telemetry": { "enabled": role_defaults.telemetry.enabled },
         "agents": { "timeout_secs": role_defaults.agents.timeout_secs },
         "editor": *app.editor.lock().unwrap(),
@@ -1090,7 +1114,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
 }
 
 const SETTING_KEYS: &[&str] = &[
-    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents",
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox",
 ];
 
 /// Tokens are not part of an export. Host connections live in another file and stay there.
@@ -1158,6 +1182,7 @@ pub async fn reset_settings(State(app): State<Arc<App>>) -> Reply {
         ("code_mode", json!({ "enabled": false })),
         ("telemetry", json!({ "enabled": false })),
         ("agents", json!({ "timeout_secs": crate::settings::DEFAULT_AGENT_SECS })),
+        ("sandbox", json!({ "shell": true, "package_indexes": true })),
     ];
     for (key, value) in defaults {
         set_setting(&project, key, value).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1247,19 +1272,23 @@ mod tests {
     #[test]
     fn a_pull_request_is_written_from_the_plan() {
         let plan = tm_core::Plan {
+            kind: Default::default(),
             contracts: vec![tm_core::ContractFile { path: "app/types.ts".into(), content: "x".into() }],
             pages: vec![tm_core::PagePlan {
                 id: "home".into(),
                 route: "/".into(),
+                ui: None,
                 owned_glob: "app/home/**".into(),
                 cites: vec!["theme".into()],
                 brief: "b".into(),
                 done: String::new(),
                 units: vec![],
                 skills: vec![],
+                phase: 0,
             }],
-            estimate: tm_core::Estimate { tokens: 1000, usd: 0.5 },
+            estimate: tm_core::Estimate { tokens: 1000, usd: 0.5, ..Default::default() },
             design: String::new(),
+            phases: vec![],
         };
         let (title, body) = pr_text("r1", Some("\nA bookshop with a cart\nmore"), &plan);
         assert_eq!(title, "A bookshop with a cart");

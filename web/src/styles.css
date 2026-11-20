@@ -4034,3 +4034,51 @@ button.lane-diff { opacity: 0; }
 }
 /* The open call's clock beside an agent's state. */
 .flow-since { color: var(--muted); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+
+/* v0.1.5: long transcripts stay cheap. A row off screen skips style, layout and paint until it is
+   scrolled to, and an agent's older rows fold behind one button. */
+.flow [data-agent-text] > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 28px;
+}
+.flow-earlier {
+  display: block;
+  margin: 2px 0 10px;
+  color: var(--muted);
+}
+.flow-earlier:hover {
+  color: var(--ink);
+}
+
+/* v0.1.5: the sketch's phases under the master, one line each; the active one open. */
+.flow-phases {
+  list-style: none;
+  margin: 8px 0 4px;
+  padding: 0;
+  border-left: 1px solid var(--line);
+}
+.flow-phase {
+  padding: 4px 0 4px 12px;
+  color: var(--muted);
+}
+.flow-phase-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.flow-phase-mark {
+  width: 1em;
+  color: var(--muted);
+}
+.flow-phase.building,
+.flow-phase.checking {
+  color: var(--ink);
+}
+.flow-phase.building .flow-phase-mark,
+.flow-phase.checking .flow-phase-mark,
+.flow-phase.done .flow-phase-mark {
+  color: var(--ink);
+}
+.flow-phase .flow-life {
+  margin: 2px 0 0 calc(1em + 8px);
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -27,17 +27,8 @@ import {
 } from "lucide-react";
 import { api, setToken, token, tokenFromRedirect, type RunSummary } from "./api";
 import { Link, isMorph, match, navigate, usePath } from "./router";
-import { Dictionary } from "./pages/Dictionary";
-import { Errorography } from "./pages/Errorography";
-import { NewRun } from "./pages/NewRun";
-import { ReviewView, Reviews } from "./pages/Reviews";
-import { RunView } from "./pages/RunView";
 import { Gallery } from "./pages/Gallery";
-import { Providers } from "./pages/Providers";
-import { Skills } from "./pages/Skills";
-import { Settings as SettingsPage } from "./pages/Settings";
 import { SignIn } from "./pages/SignIn";
-import { Files } from "./pages/Files";
 import { ContextMenu, Toasts, emit, openMenu, undoLatest, useOn, type Chip } from "./overlay";
 import { Palette, openProject, type PaletteState } from "./palette";
 import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
@@ -106,7 +97,53 @@ function useSignedIn(): boolean {
   return signedIn;
 }
 
+// Every screen but the gallery loads when first opened, so the first load carries only what
+// the home screen draws. Once the app is idle the rest is fetched, so later switches do not wait.
+const loaders = {
+  dictionary: () => import("./pages/Dictionary"),
+  errorography: () => import("./pages/Errorography"),
+  newRun: () => import("./pages/NewRun"),
+  reviews: () => import("./pages/Reviews"),
+  run: () => import("./pages/RunView"),
+  providers: () => import("./pages/Providers"),
+  skills: () => import("./pages/Skills"),
+  settings: () => import("./pages/Settings"),
+  files: () => import("./pages/Files"),
+};
+const Dictionary = lazy(() => loaders.dictionary().then((m) => ({ default: m.Dictionary })));
+const Errorography = lazy(() => loaders.errorography().then((m) => ({ default: m.Errorography })));
+const NewRun = lazy(() => loaders.newRun().then((m) => ({ default: m.NewRun })));
+const Reviews = lazy(() => loaders.reviews().then((m) => ({ default: m.Reviews })));
+const ReviewView = lazy(() => loaders.reviews().then((m) => ({ default: m.ReviewView })));
+const RunView = lazy(() => loaders.run().then((m) => ({ default: m.RunView })));
+const Providers = lazy(() => loaders.providers().then((m) => ({ default: m.Providers })));
+const Skills = lazy(() => loaders.skills().then((m) => ({ default: m.Skills })));
+const SettingsPage = lazy(() => loaders.settings().then((m) => ({ default: m.Settings })));
+const Files = lazy(() => loaders.files().then((m) => ({ default: m.Files })));
+
+function usePrefetchScreens() {
+  useEffect(() => {
+    const go = () => {
+      for (const load of Object.values(loaders)) void load().catch(() => undefined);
+    };
+    if ("requestIdleCallback" in window) {
+      const handle = window.requestIdleCallback(go, { timeout: 3000 });
+      return () => window.cancelIdleCallback(handle);
+    }
+    const handle = globalThis.setTimeout(go, 1500);
+    return () => globalThis.clearTimeout(handle);
+  }, []);
+}
+
 function Page({ path }: { path: string }) {
+  return (
+    <Suspense fallback={<div className="page" aria-busy="true" />}>
+      <Screen path={path} />
+    </Suspense>
+  );
+}
+
+function Screen({ path }: { path: string }) {
   let params: Record<string, string> | null;
   if (path === "/" || path === "/runs") return <Gallery />;
   if (path === "/runs/new") return <NewRun />;
@@ -190,7 +227,20 @@ function RunMark({ group }: { group: Group }) {
 /** A long run list is drawn a screenful at a time; a short one keeps its layout animation. */
 const VIRTUAL_AFTER = 60;
 
-function RunRow({ run, group, i, on, stamp, onPick }: { run: RunSummary; group: Group; i: number; on: boolean; stamp: string; onPick: () => void }) {
+/** A run's clock in the sidebar. Only this text ticks, so the list around it, and its layout animation, stay still. */
+function Stamp({ run, group, clock }: { run: RunSummary; group: Group; clock?: { start: number; end: number } }) {
+  const working = group === "Working";
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!working) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [working]);
+  const when = working && clock ? shortSpan(now - clock.start) : !working && clock ? shortSpan(now - clock.end) : null;
+  return <span>{working ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase())}</span>;
+}
+
+function RunRow({ run, group, i, on, clock, onPick }: { run: RunSummary; group: Group; i: number; on: boolean; clock?: { start: number; end: number }; onPick: () => void }) {
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
   const menu = (x: number, y: number) =>
@@ -231,7 +281,7 @@ function RunRow({ run, group, i, on, stamp, onPick }: { run: RunSummary; group: 
         </span>
         <span className={`runrow-phase ${group === "Working" ? "elapsed" : ""}`}>
           {i < 9 && <kbd>{i + 1}</kbd>}
-          <span>{stamp}</span>
+          <Stamp run={run} group={group} clock={clock} />
         </span>
       </Link>
       <span className="runrow-actions">
@@ -253,15 +303,8 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
   const p = usePrefs();
   const list = ordered(runs, p.showArchived);
   const clocks = useClocks(list.length > VIRTUAL_AFTER ? [] : list.map((x) => x.run.id));
-  const working = list.some((x) => x.group === "Working");
-  const [now, setNow] = useState(() => Date.now());
   const [folded, setFolded] = useState<Partial<Record<Group, boolean>>>({});
   const scroller = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!working) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [working]);
   const counts = new Map<Group, number>();
   for (const item of list) counts.set(item.group, (counts.get(item.group) ?? 0) + 1);
 
@@ -274,11 +317,6 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
     last = group;
     if (!folded[group]) items.push({ kind: "run", run, group, i });
   });
-  const stampOf = (run: RunSummary, group: Group) => {
-    const clock = clocks[run.id];
-    const when = group === "Working" && clock ? shortSpan(now - clock.start) : group !== "Working" && clock ? shortSpan(now - clock.end) : null;
-    return group === "Working" ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase());
-  };
   const isOn = (run: RunSummary) => path === `/runs/${encodeURIComponent(run.id)}` || path === `/runs/${run.id}`;
   const head = (group: Group) => (
     <button type="button" className="group-head" aria-expanded={!folded[group]} onClick={() => setFolded((f) => ({ ...f, [group]: !f[group] }))}>
@@ -308,7 +346,7 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
             const item = items[v.index]!;
             return (
               <div key={item.kind === "head" ? `h:${item.group}` : item.run.id} ref={virtual.measureElement} data-index={v.index} className="vrow" style={{ transform: `translateY(${v.start}px)` }}>
-                {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} stamp={stampOf(item.run, item.group)} onPick={onPick} />}
+                {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} clock={clocks[item.run.id]} onPick={onPick} />}
               </div>
             );
           })}
@@ -326,7 +364,7 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
                   exit={{ opacity: 0 }}
                   transition={{ duration: 0.16, ease: bezier.out, layout: { duration: dur.base, ease: bezier.out } }}
                 >
-                  {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} stamp={stampOf(item.run, item.group)} onPick={onPick} />}
+                  {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} clock={clocks[item.run.id]} onPick={onPick} />}
                 </motion.li>
               ))}
             </AnimatePresence>
@@ -373,6 +411,7 @@ export function App() {
   const [keys, setKeys] = useState(false);
   const runs = useLoad(() => (signedIn ? api.runs() : Promise.resolve([] as RunSummary[])), [signedIn], 3000);
   const settings = useSettings();
+  usePrefetchScreens();
 
   useEffect(() => {
     if (signedIn && path === "/signed-in") navigate("/", true);

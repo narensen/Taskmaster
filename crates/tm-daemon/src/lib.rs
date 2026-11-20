@@ -31,7 +31,8 @@ mod log;
 pub mod jobs;
 pub mod live;
 pub mod preview;
-mod reply;
+pub mod reply;
+pub mod report;
 mod resume;
 mod runtime;
 mod secret;
@@ -261,6 +262,15 @@ pub struct Config {
     pub checker: bool,
     /// Code Mode: workers get `run_code`, and Claude Code runs its own code mode.
     pub code_mode: bool,
+    /// Seconds a `run_code` script, and one `sh`/`test` call in it, may run (0 = default).
+    pub code_script_secs: u64,
+    pub code_sh_secs: u64,
+    /// Builders whose harness runs inside the sandbox get a shell there.
+    pub worker_shell: bool,
+    /// Fetch tools may reach the package indexes.
+    pub package_indexes: bool,
+    /// Dollars per million tokens by model id or harness id, for calls with no reported price.
+    pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
 }
 
 impl Config {
@@ -292,6 +302,11 @@ impl Config {
             browser: true,
             checker: false,
             code_mode: false,
+            code_script_secs: 0,
+            code_sh_secs: 0,
+            worker_shell: true,
+            package_indexes: true,
+            prices: crate::settings::built_in_prices(),
         }
     }
 }

@@ -4,7 +4,7 @@
 // name. A line, a line and column, or a range stays on the word. A click asks the daemon to
 // open it in the editor chosen in Settings, on the machine that holds the project.
 
-import { Fragment, useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { Fragment, memo, useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
 import { api, ApiError, type EditorInfo } from "./api";
 import { emit, openMenu, toast, type MenuItem } from "./overlay";
 import { prefs } from "./prefs";
@@ -323,8 +323,8 @@ export function ExternalLink({ href, children }: { href: string; children?: Reac
   );
 }
 
-/** Text with path words, links and masked secrets. */
-export function Rich({ text }: { text: string }) {
+/** Text with path words, links and masked secrets. Parsed again only when the text changes. */
+export const Rich = memo(function Rich({ text }: { text: string }) {
   const list = pieces(text);
   return (
     <>
@@ -342,7 +342,7 @@ export function Rich({ text }: { text: string }) {
       ))}
     </>
   );
-}
+});
 
 /** A known path (a diff file row, a tool target): a word when real, plain otherwise. */
 export function KnownPath({ path, line }: { path: string; line?: number }) {

@@ -7,8 +7,13 @@ export type Tier = "worker" | "mid" | "master";
 export type RoleName = "worker" | "mid" | "master" | "reviewer" | "verifier";
 
 export interface Estimate {
+  /** Fresh tokens: uncached input and output. */
   tokens: number;
   usd: number;
+  /** Input expected from the provider's cache, counted apart. */
+  cache_read?: number;
+  /** Whether `usd` is a price at all; without one the estimate is unpriced, not $0.00. */
+  priced?: boolean;
 }
 
 export interface Spend {
@@ -64,6 +69,10 @@ export interface PagePlan {
   units?: { id: string; owned_glob: string; brief: string; done?: string }[];
   /** Skills from the store the planner attached; the page's agents read each SKILL.md. */
   skills?: string[];
+  /** The phase of the sketch this unit belongs to, from 0. */
+  phase?: number;
+  /** Shown in a browser even though the plan is not web (true), or not although it is (false). */
+  ui?: boolean;
 }
 
 /** One agent a plan starts. Mirrors `Plan::agents` in tm-core. */
@@ -93,12 +102,25 @@ export function planAgents(plan: Plan): AgentPlan[] {
   });
 }
 
+/** One phase of a run's rough sketch (PROJECT.md). */
+export interface PhaseSketch {
+  id: string;
+  goal: string;
+  delivers?: string[];
+  interfaces?: string;
+  test?: string;
+  needs?: string;
+}
+
 export interface Plan {
+  kind?: "web" | "library" | "cli" | "server" | "migration";
   contracts: ContractFile[];
   pages: PagePlan[];
   estimate: Estimate;
   /** The planner's design spec every agent follows, when anything is shown in a browser. */
   design?: string;
+  /** The sketch, when the run is built a phase at a time. */
+  phases?: PhaseSketch[];
 }
 
 export type Roles = Record<RoleName, string>;
@@ -130,13 +152,16 @@ export interface RunSummary {
 export interface RunLimit {
   provider: string;
   role: string;
-  kind: "quota" | "rate_limit" | "auth";
+  kind: "quota" | "rate_limit" | "auth" | "balance";
   reset?: string | null;
   raw: string;
 }
 
 export interface RunDetail extends RunSummary {
   plan: Plan | null;
+  /** The phase being built, from 0, and the one being planned after it passed. */
+  phase_at?: number;
+  next_phase?: number | null;
   prompt: string | null;
   roles: Roles;
   models: Models;
@@ -156,7 +181,7 @@ export interface Finding {
   failure: string;
 }
 
-export type WorkerOutcome = "passed" | { check_failed: { errors: string } } | { flagged: Flag };
+export type WorkerOutcome = "passed" | { check_failed: { errors: string } } | { flagged: Flag } | { blocked: { reason: string } };
 
 // Serde's externally tagged enum: a bare string for a unit variant, else one key.
 export type RunEvent =
@@ -185,6 +210,11 @@ export interface LedgerEntry {
   cost_usd: number | null;
   seconds: number;
   ok: boolean;
+  /** Tool calls the gate refused in this call. */
+  refused?: string[];
+  /** The agent that made the call (`page:<id>`, `unit:<id>/<part>`), on rows that have it. */
+  agent?: string | null;
+  unit?: string | null;
 }
 
 export type ChangeKind =
@@ -472,6 +502,8 @@ export interface DaemonSettings {
   approvals?: { mode: ApprovalMode; timeout_secs: number };
   checker?: { enabled: boolean };
   code_mode?: { enabled: boolean };
+  /** The workers' sandbox: a shell inside it, and fetches to the package indexes. */
+  sandbox?: { shell: boolean; package_indexes: boolean; available: boolean };
   telemetry?: { enabled: boolean };
   /** Seconds one agent call may run; 0 is no limit. */
   agents?: { timeout_secs: number };
@@ -736,6 +768,7 @@ export const api = {
   setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
   setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
   setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
+  setSandbox: (change: { shell?: boolean; package_indexes?: boolean }) => call<DaemonSettings>("POST", "/api/settings", { sandbox: change }),
   setTelemetry: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { telemetry: enabled }),
   setAgentTimeout: (secs: number) => call<DaemonSettings>("POST", "/api/settings", { agent_timeout_secs: secs }),
   logs: () => call<{ path: string | null; lines: string[] }>("GET", "/api/logs"),

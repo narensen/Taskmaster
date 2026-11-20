@@ -27,6 +27,25 @@ test("Code Mode is off by default and can be switched on", async ({ open, page }
   await expect(toggle).toHaveAttribute("aria-checked", "false");
 });
 
+test("the worker sandbox's shell and package indexes are on by default and each can be turned off", async ({ open, page, daemon }) => {
+  await open("/settings");
+  const shell = page.getByTestId("sandbox-shell-setting").getByRole("switch", { name: "Let builders run commands in the sandbox" });
+  const indexes = page.getByTestId("sandbox-indexes-setting").getByRole("switch", { name: "Let fetch tools reach package indexes" });
+  await expect(shell).toHaveAttribute("aria-checked", "true");
+  await expect(indexes).toHaveAttribute("aria-checked", "true");
+  await shell.click();
+  await expect(shell).toHaveAttribute("aria-checked", "false");
+  await page.reload();
+  await expect(shell).toHaveAttribute("aria-checked", "false");
+  await expect(indexes).toHaveAttribute("aria-checked", "true");
+  const saved = (await (await fetch(`${daemon.url}/api/settings`, { headers: { authorization: `Bearer ${daemon.token}` } })).json()) as {
+    sandbox: { shell: boolean; package_indexes: boolean };
+  };
+  expect(saved.sandbox).toMatchObject({ shell: false, package_indexes: true });
+  await shell.click();
+  await expect(shell).toHaveAttribute("aria-checked", "true");
+});
+
 test("in the desktop app, Settings shows an available update with its notes and installs it", async ({ open, page }) => {
   // The desktop shell's commands, as the window would have them.
   await page.addInitScript(() => {

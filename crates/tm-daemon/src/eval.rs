@@ -101,7 +101,8 @@ fn side(records: &Records, run_id: &str, harness: &str, outcome: &Outcome) -> an
         .iter()
         .filter(|event| matches!(event, Event::WorkerFinished { outcome: WorkerOutcome::CheckFailed { .. }, .. }))
         .count();
-    let run = Run::replay(1, events);
+    let focused = records.meta(run_id)?.is_some_and(|meta| meta.focused);
+    let run = Run::replay_with(1, focused, events);
     let passed = run.pages.values().filter(|page| page.state == tm_core::PageState::Passed).count();
     let failed = run.pages.values().filter(|page| page.state == tm_core::PageState::Failed).count();
     let ok = matches!(outcome, Outcome::Finished { ok: true });

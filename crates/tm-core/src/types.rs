@@ -60,25 +60,112 @@ pub struct ContractFile {
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// What a plan builds. Only a web project has routes, a design system and browser checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKind {
+    /// Pages a browser shows. Plans written before kinds existed are all this.
+    #[default]
+    Web,
+    Library,
+    Cli,
+    Server,
+    Migration,
+}
+
+impl ProjectKind {
+    pub const ALL: [ProjectKind; 5] = [ProjectKind::Web, ProjectKind::Library, ProjectKind::Cli, ProjectKind::Server, ProjectKind::Migration];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            ProjectKind::Web => "web",
+            ProjectKind::Library => "library",
+            ProjectKind::Cli => "cli",
+            ProjectKind::Server => "server",
+            ProjectKind::Migration => "migration",
+        }
+    }
+
+    /// The kind a planner named, read loosely: `lib`, `api`, `upgrade` and the like.
+    pub fn parse(text: &str) -> Option<ProjectKind> {
+        Some(match text.trim().to_ascii_lowercase().as_str() {
+            "web" | "website" | "site" | "webapp" | "web-app" | "app" | "frontend" | "ui" => ProjectKind::Web,
+            "library" | "lib" | "package" | "module" | "sdk" => ProjectKind::Library,
+            "cli" | "tool" | "command" | "script" => ProjectKind::Cli,
+            "server" | "service" | "api" | "daemon" | "backend" => ProjectKind::Server,
+            "migration" | "upgrade" | "port" | "refactor" | "dependency" | "dependencies" => ProjectKind::Migration,
+            _ => return None,
+        })
+    }
+}
+
+/// One phase of the rough sketch a run starts from (PROJECT.md). Only the first phase is
+/// planned in detail up front; each later one is planned once the phases before it have
+/// locked their interfaces.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PhaseSketch {
+    /// A short slug, such as `storage`.
+    pub id: String,
+    pub goal: String,
+    /// Modules or files this phase delivers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivers: Vec<String>,
+    /// Its public interfaces, as signatures only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub interfaces: String,
+    /// The command that runs this phase's tests.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub test: String,
+    /// `results` when this phase needs what the one before it built, not only its locked
+    /// interfaces; it is then planned after that phase passes instead of while it builds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub needs: String,
+}
+
+impl PhaseSketch {
+    /// Whether this phase can be planned while the one before it is still building.
+    pub fn overlaps(&self) -> bool {
+        !self.needs.trim().eq_ignore_ascii_case("results")
+    }
+}
+
+/// One unit of a plan: a page of a web app, or a module of anything else. One agent builds
+/// it, or several when it is split into parts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PagePlan {
     pub id: PageId,
+    /// Where a browser opens it. Empty for a unit nothing shows in a browser.
+    #[serde(default)]
     pub route: String,
+    /// Set when a unit of a non-web plan is shown in a browser after all, or when a unit of
+    /// a web plan is not (`false`). `None` follows the plan's kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<bool>,
     /// The only files this page's worker may change, e.g. `app/dashboard/**`.
+    #[serde(default)]
     pub owned_glob: String,
+    #[serde(default)]
     pub cites: Vec<DictKey>,
+    #[serde(default)]
     pub brief: String,
     /// How the page's agent knows it is finished: what must exist and work.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub done: String,
     /// Optional split of this page into parallel work units with disjoint files. Empty
-    /// means one worker owns the whole page.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// means one worker owns the whole page. Planners write it as `parts`.
+    #[serde(default, alias = "parts", skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<WorkUnit>,
     /// Installed skills the planner attached: names from the skills store. The page's
     /// agents find each one's SKILL.md in their worktree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// The phase of the sketch this unit belongs to, from 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub phase: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// One worker's share of a page: a disjoint set of files and what to build in them.
@@ -185,6 +272,32 @@ pub struct AgentPlan {
 pub const DEFAULT_DONE: &str = "every file you own is written and does its part of the brief";
 
 impl Plan {
+    /// Whether a unit is shown in a browser: every unit of a web plan unless it says
+    /// `"ui": false`, and a unit of any other plan only when it says `"ui": true`.
+    pub fn is_ui(&self, page: &PagePlan) -> bool {
+        page.ui.unwrap_or(self.kind == ProjectKind::Web)
+    }
+
+    /// The id an agent of this unit runs under: `page:<id>` for a page a browser shows, and
+    /// `unit:<id>` for anything else, with `/<part>` for one part of a split unit.
+    pub fn agent_id(&self, page: &PagePlan, part: Option<&str>) -> String {
+        let prefix = if self.is_ui(page) { "page" } else { "unit" };
+        match part {
+            Some(part) => format!("{prefix}:{}/{part}", page.id),
+            None => format!("{prefix}:{}", page.id),
+        }
+    }
+
+    /// Units a browser opens, with their routes.
+    pub fn ui_routes(&self) -> Vec<(PageId, String)> {
+        self.pages.iter().filter(|p| self.is_ui(p) && !p.route.trim().is_empty()).map(|p| (p.id.clone(), p.route.clone())).collect()
+    }
+
+    /// Whether anything in this plan is shown in a browser.
+    pub fn has_ui(&self) -> bool {
+        self.pages.iter().any(|p| self.is_ui(p))
+    }
+
     /// Every build agent the plan starts, in order.
     pub fn agents(&self) -> Vec<AgentPlan> {
         let mut out = Vec::new();
@@ -192,7 +305,7 @@ impl Plan {
             let units = page.work_units();
             let split = units.len() > 1;
             for unit in units {
-                let id = if split { format!("page:{}/{}", page.id, unit.id) } else { format!("page:{}", page.id) };
+                let id = self.agent_id(page, split.then_some(unit.id.as_str()));
                 let done = if unit.done.trim().is_empty() { DEFAULT_DONE.to_string() } else { unit.done.trim().to_string() };
                 out.push(AgentPlan { id, page: page.id.clone(), owned_glob: unit.owned_glob, task: unit.brief.trim().to_string(), done });
             }
@@ -201,17 +314,33 @@ impl Plan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Estimate {
+    /// Fresh tokens: input not served from a cache, and output.
     pub tokens: u64,
     pub usd: f64,
+    /// Input the provider is expected to serve from its cache, counted apart.
+    #[serde(default)]
+    pub cache_read: u64,
+    /// Whether `usd` is a price at all. Without past prices or a price table it is not.
+    #[serde(default)]
+    pub priced: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
+    /// What is being built. Plans recorded before kinds existed read as web.
+    #[serde(default)]
+    pub kind: ProjectKind,
     /// Real source files that workers import; the compiler enforces them.
     pub contracts: Vec<ContractFile>,
+    /// The units. Planners write the key as `units`; records keep `pages`.
+    #[serde(alias = "units")]
     pub pages: Vec<PagePlan>,
+    /// The rough sketch, when the run is built a phase at a time. Empty for a small job,
+    /// which is one phase planned whole.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<PhaseSketch>,
     pub estimate: Estimate,
     /// The planner's design spec, shared by every agent: palette, type, spacing, component
     /// look, empty state, responsive layout and accessibility rules.
@@ -305,12 +434,14 @@ mod unit_tests {
         PagePlan {
             id: "todo".into(),
             route: "/".into(),
+            ui: None,
             owned_glob: "{app/**,README.md}".into(),
             cites: vec![],
             brief: "b".into(),
             done: String::new(),
             units,
             skills: vec![],
+            phase: 0,
         }
     }
 
@@ -318,7 +449,7 @@ mod unit_tests {
     fn a_plan_lists_one_agent_per_unit() {
         let mut units = vec![unit("ui", "app/index.html"), unit("js", "app/main.js")];
         units[1].done = "adding a todo shows it".into();
-        let plan = Plan { contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 }, design: String::new() };
+        let plan = Plan { kind: Default::default(), contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() }, design: String::new(), phases: vec![] };
         let agents = plan.agents();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["page:todo/ui", "page:todo/js", "page:todo"]);

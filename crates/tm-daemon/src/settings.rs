@@ -41,6 +41,42 @@ pub struct Settings {
     pub telemetry: TelemetrySettings,
     /// How long one agent call may run.
     pub agents: AgentSettings,
+    /// What a worker's sandbox lets it do.
+    pub sandbox: SandboxSettings,
+    /// Dollars per million tokens, by model id or harness id, for calls whose harness
+    /// reports no price. Grok's are built in (see [`built_in_prices`]).
+    pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+}
+
+/// Prices Taskmaster knows without a settings file: Grok Build's, as the benchmark's grader
+/// counts them ($2/M input, $0.50/M cached input, $6/M output).
+pub fn built_in_prices() -> std::collections::BTreeMap<String, tm_core::Prices> {
+    let grok = tm_core::Prices { input: 2.0, cached_input: Some(0.5), output: 6.0 };
+    ["grok", "grok-build"].iter().map(|k| (k.to_string(), grok)).collect()
+}
+
+/// The price table a run uses: the built-in prices, then the settings file's over them.
+pub fn price_table(settings: &Settings) -> std::collections::BTreeMap<String, tm_core::Prices> {
+    let mut table = built_in_prices();
+    table.extend(settings.prices.clone());
+    table
+}
+
+/// A builder's shell. It is only ever given inside the bubblewrap sandbox (or Codex's own),
+/// where it can write nothing but the worktree and the run's scratch and caches.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SandboxSettings {
+    /// Builders get a shell, so they can run their tests and install what those need.
+    pub shell: bool,
+    /// Fetch tools may reach the package indexes (PyPI, npm, crates.io), and nothing else.
+    pub package_indexes: bool,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        SandboxSettings { shell: true, package_indexes: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +114,11 @@ pub struct TelemetrySettings {
 pub struct CodeModeSettings {
     /// Workers get `run_code`, and Claude Code runs its native code mode (see `code.rs`).
     pub enabled: bool,
+    /// Seconds one `run_code` script may run; 0 keeps the default (600). A script that runs
+    /// the tests needs room.
+    pub script_secs: u64,
+    /// Seconds one `sh()` or `test()` call inside a script may run; 0 keeps the default (300).
+    pub sh_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -312,7 +353,7 @@ mod tests {
         .unwrap();
         let settings = Settings::load(&dir).unwrap();
         let records = settings.records(&dir).unwrap();
-        records.save_meta("r", &crate::store::Meta { parallel: 1, branch: None, base: None, template: None }).unwrap();
+        records.save_meta("r", &crate::store::Meta { parallel: 1, branch: None, base: None, template: None, focused: false }).unwrap();
         assert!(dir.join(".taskmaster/taskmaster.db").is_file());
         assert!(!dir.join(".taskmaster/runs").exists());
         let (auth, _) = settings.auth(records).unwrap();

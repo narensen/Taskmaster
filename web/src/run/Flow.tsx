@@ -1,10 +1,10 @@
 // One transcript. The person speaks, the master thinks and locks a plan, then each worker
 // follows in order. Role names are plain text. Nothing sits in a card.
 
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useState, type ReactNode } from "react";
 import { FileText, Globe, Pencil, Search, SquareTerminal } from "lucide-react";
 import type { Phase, Plan, RunDetail, ToolApproval } from "../api";
-import { tokens } from "../format";
+import { tokens, usd } from "../format";
 import { KnownPath, Rich, looksLikePath } from "../paths";
 import type { Call, Item, Surface, ToolItem } from "./model";
 
@@ -96,7 +96,7 @@ function planSoFar(call: Call | undefined): number {
   return pages < 0 ? 0 : (text.slice(pages).match(/"owned_glob"\s*:/g) ?? []).length;
 }
 
-function Think({ text, live, force }: { text: string; live: boolean; force: boolean }) {
+const Think = memo(function Think({ text, live, force }: { text: string; live: boolean; force: boolean }) {
   const [open, setOpen] = useState(live);
   useEffect(() => {
     setOpen(live);
@@ -115,9 +115,9 @@ function Think({ text, live, force }: { text: string; live: boolean; force: bool
       )}
     </div>
   );
-}
+});
 
-function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null; force: boolean }) {
+const Step = memo(function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null; force: boolean }) {
   const [open, setOpen] = useState(false);
   const shown = force || open;
   const { label, kind } = verbOf(item.name);
@@ -147,7 +147,7 @@ function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null
       )}
     </div>
   );
-}
+});
 
 /** A finished reply that ends in a large JSON answer folds that part away. */
 function Said({ text, done }: { text: string; done: boolean }) {
@@ -176,15 +176,66 @@ function Said({ text, done }: { text: string; done: boolean }) {
   );
 }
 
-function ItemView({ item, call, index, liveThought, force }: { item: Item; call: Call; index: number; liveThought: boolean; force: boolean }) {
-  if (item.t === "thought") return <Think text={item.text} live={liveThought} force={force} />;
+/** One row. It re-renders only when its own item, or whether its call is done, changes. */
+const ItemView = memo(function ItemView({ item, done, seconds, force }: { item: Item; done: boolean; seconds: string | null; force: boolean }) {
+  if (item.t === "thought") return <Think text={item.text} live={false} force={force} />;
   if (item.t === "life") return <p className="flow-life">{item.text}</p>;
-  if (item.t === "tool") return <Step item={item} seconds={stepSeconds(call, index)} force={force} />;
+  if (item.t === "tool") return <Step item={item} seconds={seconds} force={force} />;
   return (
     <div className="flow-said">
-      <Said text={item.text} done={!!call.end} />
-      {!call.end && <span className="caret" aria-hidden />}
+      <Said text={item.text} done={done} />
+      {!done && <span className="caret" aria-hidden />}
     </div>
+  );
+});
+
+/** Rows an agent draws before older ones fold behind a button. Keeps a long run's page small. */
+const ROWS_SHOWN = 120;
+
+type PhaseState = "done" | "checking" | "building" | "planning" | "waiting";
+
+/** Where each phase of the sketch stands, from the run's position in it. */
+function phaseStates(detail: RunDetail): PhaseState[] {
+  const phases = detail.plan?.phases ?? [];
+  const at = detail.phase_at ?? 0;
+  const finished = detail.phase === "done";
+  return phases.map((_, i) => {
+    if (i < at || (i === at && finished)) return "done";
+    if (i === at) return detail.phase === "verifying" ? "checking" : "building";
+    if (detail.next_phase === i) return "planning";
+    return "waiting";
+  });
+}
+
+/** The sketch as a vertical list: each phase with its state, the active one open with its units. */
+function PhaseList({ detail }: { detail: RunDetail }) {
+  const phases = detail.plan?.phases ?? [];
+  if (!phases.length) return null;
+  const states = phaseStates(detail);
+  const pages = detail.plan?.pages ?? [];
+  return (
+    <ol className="flow-phases" data-testid="phases" aria-label="Phases">
+      {phases.map((phase, i) => {
+        const open = states[i] === "building" || states[i] === "checking";
+        const units = pages.filter((p) => (p.phase ?? 0) === i);
+        return (
+          <li key={phase.id} className={`flow-phase ${states[i]}`} data-state={states[i]}>
+            <div className="flow-phase-line">
+              <span className="flow-phase-mark" aria-hidden>
+                {states[i] === "done" ? "✓" : open ? "●" : "○"}
+              </span>
+              <span className="mono">{phase.id}</span>
+              <span className="flow-state">{states[i]}</span>
+            </div>
+            <p className="flow-life">{phase.goal}</p>
+            {open && units.length > 0 && (
+              <p className="flow-life mono">{units.map((u) => u.id).join(" · ")}</p>
+            )}
+            {open && phase.test && <p className="flow-life mono">$ {phase.test}</p>}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -201,7 +252,13 @@ function PlanBlock({ plan }: { plan: Plan }) {
           </span>
         </div>
       ))}
-      {plan.estimate.tokens > 0 && <p className="flow-life">About {tokens(plan.estimate.tokens)} tokens.</p>}
+      {plan.estimate.tokens > 0 && (
+        <p className="flow-life">
+          About {tokens(plan.estimate.tokens)} tokens
+          {plan.estimate.cache_read ? ` and ${tokens(plan.estimate.cache_read)} read from cache` : ""}
+          {plan.estimate.priced ? `, ${usd(plan.estimate.usd)}` : ""}.
+        </p>
+      )}
       {plan.design?.trim() && <pre className="flow-design">{plan.design.trim()}</pre>}
     </div>
   );
@@ -226,8 +283,9 @@ function agentOf(approval: ToolApproval): string {
 function ownerOf(approval: ToolApproval, list: Surface[]): string {
   const id = agentOf(approval);
   if (list.some((s) => s.id === id)) return id;
-  const page = id.startsWith("page:") ? id.slice(5).split("/")[0] : "";
-  if (page && list.some((s) => s.id === `page:${page}`)) return `page:${page}`;
+  const page = id.startsWith("page:") || id.startsWith("unit:") ? id.slice(5).split("/")[0] : "";
+  const whole = page ? list.find((s) => s.id === `page:${page}` || s.id === `unit:${page}`) : undefined;
+  if (whole) return whole.id;
   return "master";
 }
 
@@ -297,6 +355,11 @@ function AgentBlock({
   const open = surface.calls.length ? surface.calls[surface.calls.length - 1] : undefined;
   const running = open && !open.end ? open : undefined;
   const written = planning ? planSoFar(running) : 0;
+  const [all, setAll] = useState(false);
+  const hidden = all ? 0 : Math.max(0, rest.length - ROWS_SHOWN);
+  const rows = hidden ? rest.slice(hidden) : rest;
+  const hiddenThoughts = all ? 0 : Math.max(0, thoughts.length - ROWS_SHOWN);
+  const shownThoughts = hiddenThoughts ? thoughts.slice(hiddenThoughts) : thoughts;
   return (
     <section
       className={`flow-agent ${focused ? "focused" : ""}`}
@@ -313,8 +376,13 @@ function AgentBlock({
         <span className="flow-by">{byline(surface, detail)}</span>
       </header>
       <div data-agent-text={surface.id}>
+        {(hidden > 0 || hiddenThoughts > 0) && (
+          <button type="button" className="link small flow-earlier" onClick={() => setAll(true)}>
+            Show {hidden + hiddenThoughts} earlier step{hidden + hiddenThoughts === 1 ? "" : "s"}
+          </button>
+        )}
         {master &&
-          thoughts.map((t) => <Think key={t.key} text={t.item.text} live={t.live} force={force} />)}
+          shownThoughts.map((t) => <Think key={t.key} text={t.item.text} live={t.live} force={force} />)}
         {master && plan}
         {planning && thoughts.length === 0 && rest.length === 0 && (
           <div className="flow-skel-lines" aria-hidden>
@@ -322,11 +390,17 @@ function AgentBlock({
             <span />
           </div>
         )}
-        {rest.map((row) =>
+        {rows.map((row) =>
           row.item.t === "thought" ? (
             <Think key={row.key} text={row.item.text} live={!row.call.end && row.index === row.call.items.length - 1} force={force} />
           ) : (
-            <ItemView key={row.key} item={row.item} call={row.call} index={row.index} liveThought={false} force={force} />
+            <ItemView
+              key={row.key}
+              item={row.item}
+              done={!!row.call.end}
+              seconds={row.item.t === "tool" ? stepSeconds(row.call, row.index) : null}
+              force={force}
+            />
           ),
         )}
         {surface.calls.length === 0 && !planning && surface.state === "waiting" && <p className="flow-life">Waiting.</p>}
@@ -400,7 +474,14 @@ export function Flow({
             detail={detail}
             focused={focus === surface.id}
             force={blown.has(surface.id)}
-            plan={surface.id === "master" && detail.plan ? <PlanBlock plan={detail.plan} /> : undefined}
+            plan={
+              surface.id === "master" && detail.plan ? (
+                <>
+                  <PlanBlock plan={detail.plan} />
+                  <PhaseList detail={detail} />
+                </>
+              ) : undefined
+            }
             ask={
               <>
                 {surface.id === "master" ? ask : null}

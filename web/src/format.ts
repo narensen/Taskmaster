@@ -148,6 +148,7 @@ export function describe(event: RunEvent): Described {
     const { page, outcome } = event.worker_finished;
     if (outcome === "passed") return { title: `${page} passed its checks`, tone: "good" };
     if ("check_failed" in outcome) return { title: `${page} failed its checks`, detail: outcome.check_failed.errors, tone: "bad" };
+    if ("blocked" in outcome) return { title: `${page} cannot go on in this run`, detail: outcome.blocked.reason, tone: "bad" };
     return { title: `${page} objected to ${outcome.flagged.key}`, detail: outcome.flagged.issue, tone: "ask" };
   }
   if ("flag_resolved" in event) {

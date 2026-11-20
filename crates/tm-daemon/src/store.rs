@@ -142,6 +142,10 @@ pub struct Meta {
     /// The template whose files are written when the contracts are locked.
     #[serde(default)]
     pub template: Option<String>,
+    /// Every tier was the same harness and model when the run started: no escalation
+    /// ladder (see `Run::focused`).
+    #[serde(default)]
+    pub focused: bool,
 }
 
 /// One go at building or repairing a page, kept so the next attempt knows what was tried.
@@ -151,8 +155,16 @@ pub struct Attempt {
     pub tier: tm_core::Tier,
     /// The harness and model, such as `agy gemini-flash`.
     pub model: String,
-    /// `merged`, `discarded` or `flagged`.
+    /// `merged`, `discarded`, `flagged` or `blocked`.
     pub outcome: String,
+    /// The agent that made it (`unit:a/part` for a part of a split unit). Older records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Seconds the attempt ran, and its fresh tokens.
+    #[serde(default)]
+    pub seconds: f64,
+    #[serde(default)]
+    pub tokens: u64,
     /// What it was asked to fix, if this was a repair.
     #[serde(default)]
     pub fixing: Option<String>,
@@ -186,6 +198,11 @@ impl Records {
 
     pub fn run_ids(&self) -> anyhow::Result<Vec<String>> {
         self.store.list("runs")
+    }
+
+    /// The agents' transcript of a run, one JSON value per line.
+    pub fn transcript(&self, run: &str) -> anyhow::Result<Vec<Value>> {
+        self.lines(&format!("runs/{run}/agents.jsonl"))
     }
 
     pub fn events(&self, run: &str) -> anyhow::Result<Vec<Event>> {
@@ -437,7 +454,7 @@ pub(crate) mod tests {
         assert!(records.inflight("r1").unwrap().is_none());
         records.save_events("r1", &[Event::PlanApproved, Event::Cancelled]).unwrap();
         records.save_inflight("r1", &[Command::RunVerify]).unwrap();
-        records.save_meta("r1", &Meta { parallel: 3, branch: None, base: None, template: None }).unwrap();
+        records.save_meta("r1", &Meta { parallel: 3, branch: None, base: None, template: None, focused: false }).unwrap();
         records.mark_merged("r1", "home", "abc").unwrap();
         assert_eq!(records.events("r1").unwrap(), vec![Event::PlanApproved, Event::Cancelled]);
         assert_eq!(records.inflight("r1").unwrap(), Some(vec![Command::RunVerify]));

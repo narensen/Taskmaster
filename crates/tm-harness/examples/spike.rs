@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         stall: None,
         read_only: false,
         code_mode: false,
+        shell: None,
     };
 
     let (tx, mut rx) = mpsc::channel(64);

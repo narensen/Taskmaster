@@ -83,3 +83,12 @@ test("the Caddy block's CSP hash matches the one inline script", async () => {
   const caddy = readFileSync(new URL("../deploy/site/Caddyfile", import.meta.url), "utf8");
   assert.ok(caddy.includes(`'sha256-${hash}'`), `deploy/site/Caddyfile should allow sha256-${hash}`);
 });
+
+test("release notes keep their tables", () => {
+  const html = markdown("### Faster\n| | 0.1.4 | 0.1.5 |\n|---|---|---|\n| Frame rate | 30.5 fps | 57.8 fps |\n| <b>x</b> | `a` | b |\n\nAfter.");
+  assert.match(html, /<table><thead><tr><th><\/th><th>0\.1\.4<\/th><th>0\.1\.5<\/th><\/tr><\/thead>/);
+  assert.match(html, /<tr><td>Frame rate<\/td><td>30\.5 fps<\/td><td>57\.8 fps<\/td><\/tr>/);
+  assert.match(html, /<td>&lt;b&gt;x&lt;\/b&gt;<\/td><td><code>a<\/code><\/td>/);
+  assert.match(html, /<\/table>\n<p>After\.<\/p>/);
+  assert.doesNotMatch(html, /\|/);
+});

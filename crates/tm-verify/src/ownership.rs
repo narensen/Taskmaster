@@ -41,22 +41,26 @@ pub fn outside_owned<'a>(owners: &Owners, page: &str, changed: &'a [String]) -> 
 pub(crate) fn test_plan(pages: &[(&str, &str)]) -> Plan {
     use tm_core::{Estimate, PagePlan};
     Plan {
+        kind: Default::default(),
         contracts: vec![],
         pages: pages
             .iter()
             .map(|(id, glob)| PagePlan {
                 id: id.to_string(),
                 route: format!("/{id}"),
+                ui: None,
                 owned_glob: glob.to_string(),
                 cites: vec![],
                 brief: String::new(),
                 done: String::new(),
                 units: vec![],
                 skills: vec![],
+                phase: 0,
             })
             .collect(),
-        estimate: Estimate { tokens: 0, usd: 0.0 },
+        estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
         design: String::new(),
+        phases: vec![],
     }
 }
 

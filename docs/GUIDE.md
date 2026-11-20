@@ -210,7 +210,7 @@ A builder's session is kept open after its turn when its harness can (`agy`, `gr
 
 ## A worker's shell
 
-A builder whose harness runs inside the sandbox (bubblewrap for `agy`, `grok` and `opencode`, Codex's own sandbox for `codex`) gets a shell. The whole filesystem is read-only to it except its worktree, `/tmp`, an empty home, its own scratch directory and the run's package caches under `.taskmaster/runs/<id>/`; toolchains under the home directory (`~/.local/bin`, `~/.cargo/bin`, `~/.rustup` and the like) are mounted read-only so they still run. It is told to run the tests for its files before it says it is done. Fetch tools reach only the package indexes (PyPI, npm and crates.io). Test caches, `__pycache__`, venvs and `node_modules` it leaves behind are never counted as its work. Where bubblewrap cannot run, or for Claude Code, workers have no shell, and the run log says so once. `sandbox.shell` and `sandbox.package_indexes` in the settings file turn either off.
+A builder whose harness runs inside the sandbox (bubblewrap for `agy`, `grok` and `opencode`, Codex's own sandbox for `codex`) gets a shell. The whole filesystem is read-only to it except its worktree, `/tmp`, an empty home, its own scratch directory and the run's package caches under `.taskmaster/runs/<id>/`; toolchains under the home directory (`~/.local/bin`, `~/.cargo/bin`, `~/.rustup` and the like) are mounted read-only so they still run. It is told to run the tests for its files before it says it is done. Fetch tools reach only the package indexes (PyPI, npm and crates.io). Test caches, `__pycache__`, venvs and `node_modules` it leaves behind are never counted as its work. Where bubblewrap cannot run, or for Claude Code, workers have no shell, and the run log says so once. Settings, under Worker sandbox, turns either off (`sandbox.shell` and `sandbox.package_indexes` in the settings file). A plan that is not a web app names its agents `unit:<id>` rather than `page:<id>`.
 
 ## Handing over
 
@@ -218,21 +218,13 @@ Each attempt at a page is kept in `.taskmaster/runs/<id>/attempts/<page>.jsonl`:
 
 ## What a run cost
 
-Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the page, the harness, the model, the tokens, the seconds, and the price when the harness reports one. The estimate is not the planner's guess. It is worked out from what build and review calls cost in this project's earlier runs, or from defaults on a first run. The last line a run prints is the total next to that estimate. Cache reads are shown apart from the rest: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. `status.json` has the same totals split by role and by model.
+Every agent call is written to `.taskmaster/runs/<id>/ledger.jsonl`: the role, the unit and the agent (each part of a split unit apart), the harness, the model, the tokens, the seconds, the tool calls the gate refused, and the price with where it came from. A price the harness reports is used: over ACP, the reply's cost or what the session's running cost grew by. Otherwise the call is priced from the price table, by model and then by harness: `prices` in the settings file, dollars per million tokens for `input`, `cached_input` and `output`. Grok's are built in ($2, $0.50 and $6). A call with neither is "unpriced", never `$0.00`; a free model that reports no charge says so.
 
-Claude Code reports a price. A harness that does not, such as Antigravity, still has its tokens counted, and the dollar total says how many calls it leaves out.
+The estimate is not the planner's guess. On a first run it is sized from the plan: each unit, a module with its tests or a web page, the repairs a unit needs on average, every later phase of a sketch, and the contracts every builder carries. After that it is worked out from what build calls cost in this project's earlier runs. Cache reads are estimated and shown apart from fresh tokens: a harness re-sends its own prompt on every step, the provider serves that from a cache at a reduced rate, and it would otherwise swamp the tokens that reflect the work. The last line a run prints is the total next to that estimate. `status.json` has the same totals split by role, model and agent.
 
-## Dictionary and Commons
+`tm-daemon report [<project>] [--run <id>]` prints where a run's time went, from its own records: planning, each unit's build with its repairs, the project's checks, idle time and the total, then the planning share, tokens, the cache-hit ratio, the cost, and the tool and `run_code` calls. `--json` prints it as JSON, and `--append <file>` adds it as one line to a results file such as `bench/results.jsonl`.
 
-The Dictionary is an immutable, content-addressed store. Pages cite keys. They do not invent a second copy of a contract in the brief.
-
-The project store is `.taskmaster/dictionary`. The Commons defaults to `~/.taskmaster/commons`, and workers search it before adding a new entry. A page that passes promotes its new local entries into the Commons. During a run the store is served on `127.0.0.1` with a bearer token for that run. The tools are cite, index, and search.
-
-## What survives the model
-
-**Errorography.** Each model has its own book in `.taskmaster/errorography.json`. The same mistake, three times for that model, is handed back on its next attempt, with a fix when one was learned.
-
-**Citations.** `.taskmaster/citations.json` stores the Dictionary hash each page was built against. A later run skips a page whose cited hashes still match. A page is recorded only once its run is merged, so a run left on its branch does not make the next one skip anything.
+The run's log says when an agent has sent nothing for two minutes (`calc: no output for 120s`), and again every two minutes while it stays quiet. `TASKMASTER_ACP_TRACE=<file>` writes every line to and from an ACP agent (`agy`, `grok`, `opencode`) to that file. The transcript, `agents.jsonl`, keeps each brief whole and one line per streamed message.
 
 **The event log.** `.taskmaster/runs/<id>/events.jsonl` is the run. Replaying it rebuilds the state. The default id is `current`.
 

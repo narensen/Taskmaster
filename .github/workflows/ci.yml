@@ -48,7 +48,7 @@ jobs:
       # Cargo.toml, the desktop crate, tauri.conf.json and the web app say one version.
       - run: scripts/version.sh check
         working-directory: .
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -71,7 +71,7 @@ jobs:
             ~/.cargo/git
             target
           key: e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93.1 --profile minimal && rustup default 1.93.1
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libdbus-1-dev pkg-config patchelf
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Icons and a stand-in sidecar

@@ -54,10 +54,11 @@ One short line per platform. Verify the download with the checksum file that shi
 
 | Platform | Get it |
 | --- | --- |
-| Ubuntu / Debian | `Taskmaster_<version>_amd64.deb` from [Releases](https://github.com/narensen/Taskmaster/releases/latest), then `sudo apt install ./Taskmaster_<version>_amd64.deb` |
+| Ubuntu / Debian | `Taskmaster_<version>_amd64.deb` from [Releases](https://github.com/narensen/Taskmaster/releases/latest), then `sudo apt install ./Taskmaster_<version>_amd64.deb`. It installs the desktop app and `tm-daemon` on PATH, and recommends `bubblewrap` (the workers' sandbox) and `python3-venv`. |
 | Any Linux | `Taskmaster_<version>_amd64.AppImage`, then `chmod +x` and run it |
-| Linux server (headless) | `taskmaster-<version>-x86_64-linux.tar.gz`, then `./install.sh` inside it. The app is copied to `~/.local/share/taskmaster/web`, so `tm-daemon serve <project>` finds it without `--web`. |
-| macOS | Build from source with `scripts/install.sh` (needs `cargo` and `git`) |
+| Linux server (headless) | `taskmaster-v<version>-x86_64-linux.tar.gz`, then `./install.sh` inside it. It installs `tm-daemon` (also as `taskmaster`) to `~/.local/bin` and the app to `~/.local/share/taskmaster/web`, so `taskmaster serve <project>` finds it. `~/.local/share/taskmaster/uninstall.sh` removes it again. |
+| macOS | `Taskmaster_<version>_aarch64.dmg` (Apple silicon) or `_x64.dmg` (Intel). Without a Developer ID it is signed ad hoc: open it once with right-click, Open. Or build from source with `scripts/install.sh`. |
+| Windows | `Taskmaster_<version>_x64-setup.exe` or the `.msi`. SmartScreen warns until the installers are signed. |
 
 Then install and sign in to at least one provider. `tm-daemon providers` prints the install and sign-in commands for each one.
 

@@ -1362,7 +1362,8 @@ impl Driver {
             // Every builder and every repair gets run_code when Code Mode is on.
             let scope = if units.len() > 1 { format!("{page}/{}", units[index].id) } else { page.clone() };
             self.offer_code(&scope, &worktree, &mut request);
-            request.code_mode = self.config.code_mode;
+            // Code Mode only means something when run_code is there to use (it needs Node).
+            request.code_mode = self.code.is_some();
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
                 feed.agent["unit"] = serde_json::json!(unit);
             }
@@ -3957,8 +3958,9 @@ const PLAN_ATTEMPTS: usize = 3;
 const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, grep, ls, \
 sh, test, check and browser. Batch your work into a few scripts rather than many single tool calls: one script loads what \
 you need with readMany and writes your files, and every script that changes code ends with `return await test()`, which \
-runs the project's tests and returns the failures. Fix what it reports in the next script. Keep your replies short: the \
-files are the work.\n";
+runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or \
+shell tools are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies \
+short: the files are the work.\n";
 
 /// A model normally starts answering a small, low-effort brief within half a minute; a
 /// minute of silence with no tool running means the provider has queued the request.

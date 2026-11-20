@@ -37,7 +37,7 @@ pub struct Report {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
-    /// Cache reads over all input, cached and not.
+    /// Cache reads over all input: uncached, written to the cache, and read from it.
     pub cache_hit: f64,
     pub cost: String,
     pub tool_calls: usize,
@@ -146,7 +146,9 @@ pub fn build(records: &Records, run: &str) -> anyhow::Result<Report> {
     let idle_seconds = (total_seconds - busy).max(0.0);
     let planning_seconds = stages[0].seconds;
     let sum = totals(&ledger);
-    let cache_hit = if sum.input + sum.cache_read == 0 { 0.0 } else { sum.cache_read as f64 / (sum.input + sum.cache_read) as f64 };
+    // Every input token is one of three: uncached, written to the cache, or read from it.
+    let all_input = sum.input + sum.cache_write + sum.cache_read;
+    let cache_hit = if all_input == 0 { 0.0 } else { sum.cache_read as f64 / all_input as f64 };
     let calls: Vec<&Value> = transcript.iter().filter(|e| e["kind"] == "tool_call").collect();
     Ok(Report {
         run: run.to_string(),

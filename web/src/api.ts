@@ -502,6 +502,8 @@ export interface DaemonSettings {
   approvals?: { mode: ApprovalMode; timeout_secs: number };
   checker?: { enabled: boolean };
   code_mode?: { enabled: boolean };
+  /** The workers' sandbox: a shell inside it, and fetches to the package indexes. */
+  sandbox?: { shell: boolean; package_indexes: boolean; available: boolean };
   telemetry?: { enabled: boolean };
   /** Seconds one agent call may run; 0 is no limit. */
   agents?: { timeout_secs: number };
@@ -766,6 +768,7 @@ export const api = {
   setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
   setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
   setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
+  setSandbox: (change: { shell?: boolean; package_indexes?: boolean }) => call<DaemonSettings>("POST", "/api/settings", { sandbox: change }),
   setTelemetry: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { telemetry: enabled }),
   setAgentTimeout: (secs: number) => call<DaemonSettings>("POST", "/api/settings", { agent_timeout_secs: secs }),
   logs: () => call<{ path: string | null; lines: string[] }>("GET", "/api/logs"),

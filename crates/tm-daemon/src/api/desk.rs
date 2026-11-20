@@ -932,10 +932,18 @@ pub struct SettingsBody {
     checker: Option<bool>,
     /// Code Mode on or off.
     code_mode: Option<bool>,
+    /// The workers' sandbox: `{shell?, package_indexes?}`.
+    sandbox: Option<SandboxBody>,
     /// Anonymous counts. Off until set.
     telemetry: Option<bool>,
     /// Seconds one agent call may run; 0 is no limit.
     agent_timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct SandboxBody {
+    shell: Option<bool>,
+    package_indexes: Option<bool>,
 }
 
 /// Change the approval policy now and keep it in the settings file that is in use (or
@@ -989,6 +997,16 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         set_setting(&app.project(), "roles", Value::Object(roles))
             .and_then(|()| save_setting(&app.project(), "models", json!(saved.models)))
             .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(sandbox) = &body.sandbox {
+        let mut changes = serde_json::Map::new();
+        if let Some(on) = sandbox.shell {
+            changes.insert("shell".into(), json!(on));
+        }
+        if let Some(on) = sandbox.package_indexes {
+            changes.insert("package_indexes".into(), json!(on));
+        }
+        save_setting(&app.project(), "sandbox", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if let Some(on) = body.code_mode {
         save_setting(&app.project(), "code_mode", json!({ "enabled": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1080,6 +1098,12 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "models": role_defaults.models,
         "checker": { "enabled": role_defaults.checker.enabled },
         "code_mode": { "enabled": role_defaults.code_mode.enabled },
+        "sandbox": {
+            "shell": role_defaults.sandbox.shell,
+            "package_indexes": role_defaults.sandbox.package_indexes,
+            // Whether this machine can give a worker a sandboxed shell at all.
+            "available": tm_harness::sandbox::bwrap_usable(),
+        },
         "telemetry": { "enabled": role_defaults.telemetry.enabled },
         "agents": { "timeout_secs": role_defaults.agents.timeout_secs },
         "editor": *app.editor.lock().unwrap(),

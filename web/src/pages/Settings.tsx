@@ -230,6 +230,7 @@ const TOC: { group: string; items: [string, string][] }[] = [
       ["time-limit", "Agent time limit"],
       ["checker", "Mid-tier checker"],
       ["code-mode", "Code Mode"],
+      ["sandbox", "Worker sandbox"],
       ["telemetry", "Telemetry"],
       ["tool-approvals", "Tool approvals"],
     ],
@@ -541,6 +542,52 @@ export function Settings() {
               }
             />
             <span>{daemon.data.code_mode?.enabled ? "On for new runs" : "Off"}</span>
+          </label>
+        </Section>
+      )}
+
+      {daemon.data && (
+        <Section
+          id="sandbox"
+          title="Worker sandbox"
+          note="A builder whose provider runs inside the sandbox (bubblewrap for Antigravity, Grok and OpenCode; Codex's own) can run commands: its tests, an install, a lockfile update. It can write only its worktree, its own scratch folder and the run's package caches; the rest of this machine is read-only to it. Claude Code workers have no shell either way."
+        >
+          {daemon.data.sandbox && !daemon.data.sandbox.available && (
+            <p className="muted small" data-testid="sandbox-missing">
+              Bubblewrap cannot run on this machine, so no worker gets a shell whatever is set here.
+            </p>
+          )}
+          <label className="row gap" data-testid="sandbox-shell-setting">
+            <Switch
+              on={daemon.data.sandbox?.shell ?? true}
+              label="Let builders run commands in the sandbox"
+              onChange={(on) =>
+                void api.setSandbox({ shell: on }).then(
+                  (next) => {
+                    daemon.setData(next);
+                    toast(on ? "Builders can run commands in new runs" : "Builders get no shell in new runs");
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span>{daemon.data.sandbox?.shell ?? true ? "On: tests and installs run in the sandbox" : "Off: no commands"}</span>
+          </label>
+          <label className="row gap" data-testid="sandbox-indexes-setting">
+            <Switch
+              on={daemon.data.sandbox?.package_indexes ?? true}
+              label="Let fetch tools reach package indexes"
+              onChange={(on) =>
+                void api.setSandbox({ package_indexes: on }).then(
+                  (next) => {
+                    daemon.setData(next);
+                    toast(on ? "Fetches may reach PyPI, npm and crates.io" : "Fetches are refused");
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span>{daemon.data.sandbox?.package_indexes ?? true ? "On: PyPI, npm and crates.io only" : "Off"}</span>
           </label>
         </Section>
       )}

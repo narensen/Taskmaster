@@ -157,9 +157,10 @@ const OVERRUN_NOTES: usize = 12_000;
 const FRESH_EFFORT: &str = "medium";
 
 /// A planner must have begun its reply within this window: 40% of the agent time limit,
-/// kept between these two.
+/// kept between these two. The top leaves the sketch, with its write-up turn, inside the
+/// three minutes the spec gives it, even with no agent time limit.
 const COMMIT_AFTER_MIN: Duration = Duration::from_secs(90);
-const COMMIT_AFTER_MAX: Duration = Duration::from_secs(240);
+const COMMIT_AFTER_MAX: Duration = Duration::from_secs(150);
 
 /// How many stored entries a search for everything returns at most.
 const ENTRIES_LISTED: usize = 20;

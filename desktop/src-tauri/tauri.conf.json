@@ -17,6 +17,10 @@
     "active": true,
     "targets": ["app", "dmg", "nsis", "msi", "appimage", "deb"],
     "category": "DeveloperTool",
+    "publisher": "Taskmaster",
+    "homepage": "https://github.com/narensen/Taskmaster",
+    "license": "MIT",
+    "copyright": "Copyright (c) Taskmaster contributors. MIT licensed.",
     "shortDescription": "One master plans, cheap workers build in parallel, every page is checked before it is done.",
     "longDescription": "Taskmaster is a multi-model coding harness. It plans a product once, builds its pages in parallel with the harness CLIs you already have, and checks each page before calling the run done.",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
@@ -37,7 +41,10 @@
     },
     "linux": {
       "deb": {
-        "depends": ["git"]
+        "depends": ["git"],
+        "recommends": ["bubblewrap", "python3-venv"],
+        "section": "devel",
+        "priority": "optional"
       }
     }
   },

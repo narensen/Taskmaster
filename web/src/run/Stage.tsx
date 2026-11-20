@@ -14,8 +14,8 @@ function routesOf(detail: RunDetail): { page: string; route: string }[] {
 
 function pageOf(entry: AgentEntry): string | null {
   const id = entry.agent.id;
-  if (id.startsWith("page:")) {
-    const page = id.slice("page:".length).split("/")[0];
+  if (id.startsWith("page:") || id.startsWith("unit:")) {
+    const page = id.slice(5).split("/")[0];
     return page || null;
   }
   return entry.agent.page ?? null;

@@ -66,6 +66,8 @@ export interface PagePlan {
   skills?: string[];
   /** The phase of the sketch this unit belongs to, from 0. */
   phase?: number;
+  /** Shown in a browser even though the plan is not web (true), or not although it is (false). */
+  ui?: boolean;
 }
 
 /** One agent a plan starts. Mirrors `Plan::agents` in tm-core. */
@@ -203,6 +205,11 @@ export interface LedgerEntry {
   cost_usd: number | null;
   seconds: number;
   ok: boolean;
+  /** Tool calls the gate refused in this call. */
+  refused?: string[];
+  /** The agent that made the call (`page:<id>`, `unit:<id>/<part>`), on rows that have it. */
+  agent?: string | null;
+  unit?: string | null;
 }
 
 export type ChangeKind =

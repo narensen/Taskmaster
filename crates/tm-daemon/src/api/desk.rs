@@ -192,7 +192,7 @@ pub struct NoteBody {
 }
 
 pub fn valid_recipient(to: &str) -> bool {
-    matches!(to, "master" | "workers" | "reviewer" | "verifier") || to.strip_prefix("page:").is_some_and(valid_key)
+    matches!(to, "master" | "workers" | "reviewer" | "verifier") || to.strip_prefix("page:").or_else(|| to.strip_prefix("unit:")).is_some_and(valid_key)
 }
 
 pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>, Json(body): Json<NoteBody>) -> Reply {

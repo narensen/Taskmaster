@@ -26,7 +26,7 @@ export function moments(detail: RunDetail, entries: AgentEntry[]): { start: numb
     if (e.kind === "start" && !firstOf.has(id)) {
       firstOf.set(id, at);
       if (id === "master") marks.push({ at, label: "Planning", kind: "plan" });
-      else if (id.startsWith("page:")) marks.push({ at, label: id.slice(5), kind: "worker" });
+      else if (id.startsWith("page:") || id.startsWith("unit:")) marks.push({ at, label: id.slice(5), kind: "worker" });
       else if (id === "reviewer" || id === "verifier") marks.push({ at, label: id === "reviewer" ? "Review" : "Verify", kind: "check" });
     }
     if (e.kind === "preview") marks.push({ at, label: "Browser check", kind: "check" });

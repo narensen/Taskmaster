@@ -289,7 +289,10 @@ export function RunView({ id }: { id: string }) {
   }, [ledger, detail]);
   useEffect(() => () => setRunChrome(null), []);
 
-  const focusAgent = useCallback((agent: string) => {
+  const focusAgent = useCallback((wanted: string) => {
+    // A chip names a page; in a plan nothing shows in a browser, its agent is a unit.
+    const other = wanted.startsWith("page:") ? `unit:${wanted.slice(5)}` : wanted;
+    const agent = document.getElementById(`agent-${wanted}`) || !document.getElementById(`agent-${other}`) ? wanted : other;
     setFocus(agent);
     const el = document.getElementById(`agent-${agent}`);
     el?.scrollIntoView({ block: "nearest" });

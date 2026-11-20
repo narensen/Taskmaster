@@ -16,6 +16,7 @@ type Part = (typeof PARTS)[number]["key"];
 function agentName(key: string): string {
   if (key === "master") return "Master (plan)";
   if (key.startsWith("page:")) return `Page ${key.slice(5)}`;
+  if (key.startsWith("unit:")) return `Unit ${key.slice(5)}`;
   const [role, page] = key.split(" page:");
   const name = role![0]!.toUpperCase() + role!.slice(1);
   return page ? `${name} · ${page}` : name;

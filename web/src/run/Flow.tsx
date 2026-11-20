@@ -277,8 +277,9 @@ function agentOf(approval: ToolApproval): string {
 function ownerOf(approval: ToolApproval, list: Surface[]): string {
   const id = agentOf(approval);
   if (list.some((s) => s.id === id)) return id;
-  const page = id.startsWith("page:") ? id.slice(5).split("/")[0] : "";
-  if (page && list.some((s) => s.id === `page:${page}`)) return `page:${page}`;
+  const page = id.startsWith("page:") || id.startsWith("unit:") ? id.slice(5).split("/")[0] : "";
+  const whole = page ? list.find((s) => s.id === `page:${page}` || s.id === `unit:${page}`) : undefined;
+  if (whole) return whole.id;
   return "master";
 }
 

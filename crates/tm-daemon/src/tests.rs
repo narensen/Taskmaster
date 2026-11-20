@@ -1399,6 +1399,12 @@ async fn a_library_plan_builds_modules_with_no_route_and_no_browser() {
     assert!(builds.iter().all(|b| !b.contains("for route") && !b.contains("app/index.html") && !b.contains("Design spec")));
     let transcript = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
     assert!(!transcript.contains("browser check"), "nothing is opened in a browser");
+    // A module is a unit everywhere: its agent, its release line, the ledger and the log.
+    assert!(transcript.contains("\"id\":\"unit:a\"") && !transcript.contains("\"id\":\"page:a\""));
+    assert!(builds.iter().all(|b| b.contains("`RELEASE unit:")), "{builds:#?}");
+    let ledger = read(&run_directory(&tmp.0, "current").join("ledger.jsonl"));
+    assert!(ledger.contains("\"agent\":\"unit:a\"") && ledger.contains("\"agent\":\"unit:b\""), "{ledger}");
+    assert!(log(&tmp.0).contains("taskmaster: built unit a"));
 }
 
 #[tokio::test]

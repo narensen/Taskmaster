@@ -278,6 +278,16 @@ impl Plan {
         page.ui.unwrap_or(self.kind == ProjectKind::Web)
     }
 
+    /// The id an agent of this unit runs under: `page:<id>` for a page a browser shows, and
+    /// `unit:<id>` for anything else, with `/<part>` for one part of a split unit.
+    pub fn agent_id(&self, page: &PagePlan, part: Option<&str>) -> String {
+        let prefix = if self.is_ui(page) { "page" } else { "unit" };
+        match part {
+            Some(part) => format!("{prefix}:{}/{part}", page.id),
+            None => format!("{prefix}:{}", page.id),
+        }
+    }
+
     /// Units a browser opens, with their routes.
     pub fn ui_routes(&self) -> Vec<(PageId, String)> {
         self.pages.iter().filter(|p| self.is_ui(p) && !p.route.trim().is_empty()).map(|p| (p.id.clone(), p.route.clone())).collect()
@@ -295,7 +305,7 @@ impl Plan {
             let units = page.work_units();
             let split = units.len() > 1;
             for unit in units {
-                let id = if split { format!("page:{}/{}", page.id, unit.id) } else { format!("page:{}", page.id) };
+                let id = self.agent_id(page, split.then_some(unit.id.as_str()));
                 let done = if unit.done.trim().is_empty() { DEFAULT_DONE.to_string() } else { unit.done.trim().to_string() };
                 out.push(AgentPlan { id, page: page.id.clone(), owned_glob: unit.owned_glob, task: unit.brief.trim().to_string(), done });
             }

@@ -8,6 +8,8 @@ import {
   type AgentEntry,
   type AgentTag,
   type LedgerEntry,
+  type PagePlan,
+  type Plan,
   type Note,
   type RunDetail,
   type RunEvent,
@@ -76,15 +78,27 @@ function mergeChunk(prev: string | undefined, next: string): string {
   return prev + next;
 }
 
+/** The page or unit an agent id names (`page:a`, `unit:a/part`), or null for any other agent. */
+export function workerPart(id: string): string | null {
+  const hit = /^(?:page|unit):(.+)$/.exec(id);
+  return hit ? hit[1]! : null;
+}
+
+/** The prefix a unit's agents run under: `page` when a browser shows it, `unit` otherwise. */
+export function unitPrefix(plan: Plan | null | undefined, page: PagePlan | undefined): "page" | "unit" {
+  const web = (plan?.kind ?? "web") === "web";
+  return (page?.ui ?? web) ? "page" : "unit";
+}
+
 export function surfaceOf(entry: LedgerEntry): string {
   if (["planner", "master", "arbiter"].includes(entry.role)) return "master";
-  if ((entry.role === "worker" || entry.role === "mid") && entry.page) return `page:${entry.page}`;
+  if ((entry.role === "worker" || entry.role === "mid") && entry.page) return entry.agent && workerPart(entry.agent) ? entry.agent : `page:${entry.page}`;
   if (entry.role === "security" || entry.role === "reviewer") return "reviewer";
   return entry.role;
 }
 
 function blankSurface(id: string): Surface {
-  const raw = id.startsWith("page:") ? id.slice(5) : null;
+  const raw = workerPart(id);
   const page = raw ? raw.split("/")[0]! : null;
   const role = page ? "worker" : id;
   return {
@@ -245,9 +259,11 @@ export class SurfaceBuilder {
     const pages = planPages.length ? planPages.map((p) => p.id) : (detail?.pages.map((p) => p.id) ?? []);
     // A page the plan split into units is one worker per unit, so six workers stay six blocks.
     const workerIds = pages.flatMap((p) => {
-      const units = planPages.find((page) => page.id === p)?.units;
-      if (units && units.length > 1) return units.map((u) => `page:${p}/${u.id}`);
-      return [`page:${p}`];
+      const planned = planPages.find((page) => page.id === p);
+      const prefix = unitPrefix(detail?.plan, planned);
+      const units = planned?.units;
+      if (units && units.length > 1) return units.map((u) => `${prefix}:${p}/${u.id}`);
+      return [`${prefix}:${p}`];
     });
     const order = ["master", ...workerIds, "reviewer", "verifier"];
     for (const id of order) if (!this.byId.has(id)) this.byId.set(id, blankSurface(id));

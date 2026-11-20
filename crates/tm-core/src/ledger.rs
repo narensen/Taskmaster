@@ -77,6 +77,13 @@ pub struct LedgerEntry {
     /// finish its turn (`ok`) and still have had calls refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<String>,
+    /// The agent that made the call, as the transcript names it: `master`, `page:<id>`, or
+    /// `unit:<id>/<part>` for one part of a split unit. Older rows have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The part of a split unit the call built, when it was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 impl LedgerEntry {
@@ -136,8 +143,15 @@ pub struct Totals {
 }
 
 impl LedgerEntry {
-    /// Which agent this call was: the key of [`Totals::by_agent`].
+    /// Which agent this call was: the key of [`Totals::by_agent`]. A builder row names its
+    /// own agent, so the parts of a split unit are counted apart.
     pub fn agent(&self) -> String {
+        if let Some(agent) = self.agent.as_ref().filter(|a| !a.is_empty())
+            && matches!(self.role, Role::Worker | Role::Mid | Role::Master)
+            && self.page.is_some()
+        {
+            return agent.clone();
+        }
         match (&self.page, self.role) {
             (None, Role::Planner) => "master".to_string(),
             (None, role) => role.name().to_string(),
@@ -234,6 +248,8 @@ mod tests {
             seconds: 1.5,
             ok: true,
             refused: Vec::new(),
+            agent: None,
+            unit: None,
         }
     }
 
@@ -300,5 +316,18 @@ mod tests {
         assert_eq!(seen.tokens, 3 * 10_000 + 2 * 400);
         assert!((seen.usd - (3.0 * 0.02 + 2.0 * 0.04)).abs() < 1e-9);
         assert_eq!(basis, 3);
+    }
+
+    #[test]
+    fn the_parts_of_a_split_unit_are_counted_apart() {
+        let mut list = entry(Role::Worker, "grok", 10, 1, None);
+        list.page = Some("books".into());
+        list.agent = Some("unit:books/list".into());
+        list.unit = Some("list".into());
+        let mut styles = list.clone();
+        styles.agent = Some("unit:books/styles".into());
+        styles.unit = Some("styles".into());
+        let sum = totals(&[list, styles]);
+        assert_eq!(sum.by_agent.keys().collect::<Vec<_>>(), ["unit:books/list", "unit:books/styles"]);
     }
 }

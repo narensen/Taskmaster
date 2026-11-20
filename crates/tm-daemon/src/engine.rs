@@ -57,6 +57,9 @@ struct Bill {
     page: Option<PageId>,
     harness: String,
     model: Option<String>,
+    /// The agent's id in the transcript, and the part of a split unit it built.
+    agent: Option<String>,
+    unit: Option<String>,
 }
 
 /// What the checker is given about a page that just passed.
@@ -184,7 +187,8 @@ struct Feed {
 
 impl AgentRequest {
     fn bill(&self, role: Role, page: Option<&str>) -> Bill {
-        Bill { role, page: page.map(str::to_string), harness: self.harness.id().to_string(), model: self.model.clone() }
+        let tag = |key: &str| self.feed.as_ref().and_then(|f| f.agent[key].as_str()).map(str::to_string);
+        Bill { role, page: page.map(str::to_string), harness: self.harness.id().to_string(), model: self.model.clone(), agent: tag("id"), unit: tag("unit") }
     }
 }
 
@@ -550,6 +554,7 @@ impl Driver {
                         || note.to == "reviewer"
                         || note.to == "verifier"
                         || note.to.starts_with("page:")
+                        || note.to.starts_with("unit:")
                 });
                 if pending {
                     self.push_event(Event::FollowUp)?;
@@ -1347,11 +1352,8 @@ impl Driver {
         self.batches.remove(&page);
         for (index, (mut request, worktree, warm)) in prepared.into_iter().enumerate() {
             // Each unit is its own agent: `page:<page>/<unit>` when the page is split.
-            let (agent, unit) = if units.len() > 1 {
-                (format!("page:{page}/{}", units[index].id), Some(units[index].id.as_str()))
-            } else {
-                (format!("page:{page}"), None)
-            };
+            let unit = (units.len() > 1).then(|| units[index].id.as_str());
+            let agent = self.agent_id(&page, unit);
             self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
             if units.len() == 1 && warm.is_none() {
                 self.offer_browser(&page, &worktree, &mut request);
@@ -1772,7 +1774,8 @@ impl Driver {
         }
         let repaired = errors.is_some();
         let kind = if repaired { ChangeKind::PageRepaired } else { ChangeKind::PageBuilt };
-        let summary = format!("{} page {page}", if repaired { "repaired" } else { "built" });
+        let noun = if self.plan()?.is_ui(self.page(page)?) { "page" } else { "unit" };
+        let summary = format!("{} {noun} {page}", if repaired { "repaired" } else { "built" });
         let message = format!("taskmaster: {summary}");
         let model = self.byline(self.harness_for(tier).id(), &self.model_for(tier));
         let entry = ChangeEntry {
@@ -2806,9 +2809,10 @@ impl Driver {
             }
         }
         let at = |dir: &Path| dir.display().to_string();
+        // Only package managers' caches move: the agent's own cache (its binaries, its models
+        // list) stays where its harness keeps it.
         let env = vec![
             ("TASKMASTER_SCRATCH".to_string(), at(&scratch)),
-            ("XDG_CACHE_HOME".into(), at(&cache)),
             ("PIP_CACHE_DIR".into(), at(&cache.join("pip"))),
             ("UV_CACHE_DIR".into(), at(&cache.join("uv"))),
             ("POETRY_CACHE_DIR".into(), at(&cache.join("poetry"))),
@@ -2888,6 +2892,18 @@ impl Driver {
         let matcher = glob.compile_matcher();
         let locked = self.locked_files();
         git::tracked_files(&self.tree).unwrap_or_default().iter().any(|f| matcher.is_match(f) && !locked.contains(f))
+    }
+
+    /// The id a builder of `page` runs under: `page:` for a page a browser shows, `unit:` for
+    /// anything else, with `/<part>` for a part of a split unit.
+    fn agent_id(&self, page: &str, part: Option<&str>) -> String {
+        match (self.plan(), self.page(page)) {
+            (Ok(plan), Ok(unit)) => plan.agent_id(unit, part),
+            _ => match part {
+                Some(part) => format!("page:{page}/{part}"),
+                None => format!("page:{page}"),
+            },
+        }
     }
 
     /// Files already in the worktree that this agent owns, so it need not look for them.
@@ -3061,10 +3077,7 @@ impl Driver {
             brief.push_str(&format!("\nYou are done when: {done}.\n"));
         }
         brief.push_str(&self.todo(&page, errors.is_some()));
-        let agent = match &split {
-            Some(mine) => format!("page:{}/{}", page.id, mine.id),
-            None => format!("page:{}", page.id),
-        };
+        let agent = self.agent_id(&page.id, split.as_ref().map(|mine| mine.id.as_str()));
         brief.push_str(&format!(
             "Then stop: end your reply with the line `{RELEASE} {agent}` to report done and ask Taskmaster to release \
              you and anything you started. Leave nothing running.\n"
@@ -3090,10 +3103,8 @@ impl Driver {
     /// What a warm session is told for a repair: it already has its task and its files, so
     /// only the failure, the list to work down, and how to finish.
     fn follow_up_brief(&self, page: &str, unit: usize, units: usize, errors: &str) -> String {
-        let agent = match self.page(page).ok().map(|p| p.work_units()).and_then(|u| u.get(unit).cloned()) {
-            Some(part) if units > 1 => format!("page:{page}/{}", part.id),
-            _ => format!("page:{page}"),
-        };
+        let part = self.page(page).ok().map(|p| p.work_units()).and_then(|u| u.get(unit).cloned()).filter(|_| units > 1);
+        let agent = self.agent_id(page, part.as_ref().map(|p| p.id.as_str()));
         let mut brief = String::from(
             "The checks failed after your last turn. Your worktree now also has what the other units built since. \
              This is the output; fix what it shows in your own files and leave every other unit alone:\n",
@@ -3240,9 +3251,10 @@ impl Driver {
         if !repair {
             return Ok(());
         }
-        let page_key = format!("page:{page}");
-        let page_unit = format!("page:{page}/");
-        if let Some(text) = self.consult(|note| note.to == page_key || note.to.starts_with(&page_unit)).await? {
+        // A note can be addressed to the page or to the unit, whichever the person saw.
+        let keys = [format!("page:{page}"), format!("unit:{page}")];
+        let parts = [format!("page:{page}/"), format!("unit:{page}/")];
+        if let Some(text) = self.consult(|note| keys.contains(&note.to) || parts.iter().any(|p| note.to.starts_with(p.as_str()))).await? {
             self.repair_decision = text;
         }
         Ok(())
@@ -3350,6 +3362,8 @@ impl Driver {
             seconds: answer.seconds,
             ok: answer.ok,
             refused: answer.refused.clone(),
+            agent: bill.agent.clone(),
+            unit: bill.unit.clone(),
         };
         self.records.charge(&self.id, &entry)
     }
@@ -4195,7 +4209,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             let id = feed.agent["id"].as_str().unwrap_or("agent");
             let asked = text.lines().any(|line| line.trim().trim_matches('`') == format!("{RELEASE} {id}"));
             feed.live.push(&feed.run, &feed.agent, "released", serde_json::json!({ "asked": asked, "processes": freed.processes, "lingering": freed.lingering }));
-            if id.starts_with("page:") {
+            if id.starts_with("page:") || id.starts_with("unit:") {
                 let how = if asked { "it reported done" } else { "its turn ended" };
                 let left = if freed.lingering == 0 { "nothing left running".to_string() } else { format!("{} still running", freed.lingering) };
                 eprintln!("taskmaster: released {id} ({how}; freed {} process{}, {left})", freed.processes, if freed.processes == 1 { "" } else { "es" });

@@ -304,8 +304,10 @@ jobs:
         run: |
           bundle="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
           deb=$(ls "$bundle"/deb/*.deb | head -n 1)
-          dpkg-deb -c "$deb" | grep -E '^-rwxr-xr-x .* (\./)?usr/bin/tm-daemon$' || { echo "tm-daemon is missing from the .deb, or not executable" >&2; exit 1; }
-          dpkg-deb -c "$deb" | grep -Eq ' (\./)?usr/lib/Taskmaster/web/index\.html$' || { echo "the web app is missing from the .deb" >&2; exit 1; }
+          # List once: `grep -q` stops reading early, and under pipefail dpkg-deb's broken pipe failed the step.
+          listing=$(dpkg-deb -c "$deb")
+          grep -E '^-rwxr-xr-x .* (\./)?usr/bin/tm-daemon$' <<<"$listing" || { echo "tm-daemon is missing from the .deb, or not executable" >&2; exit 1; }
+          grep -Eq ' (\./)?usr/lib/Taskmaster/web/index\.html$' <<<"$listing" || { echo "the web app is missing from the .deb" >&2; exit 1; }
           dpkg-deb -f "$deb" Version | grep -qx "$VERSION"
           tmp=$(mktemp -d) && dpkg-deb -x "$deb" "$tmp"
           "$tmp/usr/bin/tm-daemon" --version | grep -qx "tm-daemon $VERSION"

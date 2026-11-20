@@ -163,7 +163,7 @@ jobs:
         run: gh release upload "$GITHUB_REF_NAME" taskmaster-*.tar.gz taskmaster-*.sha256 --clobber
       - name: Keep the dry-run tarball
         if: env.PUBLISH != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-tarball
           path: taskmaster-*
@@ -312,7 +312,7 @@ jobs:
           ls "$bundle"/appimage/*.AppImage
       - name: Keep the dry-run installers
         if: env.PUBLISH != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-${{ matrix.target }}
           path: |

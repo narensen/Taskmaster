@@ -3396,6 +3396,7 @@ impl Driver {
             web: plan.has_ui(),
             phases: plan.phases.len(),
             contract_bytes: plan.contracts.iter().map(|c| c.content.len()).sum(),
+            small: self.small,
         };
         let worker = [self.config.models.worker.as_deref(), Some(self.harnesses.worker.id())];
         let prices = worker.into_iter().flatten().find_map(|key| self.config.prices.get(key).copied());

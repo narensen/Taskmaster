@@ -234,12 +234,16 @@ pub struct Shape {
     pub phases: usize,
     /// Bytes of locked contracts, which every builder carries in its prompt.
     pub contract_bytes: usize,
+    /// A small job (a few files, planned by the short pass): its units are far smaller.
+    pub small: bool,
 }
 
 /// Fresh tokens and cache reads one unit's builder uses before this project has history,
 /// from the November 2026 benchmark runs: a module with its tests, and a web page.
 const DEFAULT_MODULE: (u64, u64) = (110_000, 330_000);
 const DEFAULT_PAGE: (u64, u64) = (40_000, 120_000);
+/// One unit of a small job, from the v0.1.5 smoke runs (a file and its test).
+const DEFAULT_SMALL: (u64, u64) = (20_000, 60_000);
 /// Planning one later phase of a sketch.
 const DEFAULT_PHASE_PLAN: (u64, u64) = (25_000, 50_000);
 /// Builder calls per unit: the first attempt and the repairs a unit needs on average.
@@ -258,7 +262,7 @@ pub fn forecast(history: &[LedgerEntry], shape: &Shape, prices: Option<Prices>) 
     let units = shape.units.max(1) * phases;
     let calls = units as f64 * CALLS_PER_UNIT;
     let (per_fresh, per_cached) = if builds.is_empty() {
-        let (fresh, cached) = if shape.web { DEFAULT_PAGE } else { DEFAULT_MODULE };
+        let (fresh, cached) = if shape.small { DEFAULT_SMALL } else if shape.web { DEFAULT_PAGE } else { DEFAULT_MODULE };
         (fresh as f64 / CALLS_PER_UNIT, cached as f64 / CALLS_PER_UNIT)
     } else {
         let n = builds.len() as f64;
@@ -362,18 +366,20 @@ mod tests {
 
     #[test]
     fn a_forecast_is_sized_to_the_plan_and_counts_cache_reads_apart() {
-        let module = Shape { units: 1, web: false, phases: 0, contract_bytes: 0 };
+        let module = Shape { units: 1, web: false, phases: 0, contract_bytes: 0, small: false };
         let (one, basis) = forecast(&[], &module, None);
         assert_eq!(basis, 0);
         assert!((100_000..=120_000).contains(&one.tokens), "{one:?}");
         assert!(one.cache_read > one.tokens && !one.priced && one.usd == 0.0);
         // Three units, a sketch of two phases and 8 KB of contracts cost more, in both counts.
-        let big = Shape { units: 3, web: false, phases: 2, contract_bytes: 8_000 };
+        let big = Shape { units: 3, web: false, phases: 2, contract_bytes: 8_000, small: false };
         let (more, _) = forecast(&[], &big, None);
         assert!(more.tokens > 6 * one.tokens && more.cache_read > 6 * one.cache_read, "{more:?}");
-        // A web page is smaller than a module with its tests.
+        // A web page is smaller than a module with its tests, and a small job smaller still.
         let (page, _) = forecast(&[], &Shape { web: true, ..module }, None);
         assert!(page.tokens < one.tokens);
+        let (small, _) = forecast(&[], &Shape { small: true, ..module }, None);
+        assert!(small.tokens < page.tokens && small.tokens >= 15_000, "{small:?}");
         // With prices, the estimate is in dollars: uncached, cached and output apart.
         let grok = Prices { input: 2.0, cached_input: Some(0.5), output: 6.0 };
         let (priced, _) = forecast(&[], &module, Some(grok));

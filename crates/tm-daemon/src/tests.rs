@@ -1265,6 +1265,17 @@ async fn every_worker_brief_opens_with_the_same_shared_prefix() {
 }
 
 #[test]
+fn a_silent_agent_gets_a_heartbeat_line_every_two_minutes() {
+    use crate::engine::beat_due;
+    let s = Duration::from_secs;
+    assert!(!beat_due(s(60), None), "a minute of thinking is not news");
+    assert!(beat_due(s(120), None), "two minutes of nothing is");
+    assert!(!beat_due(s(150), Some((s(30), false))), "said 30s ago, about this same silence");
+    assert!(beat_due(s(250), Some((s(130), false))), "and again two minutes later");
+    assert!(beat_due(s(125), Some((s(200), true))), "a new silence after the agent spoke is reported anew");
+}
+
+#[test]
 fn only_commons_entries_that_bear_on_the_request_reach_the_planner() {
     let entry = |key: &str, summary: &str, content: &str, tier: DictTier| tm_core::DictionaryEntry {
         key: key.into(),

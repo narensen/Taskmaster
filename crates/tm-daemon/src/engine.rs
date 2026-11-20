@@ -3976,6 +3976,7 @@ fn collect_events(
     tee: Option<(Arc<Live>, String, serde_json::Value)>,
     watching: Option<Arc<std::sync::Mutex<Watched>>>,
     mut rx: mpsc::Receiver<HarnessEvent>,
+    heard: Arc<std::sync::Mutex<Instant>>,
 ) -> tokio::task::JoinHandle<(String, Vec<String>)> {
     tokio::spawn(async move {
         // The answer is only the text. Thoughts and tool calls go to the transcript.
@@ -3984,6 +3985,7 @@ fn collect_events(
         let mut asked: HashMap<String, String> = HashMap::new();
         let mut refused: Vec<String> = Vec::new();
         while let Some(event) = rx.recv().await {
+            *heard.lock().unwrap() = Instant::now();
             match &event {
                 HarnessEvent::ToolCall { name, input, .. } => {
                     asked.insert(name.clone(), tool_target(input).unwrap_or_default());
@@ -4046,6 +4048,40 @@ fn collect_events(
     })
 }
 
+/// How long an agent may send nothing before the log says so, and how often it says so again.
+const QUIET: Duration = Duration::from_secs(120);
+
+/// Whether a heartbeat line is due: the agent has been silent for [`QUIET`], and either no
+/// line was printed for this silence yet (`said` is how long ago the last one was, and whether
+/// it came before the agent last spoke) or the last one is [`QUIET`] old.
+pub(crate) fn beat_due(silent: Duration, said: Option<(Duration, bool)>) -> bool {
+    silent >= QUIET && said.is_none_or(|(ago, before_last_word)| before_last_word || ago >= QUIET)
+}
+
+/// The name an agent's heartbeat line uses: its unit, or its role.
+fn who_of(request: &AgentRequest) -> String {
+    let id = request.feed.as_ref().and_then(|f| f.agent["id"].as_str()).unwrap_or("an agent");
+    id.strip_prefix("page:").or_else(|| id.strip_prefix("unit:")).unwrap_or(id).to_string()
+}
+
+/// While an agent's call runs, print a line each time it has been silent for [`QUIET`]:
+/// `calc: no output for 120s`. A stalled agent is visible in the log without waiting for its
+/// time limit. Dropping the guard stops it.
+fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        let mut said: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let last = *heard.lock().unwrap();
+            let quiet = last.elapsed();
+            if beat_due(quiet, said.map(|at| (at.elapsed(), at < last))) {
+                eprintln!("taskmaster: {who}: no output for {}s", quiet.as_secs() / 10 * 10);
+                said = Some(Instant::now());
+            }
+        }
+    }))
+}
+
 /// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
 /// transcript under the same agent, and the session stays open for the next repair.
 async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>) -> anyhow::Result<Answer> {
@@ -4054,7 +4090,9 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let collect = collect_events(tee, None, rx);
+    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let collect = collect_events(tee, None, rx, heard.clone());
+    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
     let run = session.follow_up(request.brief.clone(), tx, request.timeout).await;
     let (text, refused) = collect.await.unwrap_or_default();
@@ -4147,7 +4185,9 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     // What a commit budget watches: tool calls, whether the reply has begun, the thoughts.
     let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
     let watching = request.commit.is_some().then(|| watch.clone());
-    let collect = collect_events(tee, watching, rx);
+    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let collect = collect_events(tee, watching, rx, heard.clone());
+    let _beat = heartbeat(who_of(request), heard);
     let started = Instant::now();
     let mut kept = None;
     let run = match request.commit {

@@ -704,7 +704,7 @@ mod tests {
             kind: Default::default(),
             contracts: vec![],
             pages: vec![page("book", "app/books/**"), page("cart", "app/cart/**")],
-            estimate: Estimate { tokens: 0, usd: 0.0 },
+            estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
             design: String::new(),
             phases: vec![],
         })

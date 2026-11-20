@@ -675,6 +675,7 @@ impl App {
         config.code_sh_secs = saved.code_mode.sh_secs;
         config.worker_shell = saved.sandbox.shell;
         config.package_indexes = saved.sandbox.package_indexes;
+        config.prices = crate::settings::price_table(&saved);
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
         config.run_id = id.to_string();
         config.plan = request.plan;

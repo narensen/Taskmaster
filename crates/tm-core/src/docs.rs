@@ -166,7 +166,7 @@ mod tests {
             kind: Default::default(),
             contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new() }],
             pages: vec![page("dashboard", &["auth", "nav"]), page("settings", &["auth"])],
-            estimate: Estimate { tokens: 0, usd: 0.0 },
+            estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
             design: String::new(),
             phases: vec![],
         }

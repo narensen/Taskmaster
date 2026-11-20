@@ -444,7 +444,7 @@ fn plan(pages: &[(&str, &[&str])]) -> Plan {
                 phase: 0,
             })
             .collect(),
-        estimate: Estimate { tokens: 10, usd: 0.01 },
+        estimate: Estimate { tokens: 10, usd: 0.01, ..Default::default() },
         design: String::new(),
         phases: vec![],
     }
@@ -1040,8 +1040,11 @@ async fn every_agent_call_is_charged_to_the_run() {
     assert_eq!(status["spent"]["calls"], entries.len());
     assert_eq!(status["spent"]["tokens"], entries.len() * 120);
     assert_eq!(status["spent"]["unpriced_calls"], 0);
-    // One page and no review, priced from defaults because nothing ran here before.
-    assert_eq!(status["estimate"]["tokens"], 17_000);
+    // One web page and no review, sized from the plan because nothing ran here before,
+    // with the cache reads counted apart.
+    assert_eq!(status["estimate"]["tokens"], 40_000);
+    // (plus the contract every builder carries in its prompt)
+    assert!((120_000..120_100).contains(&status["estimate"]["cache_read"].as_u64().unwrap()), "{status}");
 }
 
 #[tokio::test]
@@ -1262,6 +1265,39 @@ async fn every_worker_brief_opens_with_the_same_shared_prefix() {
     assert!(cut(&a).contains("export type Id = string;"), "the contracts are in it, in full");
     assert!(!cut(&a).contains("Build page"), "nothing unit-specific is in it");
     assert!(a.contains("Work down this list:"));
+}
+
+#[test]
+fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
+    use crate::engine::{cost_words, dollars};
+    use tm_core::{LedgerEntry, Role};
+    let call = |cost: Option<f64>, by: Option<&str>| LedgerEntry {
+        at: String::new(),
+        role: Role::Worker,
+        page: Some("a".into()),
+        harness: "grok-build".into(),
+        model: None,
+        input: 1000,
+        output: 100,
+        cache_read: 0,
+        cache_write: 0,
+        cost_usd: cost,
+        seconds: 1.0,
+        ok: true,
+        refused: vec![],
+        agent: None,
+        unit: None,
+        priced_by: by.map(str::to_string),
+    };
+    assert!(cost_words(&[call(None, None)]).starts_with("unpriced"), "no price is not $0.00");
+    assert!(cost_words(&[call(Some(0.0), Some("provider"))]).contains("charged nothing (a free model)"));
+    let mixed = cost_words(&[call(Some(0.5), Some("provider")), call(Some(0.25), Some("prices")), call(None, None)]);
+    assert_eq!(mixed, "$0.75 (1 priced by the provider, 1 from the price table, 1 unpriced)");
+    assert!(dollars(&tm_core::Estimate { tokens: 1, ..Default::default() }).starts_with("unpriced"));
+    assert_eq!(dollars(&tm_core::Estimate { tokens: 1, usd: 1.234, priced: true, ..Default::default() }), "$1.23");
+    // Grok reports no price, so the built-in table prices it as the benchmark's grader does.
+    let grok = crate::settings::built_in_prices()["grok-build"];
+    assert!((grok.cost(1_000_000, 1_000_000, 1_000_000) - 8.5).abs() < 1e-9);
 }
 
 #[test]
@@ -1558,10 +1594,12 @@ async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
     let mut second = config(&tmp.0, plan(&[("b", &[]), ("c", &[])]), true, 1);
     second.run_id = "two".into();
     assert_eq!(run(second, &world).await.unwrap(), Outcome::Finished { ok: true });
-    // Every fake call is 120 tokens and one cent: two pages, and no review.
+    // Every fake call is 120 tokens and one cent: two pages at 1.3 calls each, no review.
     let status = Records::files(&tmp.0).status("two").unwrap().unwrap();
-    assert_eq!(status["estimate"]["tokens"], 2 * 120);
-    assert!((status["estimate"]["usd"].as_f64().unwrap() - 0.02).abs() < 1e-9);
+    assert_eq!(status["estimate"]["tokens"], 312);
+    // A cent per 120 tokens, over the fresh tokens and the contract read from the cache.
+    assert!((0.026..0.03).contains(&status["estimate"]["usd"].as_f64().unwrap()), "{status}");
+    assert_eq!(status["estimate"]["priced"], true);
     assert_eq!(status["spent"]["fresh"], 2 * 120);
 }
 
@@ -2007,7 +2045,7 @@ mod http {
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
         assert_eq!(done["cancelled"], false);
-        assert_eq!(done["estimate"]["tokens"], 2 * 17_000);
+        assert_eq!(done["estimate"]["tokens"], 2 * 40_000);
         let calls = done["spent"]["calls"].as_u64().unwrap();
         assert!(calls >= 2 && done["spent"]["tokens"] == calls * 120, "{done}");
         assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);

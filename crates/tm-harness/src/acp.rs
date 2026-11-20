@@ -163,6 +163,7 @@ impl AcpHarness {
             stall: task.stall,
             tools: BTreeSet::new(),
             id: None,
+            cost: None,
         };
         let timeout = task.timeout;
         let result = match tokio::time::timeout(timeout, session.drive(task)).await {
@@ -241,6 +242,8 @@ struct Session {
     tools: BTreeSet<String>,
     /// The ACP session, once `session/new` answered.
     id: Option<String>,
+    /// The session's running cost, from the agent's `usage_update` events, when it sends one.
+    cost: Option<f64>,
 }
 
 impl Session {
@@ -298,11 +301,14 @@ impl Session {
             "sessionId": session_id,
             "prompt": [{ "type": "text", "text": text }],
         });
+        let before = self.cost;
         let result = self.call("session/prompt", prompt).await?;
+        // The reply's own price if it has one, else what the running cost grew by this turn.
+        let cost = read_cost(&result).or_else(|| self.cost.map(|now| (now - before.unwrap_or(0.0)).max(0.0)));
         Ok(RunSummary {
             ok: result["stopReason"] == "end_turn",
             usage: read_usage(&result),
-            cost_usd: None,
+            cost_usd: cost,
             denied: self.denied,
             freed: None,
         })
@@ -342,6 +348,9 @@ impl Session {
         match msg["method"].as_str() {
             Some("session/update") => {
                 track_tool(&mut self.tools, &params["update"]);
+                if let Some(cost) = running_cost(&params["update"]) {
+                    self.cost = Some(cost);
+                }
                 for event in update_events(&params["update"]) {
                     let _ = self.events.send(event).await;
                 }
@@ -588,6 +597,24 @@ fn read_usage(result: &Value) -> Usage {
     Usage { input, output, cache_read, cache_write: count(&["cachedWriteTokens", "cacheCreationTokens"]) }
 }
 
+/// A session's running cost from a `usage_update` (opencode: `{"cost":{"amount":0.12,"currency":"USD"}}`).
+/// Only US dollars are read.
+fn running_cost(update: &Value) -> Option<f64> {
+    if update["sessionUpdate"] != "usage_update" {
+        return None;
+    }
+    let cost = &update["cost"];
+    let currency = cost["currency"].as_str().unwrap_or("USD");
+    currency.eq_ignore_ascii_case("usd").then(|| cost["amount"].as_f64()).flatten()
+}
+
+/// A price a prompt reply carries, wherever the harness put it.
+fn read_cost(result: &Value) -> Option<f64> {
+    let places = [&result["usage"], &result["_meta"]["usage"], &result["_meta"], result];
+    let keys = ["costUsd", "cost_usd", "totalCostUsd", "total_cost_usd"];
+    places.iter().find_map(|place| keys.iter().find_map(|key| place[*key].as_f64()))
+}
+
 /// The tool being called. Antigravity gives a `name`; Grok Build puts an MCP tool's name in
 /// its input and a built-in's name in its metadata; the title is the last resort.
 fn tool_name(tool_call: &Value) -> String {
@@ -715,6 +742,18 @@ mod tests {
         let request = permission_request(&write);
         assert_eq!((request.tool.as_str(), request.kind), ("write", ToolKind::Edit));
         assert_eq!(request.paths, vec![PathBuf::from("/w/greeting.ts")]);
+    }
+
+    #[test]
+    fn a_price_is_read_from_the_reply_or_from_the_running_cost() {
+        assert_eq!(read_cost(&json!({ "stopReason": "end_turn", "_meta": { "usage": { "costUsd": 0.42 } } })), Some(0.42));
+        assert_eq!(read_cost(&json!({ "stopReason": "end_turn", "total_cost_usd": 0.98 })), Some(0.98));
+        assert_eq!(read_cost(&json!({ "stopReason": "end_turn", "usage": { "inputTokens": 5 } })), None);
+        // Recorded from opencode 2.3.0 with a free model.
+        let free = json!({ "sessionUpdate": "usage_update", "used": 7863, "size": 200000, "cost": { "amount": 0, "currency": "USD" } });
+        assert_eq!(running_cost(&free), Some(0.0));
+        assert_eq!(running_cost(&json!({ "sessionUpdate": "usage_update", "cost": { "amount": 3, "currency": "EUR" } })), None);
+        assert_eq!(running_cost(&json!({ "sessionUpdate": "agent_message_chunk" })), None);
     }
 
     #[test]

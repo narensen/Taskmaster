@@ -1262,7 +1262,7 @@ mod tests {
                 skills: vec![],
                 phase: 0,
             }],
-            estimate: tm_core::Estimate { tokens: 1000, usd: 0.5 },
+            estimate: tm_core::Estimate { tokens: 1000, usd: 0.5, ..Default::default() },
             design: String::new(),
             phases: vec![],
         };

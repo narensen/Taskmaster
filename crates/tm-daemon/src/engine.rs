@@ -3348,6 +3348,13 @@ impl Driver {
 
     /// Record one agent call in the run's ledger.
     fn charge(&self, bill: &Bill, answer: &Answer) -> anyhow::Result<()> {
+        // A harness that reports no price is priced from the table, by model, then harness.
+        let table = [bill.model.as_deref(), Some(bill.harness.as_str())].into_iter().flatten().find_map(|key| self.config.prices.get(key).copied());
+        let (cost_usd, priced_by) = match (answer.cost_usd, table) {
+            (Some(cost), _) => (Some(cost), Some("provider".to_string())),
+            (None, Some(prices)) => (Some(prices.cost(answer.usage.input, answer.usage.output, answer.usage.cache_read)), Some("prices".to_string())),
+            (None, None) => (None, None),
+        };
         let entry = LedgerEntry {
             at: rfc3339_now(),
             role: bill.role,
@@ -3358,12 +3365,13 @@ impl Driver {
             output: answer.usage.output,
             cache_read: answer.usage.cache_read,
             cache_write: answer.usage.cache_write,
-            cost_usd: answer.cost_usd,
+            cost_usd,
             seconds: answer.seconds,
             ok: answer.ok,
             refused: answer.refused.clone(),
             agent: bill.agent.clone(),
             unit: bill.unit.clone(),
+            priced_by,
         };
         self.records.charge(&self.id, &entry)
     }
@@ -3378,19 +3386,38 @@ impl Driver {
                 history.extend(self.records.ledger(&run)?);
             }
         }
-        // Review is on demand, so a run's own cost is only its builds.
-        let (mut estimate, basis) = forecast(&history, plan.pages.len(), 0);
-        let planning = totals(&self.records.ledger(&self.id)?);
-        estimate.tokens += planning.fresh;
-        estimate.usd += planning.cost_usd;
-        let source = if basis == 0 { "no earlier runs here, so from defaults".to_string() } else { format!("from {basis} earlier calls") };
-        eprintln!("taskmaster: estimated {} tokens, ${:.2} ({source})", estimate.tokens, estimate.usd);
+        let shape = tm_core::Shape {
+            units: plan.pages.iter().map(|p| p.work_units().len()).sum(),
+            web: plan.has_ui(),
+            phases: plan.phases.len(),
+            contract_bytes: plan.contracts.iter().map(|c| c.content.len()).sum(),
+        };
+        let worker = [self.config.models.worker.as_deref(), Some(self.harnesses.worker.id())];
+        let prices = worker.into_iter().flatten().find_map(|key| self.config.prices.get(key).copied());
+        // Review is on demand, so a run's own cost is its planning so far and its builds.
+        let (mut estimate, basis) = forecast(&history, &shape, prices);
+        let planning = self.records.ledger(&self.id)?;
+        let spent = totals(&planning);
+        estimate.tokens += spent.fresh;
+        estimate.cache_read += spent.cache_read;
+        if estimate.priced || planning.iter().any(|e| e.cost_usd.is_some()) {
+            estimate.usd += spent.cost_usd;
+            estimate.priced = true;
+        }
+        let source = if basis == 0 { "no earlier runs here, so sized from the plan".to_string() } else { format!("from {basis} earlier calls") };
+        eprintln!(
+            "taskmaster: estimated {} tokens plus {} read from cache, {} ({source})",
+            estimate.tokens,
+            estimate.cache_read,
+            dollars(&estimate)
+        );
         plan.estimate = estimate;
         Ok(plan)
     }
 
     fn spend_line(&self) -> anyhow::Result<String> {
-        let sum = totals(&self.records.ledger(&self.id)?);
+        let ledger = self.records.ledger(&self.id)?;
+        let sum = totals(&ledger);
         let mut line = format!("{} agent calls, {} tokens", sum.calls, sum.fresh);
         line.push_str(&format!(" ({} in, {} out", sum.input, sum.output));
         if sum.cache_write > 0 {
@@ -3400,15 +3427,14 @@ impl Driver {
         if sum.cache_read > 0 {
             line.push_str(&format!(" plus {} read from cache", sum.cache_read));
         }
-        if sum.unpriced_calls < sum.calls {
-            line.push_str(&format!(", ${:.2}", sum.cost_usd));
-            if sum.unpriced_calls > 0 {
-                let calls = if sum.unpriced_calls == 1 { "call" } else { "calls" };
-                line.push_str(&format!(" ({} {calls} reported no price)", sum.unpriced_calls));
-            }
-        }
+        line.push_str(&format!(", {}", cost_words(&ledger)));
         if let Some(plan) = &self.run.plan {
-            line.push_str(&format!("; the plan estimated {} tokens", plan.estimate.tokens));
+            line.push_str(&format!(
+                "; the plan estimated {} tokens plus {} read from cache, {}",
+                plan.estimate.tokens,
+                plan.estimate.cache_read,
+                dollars(&plan.estimate)
+            ));
         }
         Ok(line)
     }
@@ -4300,6 +4326,34 @@ fn kind_name(kind: EntryKind) -> &'static str {
 }
 
 /// The settings fixed when the run first started. A resumed run keeps them.
+/// An estimate in dollars, or `unpriced` when there is nothing to price it with. Never a
+/// `$0.00` that only means "unknown".
+pub(crate) fn dollars(estimate: &tm_core::Estimate) -> String {
+    if estimate.priced { format!("${:.2}", estimate.usd) } else { "unpriced (no reported prices and no price table for this model)".to_string() }
+}
+
+/// What a run's calls cost, saying where each price came from.
+pub(crate) fn cost_words(ledger: &[LedgerEntry]) -> String {
+    let by = |source: &str| ledger.iter().filter(|e| e.priced_by.as_deref() == Some(source)).count();
+    let (reported, table) = (by("provider"), by("prices"));
+    let unpriced = ledger.iter().filter(|e| e.cost_usd.is_none()).count();
+    let usd: f64 = ledger.iter().filter_map(|e| e.cost_usd).sum();
+    if reported + table == 0 && unpriced > 0 {
+        return "unpriced (the harness reported no price and none is set for this model)".into();
+    }
+    let mut parts = Vec::new();
+    if reported > 0 {
+        parts.push(if usd == 0.0 && table == 0 { "the provider charged nothing (a free model)".to_string() } else { format!("{reported} priced by the provider") });
+    }
+    if table > 0 {
+        parts.push(format!("{table} from the price table"));
+    }
+    if unpriced > 0 {
+        parts.push(format!("{unpriced} unpriced"));
+    }
+    format!("${usd:.2} ({})", parts.join(", "))
+}
+
 /// A plan as the planner writes it, for a repair call: `units`, not `pages`.
 fn plan_json(plan: &Plan, drafts: &[DraftEntry]) -> String {
     let value = serde_json::json!({

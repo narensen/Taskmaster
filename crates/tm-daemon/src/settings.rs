@@ -43,6 +43,23 @@ pub struct Settings {
     pub agents: AgentSettings,
     /// What a worker's sandbox lets it do.
     pub sandbox: SandboxSettings,
+    /// Dollars per million tokens, by model id or harness id, for calls whose harness
+    /// reports no price. Grok's are built in (see [`built_in_prices`]).
+    pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+}
+
+/// Prices Taskmaster knows without a settings file: Grok Build's, as the benchmark's grader
+/// counts them ($2/M input, $0.50/M cached input, $6/M output).
+pub fn built_in_prices() -> std::collections::BTreeMap<String, tm_core::Prices> {
+    let grok = tm_core::Prices { input: 2.0, cached_input: Some(0.5), output: 6.0 };
+    ["grok", "grok-build"].iter().map(|k| (k.to_string(), grok)).collect()
+}
+
+/// The price table a run uses: the built-in prices, then the settings file's over them.
+pub fn price_table(settings: &Settings) -> std::collections::BTreeMap<String, tm_core::Prices> {
+    let mut table = built_in_prices();
+    table.extend(settings.prices.clone());
+    table
 }
 
 /// A builder's shell. It is only ever given inside the bubblewrap sandbox (or Codex's own),

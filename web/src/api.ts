@@ -7,8 +7,13 @@ export type Tier = "worker" | "mid" | "master";
 export type RoleName = "worker" | "mid" | "master" | "reviewer" | "verifier";
 
 export interface Estimate {
+  /** Fresh tokens: uncached input and output. */
   tokens: number;
   usd: number;
+  /** Input expected from the provider's cache, counted apart. */
+  cache_read?: number;
+  /** Whether `usd` is a price at all; without one the estimate is unpriced, not $0.00. */
+  priced?: boolean;
 }
 
 export interface Spend {

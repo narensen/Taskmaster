@@ -4,7 +4,7 @@
 import { memo, useEffect, useState, type ReactNode } from "react";
 import { FileText, Globe, Pencil, Search, SquareTerminal } from "lucide-react";
 import type { Phase, Plan, RunDetail, ToolApproval } from "../api";
-import { tokens } from "../format";
+import { tokens, usd } from "../format";
 import { KnownPath, Rich, looksLikePath } from "../paths";
 import type { Call, Item, Surface, ToolItem } from "./model";
 
@@ -252,7 +252,13 @@ function PlanBlock({ plan }: { plan: Plan }) {
           </span>
         </div>
       ))}
-      {plan.estimate.tokens > 0 && <p className="flow-life">About {tokens(plan.estimate.tokens)} tokens.</p>}
+      {plan.estimate.tokens > 0 && (
+        <p className="flow-life">
+          About {tokens(plan.estimate.tokens)} tokens
+          {plan.estimate.cache_read ? ` and ${tokens(plan.estimate.cache_read)} read from cache` : ""}
+          {plan.estimate.priced ? `, ${usd(plan.estimate.usd)}` : ""}.
+        </p>
+      )}
       {plan.design?.trim() && <pre className="flow-design">{plan.design.trim()}</pre>}
     </div>
   );

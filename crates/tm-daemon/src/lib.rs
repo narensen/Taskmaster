@@ -268,6 +268,8 @@ pub struct Config {
     pub worker_shell: bool,
     /// Fetch tools may reach the package indexes.
     pub package_indexes: bool,
+    /// Dollars per million tokens by model id or harness id, for calls with no reported price.
+    pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
 }
 
 impl Config {
@@ -303,6 +305,7 @@ impl Config {
             code_sh_secs: 0,
             worker_shell: true,
             package_indexes: true,
+            prices: crate::settings::built_in_prices(),
         }
     }
 }

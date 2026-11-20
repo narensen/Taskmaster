@@ -316,8 +316,15 @@ impl Plan {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Estimate {
+    /// Fresh tokens: input not served from a cache, and output.
     pub tokens: u64,
     pub usd: f64,
+    /// Input the provider is expected to serve from its cache, counted apart.
+    #[serde(default)]
+    pub cache_read: u64,
+    /// Whether `usd` is a price at all. Without past prices or a price table it is not.
+    #[serde(default)]
+    pub priced: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -442,7 +449,7 @@ mod unit_tests {
     fn a_plan_lists_one_agent_per_unit() {
         let mut units = vec![unit("ui", "app/index.html"), unit("js", "app/main.js")];
         units[1].done = "adding a todo shows it".into();
-        let plan = Plan { kind: Default::default(), contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0 }, design: String::new(), phases: vec![] };
+        let plan = Plan { kind: Default::default(), contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() }, design: String::new(), phases: vec![] };
         let agents = plan.agents();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["page:todo/ui", "page:todo/js", "page:todo"]);

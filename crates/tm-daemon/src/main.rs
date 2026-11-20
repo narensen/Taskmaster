@@ -167,6 +167,7 @@ async fn run() -> anyhow::Result<Outcome> {
     config.code_sh_secs = settings.code_mode.sh_secs;
     config.worker_shell = settings.sandbox.shell;
     config.package_indexes = settings.sandbox.package_indexes;
+    config.prices = tm_daemon::settings::price_table(&settings);
     config.remote = settings.remote();
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;

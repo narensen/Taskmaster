@@ -218,7 +218,7 @@ mod tests {
                     phase: 0,
                 })
                 .collect(),
-            estimate: Estimate { tokens: 0, usd: 0.0 },
+            estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
             design: String::new(),
             phases: vec![],
         }

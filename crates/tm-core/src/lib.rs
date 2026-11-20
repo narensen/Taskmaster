@@ -10,7 +10,7 @@ pub mod types;
 
 pub use citations::{Citation, Citations, page_is_fresh};
 pub use errorography::{Book, Mistake, PROMOTE_AT};
-pub use ledger::{LedgerEntry, Role, Spend, Totals, forecast, totals};
+pub use ledger::{LedgerEntry, Prices, Role, Shape, Spend, Totals, forecast, totals};
 pub use plan::{DraftEntry, Rejection, Rule, check_plan, normalize_plan, rejections, rules_text};
 pub use run::{Command, Event, PageState, Run, RunPhase, Tier, WorkerOutcome};
 pub use types::*;

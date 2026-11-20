@@ -174,7 +174,7 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     }
     let value = last_json(text, '{', '}').context("the plan reply had no JSON object")?;
     let raw: RawPlan = serde_json::from_value(value).context("the plan reply was not a plan")?;
-    let estimate = raw.estimate.unwrap_or(Estimate { tokens: 0, usd: 0.0 });
+    let estimate = raw.estimate.unwrap_or(Estimate { tokens: 0, usd: 0.0, ..Default::default() });
     let design = design_text(&raw.design);
     let kind = plan_kind(raw.kind.as_deref(), &raw.pages, &raw.contracts, &design);
     let dictionary = raw.dictionary.into_iter().map(RawEntry::entry).collect();

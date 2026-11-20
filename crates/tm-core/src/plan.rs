@@ -385,7 +385,7 @@ mod tests {
                 brief: "Implement home.".into(),
                 ..Default::default()
             }],
-            estimate: Estimate { tokens: 1, usd: 0.0 },
+            estimate: Estimate { tokens: 1, usd: 0.0, ..Default::default() },
             ..Default::default()
         }
     }
@@ -467,7 +467,7 @@ mod tests {
             ],
             design: String::new(),
             phases: vec![],
-            estimate: Estimate { tokens: 0, usd: -3.0 },
+            estimate: Estimate { tokens: 0, usd: -3.0, ..Default::default() },
             ..Default::default()
         };
         let mut drafts = vec![
@@ -538,7 +538,7 @@ mod tests {
                 PagePlan { id: "a b".into(), route: "/a".into(), owned_glob: "".into(), brief: " ".into(), cites: vec!["nope".into()], ..Default::default() },
                 PagePlan { id: "lib".into(), owned_glob: "lib/**".into(), brief: "x".into(), ..Default::default() },
             ],
-            estimate: Estimate { tokens: 0, usd: -1.0 },
+            estimate: Estimate { tokens: 0, usd: -1.0, ..Default::default() },
             design: "palette".into(),
             phases: vec![],
         };

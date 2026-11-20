@@ -155,8 +155,16 @@ pub struct Attempt {
     pub tier: tm_core::Tier,
     /// The harness and model, such as `agy gemini-flash`.
     pub model: String,
-    /// `merged`, `discarded` or `flagged`.
+    /// `merged`, `discarded`, `flagged` or `blocked`.
     pub outcome: String,
+    /// The agent that made it (`unit:a/part` for a part of a split unit). Older records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Seconds the attempt ran, and its fresh tokens.
+    #[serde(default)]
+    pub seconds: f64,
+    #[serde(default)]
+    pub tokens: u64,
     /// What it was asked to fix, if this was a repair.
     #[serde(default)]
     pub fixing: Option<String>,

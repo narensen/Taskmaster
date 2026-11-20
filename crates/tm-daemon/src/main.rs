@@ -110,13 +110,22 @@ async fn run() -> anyhow::Result<Outcome> {
             serve(args).await?;
             return Ok(Outcome::Finished { ok: true });
         }
-        Invocation::Report { project, run, json } => {
+        Invocation::Report { project, run, json, append } => {
             let project = project.canonicalize().with_context(|| format!("cannot open {}", project.display()))?;
             let records = Settings::load(&project)?.records(&project)?;
             if records.events(&run)?.is_empty() && records.ledger(&run)?.is_empty() {
                 bail!("there is no run `{run}` in {}", project.display());
             }
             let report = tm_daemon::report::build(&records, &run)?;
+            // One line per run, for a benchmark's results file (bench/results.jsonl).
+            if let Some(file) = &append {
+                use std::io::Write;
+                let mut line = serde_json::to_value(&report)?;
+                line["project"] = serde_json::json!(project.display().to_string());
+                line["at"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+                let mut out = std::fs::OpenOptions::new().create(true).append(true).open(file).with_context(|| format!("cannot open {}", file.display()))?;
+                writeln!(out, "{}", serde_json::to_string(&line)?)?;
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -295,8 +304,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
 enum Invocation {
     Providers { harness: Option<String> },
-    /// `tm-daemon report [<project>] [--run <id>] [--json]`
-    Report { project: PathBuf, run: String, json: bool },
+    /// `tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]`
+    Report { project: PathBuf, run: String, json: bool, append: Option<PathBuf> },
     Serve(ServeArgs),
     Drive(Box<Args>),
 }
@@ -307,18 +316,19 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
         return Ok(Invocation::Providers { harness: providers_harness(&argv[1..])? });
     }
     if argv.first().is_some_and(|arg| arg == "report") {
-        let usage = "usage: tm-daemon report [<project>] [--run <id>] [--json]";
-        let (mut project, mut run, mut json) = (PathBuf::from("."), "current".to_string(), false);
+        let usage = "usage: tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]";
+        let (mut project, mut run, mut json, mut append) = (PathBuf::from("."), "current".to_string(), false, None);
         let mut rest = argv[1..].iter();
         while let Some(arg) = rest.next() {
             match arg.as_str() {
                 "--run" => run = rest.next().cloned().with_context(|| usage.to_string())?,
                 "--json" => json = true,
+                "--append" => append = Some(PathBuf::from(rest.next().cloned().with_context(|| usage.to_string())?)),
                 flag if flag.starts_with('-') => bail!("unknown option `{flag}`\n{usage}"),
                 path => project = PathBuf::from(path),
             }
         }
-        return Ok(Invocation::Report { project, run, json });
+        return Ok(Invocation::Report { project, run, json, append });
     }
     if argv.first().is_some_and(|arg| arg == "serve") {
         return Ok(Invocation::Serve(serve_args(&argv[1..])?));
@@ -528,11 +538,15 @@ mod args_tests {
     #[test]
     fn report_reads_a_project_and_a_run() {
         match invocation_from(["report".into(), "proj".into(), "--run".into(), "r1".into(), "--json".into()]).unwrap() {
-            Invocation::Report { project, run, json } => assert_eq!((project, run.as_str(), json), (PathBuf::from("proj"), "r1", true)),
+            Invocation::Report { project, run, json, append } => {
+                assert_eq!((project, run.as_str(), json, append), (PathBuf::from("proj"), "r1", true, None));
+            }
             _ => panic!("report was not read as a report"),
         }
         match invocation_from(["report".to_string()]).unwrap() {
-            Invocation::Report { project, run, json } => assert_eq!((project, run.as_str(), json), (PathBuf::from("."), "current", false)),
+            Invocation::Report { project, run, json, append } => {
+                assert_eq!((project, run.as_str(), json, append), (PathBuf::from("."), "current", false, None));
+            }
             _ => panic!("report was not read as a report"),
         }
         assert!(invocation_from(["report".into(), "--bogus".into()]).is_err());

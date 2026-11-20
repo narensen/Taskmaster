@@ -1649,6 +1649,9 @@ impl Driver {
             tier,
             model: self.model_byline(tier),
             outcome: label.into(),
+            agent: product.bill.agent.clone(),
+            seconds: product.answer.seconds,
+            tokens: product.answer.usage.input + product.answer.usage.output,
             fixing: fixing.map(|text| clip(text, 1500)),
             failure,
             files,
@@ -4161,6 +4164,7 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
                 end["denied"] = serde_json::json!(summary.denied);
+                end["cost_usd"] = serde_json::json!(summary.cost_usd);
                 if summary.usage.total() > 0 {
                     end["usage"] = serde_json::json!(summary.usage);
                 }
@@ -4169,6 +4173,9 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
                 end["ok"] = serde_json::json!(false);
                 end["error"] = serde_json::json!(format!("{err:#}"));
             }
+        }
+        if !refused.is_empty() {
+            end["refused"] = serde_json::json!(refused);
         }
         feed.live.push(&feed.run, &feed.agent, "end", end);
     }
@@ -4293,6 +4300,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
                 end["ok"] = serde_json::json!(summary.ok);
                 end["denied"] = serde_json::json!(summary.denied);
                 end["cost_usd"] = serde_json::json!(summary.cost_usd);
+                end["cost_usd"] = serde_json::json!(summary.cost_usd);
                 let usage = &summary.usage;
                 // Only a provider that reports usage gets a meter.
                 if usage.input + usage.output + usage.cache_read + usage.cache_write > 0 {
@@ -4303,6 +4311,9 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
                 end["ok"] = serde_json::json!(false);
                 end["error"] = serde_json::json!(format!("{err:#}"));
             }
+        }
+        if !refused.is_empty() {
+            end["refused"] = serde_json::json!(refused);
         }
         feed.live.push(&feed.run, &feed.agent, "end", end);
         if let Ok(RunSummary { freed: Some(freed), .. }) = &run {

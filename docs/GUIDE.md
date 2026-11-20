@@ -92,7 +92,7 @@ cd web && npm ci && npm run build
 tm-daemon serve . --web web/dist         # http://127.0.0.1:8737, pair with the printed code
 ```
 
-`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, and 2 when the plan is waiting for `--yes`.
+`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, 2 when the plan is waiting for `--yes`, and 3 when a provider stopped it (a usage limit, no balance left, a sign-in); run the same command again to resume. `--timeout 0` lets an agent call run with no time limit.
 
 ## Architecture
 
@@ -140,7 +140,7 @@ tm-daemon . --yes
 
 The first `tm-daemon` command records the plan and exits 2. The second approves that recorded plan and builds it. Pass `--yes` on the first command to approve immediately.
 
-A rejected plan is sent back to the planner once, with the errors. An existing Dictionary entry may be cited. Different content for the same key is refused.
+A rejected plan is repaired, not planned again: a short call with no tools gets the plan and the reasons and changes only what they name, up to two times. A reply with no plan in it at all is planned once more. An existing Dictionary entry may be cited. Different content for the same key is refused.
 
 When the run finishes clean, its branch is merged into whatever the project has checked out and then deleted. A run that fails stays on its branch, and so does one git cannot merge cleanly; either way the project is left as it was. A repository with no commit yet has nothing to branch from, so its first run builds in place.
 
@@ -172,7 +172,7 @@ The harnesses are `claude`, `agy`, `grok`, `codex`, and `opencode`.
 
 ## The brakes
 
-A page that fails its checks is sent back with the errors. It gets two repairs on the worker, then two on the mid model, then two on the master. After that, the page fails. A Dictionary entry can be amended once in a run. Review runs for two rounds, and the round after the last one goes straight to verification.
+A page that fails its checks is sent back with the errors: the failing output itself, the calls the gate refused with what they asked for, and, when the attempt changed nothing, that it changed nothing and its last words. It gets two repairs on the worker, then two on the mid model, then two on the master. After that, the page fails. When worker, mid and master are the same harness and model, climbing the ladder would only repeat the attempt, so there is none: two focused repairs, then the page fails. An attempt that changed nothing after a shell command or a fetch was refused is not retried at all: the same refusal would meet every retry, so the page fails at once and says what it needed. A Dictionary entry can be amended once in a run. Review runs for two rounds, and the round after the last one goes straight to verification.
 
 The reviewer and the verifier are different harnesses, so one model does not grade its own page. Findings the verifier rejects are dropped. A write outside the page's glob fails the attempt, including a write to a locked contract. Up to four pages build at once. `--parallel` changes that for a new run. A resumed run keeps the parallelism it started with.
 
@@ -195,6 +195,18 @@ A screenshot of each page is kept, and the app shows it next to the page. Chrome
 ## What a plan is
 
 A plan names its `kind`: `web`, `library`, `cli`, `server` or `migration`. Its `units` are the pieces of work, each one agent (or several, when it is split into `parts`) owning one glob. Only a unit a browser shows (every unit of a `web` plan, or one marked `"ui": true`) has a `route`, and only a plan with such a unit has a `design`. Contracts are interfaces that more than one unit imports, never implementations: signatures, types, constants and schemas with stub bodies, at most 120 lines each and 400 in all, and never a file a unit owns. The planner is shown the same list of rules the plan is checked against, and a field with one sensible fix (a route on a module, a design on a library, a path written `./x`) is fixed in place rather than sending the plan back. A unit whose files are already right and whose agent changes nothing is done, not failed.
+
+## Phases and PROJECT.md
+
+A job bigger than a small one is sketched first. The first planning call returns 2-6 phases in build order, each with its goal, the files it delivers, its interfaces as signatures only, and the command that runs its tests, and plans only the first phase in detail. Small jobs (a dependency upgrade, a fix, or fewer than about five files) are one phase with one or two units, as before.
+
+One phase builds at a time. When it passes the project's checks, Taskmaster writes what it landed into `PROJECT.md` at the project root (from the change log, so it records what actually happened), keeps a checkpoint of the run's branch under `refs/taskmaster/<run>/phase-<n>`, and adds the next phase's units. A phase that needs only the interfaces before it is planned while that phase builds, so its workers start as soon as it passes. A project that has a `PROJECT.md` of its own keeps it; Taskmaster's is then not written. The run view lists the phases under the master, each with its state.
+
+Every builder's brief opens with the same text, word for word: the project kind, `PROJECT.md`, the locked contracts in full in path order, the design for web units, and the shared rules. Its own task follows. Providers cache a prompt's leading text, so that shared part is served from their cache. The task ends with a short list to work down, which ends with running the tests. A planner lists only this project's Dictionary entries and the Commons entries the request names or shares two words with.
+
+## Repairs go back to the same agent
+
+A builder's session is kept open after its turn when its harness can (`agy`, `grok` and `opencode`), up to eight at a time. When that unit comes back for repair on the same tier, the failure is sent to it as a follow-up turn: it still has its task, its files and the provider's cache. Its worktree first gets every file the run's tree changed since, and a file left the same as the tree is never counted as the unit's work. If a repair by the master breaks units that had passed, its files are put back as they were at the checkpoint taken just before it.
 
 ## A worker's shell
 
@@ -230,7 +242,7 @@ Both are off until you switch them on in Settings (or `checker.enabled` and `cod
 
 The **checker** gives a page that just passed its own checks one read-only call on the mid role's model, but only when the page changes UI files, is large, or needed a stronger tier. It reads `diff.patch`, a screenshot of the page as the worker left it, the brief, the done line and the worker's last words, and answers `pass` or up to five fixes. Those fixes join the verify step's errors, so the page is repaired the usual way. Each page is checked once, the check runs beside the rest of the build, and verification waits at most 20 seconds for a check still running.
 
-**Code Mode** gives each worker `run_code`: an async JavaScript body with `read`, `write`, `edit`, `grep`, `ls`, `sh`, `check` and `browser`, run in Node with its permission model on (no files, processes or workers of its own) and, under bubblewrap, no network. Every call goes to the same permission gate as the worker's own tools. Claude Code workers instead run Claude Code's native code mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`) in an interactive session on a terminal.
+**Code Mode** gives every worker and every repair `run_code`: an async JavaScript body with `read`, `readMany`, `write`, `edit`, `grep`, `ls`, `sh`, `test`, `check` and `browser`, run in Node with its permission model on (no files, processes or workers of its own) and, under bubblewrap, no network. `test()` runs the project's own tests in the worker's sandbox and returns `{ok, failed, output}`; `sh()` and `test()` run only inside the sandbox. Workers are told to batch their reads, edits and checks into a few scripts that each end with `return await test()`. A script may run 600 seconds and one `sh()` or `test()` call 300; `code_mode.script_secs` and `code_mode.sh_secs` change that. Every call goes to the same permission gate as the worker's own tools. Claude Code workers instead run Claude Code's native code mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`) in an interactive session on a terminal.
 
 `scripts/bench.sh` builds one locked plan under different settings, and runs a single-agent baseline, writing each result to `bench/results.jsonl`.
 
@@ -374,7 +386,7 @@ tm-review <repo | url> [--base <rev>] [--head <rev>] [--pr <n>] [--dirty]
           [--reviewer-model <m>] [--verifier-model <m>] [--install-lints] [--keep]
 ```
 
-`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, and 2 when the plan is waiting for `--yes`.
+`tm-daemon` exits 0 when the run finishes clean, 1 when it fails, 2 when the plan is waiting for `--yes`, and 3 when a provider stopped it (a usage limit, no balance left, a sign-in); run the same command again to resume. `--timeout 0` lets an agent call run with no time limit.
 
 Commits the daemon makes need `user.name` and `user.email` on that repository. Taskmaster does not write git config.
 

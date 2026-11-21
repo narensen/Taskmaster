@@ -427,26 +427,20 @@ fn plan_json(cite: &str, entry: &str) -> String {
 
 fn plan(pages: &[(&str, &[&str])]) -> Plan {
     Plan {
-        kind: Default::default(),
         contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into() }],
         pages: pages
             .iter()
             .map(|(id, cites)| PagePlan {
                 id: (*id).into(),
                 route: format!("/{id}"),
-                ui: None,
                 owned_glob: format!("app/{id}/**"),
                 cites: cites.iter().map(|c| (*c).to_string()).collect(),
                 brief: format!("Implement {id}."),
-                done: String::new(),
-                units: vec![],
-                skills: vec![],
-                phase: 0,
+                ..Default::default()
             })
             .collect(),
         estimate: Estimate { tokens: 10, usd: 0.01, ..Default::default() },
-        design: String::new(),
-        phases: vec![],
+        ..Default::default()
     }
 }
 
@@ -649,8 +643,8 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     let world = World::new(Mode::Units(Arc::new(Barrier::new(2))));
     let mut split = plan(&[("a", &[])]);
     split.pages[0].units = vec![
-        WorkUnit { id: "markup".into(), owned_glob: "app/a/index.html".into(), brief: "The markup.".into(), done: String::new() },
-        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into(), done: "clicking add shows a todo".into() },
+        WorkUnit { id: "markup".into(), owned_glob: "app/a/index.html".into(), brief: "The markup.".into(), ..Default::default() },
+        WorkUnit { id: "logic".into(), owned_glob: "app/a/main.js".into(), brief: "The script.".into(), done: "clicking add shows a todo".into(), ..Default::default() },
     ];
     let outcome = run(config(&tmp.0, split, true, 2), &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
@@ -3340,5 +3334,38 @@ mod role_defaults {
         assert_eq!((roles.master.as_str(), roles.worker.as_str(), roles.mid.as_str()), ("claude", "codex", "opencode"));
         let err = crate::Roles::resolve(saved.as_object().unwrap(), &Default::default()).unwrap_err().to_string();
         assert!(err.contains("mid, reviewer, verifier"), "{err}");
+    }
+
+    #[test]
+    fn default_worker_time_limit_is_unlimited() {
+        assert_eq!(crate::settings::DEFAULT_AGENT_SECS, 0);
+        let cfg = crate::Config::new(std::path::PathBuf::from("/tmp"));
+        assert_eq!(cfg.timeout, crate::settings::NO_LIMIT);
+    }
+
+    #[test]
+    fn plan_json_accepts_summary_workers_alias_and_per_worker_context() {
+        let raw = r#"{
+            "summary": "Build auth and billing in parallel",
+            "workers": [
+                {
+                    "id": "auth",
+                    "owned_glob": "src/auth/**",
+                    "brief": "Implement JWT middleware and login route.",
+                    "context": "Use argon2 for hashing and export requireAuth from src/auth/index.ts."
+                },
+                {
+                    "id": "billing",
+                    "owned_glob": "src/billing/**",
+                    "brief": "Implement Stripe webhook handler.",
+                    "context": "Reuse UserId from contracts/types.ts."
+                }
+            ]
+        }"#;
+        let (plan, _) = crate::reply::parse_plan(raw).unwrap();
+        assert_eq!(plan.summary, "Build auth and billing in parallel");
+        assert_eq!(plan.pages.len(), 2);
+        assert_eq!(plan.pages[0].context, "Use argon2 for hashing and export requireAuth from src/auth/index.ts.");
+        assert_eq!(plan.pages[1].context, "Reuse UserId from contracts/types.ts.");
     }
 }

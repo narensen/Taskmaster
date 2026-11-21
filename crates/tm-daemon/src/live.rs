@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 use crate::store::Store;
 use crate::time::rfc3339_now;
@@ -34,6 +35,7 @@ pub struct Live {
     cache: Mutex<HashMap<String, Cached>>,
     write: Mutex<()>,
     calls: AtomicU64,
+    wake: broadcast::Sender<String>,
     /// Risky calls waiting for a person. Shared with every agent call of every run.
     pub approvals: Arc<crate::approvals::Approvals>,
 }
@@ -50,13 +52,20 @@ pub struct Note {
 
 impl Live {
     pub fn new(store: Arc<dyn Store>) -> Self {
+        let (wake, _) = broadcast::channel(512);
         Live {
             store,
             cache: Mutex::new(HashMap::new()),
             write: Mutex::new(()),
             calls: AtomicU64::new(0),
+            wake,
             approvals: Arc::default(),
         }
+    }
+
+    /// Subscribe to immediate notifications whenever a run receives a new transcript entry.
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.wake.subscribe()
     }
 
     fn key(run: &str, name: &str) -> String {
@@ -79,10 +88,14 @@ impl Live {
         object.insert("agent".into(), agent.clone());
         object.insert("kind".into(), json!(kind));
         let line = serde_json::to_string(&fields).unwrap_or_default();
-        let _guard = self.write.lock().unwrap();
-        if let Err(err) = self.store.append(&Self::key(run, "agents.jsonl"), &line) {
-            eprintln!("taskmaster: the agent transcript of {run} was not written: {err}");
+        {
+            let _guard = self.write.lock().unwrap();
+            if let Err(err) = self.store.append(&Self::key(run, "agents.jsonl"), &line) {
+                eprintln!("taskmaster: the agent transcript of {run} was not written: {err}");
+                return;
+            }
         }
+        let _ = self.wake.send(run.to_string());
     }
 
     /// Every entry after the first `after`, and how many there are in all.
@@ -295,5 +308,14 @@ mod tests {
         assert_eq!(tool_target(&json!({ "file_path": "app/a.ts", "content": "x" })).as_deref(), Some("app/a.ts"));
         assert_eq!(tool_target(&json!({ "command": "ls" })).as_deref(), Some("ls"));
         assert_eq!(tool_target(&json!({ "other": 1 })), None);
+    }
+
+    #[tokio::test]
+    async fn subscribe_wakes_immediately_on_push() {
+        let live = Live::new(tmp("wake"));
+        let mut rx = live.subscribe();
+        live.push("run-42", &json!({ "id": "master" }), "thought", json!({ "text": "planning" }));
+        let woken = rx.recv().await.unwrap();
+        assert_eq!(woken, "run-42");
     }
 }

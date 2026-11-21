@@ -92,8 +92,8 @@ impl Default for AgentSettings {
     }
 }
 
-/// Ten minutes, the limit a fresh install has.
-pub const DEFAULT_AGENT_SECS: u64 = 600;
+/// No time limit by default so workers and planners are never killed mid-task.
+pub const DEFAULT_AGENT_SECS: u64 = 0;
 
 /// What "no limit" becomes: long enough never to matter, short enough to add to a clock.
 pub const NO_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);

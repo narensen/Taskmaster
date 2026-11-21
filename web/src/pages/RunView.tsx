@@ -1,9 +1,9 @@
-// A run is one transcript: you, then the master, then each worker. A side panel holds
-// files, the diff, the preview and the terminal. Tokens and the approval mode live in
-// the title bar. A small screen in the corner shows the app this run is building.
+// A run is a clean T3 Code-style activity thread: live headline on top, your prompt,
+// Master with its Overall Plan, and each parallel Worker with click-to-inspect activity
+// and accessed files. A toggleable side panel holds files, diff, preview, and terminal.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { GitBranch, GitMerge } from "lucide-react";
+import { AlertCircle, Check, GitBranch, GitMerge, Loader2, PanelRight } from "lucide-react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import { api, type ReviewJob, type RunDetail } from "../api";
 import { takeAttachments } from "../App";
@@ -23,7 +23,6 @@ import { Flow, FlowSkeleton, fileTarget } from "../run/Flow";
 import { LimitNotice } from "../run/LimitNotice";
 import { LivePreview } from "../run/LivePreview";
 import { useRun, useSurfaces } from "../run/model";
-import { Stage } from "../run/Stage";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
 import { morphName } from "./Gallery";
@@ -299,6 +298,56 @@ export function RunView({ id }: { id: string }) {
     el?.focus({ preventScroll: true });
   }, []);
 
+  const toggleAgent = useCallback((agentId: string) => {
+    setBlown((cur) => {
+      const next = new Set(cur);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
+      return next;
+    });
+  }, []);
+
+  const inspectAgent = useCallback(
+    (agentId: string) => {
+      const other = agentId.startsWith("page:") ? `unit:${agentId.slice(5)}` : agentId;
+      const resolved = document.getElementById(`agent-${agentId}`) || !document.getElementById(`agent-${other}`) ? agentId : other;
+      setBlown((cur) => (cur.has(resolved) ? cur : new Set(cur).add(resolved)));
+      focusAgent(resolved);
+    },
+    [focusAgent],
+  );
+
+  const runHeadline = useMemo(() => {
+    if (!detail) return "";
+    if (detail.phase === "awaiting_approval") return "Plan ready — awaiting your approval";
+    if (detail.phase === "planning") {
+      const master = list.find((s) => s.id === "master");
+      return master?.summary.headline || "Planning";
+    }
+    if (detail.active) {
+      const working = list.filter((s) => s.state === "working");
+      const workingWorkers = working.filter((s) => s.role === "worker");
+      const active = workingWorkers.length ? workingWorkers : working;
+      if (active.length === 1) {
+        const only = active[0]!;
+        const who = only.id === "master" ? "Master" : only.title.replace(/^Worker · /, "");
+        return `${who}: ${only.summary.headline}`;
+      }
+      if (active.length > 1) {
+        return `${active.length} workers active · ${active[0]!.summary.headline}`;
+      }
+      return phaseLabel(detail);
+    }
+    if (detail.cancelled) return "Cancelled";
+    if (detail.phase === "done") {
+      if (detail.merged && detail.merge_commit) return `Merged into ${detail.base || "the project"}`;
+      const passed = detail.pages.filter((p) => p.state === "passed").length;
+      return detail.pages.length > 0 ? `Completed · ${passed}/${detail.pages.length} passed` : "Completed";
+    }
+    if (detail.phase === "failed") return "Run failed";
+    return phaseLabel(detail);
+  }, [detail, list]);
+
   const openTab = useCallback(
     (t: string) => {
       setTab(t);
@@ -399,12 +448,7 @@ export function RunView({ id }: { id: string }) {
         if (idNext) focusAgent(idNext);
       } else if (e.key === "Enter" && focus && focus !== "you") {
         e.preventDefault();
-        setBlown((cur) => {
-          const n = new Set(cur);
-          if (n.has(focus)) n.delete(focus);
-          else n.add(focus);
-          return n;
-        });
+        toggleAgent(focus);
       } else if (e.key === "e" && focus) {
         e.preventDefault();
         const surface = list.find((s) => s.id === focus);
@@ -415,7 +459,7 @@ export function RunView({ id }: { id: string }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cite, focus, focusAgent, list, narrow, openTab, panelOpen, sheet]);
+  }, [cite, focus, focusAgent, list, narrow, openTab, panelOpen, sheet, toggleAgent]);
 
   useEffect(() => {
     const onUp = () => {
@@ -451,6 +495,7 @@ export function RunView({ id }: { id: string }) {
   const pending = notes.filter((n) => !n.delivered && !removed.has(n.id));
   const delivered = notes.filter((n) => n.delivered);
   const settled = !detail.active && (detail.phase === "done" || detail.phase === "failed");
+  const sideVisible = narrow ? sheet : panelOpen;
 
   const panel = (
     <div className="panel" data-testid="right-panel">
@@ -479,9 +524,19 @@ export function RunView({ id }: { id: string }) {
 
   const main = (
     <div className="run-main">
-      <div className="run-scroll with-stage">
-        <div className="flow-top" style={{ viewTransitionName: morphName(id) } as React.CSSProperties}>
-          <span className="flow-phase">{phaseLabel(detail)}</span>
+      <header className="flow-top" style={{ viewTransitionName: morphName(id) } as React.CSSProperties}>
+        <div className="flow-top-status">
+          {detail.active ? (
+            <Loader2 size={14} strokeWidth={1.8} className="spin-ico agent-ico working" aria-hidden />
+          ) : detail.phase === "done" ? (
+            <Check size={14} strokeWidth={2} className="agent-ico done" aria-hidden />
+          ) : detail.phase === "failed" ? (
+            <AlertCircle size={14} strokeWidth={1.8} className="agent-ico failed" aria-hidden />
+          ) : null}
+          <span className="flow-top-headline clip" data-testid="run-headline" title={runHeadline}>
+            {runHeadline}
+          </span>
+          <span className="flow-top-phase">{phaseLabel(detail)}</span>
           {detail.merged && detail.merge_commit ? (
             <span className="merged-into" data-testid="merged-into">
               <GitMerge size={12} aria-hidden /> {detail.base || "the project"}{" "}
@@ -498,12 +553,13 @@ export function RunView({ id }: { id: string }) {
             </span>
           ) : (
             detail.branch && (
-              <span className="mono">
+              <span className="flow-top-branch mono clip" title={detail.branch}>
                 <GitBranch size={12} aria-hidden /> {detail.branch}
               </span>
             )
           )}
-          <span className="grow" />
+        </div>
+        <div className="flow-top-actions">
           {!detail.active && !["done", "failed", "awaiting_approval"].includes(detail.phase) && (
             <button type="button" className="ghost small" onClick={() => void api.resume(id).then(() => (data.refollow(), data.reload()))}>
               Resume
@@ -529,93 +585,108 @@ export function RunView({ id }: { id: string }) {
             </button>
           )}
           {pr && <ExternalLink href={pr}>pull request</ExternalLink>}
+          <button
+            type="button"
+            className={`ghost small icon-btn ${sideVisible ? "on" : ""}`}
+            aria-label={sideVisible ? "Hide side panel" : "Show side panel"}
+            aria-pressed={sideVisible}
+            title="Toggle side panel (⌘\\)"
+            onClick={() => (narrow ? setSheet((v) => !v) : setPanelOpen(!panelOpen))}
+          >
+            <PanelRight size={14} strokeWidth={1.7} aria-hidden />
+          </button>
         </div>
+      </header>
 
-        <Flow
-          detail={detail}
-          list={list}
-          focus={focus}
-          blown={blown}
-          approvals={toolApprovals.list}
-          onTool={toolApprovals.answer}
-          ask={
-            phase === "awaiting_approval" ? (
-              <ApprovalAsk
-                id={id}
-                detail={detail}
-                composer={composer}
-                onOptimistic={data.patch}
-                onDone={() => {
-                  void data.reload();
-                  data.refollow();
-                }}
-              />
-            ) : null
-          }
-        />
+      <div className="run-scroll">
+        <div className="run-thread">
+          <Flow
+            detail={detail}
+            list={list}
+            focus={focus}
+            blown={blown}
+            onToggleAgent={toggleAgent}
+            onFocusAgent={inspectAgent}
+            approvals={toolApprovals.list}
+            onTool={toolApprovals.answer}
+            ask={
+              phase === "awaiting_approval" ? (
+                <ApprovalAsk
+                  id={id}
+                  detail={detail}
+                  composer={composer}
+                  onOptimistic={data.patch}
+                  onDone={() => {
+                    void data.reload();
+                    data.refollow();
+                  }}
+                />
+              ) : null
+            }
+          />
 
-        {detail.limit && detail.error && phase !== "done" && phase !== "failed" ? (
-          <LimitNotice id={id} limit={detail.limit} message={detail.error} onDone={() => { void data.reload(); data.refollow(); }} />
-        ) : (
-          detail.error && phase !== "done" && phase !== "failed" && (
-            <p className="flow-fail">
-              <Rich text={detail.error} />
-            </p>
-          )
-        )}
-        {settled && <EndLine detail={detail} onDiff={() => openTab("diff")} onRetry={() => { void data.reload(); data.refollow(); }} />}
-        {settled && detail.branch && <ReviewAsk id={id} />}
-
-        {(pending.length > 0 || delivered.length > 0) && (
-          <section className="flow-notes">
-            {pending.map((n) => (
-              <div key={n.id} className="flow-note" data-testid="draft">
-                <header className="flow-role">
-                  <h2>You</h2>
-                  <span className="flow-state">waiting for the master</span>
-                  <button
-                    type="button"
-                    className="link small"
-                    onClick={() => {
-                      const text = window.prompt("Edit the note", n.text);
-                      if (text !== null) void api.editNote(id, n.id, text || undefined).then(data.reloadNotes);
-                    }}
-                  >
-                    edit
-                  </button>
-                  <button
-                    type="button"
-                    className="link small"
-                    onClick={() => {
-                      setRemoved((r) => new Set(r).add(n.id));
-                      void api.editNote(id, n.id).then(data.reloadNotes, () => {
-                        setRemoved((r) => {
-                          const next = new Set(r);
-                          next.delete(n.id);
-                          return next;
-                        });
-                        toast("The note was not removed");
-                      });
-                      undoable("Removed the note", () => void api.addNote(id, "master", n.text).then(data.reloadNotes));
-                    }}
-                  >
-                    remove
-                  </button>
-                </header>
-                <div className="flow-said">
-                  <Rich text={n.text} />
-                </div>
-              </div>
-            ))}
-            {delivered.map((n) => (
-              <p key={n.id} className="flow-life">
-                Note to the master: <Rich text={n.text} />
+          {detail.limit && detail.error && phase !== "done" && phase !== "failed" ? (
+            <LimitNotice id={id} limit={detail.limit} message={detail.error} onDone={() => { void data.reload(); data.refollow(); }} />
+          ) : (
+            detail.error && phase !== "done" && phase !== "failed" && (
+              <p className="flow-fail">
+                <Rich text={detail.error} />
               </p>
-            ))}
-          </section>
-        )}
+            )
+          )}
+          {settled && <EndLine detail={detail} onDiff={() => openTab("diff")} onRetry={() => { void data.reload(); data.refollow(); }} />}
+          {settled && detail.branch && <ReviewAsk id={id} />}
+
+          {(pending.length > 0 || delivered.length > 0) && (
+            <section className="flow-notes">
+              {pending.map((n) => (
+                <div key={n.id} className="flow-note" data-testid="draft">
+                  <header className="flow-role">
+                    <h2>You</h2>
+                    <span className="flow-state">waiting for the master</span>
+                    <button
+                      type="button"
+                      className="link small"
+                      onClick={() => {
+                        const text = window.prompt("Edit the note", n.text);
+                        if (text !== null) void api.editNote(id, n.id, text || undefined).then(data.reloadNotes);
+                      }}
+                    >
+                      edit
+                    </button>
+                    <button
+                      type="button"
+                      className="link small"
+                      onClick={() => {
+                        setRemoved((r) => new Set(r).add(n.id));
+                        void api.editNote(id, n.id).then(data.reloadNotes, () => {
+                          setRemoved((r) => {
+                            const next = new Set(r);
+                            next.delete(n.id);
+                            return next;
+                          });
+                          toast("The note was not removed");
+                        });
+                        undoable("Removed the note", () => void api.addNote(id, "master", n.text).then(data.reloadNotes));
+                      }}
+                    >
+                      remove
+                    </button>
+                  </header>
+                  <div className="flow-said">
+                    <Rich text={n.text} />
+                  </div>
+                </div>
+              ))}
+              {delivered.map((n) => (
+                <p key={n.id} className="flow-life">
+                  Note to the master: <Rich text={n.text} />
+                </p>
+              ))}
+            </section>
+          )}
+        </div>
       </div>
-      <Stage id={id} detail={detail} entries={entries} />
       <div className="composer-bar">
         <Composer
           ref={composer}

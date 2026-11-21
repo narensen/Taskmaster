@@ -1,5 +1,5 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
+import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MotionConfig, motion } from "motion/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Archive,
@@ -35,7 +35,7 @@ import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan } from "./format";
 import { readFile } from "./composer";
-import { bezier, dur } from "./motion";
+import { bezier } from "./motion";
 import { useLoad } from "./ui";
 import { typing } from "./keys";
 import { RunBar } from "./run/Meter";
@@ -124,7 +124,8 @@ const Files = lazy(() => loaders.files().then((m) => ({ default: m.Files })));
 function usePrefetchScreens() {
   useEffect(() => {
     const go = () => {
-      for (const load of Object.values(loaders)) void load().catch(() => undefined);
+      void loaders.run().catch(() => undefined);
+      void loaders.newRun().catch(() => undefined);
     };
     if ("requestIdleCallback" in window) {
       const handle = window.requestIdleCallback(go, { timeout: 3000 });
@@ -196,10 +197,13 @@ function crumbsFor(path: string, project: string): Crumb[] {
 /** First and last ledger timestamps, so Working can show elapsed time and Settled a relative time. */
 function useClocks(ids: string[]) {
   const [clocks, setClocks] = useState<Record<string, { start: number; end: number }>>({});
+  const fetched = useRef(new Set<string>());
   const key = ids.join("|");
   useEffect(() => {
     let cancel = false;
     for (const id of key ? key.split("|") : []) {
+      if (fetched.current.has(id)) continue;
+      fetched.current.add(id);
       api
         .ledger(id)
         .then((ledger) => {
@@ -207,7 +211,9 @@ function useClocks(ids: string[]) {
           if (cancel || !stamps.length) return;
           setClocks((c) => (c[id] ? c : { ...c, [id]: { start: Math.min(...stamps), end: Math.max(...stamps) } }));
         })
-        .catch(() => {});
+        .catch(() => {
+          fetched.current.delete(id);
+        });
     }
     return () => {
       cancel = true;
@@ -224,10 +230,10 @@ function RunMark({ group }: { group: Group }) {
   return <Circle size={13} />;
 }
 
-/** A long run list is drawn a screenful at a time; a short one keeps its layout animation. */
+/** A long run list is drawn a screenful at a time. */
 const VIRTUAL_AFTER = 60;
 
-/** A run's clock in the sidebar. Only this text ticks, so the list around it, and its layout animation, stay still. */
+/** A run's clock in the sidebar. Only this text ticks, so the list around it stays still. */
 function Stamp({ run, group, clock }: { run: RunSummary; group: Group; clock?: { start: number; end: number } }) {
   const working = group === "Working";
   const [now, setNow] = useState(() => Date.now());
@@ -240,7 +246,21 @@ function Stamp({ run, group, clock }: { run: RunSummary; group: Group; clock?: {
   return <span>{working ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase())}</span>;
 }
 
-function RunRow({ run, group, i, on, clock, onPick }: { run: RunSummary; group: Group; i: number; on: boolean; clock?: { start: number; end: number }; onPick: () => void }) {
+const RunRow = memo(function RunRow({
+  run,
+  group,
+  i,
+  on,
+  clock,
+  onPick,
+}: {
+  run: RunSummary;
+  group: Group;
+  i: number;
+  on: boolean;
+  clock?: { start: number; end: number };
+  onPick: () => void;
+}) {
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
   const menu = (x: number, y: number) =>
@@ -297,12 +317,18 @@ function RunRow({ run, group, i, on, clock, onPick }: { run: RunSummary; group: 
       </span>
     </div>
   );
-}
+});
 
-function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onPick: () => void }) {
+const RunList = memo(function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onPick: () => void }) {
   const p = usePrefs();
-  const list = ordered(runs, p.showArchived);
-  const clocks = useClocks(list.length > VIRTUAL_AFTER ? [] : list.map((x) => x.run.id));
+  const list = useMemo(() => ordered(runs, p.showArchived), [runs, p.showArchived]);
+  const clockIds = useMemo(() => {
+    if (list.length > VIRTUAL_AFTER) return [];
+    const active = list.filter((x) => x.group === "Working").map((x) => x.run.id);
+    const recent = list.slice(0, 12).map((x) => x.run.id);
+    return [...new Set([...active, ...recent])];
+  }, [list]);
+  const clocks = useClocks(clockIds);
   const [folded, setFolded] = useState<Partial<Record<Group, boolean>>>({});
   const scroller = useRef<HTMLDivElement>(null);
   const counts = new Map<Group, number>();
@@ -352,24 +378,13 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
           })}
         </div>
       ) : (
-        <LayoutGroup>
-          <ul>
-            <AnimatePresence initial={false}>
-              {items.map((item) => (
-                <motion.li
-                  key={item.kind === "head" ? `h:${item.group}` : item.run.id}
-                  layout="position"
-                  initial={{ opacity: 0, y: 4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.16, ease: bezier.out, layout: { duration: dur.base, ease: bezier.out } }}
-                >
-                  {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} clock={clocks[item.run.id]} onPick={onPick} />}
-                </motion.li>
-              ))}
-            </AnimatePresence>
-          </ul>
-        </LayoutGroup>
+        <ul>
+          {items.map((item) => (
+            <li key={item.kind === "head" ? `h:${item.group}` : item.run.id}>
+              {item.kind === "head" ? head(item.group) : <RunRow run={item.run} group={item.group} i={item.i} on={isOn(item.run)} clock={clocks[item.run.id]} onPick={onPick} />}
+            </li>
+          ))}
+        </ul>
       )}
       <label className="check small">
         <input type="checkbox" checked={p.showArchived} onChange={(e) => setPrefs({ showArchived: e.target.checked })} />
@@ -377,7 +392,7 @@ function RunList({ runs, path, onPick }: { runs: RunSummary[]; path: string; onP
       </label>
     </div>
   );
-}
+});
 
 /** Open the project this browser had open last, once, if the daemon started on another. */
 function useLastProject(project: string | undefined) {

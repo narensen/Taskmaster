@@ -160,7 +160,7 @@ const FRESH_EFFORT: &str = "medium";
 /// kept between these two. The top leaves the sketch, with its write-up turn, inside the
 /// three minutes the spec gives it, even with no agent time limit.
 const COMMIT_AFTER_MIN: Duration = Duration::from_secs(90);
-const COMMIT_AFTER_MAX: Duration = Duration::from_secs(150);
+const COMMIT_AFTER_MAX: Duration = Duration::from_secs(300);
 
 /// How many stored entries a search for everything returns at most.
 const ENTRIES_LISTED: usize = 20;
@@ -760,7 +760,8 @@ impl Driver {
         let sketch = plan.phases.get(phase).cloned().context("no such phase in the sketch")?;
         let planned: String = plan.pages.iter().map(|p| format!("- `{}` owns `{}`: {}\n", p.id, p.owned_glob, first_lines(&p.brief, 1))).collect();
         let md = if self.project_md.is_empty() { self.render_project_md() } else { self.project_md.clone() };
-        let brief = crate::small::phase_brief(phase + 1, plan.phases.len(), &sketch, &md, &planned, self.parallel);
+        let worker = self.worker_label();
+        let brief = crate::small::phase_brief(phase + 1, plan.phases.len(), &sketch, &md, &planned, self.parallel, Some(&worker));
         let cwd = self.planner_dir()?;
         let token = self.master_token.clone();
         let mut request = self.read_request(&cwd, brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
@@ -970,7 +971,16 @@ impl Driver {
     /// it nothing to look at, so a stray tool call or two is all it gets.
     fn commit_budget(&self, fresh: bool) -> Commit {
         let after = (self.config.timeout * 2 / 5).clamp(COMMIT_AFTER_MIN, COMMIT_AFTER_MAX);
-        Commit { tools: if fresh { 4 } else { 12 }, after }
+        Commit { tools: if fresh { 8 } else { 24 }, after }
+    }
+
+    /// Human-readable label for the worker harness/model so the planner knows who it delegates to.
+    fn worker_label(&self) -> String {
+        let harness = self.harnesses.worker.id();
+        match self.config.models.worker.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(model) if model != harness => format!("{harness} / {model}"),
+            _ => harness.to_string(),
+        }
     }
 
     /// Project files other than a README and dotfiles, at the top level.
@@ -1067,9 +1077,10 @@ impl Driver {
     }
 
     fn planner_brief_inner(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
+        let worker = self.worker_label();
         if self.small_pass(prompt) {
             let template = self.template.as_ref().map(|t| t.brief()).unwrap_or_default();
-            let mut brief = crate::small::small_brief(prompt, &self.entry_listing(prompt)?, &template, self.parallel);
+            let mut brief = crate::small::small_brief(prompt, &self.entry_listing(prompt)?, &template, self.parallel, Some(&worker));
             if !errors.is_empty() {
                 brief.push_str("\nThe last plan was rejected:\n");
                 for error in errors {
@@ -1085,8 +1096,10 @@ impl Driver {
         } else {
             "Search the Dictionary before inventing a key."
         };
+        let pool = crate::small::worker_pool_rule(self.parallel, Some(&worker));
         let mut brief = format!(
             "Plan this product and lock its contracts.\n\n\
+             {pool}\n\
              Request:\n{prompt}\n\n\
              {look} Cite an existing entry instead of rewriting it. \
              If you include an existing key, its content must match exactly.\n\n\
@@ -1108,11 +1121,12 @@ impl Driver {
         brief.push_str(
             "\nReply with one JSON object and do not edit files. \
              Leave `estimate` at zero: Taskmaster works it out from what past runs cost. \
+             `summary` is one concise paragraph describing the overall plan and how work is divided across workers. \
              `kind` says what is being built: web, library, cli, server or migration. \
              `contracts` are shared interface files that more than one unit imports, locked before any unit starts. \
-             `units` are the pieces of work; each owns one glob. \
+             `units` are the parallel worker assignments; each owns one disjoint glob. \
              `dictionary` holds new entries those units cite; an entry's `kind` is schema, routes, component_api, pattern, or hint. \
-             Every unit, and every part of one, is one agent: its `brief` is that agent's whole task and `done` is one line \
+             Every unit, and every part of one, is one worker agent: its `brief` is its task, `context` is the self-contained architectural/integration context it needs (shared interfaces, DOM ids, symbols, conventions, sibling boundaries), and `done` is one line \
              saying how it knows it is finished.\n",
         );
         brief.push_str(&crate::small::plan_shape());
@@ -2990,11 +3004,18 @@ impl Driver {
             format!("Build unit `{}` of this {} project.", page.id, self.plan()?.kind.id())
         };
         let mut brief = self.shared_prefix()?;
+        let plan_summary = self.plan()?.summary.trim().to_string();
+        if !plan_summary.is_empty() {
+            brief.push_str(&format!("Overall plan:\n{plan_summary}\n\n"));
+        }
         brief.push_str(&format!(
             "{opening}\nYou may create or edit only files matching `{glob}`.\nCite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
             glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
             body = page.brief.trim_end(),
         ));
+        if !page.context.trim().is_empty() {
+            brief.push_str(&format!("\nContext from planner:\n{}\n", page.context.trim()));
+        }
         if ui {
             brief.push_str("A link or import inside a file is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n");
         }
@@ -3008,10 +3029,27 @@ impl Driver {
                 "\nThis unit is split across {units} parallel workers who each own different files. You are unit `{}`: build only {}. {}\n",
                 mine.id, mine.owned_glob, mine.brief
             ));
+            if !mine.context.trim().is_empty() {
+                brief.push_str(&format!("Unit context:\n{}\n", mine.context.trim()));
+            }
             for other in page.work_units().iter().filter(|u| u.id != mine.id) {
                 brief.push_str(&format!("Unit `{}` (another worker) owns `{}`.\n", other.id, other.owned_glob));
             }
             brief.push_str("Rely only on the locked contracts and Dictionary entries to line up with them; do not write their files.\n");
+        } else {
+            let siblings: Vec<_> = self
+                .plan()?
+                .pages
+                .iter()
+                .filter(|other| other.id != page.id)
+                .map(|other| format!("Unit `{}` (another worker) owns `{}`.", other.id, other.owned_glob))
+                .collect();
+            if !siblings.is_empty() {
+                brief.push_str(&format!(
+                    "\nOther parallel workers in this run:\n{}\nRely on the locked contracts and planner context to integrate with them; do not write their files.\n",
+                    siblings.join("\n"),
+                ));
+            }
         }
         if let Some(errors) = errors {
             brief.push_str("\nChecks failed last time. This is their output; fix what it shows and leave every other unit alone:\n");
@@ -3963,11 +4001,11 @@ runs the project's tests and returns the failures. Fix what it reports in the ne
 shell tools are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies \
 short: the files are the work.\n";
 
-/// A model normally starts answering a small, low-effort brief within half a minute; a
-/// minute of silence with no tool running means the provider has queued the request.
-const SMALL_STALL: Duration = Duration::from_secs(60);
-/// Larger briefs at default effort can think for a while before the first token.
-const STALL: Duration = Duration::from_secs(180);
+/// Generous silence window so thinking models are never killed mid-reasoning,
+/// while genuinely hung sockets still recover automatically.
+const SMALL_STALL: Duration = Duration::from_secs(300);
+/// Larger briefs and deep reasoning turns can think quietly for several minutes.
+const STALL: Duration = Duration::from_secs(600);
 /// Fresh agents started after a stall. The last one may wait for the whole timeout.
 const STALL_RESTARTS: usize = 2;
 
@@ -4112,7 +4150,7 @@ pub(crate) fn collect_events(
 }
 
 /// The longest a streamed message is held before its text so far is written to the transcript.
-const MERGE_FOR: Duration = Duration::from_secs(1);
+const MERGE_FOR: Duration = Duration::from_millis(120);
 
 /// How long an agent may send nothing before the log says so, and how often it says so again.
 const QUIET: Duration = Duration::from_secs(120);

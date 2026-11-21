@@ -9,10 +9,12 @@ use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, 
 struct RawPlan {
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default, alias = "overview")]
+    summary: String,
     #[serde(default)]
     contracts: Vec<ContractFile>,
-    /// Planners now write `units`; `pages` is still read.
-    #[serde(default, alias = "units")]
+    /// Planners write `units` or `workers`; `pages` is still read.
+    #[serde(default, alias = "units", alias = "workers")]
     pages: Vec<PagePlan>,
     #[serde(default)]
     estimate: Option<Estimate>,
@@ -181,7 +183,18 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     let phases: Vec<PhaseSketch> = raw.phases.iter().enumerate().filter_map(|(i, v)| phase_of(v, i)).collect();
     // One phase is not a sketch: the plan is the whole job.
     let phases = if phases.len() >= 2 { phases } else { Vec::new() };
-    Ok((Plan { kind, contracts: raw.contracts, pages: raw.pages, estimate, design, phases }, dictionary))
+    Ok((
+        Plan {
+            kind,
+            summary: raw.summary.trim().to_string(),
+            contracts: raw.contracts,
+            pages: raw.pages,
+            estimate,
+            design,
+            phases,
+        },
+        dictionary,
+    ))
 }
 
 pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {

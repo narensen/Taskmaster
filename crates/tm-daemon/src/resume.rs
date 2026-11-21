@@ -197,30 +197,21 @@ fn finding_lines(findings: &[Finding], page: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tm_core::{Estimate, PagePlan, Plan, Tier};
+    use tm_core::{PagePlan, Plan, Tier};
 
     fn plan(pages: &[(&str, &[&str])]) -> Plan {
         Plan {
-            kind: Default::default(),
-            contracts: vec![],
             pages: pages
                 .iter()
                 .map(|(id, cites)| PagePlan {
                     id: (*id).into(),
                     route: format!("/{id}"),
-                    ui: None,
                     owned_glob: format!("app/{id}/**"),
                     cites: cites.iter().map(|c| (*c).to_string()).collect(),
-                    brief: String::new(),
-                    done: String::new(),
-                    units: vec![],
-                    skills: vec![],
-                    phase: 0,
+                    ..Default::default()
                 })
                 .collect(),
-            estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
-            design: String::new(),
-            phases: vec![],
+            ..Default::default()
         }
     }
 

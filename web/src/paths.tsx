@@ -4,7 +4,7 @@
 // name. A line, a line and column, or a range stays on the word. A click asks the daemon to
 // open it in the editor chosen in Settings, on the machine that holds the project.
 
-import { Fragment, memo, useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react";
 import { api, ApiError, type EditorInfo } from "./api";
 import { emit, openMenu, toast, type MenuItem } from "./overlay";
 import { prefs } from "./prefs";
@@ -81,7 +81,18 @@ function splitBy(pieces: Piece[], re: RegExp, make: (m: RegExpExecArray) => Piec
   return out;
 }
 
+const PIECES_CACHE_MAX = 512;
+const piecesCache = new Map<string, Piece[]>();
+
 export function pieces(text: string): Piece[] {
+  if (text.length <= 8000) {
+    const hit = piecesCache.get(text);
+    if (hit) {
+      piecesCache.delete(text);
+      piecesCache.set(text, hit);
+      return hit;
+    }
+  }
   let out: Piece[] = [{ t: "text", s: text }];
   out = splitBy(out, URL_RE, (m) => ({ t: "url", s: m[0] }));
   for (const re of SECRET_RES) out = splitBy(out, re, (m) => ({ t: "secret", s: m[0] }));
@@ -97,6 +108,13 @@ export function pieces(text: string): Piece[] {
     };
     return { t: "path", s: m[0], ref };
   });
+  if (text.length <= 8000) {
+    if (piecesCache.size >= PIECES_CACHE_MAX) {
+      const oldest = piecesCache.keys().next().value;
+      if (oldest !== undefined) piecesCache.delete(oldest);
+    }
+    piecesCache.set(text, out);
+  }
   return out;
 }
 
@@ -117,12 +135,46 @@ type Resolved = Record<string, string | null>;
 let resolved: Resolved = {};
 const pending = new Set<string>();
 let timer: number | null = null;
-const listeners = new Set<() => void>();
-let version = 0;
+const pathListeners = new Set<() => void>();
+const editorListeners = new Set<() => void>();
+let editorVersion = 0;
+const labelCache = new Map<string, string>();
+let byBasename = new Map<string, Set<string>>();
 
-function notify() {
-  version++;
-  listeners.forEach((l) => l());
+function rebuildIndex() {
+  labelCache.clear();
+  const map = new Map<string, Set<string>>();
+  for (const full of Object.values(resolved)) {
+    if (!full) continue;
+    const base = full.split("/").pop() ?? full;
+    let bucket = map.get(base);
+    if (!bucket) {
+      bucket = new Set();
+      map.set(base, bucket);
+    }
+    bucket.add(full);
+  }
+  byBasename = map;
+}
+
+function notifyPaths() {
+  rebuildIndex();
+  pathListeners.forEach((l) => l());
+}
+
+function notifyEditors() {
+  editorVersion++;
+  editorListeners.forEach((l) => l());
+}
+
+function subscribePaths(l: () => void) {
+  pathListeners.add(l);
+  return () => pathListeners.delete(l);
+}
+
+function subscribeEditors(l: () => void) {
+  editorListeners.add(l);
+  return () => editorListeners.delete(l);
 }
 
 function flush() {
@@ -133,8 +185,14 @@ function flush() {
   api
     .paths(batch)
     .then((reply) => {
-      resolved = { ...resolved, ...reply.paths };
-      notify();
+      let changed = false;
+      for (const [k, v] of Object.entries(reply.paths)) {
+        if (resolved[k] !== v) {
+          resolved[k] = v;
+          changed = true;
+        }
+      }
+      if (changed) notifyPaths();
     })
     .catch(() => {
       // Unknown stays plain text; try again later.
@@ -149,14 +207,12 @@ function want(raw: string) {
   if (timer === null) timer = window.setTimeout(flush, 30);
 }
 
-function useResolved(): number {
-  return useSyncExternalStore(
-    (l) => {
-      listeners.add(l);
-      return () => listeners.delete(l);
-    },
-    () => version,
-  );
+/** Subscribe a PathWord only to its own resolved path + disambiguated label. */
+function usePathSnapshot(raw: string): string {
+  return useSyncExternalStore(subscribePaths, () => {
+    const full = resolved[raw];
+    return full ? `${full}\0${label(full)}` : "";
+  });
 }
 
 export function resolvedPath(raw: string): string | null | undefined {
@@ -165,13 +221,24 @@ export function resolvedPath(raw: string): string | null | undefined {
 
 /** The visible word: the file name, with the shortest parent suffix that is unique. */
 export function label(full: string): string {
+  const cached = labelCache.get(full);
+  if (cached !== undefined) return cached;
   const parts = full.split("/").filter(Boolean);
-  const others = new Set(Object.values(resolved).filter((v): v is string => !!v && v !== full));
-  const sameName = [...others].filter((o) => o.split("/").pop() === parts[parts.length - 1]);
+  const base = parts[parts.length - 1] ?? full;
+  const bucket = byBasename.get(base);
+  if (!bucket || bucket.size <= 1) {
+    labelCache.set(full, base);
+    return base;
+  }
+  const sameName = [...bucket].filter((o) => o !== full);
   for (let n = 1; n <= parts.length; n++) {
     const suffix = parts.slice(-n).join("/");
-    if (!sameName.some((o) => o === suffix || o.endsWith(`/${suffix}`))) return suffix;
+    if (!sameName.some((o) => o === suffix || o.endsWith(`/${suffix}`))) {
+      labelCache.set(full, suffix);
+      return suffix;
+    }
   }
+  labelCache.set(full, full);
   return full;
 }
 
@@ -195,7 +262,7 @@ export function loadEditors(force = false): Promise<void> {
       .then((r) => {
         editorList = r.editors;
         editorDefault = r.default;
-        notify();
+        notifyEditors();
       })
       .catch(() => {
         editorLoad = null;
@@ -209,7 +276,7 @@ export function editors(): { list: EditorInfo[]; fallback: string } {
 }
 
 export function useEditors() {
-  useResolved();
+  useSyncExternalStore(subscribeEditors, () => editorVersion);
   useEffect(() => {
     void loadEditors();
   }, []);
@@ -281,20 +348,23 @@ export function useLongPress(onLong: (x: number, y: number) => void) {
   };
 }
 
-export function PathWord({ text, refd }: { text: string; refd: PathRef }) {
-  useResolved();
+export const PathWord = memo(function PathWord({ text, refd }: { text: string; refd: PathRef }) {
+  const snap = usePathSnapshot(refd.raw);
   useEffect(() => {
     want(refd.raw);
   }, [refd.raw]);
-  const full = resolvedPath(refd.raw);
+  const sep = snap.indexOf("\0");
+  const full = sep >= 0 ? snap.slice(0, sep) : "";
+  const shortLabel = sep >= 0 ? snap.slice(sep + 1) : "";
   const long = useLongPress((x, y) => full && openPathMenu(x, y, full, refd));
   if (!full) return <>{text}</>;
-  const word = label(full) + lineSuffix(refd);
+  const suffix = lineSuffix(refd);
+  const word = shortLabel + suffix;
   return (
     <a
       className="path"
       href="#"
-      title={full + lineSuffix(refd)}
+      title={full + suffix}
       data-path={full}
       data-line={refd.line ?? ""}
       onClick={(e) => {
@@ -313,7 +383,7 @@ export function PathWord({ text, refd }: { text: string; refd: PathRef }) {
       {word}
     </a>
   );
-}
+});
 
 export function ExternalLink({ href, children }: { href: string; children?: ReactNode }) {
   return (
@@ -345,6 +415,7 @@ export const Rich = memo(function Rich({ text }: { text: string }) {
 });
 
 /** A known path (a diff file row, a tool target): a word when real, plain otherwise. */
-export function KnownPath({ path, line }: { path: string; line?: number }) {
-  return <PathWord text={path} refd={{ raw: path, line }} />;
-}
+export const KnownPath = memo(function KnownPath({ path, line }: { path: string; line?: number }) {
+  const refd = useMemo(() => ({ raw: path, line }), [path, line]);
+  return <PathWord text={path} refd={refd} />;
+});

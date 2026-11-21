@@ -210,8 +210,8 @@ function Section({ id, title, children, note }: { id?: string; title: string; ch
 
 /** The agent time limits offered, with the one in the settings file if it is another. */
 function limitChoices(current: number): number[] {
-  const offered = [300, 600, 1200, 1800, 3600, 0];
-  return offered.includes(current) ? offered : [...offered.slice(0, -1), current, 0].sort((a, b) => (a === 0 ? 1 : b === 0 ? -1 : a - b));
+  const offered = [0, 600, 1200, 1800, 3600];
+  return offered.includes(current) ? offered : [0, ...[...offered.slice(1), current].sort((a, b) => a - b)];
 }
 
 function limitLabel(secs: number): string {
@@ -468,13 +468,13 @@ export function Settings() {
         <Section
           id="time-limit"
           title="Agent time limit"
-          note="How long one agent call (a plan, a page, a review) may run before it is stopped. Whatever this is, a planner that has not started writing after a few minutes is asked to write its plan from what it has decided."
+          note="Optional cap on how long a single agent call may run. Off by default (No limit) so workers and planners can finish without arbitrary cutoffs."
         >
           <label className="row gap small" data-testid="time-limit">
             <span className="muted">Stop an agent after</span>
             <select
               aria-label="Agent time limit"
-              value={String(daemon.data.agents?.timeout_secs ?? 600)}
+              value={String(daemon.data.agents?.timeout_secs ?? 0)}
               onChange={(e) => {
                 const secs = Number(e.target.value);
                 void api.setAgentTimeout(secs).then(
@@ -486,7 +486,7 @@ export function Settings() {
                 );
               }}
             >
-              {limitChoices(daemon.data.agents?.timeout_secs ?? 600).map((secs) => (
+              {limitChoices(daemon.data.agents?.timeout_secs ?? 0).map((secs) => (
                 <option key={secs} value={secs}>
                   {limitLabel(secs)}
                 </option>

@@ -685,28 +685,18 @@ pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tm_core::{Estimate, PagePlan, Plan};
+    use tm_core::{PagePlan, Plan};
 
     fn owners() -> Owners {
         let page = |id: &str, glob: &str| PagePlan {
             id: id.into(),
             route: format!("/{id}"),
-            ui: None,
             owned_glob: glob.into(),
-            cites: vec![],
-            brief: String::new(),
-            done: String::new(),
-            units: vec![],
-            skills: vec![],
-            phase: 0,
+            ..Default::default()
         };
         Owners::from_plan(&Plan {
-            kind: Default::default(),
-            contracts: vec![],
             pages: vec![page("book", "app/books/**"), page("cart", "app/cart/**")],
-            estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() },
-            design: String::new(),
-            phases: vec![],
+            ..Default::default()
         })
         .unwrap()
     }

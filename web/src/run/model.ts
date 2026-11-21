@@ -17,6 +17,7 @@ import {
 } from "../api";
 import { keys, queryClient } from "../query";
 import { checksFailed, pageDone } from "../notify";
+import { looksLikePath } from "../paths";
 
 export interface ToolItem {
   t: "tool";
@@ -48,6 +49,26 @@ export interface Call {
   at: string;
 }
 
+export interface SurfaceSummary {
+  /** Single crisp headline describing what this agent is doing right now or what it accomplished. */
+  headline: string;
+  /** Latest concise glimpse of reasoning (only present when the harness emitted thoughts). */
+  thoughtGlimpse: string | null;
+  /** Deduplicated files created or modified by this agent. */
+  editedFiles: string[];
+  /** Deduplicated files read/inspected by this agent (excluding editedFiles). */
+  readFiles: string[];
+  /** Shell commands executed by this agent. */
+  commands: string[];
+  /** Total number of tool steps taken. */
+  toolCount: number;
+  /** Latest error message from a failed call, if any. */
+  error: string | null;
+  /** Timestamp of the latest running or completed call. */
+  latestStart: string | null;
+  latestEnd: string | null;
+}
+
 export interface Surface {
   id: string;
   title: string;
@@ -56,6 +77,7 @@ export interface Surface {
   calls: Call[];
   tag: AgentTag | null;
   state: "waiting" | "working" | "done" | "failed";
+  summary: SurfaceSummary;
   tokens: number;
   /** The same tokens, split four ways, from each finished call's usage. */
   split: TokenSplit;
@@ -97,6 +119,167 @@ export function surfaceOf(entry: LedgerEntry): string {
   return entry.role;
 }
 
+const EDIT_TOOL_RE = /edit|write|patch|strreplace|apply_patch|create_file|replace/i;
+const RUN_TOOL_RE = /bash|shell|command|exec|terminal|run_code/i;
+const SEARCH_TOOL_RE = /search|grep|find|rg\b|glob/i;
+const LOOK_TOOL_RE = /browser|preview|screenshot|navigate/i;
+const READ_TOOL_RE = /read|cat\b|open|view|list/i;
+
+function shortName(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length <= 2) return path;
+  return parts.slice(-2).join("/");
+}
+
+function cleanLine(text: string, max = 140): string {
+  const cleaned = text
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((l) => l.trim().replace(/^[#>*`-\s]+/, "").trim())
+    .find((l) => l.length > 0 && !l.startsWith("{") && !l.startsWith("```"));
+  if (!cleaned) return "";
+  return cleaned.length > max ? `${cleaned.slice(0, max - 1).trimEnd()}…` : cleaned;
+}
+
+function extractGlimpse(text: string, max = 180): string | null {
+  const lines = text
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("```"));
+  if (!lines.length) return null;
+  // Take the latest meaningful sentence/line so streaming thoughts feel alive.
+  const picked = lines.length >= 2 ? `${lines[lines.length - 2]} ${lines[lines.length - 1]}` : lines[0]!;
+  const collapsed = picked.replace(/\s+/g, " ").trim();
+  if (!collapsed) return null;
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1).trimEnd()}…` : collapsed;
+}
+
+function toolHeadline(item: ToolItem): string {
+  const target = (item.target ?? "").trim();
+  const firstToken = target.split(/\s+/)[0] ?? "";
+  const isPath = firstToken && looksLikePath(firstToken);
+  const name = item.name;
+  if (EDIT_TOOL_RE.test(name)) return isPath ? `Editing ${shortName(firstToken)}` : target ? `Editing ${target.slice(0, 64)}` : "Editing files";
+  if (RUN_TOOL_RE.test(name)) return target ? `Running ${target.slice(0, 68)}` : "Running command";
+  if (SEARCH_TOOL_RE.test(name)) return target ? `Searching ${target.slice(0, 64)}` : "Searching codebase";
+  if (LOOK_TOOL_RE.test(name)) return target ? `Checking ${target.slice(0, 64)}` : "Checking browser preview";
+  if (READ_TOOL_RE.test(name)) return isPath ? `Reading ${shortName(firstToken)}` : target ? `Reading ${target.slice(0, 64)}` : "Reading files";
+  return target ? `${name} ${target.slice(0, 60)}` : name;
+}
+
+function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
+  const editedSet = new Set<string>();
+  const readSet = new Set<string>();
+  const commands: string[] = [];
+  let toolCount = 0;
+  let lastTool: ToolItem | null = null;
+  let latestThought: string | null = null;
+  let lastError: string | null = null;
+  let latestStart: string | null = null;
+  let latestEnd: string | null = null;
+
+  for (const call of s.calls) {
+    latestStart = call.at;
+    latestEnd = call.end?.at ?? null;
+    if (call.end?.error) lastError = call.end.error;
+    for (const item of call.items) {
+      if (item.t === "thought" && item.text.trim()) {
+        latestThought = item.text;
+      } else if (item.t === "tool") {
+        toolCount++;
+        lastTool = item;
+        const raw = (item.target ?? "").trim();
+        const firstToken = raw.split(/\s+/)[0] ?? "";
+        if (RUN_TOOL_RE.test(item.name)) {
+          if (raw && commands[commands.length - 1] !== raw) commands.push(raw);
+        } else if (firstToken && looksLikePath(firstToken)) {
+          if (EDIT_TOOL_RE.test(item.name)) {
+            editedSet.add(firstToken);
+            readSet.delete(firstToken);
+          } else if (!editedSet.has(firstToken)) {
+            readSet.add(firstToken);
+          }
+        }
+      }
+    }
+  }
+
+  const editedFiles = [...editedSet];
+  const readFiles = [...readSet];
+  const thoughtGlimpse = latestThought ? extractGlimpse(latestThought) : null;
+  const isMaster = s.id === "master";
+  const open = s.calls.length > 0 && !s.calls[s.calls.length - 1]!.end;
+
+  let headline = "Waiting";
+  if (s.state === "failed" || lastError) {
+    headline = lastError ? cleanLine(lastError, 96) || "Failed" : "Failed";
+  } else if (open) {
+    if (lastTool) {
+      headline = toolHeadline(lastTool);
+    } else if (thoughtGlimpse) {
+      headline = cleanLine(thoughtGlimpse, 92) || (isMaster ? "Planning architecture & workers" : "Reasoning through task");
+    } else if (isMaster && detail?.phase === "planning") {
+      headline = "Planning architecture & worker split";
+    } else if (s.id === "reviewer") {
+      headline = "Reviewing changes";
+    } else if (s.id === "verifier") {
+      headline = "Verifying findings";
+    } else {
+      headline = "Working on assigned unit";
+    }
+  } else if (s.state === "done" || (isMaster && detail?.plan)) {
+    if (isMaster && detail?.plan) {
+      const workerCount = detail.plan.pages.reduce((n, p) => n + (p.units && p.units.length > 1 ? p.units.length : 1), 0);
+      if (detail.phase === "awaiting_approval") {
+        headline = `Plan ready · ${workerCount} worker${workerCount === 1 ? "" : "s"} awaiting approval`;
+      } else {
+        headline = `Planned ${workerCount} worker${workerCount === 1 ? "" : "s"}${detail.plan.contracts.length ? ` · ${detail.plan.contracts.length} contract${detail.plan.contracts.length === 1 ? "" : "s"}` : ""}`;
+      }
+    } else {
+      const parts: string[] = [];
+      if (editedFiles.length) parts.push(`Edited ${editedFiles.length} file${editedFiles.length === 1 ? "" : "s"}`);
+      if (readFiles.length && !editedFiles.length) parts.push(`Read ${readFiles.length} file${readFiles.length === 1 ? "" : "s"}`);
+      if (commands.length) parts.push(`ran ${commands.length} command${commands.length === 1 ? "" : "s"}`);
+      headline = parts.length
+        ? parts.join(" · ")
+        : toolCount
+          ? `Completed ${toolCount} step${toolCount === 1 ? "" : "s"}`
+          : s.calls.length === 0
+            ? "Up to date"
+            : "Completed";
+    }
+  } else if (isMaster && detail?.phase === "planning") {
+    headline = "Starting plan";
+  } else if (s.role === "worker") {
+    headline = "Queued";
+  }
+
+  return {
+    headline,
+    thoughtGlimpse,
+    editedFiles,
+    readFiles,
+    commands,
+    toolCount,
+    error: lastError,
+    latestStart,
+    latestEnd,
+  };
+}
+
+const EMPTY_SUMMARY: SurfaceSummary = {
+  headline: "Waiting",
+  thoughtGlimpse: null,
+  editedFiles: [],
+  readFiles: [],
+  commands: [],
+  toolCount: 0,
+  error: null,
+  latestStart: null,
+  latestEnd: null,
+};
+
 function blankSurface(id: string): Surface {
   const raw = workerPart(id);
   const page = raw ? raw.split("/")[0]! : null;
@@ -109,6 +292,7 @@ function blankSurface(id: string): Surface {
     calls: [],
     tag: null,
     state: "waiting",
+    summary: EMPTY_SUMMARY,
     tokens: 0,
     split: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
     usage: false,
@@ -129,6 +313,7 @@ export class SurfaceBuilder {
   private byId = new Map<string, Surface>();
   /** Where each call sits: its agent, and its index in that agent's calls. */
   private where = new Map<string, { id: string; index: number }>();
+  private dirtySummary = new Set<string>();
 
   /** Whether `entries` is the list this builder has read so far, with more on the end. */
   continues(entries: AgentEntry[]): boolean {
@@ -147,12 +332,14 @@ export class SurfaceBuilder {
         s = blankSurface(id);
         this.byId.set(id, s);
         touched.add(id);
+        this.dirtySummary.add(id);
         return s;
       }
       if (!touched.has(id)) {
         s = { ...s, calls: s.calls.slice(), split: { ...s.split } };
         this.byId.set(id, s);
         touched.add(id);
+        this.dirtySummary.add(id);
       }
       return s;
     };
@@ -253,6 +440,9 @@ export class SurfaceBuilder {
     return this;
   }
 
+  private lastPhase: string | undefined;
+  private lastPlanLen = -1;
+
   /** Every agent in plan order, with its cost and state. An unchanged agent is the same object as last time. */
   snapshot(detail: RunDetail | null, ledger: LedgerEntry[]): Surface[] {
     const planPages = detail?.plan?.pages ?? [];
@@ -266,7 +456,17 @@ export class SurfaceBuilder {
       return [`${prefix}:${p}`];
     });
     const order = ["master", ...workerIds, "reviewer", "verifier"];
-    for (const id of order) if (!this.byId.has(id)) this.byId.set(id, blankSurface(id));
+    for (const id of order) {
+      if (!this.byId.has(id)) {
+        this.byId.set(id, blankSurface(id));
+        this.dirtySummary.add(id);
+      }
+    }
+    if (this.lastPhase !== detail?.phase || this.lastPlanLen !== planPages.length) {
+      this.lastPhase = detail?.phase;
+      this.lastPlanLen = planPages.length;
+      this.dirtySummary.add("master");
+    }
     const cost = new Map<string, { usd: number; n: number }>();
     for (const entry of ledger) {
       const key = surfaceOf(entry);
@@ -281,10 +481,15 @@ export class SurfaceBuilder {
       const failed = s.calls.length > 0 && s.calls[s.calls.length - 1]!.end?.ok === false;
       let state: Surface["state"] = s.calls.length === 0 ? "waiting" : open ? "working" : failed ? "failed" : "done";
       if (s.page && detail?.pages.find((p) => p.id === s.page)?.state === "failed") state = "failed";
-      if (s.cost !== c.usd || s.calls_billed !== c.n || s.state !== state) {
-        this.byId.set(id, { ...s, cost: c.usd, calls_billed: c.n, state });
+      const stateChanged = s.state !== state;
+      const dirty = this.dirtySummary.has(id) || stateChanged;
+      if (s.cost !== c.usd || s.calls_billed !== c.n || stateChanged || dirty) {
+        const next: Surface = { ...s, cost: c.usd, calls_billed: c.n, state };
+        if (dirty) next.summary = computeSummary(next, detail);
+        this.byId.set(id, next);
       }
     }
+    this.dirtySummary.clear();
     const rank = (id: string) => {
       const i = order.indexOf(id);
       return i < 0 ? order.length : i;
@@ -326,9 +531,6 @@ export interface RunData {
   patch: (change: Partial<RunDetail>) => void;
 }
 
-/** How often streamed transcript entries are drawn. */
-const FLUSH_MS = 90;
-
 export function useRun(id: string): RunData {
   // A run prefetched on hover opens with what was fetched, then catches up.
   const [detail, setDetailState] = useState<RunDetail | null>(() => queryClient.getQueryData<RunDetail>(keys.run(id)) ?? null);
@@ -353,40 +555,54 @@ export function useRun(id: string): RunData {
     api.notes(id).then(setNotes).catch(() => {});
   }, [id]);
 
+  // Coalesce concurrent reloads so bursts of SSE events never trigger duplicate HTTP storms.
+  const reloadInFlight = useRef<Promise<void> | null>(null);
+  const reloadQueued = useRef(false);
   const reload = useCallback(async () => {
-    try {
-      const [d, l] = await Promise.all([api.run(id), api.ledger(id)]);
-      setDetail(d);
-      setLedger(l);
-      setError(null);
-    } catch (err) {
-      setError(err);
+    if (reloadInFlight.current) {
+      reloadQueued.current = true;
+      return reloadInFlight.current;
     }
-    reloadNotes();
+    const runOnce = async () => {
+      try {
+        const [d, l] = await Promise.all([api.run(id), api.ledger(id)]);
+        setDetail(d);
+        setLedger(l);
+        setError(null);
+      } catch (err) {
+        setError(err);
+      }
+      reloadNotes();
+    };
+    const p = (async () => {
+      do {
+        reloadQueued.current = false;
+        await runOnce();
+      } while (reloadQueued.current);
+    })().finally(() => {
+      reloadInFlight.current = null;
+    });
+    reloadInFlight.current = p;
+    return p;
   }, [id, reloadNotes, setDetail]);
 
-  // Streamed entries are added at most every FLUSH_MS, on an animation frame, however fast
-  // they arrive: three workers sending tokens become a few renders a second, not hundreds.
+  // Flush streamed entries on the very next display frame (zero artificial throttle) so
+  // high-refresh displays render smoothly with at most one React commit per frame.
   const pending = useRef<AgentEntry[]>([]);
   const frame = useRef(0);
-  const timer = useRef(0);
   const push = useCallback((entry: AgentEntry) => {
     pending.current.push(entry);
-    if (frame.current || timer.current) return;
-    timer.current = window.setTimeout(() => {
-      timer.current = 0;
-      frame.current = requestAnimationFrame(() => {
-        frame.current = 0;
-        const batch = pending.current;
-        pending.current = [];
-        setEntries((all) => all.concat(batch));
-      });
-    }, FLUSH_MS);
+    if (frame.current) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = 0;
+      const batch = pending.current;
+      pending.current = [];
+      if (batch.length) setEntries((all) => all.concat(batch));
+    });
   }, []);
   useEffect(
     () => () => {
-      cancelAnimationFrame(frame.current);
-      window.clearTimeout(timer.current);
+      if (frame.current) cancelAnimationFrame(frame.current);
     },
     [],
   );

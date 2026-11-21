@@ -1272,23 +1272,17 @@ mod tests {
     #[test]
     fn a_pull_request_is_written_from_the_plan() {
         let plan = tm_core::Plan {
-            kind: Default::default(),
             contracts: vec![tm_core::ContractFile { path: "app/types.ts".into(), content: "x".into() }],
             pages: vec![tm_core::PagePlan {
                 id: "home".into(),
                 route: "/".into(),
-                ui: None,
                 owned_glob: "app/home/**".into(),
                 cites: vec!["theme".into()],
                 brief: "b".into(),
-                done: String::new(),
-                units: vec![],
-                skills: vec![],
-                phase: 0,
+                ..Default::default()
             }],
             estimate: tm_core::Estimate { tokens: 1000, usd: 0.5, ..Default::default() },
-            design: String::new(),
-            phases: vec![],
+            ..Default::default()
         };
         let (title, body) = pr_text("r1", Some("\nA bookshop with a cart\nmore"), &plan);
         assert_eq!(title, "A bookshop with a cart");

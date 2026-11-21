@@ -290,7 +290,7 @@ impl Config {
             template: None,
             store: None,
             remote: None,
-            timeout: Duration::from_secs(600),
+            timeout: crate::settings::NO_LIMIT,
             dictionary: None,
             commons: None,
             incremental: true,

@@ -64,9 +64,11 @@ export interface PagePlan {
   owned_glob: string;
   cites: string[];
   brief: string;
+  /** Self-contained context handed by the planner to this unit's worker. */
+  context?: string;
   /** How the page's agent knows it is finished. */
   done?: string;
-  units?: { id: string; owned_glob: string; brief: string; done?: string }[];
+  units?: { id: string; owned_glob: string; brief: string; context?: string; done?: string }[];
   /** Skills from the store the planner attached; the page's agents read each SKILL.md. */
   skills?: string[];
   /** The phase of the sketch this unit belongs to, from 0. */
@@ -90,7 +92,7 @@ const DEFAULT_DONE = "every file you own is written and does its part of the bri
 export function planAgents(plan: Plan): AgentPlan[] {
   return plan.pages.flatMap((page) => {
     const units = page.units ?? [];
-    const split = units.length >= 2 && units.length <= 4;
+    const split = units.length >= 2 && units.length <= 16;
     const list = split ? units : [{ id: page.id, owned_glob: page.owned_glob, brief: page.brief, done: page.done }];
     return list.map((u) => ({
       id: split ? `page:${page.id}/${u.id}` : `page:${page.id}`,
@@ -114,6 +116,8 @@ export interface PhaseSketch {
 
 export interface Plan {
   kind?: "web" | "library" | "cli" | "server" | "migration";
+  /** Concise overview of the overall plan and worker division. */
+  summary?: string;
   contracts: ContractFile[];
   pages: PagePlan[];
   estimate: Estimate;
@@ -129,6 +133,8 @@ export type Models = Partial<Record<RoleName, string | null>>;
 export interface RunSummary {
   id: string;
   phase: Phase;
+  /** Number of parallel worker slots configured for this run. */
+  parallel?: number;
   active: boolean;
   /** The run was cancelled. Its phase is `failed`. */
   cancelled: boolean;

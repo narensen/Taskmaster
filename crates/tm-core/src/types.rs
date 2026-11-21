@@ -148,12 +148,16 @@ pub struct PagePlan {
     pub cites: Vec<DictKey>,
     #[serde(default)]
     pub brief: String,
+    /// Self-contained context for this unit's worker: architecture notes, key symbols,
+    /// integration details, and conventions it needs without re-exploring the whole repo.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
     /// How the page's agent knows it is finished: what must exist and work.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub done: String,
     /// Optional split of this page into parallel work units with disjoint files. Empty
-    /// means one worker owns the whole page. Planners write it as `parts`.
-    #[serde(default, alias = "parts", skip_serializing_if = "Vec::is_empty")]
+    /// means one worker owns the whole page. Planners write it as `parts` or `workers`.
+    #[serde(default, alias = "parts", alias = "workers", skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<WorkUnit>,
     /// Installed skills the planner attached: names from the skills store. The page's
     /// agents find each one's SKILL.md in their worktree.
@@ -169,19 +173,22 @@ fn is_zero(n: &usize) -> bool {
 }
 
 /// One worker's share of a page: a disjoint set of files and what to build in them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkUnit {
     pub id: String,
     /// Files this unit may change. Braces list several: `{app/index.html,app/styles.css}`.
     pub owned_glob: String,
     pub brief: String,
+    /// Self-contained context for this worker (contracts, integration details, key types).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
     /// How this unit's agent knows it is finished: what must exist and work.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub done: String,
 }
 
 /// The most units a page is split into.
-pub const MAX_UNITS: usize = 4;
+pub const MAX_UNITS: usize = 16;
 
 impl PagePlan {
     /// The units to run. The declared split when it is safe (2 to [`MAX_UNITS`] units, unique
@@ -194,6 +201,7 @@ impl PagePlan {
             id: self.id.clone(),
             owned_glob: self.owned_glob.clone(),
             brief: self.brief.clone(),
+            context: self.context.clone(),
             done: self.done.clone(),
         }]
     }
@@ -332,10 +340,13 @@ pub struct Plan {
     /// What is being built. Plans recorded before kinds existed read as web.
     #[serde(default)]
     pub kind: ProjectKind,
+    /// One-paragraph overview of the plan and how work is divided across workers.
+    #[serde(default, alias = "overview", skip_serializing_if = "String::is_empty")]
+    pub summary: String,
     /// Real source files that workers import; the compiler enforces them.
     pub contracts: Vec<ContractFile>,
-    /// The units. Planners write the key as `units`; records keep `pages`.
-    #[serde(alias = "units")]
+    /// The units. Planners write the key as `units` or `workers`; records keep `pages`.
+    #[serde(alias = "units", alias = "workers")]
     pub pages: Vec<PagePlan>,
     /// The rough sketch, when the run is built a phase at a time. Empty for a small job,
     /// which is one phase planned whole.
@@ -427,7 +438,7 @@ mod unit_tests {
     use super::*;
 
     fn unit(id: &str, glob: &str) -> WorkUnit {
-        WorkUnit { id: id.into(), owned_glob: glob.into(), brief: "x".into(), done: String::new() }
+        WorkUnit { id: id.into(), owned_glob: glob.into(), brief: "x".into(), ..Default::default() }
     }
 
     fn page(units: Vec<WorkUnit>) -> PagePlan {
@@ -438,6 +449,7 @@ mod unit_tests {
             owned_glob: "{app/**,README.md}".into(),
             cites: vec![],
             brief: "b".into(),
+            context: String::new(),
             done: String::new(),
             units,
             skills: vec![],
@@ -449,7 +461,7 @@ mod unit_tests {
     fn a_plan_lists_one_agent_per_unit() {
         let mut units = vec![unit("ui", "app/index.html"), unit("js", "app/main.js")];
         units[1].done = "adding a todo shows it".into();
-        let plan = Plan { kind: Default::default(), contracts: vec![], pages: vec![page(units), page(vec![])], estimate: Estimate { tokens: 0, usd: 0.0, ..Default::default() }, design: String::new(), phases: vec![] };
+        let plan = Plan { pages: vec![page(units), page(vec![])], ..Default::default() };
         let agents = plan.agents();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["page:todo/ui", "page:todo/js", "page:todo"]);
@@ -484,7 +496,7 @@ mod unit_tests {
         assert_eq!(page(vec![unit("a", "app/a.js")]).work_units().len(), 1);
         assert_eq!(page(vec![unit("a", "a.js"), unit("a", "b.js")]).work_units().len(), 1);
         assert_eq!(page(vec![unit("a", "a.js"), unit("b", "../b.js")]).work_units().len(), 1);
-        let five: Vec<_> = (0..5).map(|i| unit(&format!("u{i}"), &format!("f{i}.js"))).collect();
-        assert_eq!(page(five).work_units().len(), 1);
+        let too_many: Vec<_> = (0..=MAX_UNITS).map(|i| unit(&format!("u{i}"), &format!("f{i}.js"))).collect();
+        assert_eq!(page(too_many).work_units().len(), 1);
     }
 }

@@ -627,6 +627,7 @@ impl App {
         Ok(json!({
             "id": id,
             "phase": run.phase,
+            "parallel": self.parallel(id),
             "cancelled": cancelled,
             "active": self.is_active(id),
             "pending_approvals": self.live.approvals.count(id),
@@ -895,6 +896,7 @@ struct Feed {
     agents_seen: usize,
     ready: VecDeque<SseEvent>,
     over: bool,
+    wake: tokio::sync::broadcast::Receiver<String>,
 }
 
 async fn run_stream(
@@ -911,7 +913,8 @@ async fn run_stream(
     let resume = headers.get("last-event-id").and_then(|value| value.to_str().ok()).map(str::to_string);
     let seen = resume.or_else(|| query.get("after").cloned()).and_then(|n| n.parse().ok()).unwrap_or(0);
     let agents_seen = query.get("agents_after").and_then(|n| n.parse().ok()).unwrap_or(0);
-    let feed = Feed { app, id, seen, agents_seen, ready: VecDeque::new(), over: false };
+    let wake = app.live.subscribe();
+    let feed = Feed { app, id, seen, agents_seen, ready: VecDeque::new(), over: false, wake };
     let events = stream::unfold(feed, |mut feed| async move {
         loop {
             if let Some(event) = feed.ready.pop_front() {
@@ -943,7 +946,16 @@ async fn run_stream(
                 feed.ready.push_back(SseEvent::default().event("idle").data(json!({ "phase": phase }).to_string()));
                 feed.over = true;
             } else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Wake instantly whenever this run emits a live entry, with a short fallback
+                // tick for run-level event log writes and cross-process updates.
+                tokio::select! {
+                    msg = feed.wake.recv() => {
+                        if let Ok(run_id) = msg && run_id != feed.id {
+                            continue;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
             }
         }
     });

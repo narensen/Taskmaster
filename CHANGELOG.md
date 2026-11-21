@@ -3,6 +3,46 @@
 What changed in each release, for the people who use Taskmaster. The section for a version is
 also its GitHub release notes (`scripts/release-notes.sh` takes it from here).
 
+## 0.1.6
+
+This release makes a run easier to follow while it streams, and gives the master a clearer picture
+of the workers it hands work to.
+
+### A run view you can read at a glance
+
+- A headline at the top of a run says what it is doing now, or how it finished.
+- The master and each worker show one line about their current step and a short glimpse of their
+  reasoning, instead of a wall of raw output.
+- Click an agent's headline to open its activity: the files it changed, the files it read, the
+  commands it ran and its last error. Raw output stays folded until you ask for it.
+- The master's card carries the plan's overview and the workers it delegated to, split units
+  included. Inspect on any of them jumps straight to that worker's activity.
+- Streamed entries are drawn on the next display frame, at most once a frame, and bursts of
+  updates share one reload, so long runs stay smooth.
+- The daemon wakes a run's live stream the moment a new entry arrives, instead of on a timer.
+- Long run lists are drawn a screenful at a time, and only a run's clock ticks in the sidebar.
+- Refreshed styles for the run view in both the dark and light themes, checked for 4.5:1 contrast.
+
+### Planning and delegation
+
+- The master is told how many parallel workers it has and which harness and model they use.
+- A plan now has a one-paragraph summary, and every unit and part can carry its own context:
+  interfaces, symbols, conventions and where its siblings' files are. Each worker's brief includes
+  the summary, its context and the globs the other workers own.
+- A run can split work across up to 16 units, instead of 4.
+- Planners may write `workers` as well as `units` or `parts`.
+
+### Fewer runs cut short
+
+- Agents have no time limit by default (Settings can still set one).
+- Thinking models get longer before a quiet stream counts as stalled: five minutes for small briefs
+  and ten for larger ones.
+- The planner has up to five minutes, and more tool calls, before it is asked to commit to a plan.
+
+### Packaging
+
+- The release check for the Linux package no longer fails after the upload has finished.
+
 ## 0.1.5
 
 This release is about making the orchestration pay for itself. Workers test their own work, verify

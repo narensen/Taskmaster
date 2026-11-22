@@ -298,9 +298,22 @@ export function RunView({ id }: { id: string }) {
   const split = useDefaultLayout({ id: "taskmaster-run", storage: localStorage });
   const [diffRequest, setDiffRequest] = useState<{ scope: Scope; page?: string; attempt?: number; n: number } | null>(null);
   const [diffStats, setDiffStats] = useState<DiffStats | null>(null);
+  // Defer mounting the side panel body until the stream has painted (P6).
+  const [panelReady, setPanelReady] = useState(false);
+  useEffect(() => {
+    setPanelReady(false);
+    const go = () => setPanelReady(true);
+    if ("requestIdleCallback" in window) {
+      const h = window.requestIdleCallback(go, { timeout: 120 });
+      return () => window.cancelIdleCallback(h);
+    }
+    const t = globalThis.setTimeout(go, 40);
+    return () => globalThis.clearTimeout(t);
+  }, [id]);
   const setTab = useCallback(
     (t: string) => {
       const next = panelTab(t);
+      setPanelReady(true);
       setTabState(next);
       setPrefs((p) => ({ panelTab: { ...p.panelTab, [id]: next } }));
     },
@@ -343,13 +356,31 @@ export function RunView({ id }: { id: string }) {
     setPinned(true);
   }, [id]);
 
-  // Smart auto-scroll: stay pinned to the bottom during active runs until the user scrolls up.
+  // Smart auto-scroll: coalesce into one rAF and only touch scrollTop when scrollHeight grew (P7).
+  const lastScrollHeightRef = useRef(0);
+  const scrollRafRef = useRef(0);
   useEffect(() => {
     if (!detail?.active || !pinned) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    if (scrollRafRef.current) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0;
+      const el = scrollRef.current;
+      if (!el) return;
+      const h = el.scrollHeight;
+      if (h !== lastScrollHeightRef.current) {
+        lastScrollHeightRef.current = h;
+        el.scrollTop = h;
+      }
+    });
   }, [detail?.active, pinned, data.entriesVersion, list.length]);
+  useEffect(
+    () => () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = 0;
+      lastScrollHeightRef.current = 0;
+    },
+    [id],
+  );
 
   useEffect(() => {
     if (!detail?.branch) {
@@ -516,28 +547,54 @@ export function RunView({ id }: { id: string }) {
     else panel?.collapse();
   }, [panelOpen, narrow, splitPanel]);
 
+  const keyStateRef = useRef({
+    cite,
+    focus,
+    focusAgent,
+    list,
+    narrow,
+    openTab,
+    panelOpen,
+    setPanelOpen,
+    sheet,
+    toggleAgent,
+  });
+  keyStateRef.current = {
+    cite,
+    focus,
+    focusAgent,
+    list,
+    narrow,
+    openTab,
+    panelOpen,
+    setPanelOpen,
+    sheet,
+    toggleAgent,
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const s = keyStateRef.current;
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key === "\\") {
         e.preventDefault();
-        if (narrow) setSheet((v) => !v);
-        else setPanelOpen(!panelOpen);
+        if (s.narrow) setSheet((v) => !v);
+        else s.setPanelOpen(!s.panelOpen);
         return;
       }
       if (typingTarget(e.target)) return;
       if (e.key === "Escape") {
-        if (cite) {
+        if (s.cite) {
           setCite(null);
           return;
         }
-        if (narrow && sheet) {
+        if (s.narrow && s.sheet) {
           setSheet(false);
           return;
         }
-        if (panelOpen) {
+        if (s.panelOpen) {
           e.preventDefault();
-          setPanelOpen(false);
+          s.setPanelOpen(false);
         }
         return;
       }
@@ -565,26 +622,26 @@ export function RunView({ id }: { id: string }) {
       const nodes = [...(runRef.current?.querySelectorAll<HTMLElement>("[data-agent]") ?? [])];
       const ids = nodes.map((n) => n.dataset.agent!).filter(Boolean);
       if (!ids.length) return;
-      const at = Math.max(0, ids.indexOf(focus ?? ""));
+      const at = Math.max(0, ids.indexOf(s.focus ?? ""));
       if (e.key === "j" || e.key === "k") {
         e.preventDefault();
-        const next = e.key === "j" ? Math.min(ids.length - 1, (focus ? at : -1) + 1) : Math.max(0, (focus ? at : 0) - 1);
+        const next = e.key === "j" ? Math.min(ids.length - 1, (s.focus ? at : -1) + 1) : Math.max(0, (s.focus ? at : 0) - 1);
         const idNext = ids[next];
-        if (idNext) focusAgent(idNext);
-      } else if (e.key === "Enter" && focus && focus !== "you") {
+        if (idNext) s.focusAgent(idNext);
+      } else if (e.key === "Enter" && s.focus && s.focus !== "you") {
         e.preventDefault();
-        toggleAgent(focus);
-      } else if (e.key === "e" && focus) {
+        s.toggleAgent(s.focus);
+      } else if (e.key === "e" && s.focus) {
         e.preventDefault();
-        const surface = list.find((s) => s.id === focus);
+        const surface = s.list.find((item) => item.id === s.focus);
         const path = surface ? fileTarget(surface) : null;
         if (path && looksLikePath(path)) emit("preview", { path });
-        else openTab("files");
+        else s.openTab("files");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cite, focus, focusAgent, list, narrow, openTab, panelOpen, sheet, toggleAgent]);
+  }, []);
 
   useEffect(() => {
     const onUp = () => {
@@ -646,15 +703,15 @@ export function RunView({ id }: { id: string }) {
         ))}
       </div>
       <div className="panel-body">
-        {tab === "files" && <FilesPanel run={id} open={fileOpen} layout="vertical" />}
-        {tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
-        {tab === "preview" && (
+        {panelReady && tab === "files" && <FilesPanel run={id} open={fileOpen} layout="vertical" />}
+        {panelReady && tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
+        {panelReady && tab === "preview" && (
           <div className="preview-stack">
             <LivePreview id={id} detail={detail} />
             <BrowserTab run={id} detail={detail} entries={entries} />
           </div>
         )}
-        {tab === "terminal" && <TerminalTab run={id} entries={entries} project={settings.data?.project ?? ""} onRan={() => void data.catchUp()} />}
+        {panelReady && tab === "terminal" && <TerminalTab run={id} entries={entries} project={settings.data?.project ?? ""} onRan={() => void data.catchUp()} />}
       </div>
     </div>
   );

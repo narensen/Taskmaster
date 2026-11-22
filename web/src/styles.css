@@ -6919,3 +6919,35 @@ button.glob-file:hover { color: var(--ink); border-color: var(--line-strong); ba
 .connection-banner span { flex: 1; min-width: 0; }
 .composer-link-btn { color: var(--muted); }
 .composer-link-btn:hover { color: var(--ink); }
+
+/* P8: virtualized activity container for large expanded agents */
+.agent-steps-vscroll {
+  max-height: 520px;
+  overflow: auto;
+  contain: strict;
+}
+
+/* P10: limit continuous animations and skip paint/animation work on off-screen cards */
+.dot.busy { animation: none; }
+.agent-block,
+.run-card,
+.gallery-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+}
+
+.no-motion *,
+.no-motion *::before,
+.no-motion *::after {
+  animation: none !important;
+  transition: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

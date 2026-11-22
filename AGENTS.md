@@ -35,6 +35,7 @@ Do not run `npx tsc` from the repository root. CI is `.github/workflows/ci.yml`:
 - A quota, rate limit, or sign-in stop is a typed limit: a sentence, a reset time when the reply has one, Switch, and Retry.
 - A note on a finished run is a follow-up. The master reads it before any worker.
 - Telemetry stays off until the settings file turns it on. An export clears `commons.token`. Host tokens stay in `~/.taskmaster/hosts.json`.
+- **Multiplicative paths:** before adding work to a per-entry, per-frame, per-row, or per-feed path, name its `frequency × cardinality` (e.g. open feeds × streaming pushes/sec, or rows × polls/min) and keep it O(1) or incremental.
 - The daemon log is `$XDG_STATE_HOME/taskmaster/daemon.log`, or `~/.local/state/taskmaster/daemon.log`.
 
 ## Skills

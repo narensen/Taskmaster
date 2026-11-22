@@ -9,13 +9,13 @@ import {
   Circle,
   CircleAlert,
   CircleCheck,
+  CircleDot,
   Compass,
   Cpu,
   FolderTree,
   GitBranch,
   GitPullRequest,
   LayoutGrid,
-  Loader2,
   Pin,
   PinOff,
   Plug,
@@ -37,7 +37,6 @@ import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan, usd } from "./format";
 import { readFile } from "./composer";
-import { useLoad } from "./ui";
 import { typing } from "./keys";
 import { RunBar } from "./run/Meter";
 import { TitleBar, type Crumb } from "./shell/TitleBar";
@@ -212,6 +211,7 @@ function crumbsFor(path: string, project: string): Crumb[] {
 function useClocks(ids: string[], runs: RunSummary[] = []) {
   const [clocks, setClocks] = useState<Record<string, { start: number; end: number }>>({});
   const fetched = useRef(new Set<string>());
+  const stable = useRef<Record<string, { start: number; end: number }>>({});
   // A daemon that sends the timestamps with the list needs no ledger fetch per run.
   const listed = useMemo(() => {
     const out: Record<string, { start: number; end: number }> = {};
@@ -219,7 +219,16 @@ function useClocks(ids: string[], runs: RunSummary[] = []) {
       if (!("started_at" in run)) continue;
       const start = run.started_at ? Date.parse(run.started_at) : NaN;
       const end = run.last_at ? Date.parse(run.last_at) : NaN;
-      if (!Number.isNaN(start) && !Number.isNaN(end)) out[run.id] = { start, end };
+      if (!Number.isNaN(start) && !Number.isNaN(end)) {
+        const prev = stable.current[run.id];
+        if (prev && prev.start === start && prev.end === end) {
+          out[run.id] = prev;
+        } else {
+          const next = { start, end };
+          stable.current[run.id] = next;
+          out[run.id] = next;
+        }
+      }
       fetched.current.add(run.id);
     }
     return out;
@@ -249,7 +258,7 @@ function useClocks(ids: string[], runs: RunSummary[] = []) {
 }
 
 function RunMark({ group }: { group: Group }) {
-  if (group === "Working") return <Loader2 size={13} className="spin-ico" />;
+  if (group === "Working") return <CircleDot size={13} />;
   if (group === "Needs approval") return <CircleAlert size={13} />;
   if (group === "Pinned") return <Pin size={13} />;
   if (group === "Archived") return <Archive size={13} />;
@@ -446,6 +455,106 @@ function useLastProject(project: string | undefined) {
   }, [project]);
 }
 
+/**
+ * Poll `/api/runs?since=<seq>` with structural sharing by run id: unchanged rows keep their exact
+ * object reference so memoized sidebar rows never re-render while another run is active (P9).
+ */
+function useRuns(signedIn: boolean) {
+  const [data, setData] = useState<RunSummary[]>([]);
+  const seqRef = useRef<number | undefined>(undefined);
+  const byId = useRef<Map<string, { raw: string; run: RunSummary }>>(new Map());
+  const orderRef = useRef<string[]>([]);
+
+  const fetchRuns = useCallback(
+    async (full = false) => {
+      if (!signedIn) {
+        seqRef.current = undefined;
+        byId.current.clear();
+        orderRef.current = [];
+        setData((prev) => (prev.length === 0 ? prev : []));
+        return;
+      }
+      try {
+        const res = await api.runsDelta(full ? undefined : seqRef.current);
+        if (typeof res.seq === "number") seqRef.current = res.seq;
+        let changed = false;
+
+        if (res.delta && res.all_ids) {
+          for (const run of res.runs) {
+            const raw = JSON.stringify(run);
+            const prev = byId.current.get(run.id);
+            if (!prev || prev.raw !== raw) {
+              byId.current.set(run.id, { raw, run });
+              changed = true;
+            }
+          }
+          const alive = new Set(res.all_ids);
+          for (const id of [...byId.current.keys()]) {
+            if (!alive.has(id)) {
+              byId.current.delete(id);
+              changed = true;
+            }
+          }
+          // If an id in all_ids isn't cached yet (e.g. switched project), fall back to a full sync.
+          const missing = res.all_ids.some((id) => !byId.current.has(id));
+          if (missing) {
+            seqRef.current = undefined;
+            await fetchRuns(true);
+            return;
+          }
+          const sameOrder =
+            res.all_ids.length === orderRef.current.length &&
+            res.all_ids.every((id, i) => orderRef.current[i] === id);
+          if (!changed && sameOrder) return;
+          orderRef.current = res.all_ids;
+          setData(res.all_ids.map((id) => byId.current.get(id)!.run));
+        } else {
+          const nextIds: string[] = [];
+          const nextMap = new Map<string, { raw: string; run: RunSummary }>();
+          const nextList: RunSummary[] = [];
+          for (const run of res.runs) {
+            nextIds.push(run.id);
+            const raw = JSON.stringify(run);
+            const prev = byId.current.get(run.id);
+            if (prev && prev.raw === raw) {
+              nextMap.set(run.id, prev);
+              nextList.push(prev.run);
+            } else {
+              const entry = { raw, run };
+              nextMap.set(run.id, entry);
+              nextList.push(run);
+              changed = true;
+            }
+          }
+          const sameOrder =
+            nextIds.length === orderRef.current.length &&
+            nextIds.every((id, i) => orderRef.current[i] === id);
+          byId.current = nextMap;
+          if (!changed && sameOrder) return;
+          orderRef.current = nextIds;
+          setData(nextList);
+        }
+      } catch {
+        // Connection banner handles offline state; next tick retries.
+      }
+    },
+    [signedIn],
+  );
+
+  useEffect(() => {
+    seqRef.current = undefined;
+    void fetchRuns(true);
+    if (!signedIn) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void fetchRuns(false);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [signedIn, fetchRuns]);
+
+  const reload = useCallback(() => fetchRuns(true), [fetchRuns]);
+  return { data, reload };
+}
+
 export function App() {
   const path = usePath();
   const signedIn = useSignedIn();
@@ -453,10 +562,11 @@ export function App() {
   const motionOn = useMotion();
   const [palette, setPalette] = useState<PaletteState | null>(null);
   const [drawer, setDrawer] = useState(false);
+  const closeDrawer = useCallback(() => setDrawer(false), []);
   const [term, setTerm] = useState(false);
   const [termMounted, setTermMounted] = useState(false);
   const [keys, setKeys] = useState(false);
-  const runs = useLoad(() => (signedIn ? api.runs() : Promise.resolve([] as RunSummary[])), [signedIn], 3000);
+  const runs = useRuns(signedIn);
   const settings = useSettings();
   usePrefetchScreens();
 
@@ -602,7 +712,7 @@ export function App() {
                 );
               })}
             </nav>
-            <RunList runs={runs.data ?? []} path={path} onPick={() => setDrawer(false)} />
+            <RunList runs={runs.data} path={path} onPick={closeDrawer} />
           </aside>
           {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
           <main className="main">

@@ -4257,3 +4257,94 @@ async fn web_access_api_persists_settings_vaults_api_key_and_serves_run_web_acti
     drop(server);
 }
 
+#[tokio::test]
+async fn runs_delta_since_and_ledger_after_return_only_new_records() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+        let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+        (status, serde_json::from_str(rest).unwrap_or(serde_json::Value::Null))
+    }
+
+    let tmp = seeded("p9-p11");
+    let records = Records::files(&tmp.0);
+    let p = plan(&[("a", &[])]);
+    records.save_events("r1", &[tm_core::Event::PlanReady(p.clone())]).unwrap();
+    records.save_events("r2", &[tm_core::Event::PlanReady(p.clone())]).unwrap();
+    let entry1: tm_core::LedgerEntry = serde_json::from_value(serde_json::json!({
+        "at": "2026-11-22T00:00:00Z",
+        "role": "planner",
+        "harness": "fixture",
+        "model": "fixture",
+        "input": 100,
+        "output": 50,
+        "cost_usd": 0.01,
+        "seconds": 1.0,
+        "ok": true
+    }))
+    .unwrap();
+    records.charge("r1", &entry1).unwrap();
+
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // P9: initial GET /api/runs returns all runs and a seq; ?since=<seq> returns empty delta.
+    let (st, full) = call(&addr, Some(&token), "GET", "/api/runs", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(full["runs"].as_array().unwrap().len(), 2);
+    let seq1 = full["seq"].as_u64().unwrap();
+
+    let (st, empty_delta) = call(&addr, Some(&token), "GET", &format!("/api/runs?since={seq1}"), None).await;
+    assert_eq!(st, 200);
+    assert_eq!(empty_delta["delta"], true);
+    assert_eq!(empty_delta["runs"].as_array().unwrap().len(), 0);
+    assert_eq!(empty_delta["all_ids"].as_array().unwrap().len(), 2);
+
+    // Mutate only r1; delta since seq1 returns ONLY r1, not r2.
+    records
+        .save_events("r1", &[tm_core::Event::PlanReady(p.clone()), tm_core::Event::PlanApproved])
+        .unwrap();
+    let (st, one_delta) = call(&addr, Some(&token), "GET", &format!("/api/runs?since={seq1}"), None).await;
+    assert_eq!(st, 200);
+    let changed = one_delta["runs"].as_array().unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0]["id"], "r1");
+    assert!(one_delta["seq"].as_u64().unwrap() > seq1);
+
+    // P11: GET /api/runs/r1/ledger?after=1 returns 0 entries, then after appending returns only the new one.
+    let (st, l0) = call(&addr, Some(&token), "GET", "/api/runs/r1/ledger", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(l0["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(l0["total_entries"], 1);
+
+    let (st, l1) = call(&addr, Some(&token), "GET", "/api/runs/r1/ledger?after=1", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(l1["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(l1["total_entries"], 1);
+
+    records.charge("r1", &entry1).unwrap();
+    let (st, l2) = call(&addr, Some(&token), "GET", "/api/runs/r1/ledger?after=1", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(l2["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(l2["total_entries"], 2);
+    assert_eq!(l2["after"], 1);
+
+    drop(server);
+}
+
+

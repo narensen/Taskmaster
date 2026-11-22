@@ -3,9 +3,8 @@
 // file as a diff (D). Open tabs, the active one and the split are remembered.
 
 import { ChevronDown, ChevronUp, FileDiff as DiffIcon, ExternalLink, Search, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
-import { PatchDiff } from "@pierre/diffs/react";
 import { api, type GrepHit } from "../api";
 import { typing } from "../keys";
 import { MOD } from "../desktop";
@@ -15,6 +14,8 @@ import { useFile, useProjectFiles, useRunDiff, useSettings, prefetchFile } from 
 import { Tip } from "../components/Tip";
 import { CodeView, findMatches } from "./CodeView";
 import { FileTree } from "./FileTree";
+
+const PatchDiffLazy = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 
 interface Target {
   n: number;
@@ -328,18 +329,20 @@ export function FilesPanel({ run, open: openRequest, layout = "horizontal" }: { 
                     <CodeSkeleton />
                   ) : patch ? (
                     <div className="fdiff">
-                      <PatchDiff
-                        patch={patch}
-                        disableWorkerPool
-                        options={{
-                          theme: { dark: "min-dark", light: "min-light" },
-                          themeType: p.theme,
-                          diffStyle: "unified",
-                          disableFileHeader: true,
-                          overflow: "scroll",
-                          unsafeCSS: DIFF_CSS,
-                        }}
-                      />
+                      <Suspense fallback={<CodeSkeleton />}>
+                        <PatchDiffLazy
+                          patch={patch}
+                          disableWorkerPool
+                          options={{
+                            theme: { dark: "min-dark", light: "min-light" },
+                            themeType: p.theme,
+                            diffStyle: "unified",
+                            disableFileHeader: true,
+                            overflow: "scroll",
+                            unsafeCSS: DIFF_CSS,
+                          }}
+                        />
+                      </Suspense>
                     </div>
                   ) : (
                     <div className="tab-empty">This run did not change {active.split("/").pop()}.</div>

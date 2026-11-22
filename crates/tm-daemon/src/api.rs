@@ -257,6 +257,13 @@ struct Active {
 
 type RunFingerprint = [(u64, u128); 4];
 
+#[derive(Default)]
+struct RunsTracker {
+    seq: u64,
+    /// Per `(project, run_id)` last JSON representation and the `seq` when it changed.
+    entries: HashMap<(PathBuf, String), (String, u64)>,
+}
+
 struct App {
     /// Parent of the first project this daemon opened; new projects are created here.
     workspace: PathBuf,
@@ -272,6 +279,8 @@ struct App {
     active: Mutex<HashMap<String, Active>>,
     /// Cached `view()` JSON for settled (inactive) runs, validated via O(1) file metadata stats.
     summary_cache: Mutex<HashMap<(PathBuf, String), (RunFingerprint, Value)>>,
+    /// Tracks per-run revision numbers so `GET /api/runs?since=<seq>` returns only changed rows.
+    runs_tracker: Mutex<RunsTracker>,
     /// The address the API listens on, for the links that pair a device.
     addr: SocketAddr,
     /// Each harness's model list, kept so a page or a new run does not wait on five CLIs.
@@ -346,6 +355,7 @@ impl Server {
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
             summary_cache: Mutex::new(HashMap::new()),
+            runs_tracker: Mutex::new(RunsTracker::default()),
             addr,
             providers: Default::default(),
             live,
@@ -1061,10 +1071,15 @@ impl App {
     }
 }
 
-async fn list_runs(State(app): State<Arc<App>>) -> Reply {
+#[derive(Deserialize, Default)]
+struct RunsQuery {
+    since: Option<u64>,
+}
+
+async fn list_runs(State(app): State<Arc<App>>, Query(query): Query<RunsQuery>) -> Reply {
     let project = app.project();
     let records = app.records();
-    let mut runs = Vec::new();
+    let mut pairs: Vec<(String, Value)> = Vec::new();
     for id in records.run_ids()? {
         let is_active = app.is_active(&id);
         let pending_approvals = app.live.approvals.list(Some(&id)).len();
@@ -1078,7 +1093,7 @@ async fn list_runs(State(app): State<Arc<App>>) -> Reply {
                 .filter(|(cached_fp, _)| *cached_fp == fp)
                 .map(|(_, v)| v.clone());
             if let Some(view) = hit {
-                runs.push(view);
+                pairs.push((id, view));
                 continue;
             }
         }
@@ -1087,10 +1102,54 @@ async fn list_runs(State(app): State<Arc<App>>) -> Reply {
             if let Some(fp) = fp {
                 app.summary_cache.lock().unwrap().insert((project.clone(), id.clone()), (fp, view.clone()));
             }
-            runs.push(view);
+            pairs.push((id, view));
         }
     }
-    ok(json!({ "runs": runs }))
+
+    let mut tracker = app.runs_tracker.lock().unwrap();
+    let current_ids: std::collections::HashSet<&str> = pairs.iter().map(|(id, _)| id.as_str()).collect();
+    let had_removed = tracker
+        .entries
+        .keys()
+        .any(|(p, id)| p == &project && !current_ids.contains(id.as_str()));
+    let mut changed = Vec::new();
+    for (idx, (id, view)) in pairs.iter().enumerate() {
+        let raw = serde_json::to_string(view).unwrap_or_default();
+        let unchanged = tracker
+            .entries
+            .get(&(project.clone(), id.clone()))
+            .map(|(prev, _)| prev == &raw)
+            .unwrap_or(false);
+        if !unchanged {
+            changed.push((idx, raw));
+        }
+    }
+    if had_removed || !changed.is_empty() {
+        tracker.seq = tracker.seq.saturating_add(1);
+        let next_seq = tracker.seq;
+        if had_removed {
+            tracker.entries.retain(|(p, id), _| p != &project || current_ids.contains(id.as_str()));
+        }
+        for (idx, raw) in changed {
+            let id = pairs[idx].0.clone();
+            tracker.entries.insert((project.clone(), id), (raw, next_seq));
+        }
+    }
+    let seq = tracker.seq;
+    if let Some(since) = query.since {
+        let all_ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+        let delta_runs: Vec<Value> = pairs
+            .into_iter()
+            .filter_map(|(id, view)| {
+                let entry_seq = tracker.entries.get(&(project.clone(), id)).map(|(_, s)| *s).unwrap_or(seq);
+                (entry_seq > since).then_some(view)
+            })
+            .collect();
+        ok(json!({ "runs": delta_runs, "seq": seq, "all_ids": all_ids, "delta": true }))
+    } else {
+        let runs: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+        ok(json!({ "runs": runs, "seq": seq }))
+    }
 }
 
 /// Restart one worker without cancelling sibling parallel workers. If the worker is currently
@@ -1357,10 +1416,35 @@ async fn run_stream(
     Ok(Sse::new(events).keep_alive(KeepAlive::default()))
 }
 
-async fn run_ledger(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+#[derive(Deserialize, Default)]
+struct LedgerQuery {
+    after: Option<usize>,
+}
+
+async fn run_ledger(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<LedgerQuery>,
+) -> Reply {
     app.known(&id)?;
     let entries = app.records().ledger(&id)?;
-    ok(json!({ "totals": totals(&entries), "entries": entries }))
+    let total_entries = entries.len();
+    let tot = totals(&entries);
+    if let Some(after) = query.after {
+        let start = after.min(total_entries);
+        ok(json!({
+            "totals": tot,
+            "entries": &entries[start..],
+            "total_entries": total_entries,
+            "after": start,
+        }))
+    } else {
+        ok(json!({
+            "totals": tot,
+            "entries": entries,
+            "total_entries": total_entries,
+        }))
+    }
 }
 
 async fn run_changes(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {

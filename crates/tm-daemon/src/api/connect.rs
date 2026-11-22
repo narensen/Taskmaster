@@ -435,7 +435,7 @@ async fn call_tool(app: &Arc<App>, name: &str, args: &Value) -> Result<Value, St
     match name {
         "taskmaster_list_runs" => {
             let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 50) as usize;
-            let listed = body_of(super::list_runs(State(app.clone())).await).await?;
+            let listed = body_of(super::list_runs(State(app.clone()), axum::extract::Query(super::RunsQuery::default())).await).await?;
             let mut runs: Vec<Value> = listed["runs"].as_array().cloned().unwrap_or_default();
             runs.sort_by(|a, b| b["last_at"].as_str().unwrap_or("").cmp(a["last_at"].as_str().unwrap_or("")));
             Ok(json!({ "runs": runs.iter().take(limit).map(|run| {

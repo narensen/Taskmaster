@@ -2,17 +2,18 @@
 // walls), click-to-inspect activity & accessed files for Master and every Worker, and a clean
 // Overall Plan card under Master showing worker delegation and phases.
 
-import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   Check,
   ChevronRight,
   Circle,
+  CircleDot,
   FileCode2,
   FileText,
   Globe,
   Layers,
-  Loader2,
   Pencil,
   RotateCcw,
   Search,
@@ -98,7 +99,7 @@ function statusWord(surface: Surface, phase: Phase | undefined): string {
 
 function StatusGlyph({ state }: { state: string }) {
   if (state === "working" || state === "planning") {
-    return <Loader2 size={14} strokeWidth={1.8} className="spin-ico agent-ico working" aria-hidden />;
+    return <CircleDot size={13} strokeWidth={2} className="agent-ico working" aria-hidden />;
   }
   if (state === "done") {
     return <Check size={14} strokeWidth={2} className="agent-ico done" aria-hidden />;
@@ -220,7 +221,7 @@ const DraftingPlan = memo(function DraftingPlan({ draft }: { draft: DraftPlan })
     <div className="plan-card plan-drafting" data-testid="drafting-plan">
       <div className="plan-card-head">
         <span className="plan-card-title">
-          <Loader2 size={13} strokeWidth={1.8} className="spin-ico" aria-hidden />
+          <CircleDot size={13} strokeWidth={2} className="agent-ico working" aria-hidden />
           Drafting overall plan
         </span>
         <span className="plan-card-meta">
@@ -625,6 +626,8 @@ function ToolAsk({ approval, onAnswer }: { approval: ToolApproval; onAnswer: (id
   );
 }
 
+const VIRTUAL_STEPS_AFTER = 60;
+
 /** Lazy expanded activity inspector: only computed & mounted when the user clicks the headline. */
 const AgentActivity = memo(function AgentActivity({
   surface,
@@ -634,6 +637,8 @@ const AgentActivity = memo(function AgentActivity({
   force: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
+  const [rawOpen, setRawOpen] = useState(false);
+  const stepsScrollRef = useRef<HTMLDivElement>(null);
   const { editedFiles, readFiles, commands } = surface.summary;
 
   const { activity, rawOutputs } = useMemo(() => {
@@ -656,8 +661,36 @@ const AgentActivity = memo(function AgentActivity({
 
   const hidden = showAll ? 0 : Math.max(0, activity.length - ROWS_SHOWN);
   const visible = hidden ? activity.slice(hidden) : activity;
+  const virtualize = visible.length > VIRTUAL_STEPS_AFTER;
+  const stepVirtualizer = useVirtualizer({
+    count: visible.length,
+    getScrollElement: () => stepsScrollRef.current,
+    estimateSize: () => 34,
+    overscan: 12,
+    enabled: virtualize,
+  });
   const hasFiles = editedFiles.length > 0 || readFiles.length > 0;
   const hasUsage = surface.usage || surface.tokens > 0 || surface.cost > 0;
+
+  const renderRow = (row: { item: Item; call: Call; index: number; key: string }) =>
+    row.item.t === "thought" ? (
+      <ThoughtNote
+        key={row.key}
+        text={row.item.text}
+        live={!row.call.end && row.index === row.call.items.length - 1}
+      />
+    ) : row.item.t === "life" ? (
+      <p key={row.key} className="flow-life">
+        {row.item.text}
+      </p>
+    ) : row.item.t === "tool" ? (
+      <Step
+        key={row.key}
+        item={row.item}
+        seconds={stepSeconds(row.call, row.index)}
+        force={force}
+      />
+    ) : null;
 
   return (
     <div className="agent-activity" data-testid="agent-activity">
@@ -750,25 +783,26 @@ const AgentActivity = memo(function AgentActivity({
               Show {hidden} earlier step{hidden === 1 ? "" : "s"}
             </button>
           )}
-          {visible.map((row) =>
-            row.item.t === "thought" ? (
-              <ThoughtNote
-                key={row.key}
-                text={row.item.text}
-                live={!row.call.end && row.index === row.call.items.length - 1}
-              />
-            ) : row.item.t === "life" ? (
-              <p key={row.key} className="flow-life">
-                {row.item.text}
-              </p>
-            ) : row.item.t === "tool" ? (
-              <Step
-                key={row.key}
-                item={row.item}
-                seconds={stepSeconds(row.call, row.index)}
-                force={force}
-              />
-            ) : null,
+          {virtualize ? (
+            <div className="agent-steps-vscroll" ref={stepsScrollRef}>
+              <div style={{ height: stepVirtualizer.getTotalSize(), position: "relative" }}>
+                {stepVirtualizer.getVirtualItems().map((v) => {
+                  const row = visible[v.index]!;
+                  return (
+                    <div
+                      key={row.key}
+                      data-index={v.index}
+                      ref={stepVirtualizer.measureElement}
+                      style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${v.start}px)` }}
+                    >
+                      {renderRow(row)}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            visible.map(renderRow)
           )}
         </div>
       ) : (
@@ -776,15 +810,21 @@ const AgentActivity = memo(function AgentActivity({
       )}
 
       {rawOutputs.length > 0 && (
-        <details className="agent-raw">
+        <details
+          className="agent-raw"
+          open={rawOpen}
+          onToggle={(e) => setRawOpen((e.currentTarget as HTMLDetailsElement).open)}
+        >
           <summary>Raw model output ({rawOutputs.length})</summary>
-          <div className="agent-raw-body">
-            {rawOutputs.map((r) => (
-              <pre key={r.key} className="step-io">
-                <Rich text={r.text} />
-              </pre>
-            ))}
-          </div>
+          {rawOpen && (
+            <div className="agent-raw-body">
+              {rawOutputs.map((r) => (
+                <pre key={r.key} className="step-io">
+                  <Rich text={r.text} />
+                </pre>
+              ))}
+            </div>
+          )}
         </details>
       )}
     </div>

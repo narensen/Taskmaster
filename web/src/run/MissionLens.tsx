@@ -12,11 +12,11 @@ import {
   Check,
   CheckCircle2,
   Circle,
+  CircleDot,
   Edit3,
   FileCode2,
   GitBranch,
   Layers,
-  Loader2,
   Plus,
   RotateCw,
   Save,
@@ -95,7 +95,7 @@ function statusClass(state: ShownState): string {
 function StateGlyph({ state }: { state: ShownState }) {
   if (state === "stopped") return <Square size={11} strokeWidth={2.2} className="dag-ico stopped" aria-hidden />;
   if (state === "passed") return <CheckCircle2 size={14} className="dag-ico passed" aria-hidden />;
-  if (state === "building") return <Loader2 size={14} className="dag-ico building spin-ico" aria-hidden />;
+  if (state === "building") return <CircleDot size={14} className="dag-ico building" aria-hidden />;
   if (state === "flagged") return <AlertTriangle size={14} className="dag-ico flagged" aria-hidden />;
   if (state === "failed") return <AlertTriangle size={14} className="dag-ico failed" aria-hidden />;
   return <Circle size={13} className="dag-ico queued" aria-hidden />;

@@ -727,19 +727,43 @@ export function useRun(id: string): RunData {
     api.notes(id).then(setNotes).catch(() => {});
   }, [id]);
 
-  // Coalesce concurrent reloads so bursts of SSE events never trigger duplicate HTTP storms.
+  // Incremental ledger fetcher (?after=n): only downloads newly appended ledger rows (P11).
+  const ledgerRef = useRef<RunData["ledger"]>(null);
+  const fetchLedger = useCallback(async () => {
+    const after = ledgerRef.current?.entries.length;
+    const res = await api.ledger(id, after);
+    const prev = ledgerRef.current;
+    let next: NonNullable<RunData["ledger"]>;
+    if (prev && after !== undefined && res.after === after && (res.total_entries === undefined || res.total_entries >= after)) {
+      next = res.entries.length > 0
+        ? { totals: res.totals, entries: [...prev.entries, ...res.entries] }
+        : { totals: res.totals, entries: prev.entries };
+    } else {
+      next = { totals: res.totals, entries: res.entries };
+    }
+    ledgerRef.current = next;
+    setLedger(next);
+    return next;
+  }, [id]);
+
+  // Coalesce concurrent reloads and debounce SSE bursts within 100ms (P11).
   const reloadInFlight = useRef<Promise<void> | null>(null);
   const reloadQueued = useRef(false);
+  const reloadTimer = useRef<number | null>(null);
+  const ledgerTimer = useRef<number | null>(null);
   const reload = useCallback(async () => {
+    if (reloadTimer.current !== null) {
+      window.clearTimeout(reloadTimer.current);
+      reloadTimer.current = null;
+    }
     if (reloadInFlight.current) {
       reloadQueued.current = true;
       return reloadInFlight.current;
     }
     const runOnce = async () => {
       try {
-        const [d, l] = await Promise.all([api.run(id), api.ledger(id)]);
+        const [d] = await Promise.all([api.run(id), fetchLedger()]);
         setDetail(d);
-        setLedger(l);
         setError(null);
       } catch (err) {
         setError(err);
@@ -756,7 +780,34 @@ export function useRun(id: string): RunData {
     });
     reloadInFlight.current = p;
     return p;
-  }, [id, reloadNotes, setDetail]);
+  }, [id, reloadNotes, setDetail, fetchLedger]);
+
+  const scheduleReload = useCallback(() => {
+    if (reloadTimer.current !== null) return;
+    reloadTimer.current = window.setTimeout(() => {
+      reloadTimer.current = null;
+      void reload();
+    }, 100);
+  }, [reload]);
+
+  const scheduleLedger = useCallback(() => {
+    if (ledgerTimer.current !== null) return;
+    ledgerTimer.current = window.setTimeout(() => {
+      ledgerTimer.current = null;
+      void fetchLedger().catch(() => undefined);
+    }, 100);
+  }, [fetchLedger]);
+
+  useEffect(
+    () => () => {
+      if (reloadTimer.current !== null) window.clearTimeout(reloadTimer.current);
+      if (ledgerTimer.current !== null) window.clearTimeout(ledgerTimer.current);
+      reloadTimer.current = null;
+      ledgerTimer.current = null;
+      ledgerRef.current = null;
+    },
+    [id],
+  );
 
   // Flush streamed entries on the very next display frame (zero artificial throttle) so
   // high-refresh displays render smoothly with at most one React commit per frame.
@@ -812,13 +863,13 @@ export function useRun(id: string): RunData {
             if (outcome === "passed") pageDone(id, page);
             else if (typeof outcome === "object" && "check_failed" in outcome) checksFailed(id, page, outcome.check_failed.errors);
           }
-          void reload();
+          scheduleReload();
         },
         agent: (entry) => {
           counts.current.entries += 1;
           push(entry);
-          // A finished call is in the ledger now: refresh the token split.
-          if (entry.kind === "end") api.ledger(id).then(setLedger, () => undefined);
+          // A finished call is in the ledger now: refresh only new ledger rows, coalesced.
+          if (entry.kind === "end") scheduleLedger();
         },
         idle: () => {
           stop.current = null;
@@ -830,7 +881,7 @@ export function useRun(id: string): RunData {
       },
       counts.current.entries,
     );
-  }, [id, reload, push]);
+  }, [id, reload, scheduleReload, scheduleLedger, push]);
 
   useEffect(() => {
     let stale = false;

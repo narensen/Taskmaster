@@ -1263,13 +1263,22 @@ export const api = {
   revokeDevice: (id: string) => call<{ ok: boolean }>("POST", `/api/devices/${enc(id)}/revoke`, {}),
   mintAgent: (label: string) => call<{ token: string; id: string; mcp_url: string }>("POST", "/api/devices/agent", { label }),
 
-  runs: () => call<{ runs: RunSummary[] }>("GET", "/api/runs").then((r) => r.runs),
+  runs: () => call<{ runs: RunSummary[]; seq?: number }>("GET", "/api/runs").then((r) => r.runs),
+  runsDelta: (since?: number) =>
+    call<{ runs: RunSummary[]; seq?: number; all_ids?: string[]; delta?: boolean }>(
+      "GET",
+      since !== undefined ? `/api/runs?since=${since}` : "/api/runs",
+    ),
   run: (id: string) => call<RunDetail>("GET", `/api/runs/${enc(id)}`),
   createRun: (body: NewRun) => call<{ id: string }>("POST", "/api/runs", body),
   createProject: (body: NewProject) => call<{ project: string; id?: string }>("POST", "/api/projects", body),
   events: (id: string, after = 0) =>
     call<{ next: number; events: RunEvent[] }>("GET", `/api/runs/${enc(id)}/events?after=${after}`),
-  ledger: (id: string) => call<{ totals: Totals; entries: LedgerEntry[] }>("GET", `/api/runs/${enc(id)}/ledger`),
+  ledger: (id: string, after?: number) =>
+    call<{ totals: Totals; entries: LedgerEntry[]; total_entries?: number; after?: number }>(
+      "GET",
+      after !== undefined ? `/api/runs/${enc(id)}/ledger?after=${after}` : `/api/runs/${enc(id)}/ledger`,
+    ),
   changes: (id: string) => call<{ changes: ChangeEntry[] }>("GET", `/api/runs/${enc(id)}/changes`).then((r) => r.changes),
   attempts: (id: string, page: string) =>
     call<{ attempts: Attempt[] }>("GET", `/api/runs/${enc(id)}/attempts/${enc(page)}`).then((r) => r.attempts),

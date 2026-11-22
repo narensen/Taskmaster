@@ -305,6 +305,7 @@ const TOC: { group: string; items: [string, string][] }[] = [
     items: [
       ["providers-for-each-role", "Providers for each role"],
       ["time-limit", "Agent time limit"],
+      ["settle", "Settling runs"],
       ["checker", "Mid-tier checker"],
       ["code-mode", "Code Mode"],
       ["scorecard", "Model scorecard"],
@@ -677,6 +678,55 @@ export function Settings() {
               ))}
             </select>
           </label>
+        </Section>
+      )}
+
+      {daemon.data && (
+        <Section
+          id="settle"
+          title="Settling runs"
+          note="Taskmaster moves a finished run to Settled on its own, on every device, once there is nothing left to do with it. Settling stops its preview and removes its leftover worktrees; a new message takes it out again. A run's menu can say Never."
+        >
+          <div className="row gap small" data-testid="settle-settings">
+            <label className="row gap">
+              <span className="muted">After a merge, wait</span>
+              <select
+                aria-label="Minutes after a merge"
+                value={String(daemon.data.settle?.after_merge_mins ?? 60)}
+                onChange={(e) =>
+                  void api.setSettle({ settle_after_merge_mins: Number(e.target.value) }).then(
+                    (next) => daemon.setData(next),
+                    (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                  )
+                }
+              >
+                {[0, 15, 60, 240, 1440].map((m) => (
+                  <option key={m} value={m}>
+                    {m === 0 ? "no time" : m < 60 ? `${m} minutes` : m === 60 ? "1 hour" : m < 1440 ? `${m / 60} hours` : "1 day"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="row gap">
+              <span className="muted">Settle any run idle for</span>
+              <select
+                aria-label="Days idle"
+                value={String(daemon.data.settle?.idle_days ?? 7)}
+                onChange={(e) =>
+                  void api.setSettle({ settle_idle_days: Number(e.target.value) }).then(
+                    (next) => daemon.setData(next),
+                    (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                  )
+                }
+              >
+                {[0, 1, 3, 7, 14, 30].map((d) => (
+                  <option key={d} value={d}>
+                    {d === 0 ? "never" : d === 1 ? "1 day" : `${d} days`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
         </Section>
       )}
 

@@ -19,7 +19,7 @@ import { Link, navigate } from "../router";
 import { ExternalLink } from "../paths";
 import { approvalLabel, isUnpriced, phaseLabel, tokens, usd } from "../format";
 import { isRunUnread, markRunSeen, motionOn, prefs, setPrefs, usePrefs } from "../prefs";
-import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
+import { byRecent, flagsOf, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
 import { consumeCloneRequest } from "../commands";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
@@ -109,7 +109,7 @@ function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: num
   const card = useRef<HTMLElement>(null);
   const { shot, prompt } = useShot(run, useSeen(card));
   const p = usePrefs();
-  const flags = p.runFlags[run.id] ?? {};
+  const flags = flagsOf(run);
   const unread = isRunUnread(run, p.seenRuns);
   const needsYou = !!run.needs_you || (run.pending_approvals ?? 0) > 0 || run.phase === "awaiting_approval";
   return (
@@ -157,11 +157,11 @@ function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: num
           </div>
         </div>
         <div className="card-actions">
-          <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
+          <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run, "pinned")}>
             {flags.pinned ? <PinOff size={14} aria-hidden /> : <Pin size={14} aria-hidden />}
             <span className="sr-only">{flags.pinned ? "unpin" : "pin"}</span>
           </button>
-          <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
+          <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run, "archived")}>
             {flags.archived ? <ArchiveRestore size={14} aria-hidden /> : <Archive size={14} aria-hidden />}
             <span className="sr-only">{flags.archived ? "unarchive" : "archive"}</span>
           </button>

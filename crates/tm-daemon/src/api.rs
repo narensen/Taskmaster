@@ -148,6 +148,7 @@ mod connect;
 mod desk;
 mod hosts;
 mod ops;
+mod settle;
 mod setup;
 mod skills;
 mod studio;
@@ -372,6 +373,7 @@ impl Server {
             idempotency: Mutex::new(HashMap::new()),
         });
         app.close_interrupted_reviews();
+        settle::spawn_sweeper(Arc::downgrade(&app));
         let (tx, rx) = oneshot::channel();
         let router = router(app.clone());
         let task = tokio::spawn(async move {
@@ -401,6 +403,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/reject", post(reject_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/flags", post(settle::set_flags))
         .route("/api/runs/{id}/undo", post(undo_run))
         .route("/api/runs/{id}/workers/{page}/restart", post(restart_worker))
         .route("/api/search", get(web_search))
@@ -932,6 +935,7 @@ impl App {
             "mode": request.as_ref().map(|r| r.mode),
             "permission_mode": request.as_ref().and_then(|r| r.permission_mode),
             "goal": self.records().goal(id).ok().flatten(),
+            "flags": self.run_flags(id),
             "started_at": started_at,
             "last_at": last_at,
             "cancelled": cancelled,
@@ -1031,6 +1035,7 @@ impl App {
         self.previews.stop(id);
         self.summary_cache.lock().unwrap().remove(&(self.project(), id.to_string()));
         active.insert(id.to_string(), Active { cancel, cancel_mode, budget_usd, worker_restarts, in_place });
+        self.unsettle_on_start(id);
         drop(active);
 
         let app = self.clone();
@@ -1061,6 +1066,13 @@ impl App {
             // A note (from a person or from an unmet goal) wakes the next turn now.
             if let Err(err) = app.wake_for_note(&id) {
                 eprintln!("taskmaster: run {id}: a note was not picked up: {}", err.1);
+            }
+            // A8: a run that has nothing left to do settles itself (the sweep asks gh about
+            // pull requests; this does not).
+            if !app.is_active(&id) {
+                let settler = app.clone();
+                let run = id.clone();
+                let _ = tokio::task::spawn_blocking(move || settler.auto_settle(&run, false)).await;
             }
         });
         Ok(())

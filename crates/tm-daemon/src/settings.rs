@@ -47,6 +47,8 @@ pub struct Settings {
     pub web_access: crate::web_access::WebAccessSettings,
     /// Provider usage meter settings (O4). OAuth polling is opt-in and off by default.
     pub usage: UsageSettings,
+    /// When the daemon settles finished runs on its own (A8).
+    pub settle: crate::settling::SettleSettings,
     /// Dollars per million tokens, by model id or harness id, for calls whose harness
     /// reports no price. Grok's are built in (see [`built_in_prices`]).
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,

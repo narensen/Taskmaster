@@ -438,6 +438,14 @@ impl Records {
         self.save(&format!("runs/{run}/plan.json"), plan)
     }
 
+    pub fn flags(&self, run: &str) -> anyhow::Result<Option<crate::settling::RunFlags>> {
+        self.load(&format!("runs/{run}/flags.json"))
+    }
+
+    pub fn save_flags(&self, run: &str, flags: &crate::settling::RunFlags) -> anyhow::Result<()> {
+        self.save(&format!("runs/{run}/flags.json"), flags)
+    }
+
     pub fn goal(&self, run: &str) -> anyhow::Result<Option<crate::goals::GoalProgress>> {
         self.load(&format!("runs/{run}/goal.json"))
     }

@@ -195,6 +195,22 @@ export interface RunSummary {
   permission_mode?: PermissionMode | null;
   /** The goal checked after each turn, and how far it got (A4). */
   goal?: GoalProgress | null;
+  /** Pin, Settle and Archive, kept by the daemon so every device agrees (A8). */
+  flags?: ServerRunFlags;
+}
+
+/** A run's flags on the daemon (A8). Missing fields are false. */
+export interface ServerRunFlags {
+  pinned?: boolean;
+  settled?: boolean;
+  archived?: boolean;
+  /** The daemon never settles this run on its own. */
+  never_settle?: boolean;
+  /** `you` or `taskmaster`, and why. */
+  settled_by?: "you" | "taskmaster";
+  settled_reason?: string;
+  settled_at?: string;
+  pr_url?: string;
 }
 
 /** One match from searching inside runs (A7). */
@@ -702,6 +718,8 @@ export interface DaemonSettings {
   telemetry?: { enabled: boolean };
   /** Seconds one agent call may run; 0 is no limit. */
   agents?: { timeout_secs: number; budget_usd?: number };
+  /** When the daemon settles finished runs on its own (A8). */
+  settle?: { after_merge_mins: number; idle_days: number };
 }
 
 export type ApprovalMode = "always" | "risky" | "never";
@@ -1474,6 +1492,8 @@ export const api = {
       older_calls?: OlderCallSummary[];
     }>("GET", `/api/runs/${enc(id)}/agents?${params}`);
   },
+  setRunFlags: (id: string, flags: { pinned?: boolean; settled?: boolean; archived?: boolean; never_settle?: boolean }) =>
+    call<{ flags: ServerRunFlags }>("POST", `/api/runs/${enc(id)}/flags`, flags).then((r) => r.flags),
   /** Words from the project's runs (A7): each hit names the run, the entry, the agent and the turn. */
   searchRuns: (q: string, limit = 20) =>
     call<{ hits: RunSearchHit[] }>("GET", `/api/search/runs?q=${encodeURIComponent(q)}&limit=${limit}`).then((r) => r.hits),
@@ -1535,6 +1555,7 @@ export const api = {
   setSandbox: (change: { shell?: boolean; package_indexes?: boolean }) => call<DaemonSettings>("POST", "/api/settings", { sandbox: change }),
   setTelemetry: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { telemetry: enabled }),
   setAgentTimeout: (secs: number) => call<DaemonSettings>("POST", "/api/settings", { agent_timeout_secs: secs }),
+  setSettle: (body: { settle_after_merge_mins?: number; settle_idle_days?: number }) => call<DaemonSettings>("POST", "/api/settings", body),
   logs: () => call<{ path: string | null; lines: string[] }>("GET", "/api/logs"),
   exportSettings: () => call<{ settings: Record<string, unknown>; note: string }>("GET", "/api/settings/export"),
   importSettings: (settings: unknown) => call<DaemonSettings>("POST", "/api/settings/import", { settings }),

@@ -124,20 +124,52 @@ test("a merged run is undone from its header after one confirm, and says so afte
   }
 });
 
-test("Ctrl+K finds words an agent said and opens the run at them, marked", async ({ openFixture, page, daemon }) => {
+test("Ctrl+K finds words said in a run and opens the run at them, marked", async ({ openFixture, page, daemon }) => {
   test.setTimeout(60_000);
-  await finishedRun(daemon.fixture!, "said-search", "A bookshop with a cart");
+  const fixture = daemon.fixture!;
+  await finishedRun(fixture, "said-search", "A bookshop with a cart");
+  // A follow-up only this run has, so the search is about this run whatever else ran.
+  const headers = { "content-type": "application/json", authorization: `Bearer ${fixture.token}` };
+  const noted = await fetch(`${fixture.url}/api/runs/said-search/notes`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ to: "master", text: "Paint the zebrafish banner teal", mode: "agent" }),
+  });
+  expect(noted.status).toBe(200);
+  await expect
+    .poll(async () => (await (await fetch(`${fixture.url}/api/runs/said-search`, { headers })).json()).active, { timeout: 30_000 })
+    .toBe(false);
   await openFixture("/");
   await page.keyboard.press("Control+k");
   const palette = page.getByRole("dialog", { name: "Command palette" });
   await expect(palette).toBeVisible();
-  await page.keyboard.type("stays mask");
-  const hit = palette.getByTestId("palette-said").filter({ hasText: "stays masked" }).first();
+  await page.keyboard.type("zebrafis");
+  const hit = palette.getByTestId("palette-said").filter({ hasText: "zebrafish banner" }).first();
   await expect(hit).toBeVisible();
   await expect(hit).toContainText("A bookshop with a cart");
+  await expect(hit).toContainText("turn 2");
   await hit.click();
   await page.waitForURL(/\/runs\/said-search$/);
-  // The agent that said it is open, and its words are marked.
   await expect.poll(() => page.evaluate(() => (CSS as unknown as { highlights?: Map<string, Set<unknown>> }).highlights?.get("run-hit")?.size ?? 0)).toBeGreaterThan(0);
-  await expect(page.locator(".agent-card.focused")).toContainText("stays masked");
+});
+
+test("Settle lives on the daemon: a cleared browser still shows the run settled", async ({ openFixture, page, daemon }) => {
+  test.setTimeout(60_000);
+  await finishedRun(daemon.fixture!, "flag-run", "A page to settle");
+  await openFixture("/");
+  const row = page.locator(".runrow", { hasText: "flag-run" });
+  await expect(row).toBeVisible();
+  await row.hover();
+  await row.getByRole("button", { name: "Settle" }).click();
+  await expect(row).toHaveClass(/settled/);
+  const headers = { authorization: `Bearer ${daemon.fixture!.token}` };
+  const run = await (await fetch(`${daemon.fixture!.url}/api/runs/flag-run`, { headers })).json();
+  expect(run.flags).toMatchObject({ settled: true, settled_by: "you" });
+  // Another device has none of this browser's prefs.
+  await page.evaluate(() => localStorage.removeItem("taskmaster.prefs"));
+  await page.reload();
+  await expect(page.locator(".runrow", { hasText: "flag-run" })).toHaveClass(/settled/);
+  await page.locator(".runrow", { hasText: "flag-run" }).hover();
+  await page.locator(".runrow", { hasText: "flag-run" }).getByRole("button", { name: "Unsettle" }).click();
+  await expect(page.locator(".runrow", { hasText: "flag-run" })).not.toHaveClass(/settled/);
 });

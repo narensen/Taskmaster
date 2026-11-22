@@ -175,10 +175,6 @@ export function rememberRun(id: string) {
   setPrefs((p) => ({ recentRuns: { ...p.recentRuns, [id]: Date.now() } }));
 }
 
-export function setRunFlag(id: string, flag: keyof RunFlags, value: boolean) {
-  setPrefs((p) => ({ runFlags: { ...p.runFlags, [id]: { ...p.runFlags[id], [flag]: value } } }));
-}
-
 /** Whether animation should run: the system setting and the switch in Settings. */
 export function useMotion(): boolean {
   const { motion } = usePrefs();

@@ -2,15 +2,22 @@
 // way in the sidebar, the gallery, the palette and Command-1 to Command-9.
 
 import { createContext, useContext } from "react";
-import type { RunSummary } from "./api";
-import { undoable } from "./overlay";
-import { prefs, setRunFlag, type RunFlags } from "./prefs";
+import { api, type RunSummary, type ServerRunFlags } from "./api";
+import { toast, undoable } from "./overlay";
+import { prefs, setPrefs, type RunFlags } from "./prefs";
 
 export type Group = "Needs you" | "Working" | "Pinned" | "Runs" | "Settled" | "Archived";
 
 export const WORKING = new Set(["planning", "building", "reviewing", "verifying"]);
 
-export function groupOf(run: RunSummary, flags: RunFlags | undefined): Group {
+/** A run's flags: the daemon's (A8). A browser's own flags from before count until they move up. */
+export function flagsOf(run: RunSummary): ServerRunFlags {
+  const server = run.flags;
+  if (server && Object.keys(server).length) return server;
+  return prefs().runFlags[run.id] ?? server ?? {};
+}
+
+export function groupOf(run: RunSummary, flags: ServerRunFlags | RunFlags | undefined = flagsOf(run)): Group {
   if (flags?.archived) return "Archived";
   if (run.needs_you || (run.pending_approvals ?? 0) > 0 || run.phase === "awaiting_approval") return "Needs you";
   if (WORKING.has(run.phase) && run.active) return "Working";
@@ -23,9 +30,8 @@ const ORDER: Group[] = ["Needs you", "Working", "Pinned", "Runs", "Settled", "Ar
 
 /** Runs in the order they are shown, with their group. Archived ones only when asked. */
 export function ordered(runs: RunSummary[], showArchived: boolean): { run: RunSummary; group: Group }[] {
-  const flags = prefs().runFlags;
   return runs
-    .map((run) => ({ run, group: groupOf(run, flags[run.id]) }))
+    .map((run) => ({ run, group: groupOf(run) }))
     .filter((x) => showArchived || x.group !== "Archived")
     .sort((a, b) => ORDER.indexOf(a.group) - ORDER.indexOf(b.group) || b.run.id.localeCompare(a.run.id));
 }
@@ -37,17 +43,56 @@ export function byRecent(list: { run: RunSummary; group: Group }[]): { run: RunS
   return [...list].sort((a, b) => (recent[b.run.id] ?? 0) - (recent[a.run.id] ?? 0) || list.indexOf(a) - list.indexOf(b));
 }
 
-const VERB: Record<keyof RunFlags, [string, string]> = {
+type Flag = "pinned" | "settled" | "archived" | "never_settle";
+
+const VERB: Record<Flag, [string, string]> = {
   pinned: ["Pinned", "Unpinned"],
   settled: ["Settled", "Unsettled"],
   archived: ["Archived", "Unarchived"],
+  never_settle: ["Taskmaster will not settle", "Taskmaster may settle"],
 };
 
-/** Flip a flag, with Undo for five seconds. */
-export function toggleFlag(id: string, flag: keyof RunFlags) {
-  const before = !!prefs().runFlags[id]?.[flag];
-  setRunFlag(id, flag, !before);
-  undoable(`${VERB[flag][before ? 1 : 0]} ${id}`, () => setRunFlag(id, flag, before));
+let reloadRuns: () => void = () => {};
+/** The shell's run list registers how to reload it, so a flag change shows at once. */
+export function setRunsReloader(fn: () => void) {
+  reloadRuns = fn;
+}
+
+async function setFlag(id: string, flag: Flag, value: boolean) {
+  try {
+    await api.setRunFlags(id, { [flag]: value });
+  } catch (err) {
+    toast("The run was not changed", err instanceof Error ? err.message : String(err));
+  }
+  reloadRuns();
+}
+
+/** Flip a flag on the daemon, with Undo for five seconds. */
+export function toggleFlag(run: RunSummary, flag: Flag) {
+  const before = !!flagsOf(run)[flag];
+  void setFlag(run.id, flag, !before);
+  undoable(`${VERB[flag][before ? 1 : 0]} ${run.id}`, () => void setFlag(run.id, flag, before));
+}
+
+/** Move this browser's flags from before A8 up to the daemon, once per run it knows. */
+let migrating = false;
+export function migrateLocalFlags(runs: RunSummary[]) {
+  const local = prefs().runFlags;
+  const ids = Object.keys(local).filter((id) => runs.some((r) => r.id === id));
+  if (!ids.length || migrating) return;
+  migrating = true;
+  void Promise.all(
+    ids.map((id) => {
+      const mine = local[id] ?? {};
+      const theirs = runs.find((r) => r.id === id)?.flags ?? {};
+      const missing = Object.fromEntries((["pinned", "settled", "archived"] as const).filter((f) => mine[f] && !theirs[f]).map((f) => [f, true]));
+      return Object.keys(missing).length ? api.setRunFlags(id, missing).catch(() => null) : null;
+    }),
+  ).then(() => {
+    setPrefs((p) => ({ runFlags: Object.fromEntries(Object.entries(p.runFlags).filter(([id]) => !ids.includes(id))) }));
+    migrating = false;
+    reloadRuns();
+  });
 }
 
 export interface RunsState {

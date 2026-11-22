@@ -926,7 +926,11 @@ pub async fn open_pr(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) 
     .await
     .unwrap_or_else(|_| Err("stopped".into()));
     match made {
-        Ok(url) => ok(json!({ "url": url })),
+        Ok(url) => {
+            // A8: the pull request's merge settles the run.
+            app.remember_pr(&id, &url);
+            ok(json!({ "url": url }))
+        }
         Err(err) => Err(fail(StatusCode::CONFLICT, err)),
     }
 }
@@ -1740,6 +1744,10 @@ pub struct SettingsBody {
     warm_idle_secs: Option<u64>,
     /// Opt-in OAuth usage polling (O4). Off by default.
     usage_oauth_polling: Option<bool>,
+    /// A8: minutes a merged run stays out before it settles itself.
+    settle_after_merge_mins: Option<u32>,
+    /// A8: days with no activity before a finished run settles itself; 0 is off.
+    settle_idle_days: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1830,6 +1838,18 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
             return Err(fail(StatusCode::BAD_REQUEST, "warm_idle_secs is at most 86400"));
         }
         save_setting(&app.project(), "agents", json!({ "warm_idle_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(mins) = body.settle_after_merge_mins {
+        if mins > 30 * 24 * 60 {
+            return Err(fail(StatusCode::BAD_REQUEST, "settle_after_merge_mins is at most 43200 (30 days)"));
+        }
+        save_setting(&app.project(), "settle", json!({ "after_merge_mins": mins })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(days) = body.settle_idle_days {
+        if days > 365 {
+            return Err(fail(StatusCode::BAD_REQUEST, "settle_idle_days is at most 365"));
+        }
+        save_setting(&app.project(), "settle", json!({ "idle_days": days })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if let Some(on) = body.usage_oauth_polling {
         save_setting(&app.project(), "usage", json!({ "oauth_polling": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1922,6 +1942,10 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         },
         "usage": {
             "oauth_polling": role_defaults.usage.oauth_polling,
+        },
+        "settle": {
+            "after_merge_mins": role_defaults.settle.after_merge_mins,
+            "idle_days": role_defaults.settle.idle_days,
         },
         "web_access": {
             "enabled": role_defaults.web_access.enabled,

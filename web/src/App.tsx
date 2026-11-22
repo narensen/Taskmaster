@@ -34,7 +34,7 @@ import { ContextMenu, Toasts, emit, openMenu, toast, undoLatest, useOn, type Chi
 import type { PaletteState } from "./palette";
 import { openProject } from "./openProject";
 import { isRunUnread, markRunSeen, prefs, setPrefs, useMotion, usePrefs } from "./prefs";
-import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
+import { RunsContext, flagsOf, migrateLocalFlags, ordered, setRunsReloader, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan, usd } from "./format";
 import { readFile } from "./composer";
 import { typing } from "./keys";
@@ -304,20 +304,24 @@ const RunRow = memo(function RunRow({
   onPick: () => void;
 }) {
   const p = usePrefs();
-  const flags = p.runFlags[run.id] ?? {};
+  const flags = flagsOf(run);
   const unread = !on && isRunUnread(run, p.seenRuns);
   const menu = (x: number, y: number) =>
     openMenu(x, y, [
-      { label: flags.pinned ? "Unpin" : "Pin", run: () => toggleFlag(run.id, "pinned") },
-      { label: flags.settled ? "Unsettle" : "Settle", run: () => toggleFlag(run.id, "settled") },
-      { label: flags.archived ? "Unarchive" : "Archive", run: () => toggleFlag(run.id, "archived") },
+      { label: flags.pinned ? "Unpin" : "Pin", run: () => toggleFlag(run, "pinned") },
+      { label: flags.settled ? "Unsettle" : "Settle", run: () => toggleFlag(run, "settled") },
+      { label: flags.archived ? "Unarchive" : "Archive", run: () => toggleFlag(run, "archived") },
+      {
+        label: flags.never_settle ? "Let Taskmaster settle it" : "Never settle on its own",
+        run: () => toggleFlag(run, "never_settle"),
+      },
     ]);
   return (
     <div
       className={`runrow ${on ? "on" : ""} ${group === "Needs you" ? "ask" : ""} ${group === "Settled" ? "settled" : ""} ${unread ? "unread" : ""}`}
       data-unread={unread ? "true" : undefined}
       data-run-state={run.state}
-      title={run.state_reason}
+      title={flags.settled && flags.settled_reason ? `Settled by Taskmaster: ${flags.settled_reason}` : run.state_reason}
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
       onDrop={(e) => {
         if (e.dataTransfer.files.length) {
@@ -358,13 +362,13 @@ const RunRow = memo(function RunRow({
         </span>
       </Link>
       <span className="runrow-actions">
-        <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run.id, "pinned")}>
+        <button className="icon" title={flags.pinned ? "Unpin" : "Pin"} aria-label={flags.pinned ? "Unpin" : "Pin"} onClick={() => toggleFlag(run, "pinned")}>
           {flags.pinned ? <PinOff size={13} /> : <Pin size={13} />}
         </button>
-        <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run.id, "settled")}>
+        <button className="icon" title={flags.settled ? "Unsettle" : "Settle"} aria-label={flags.settled ? "Unsettle" : "Settle"} onClick={() => toggleFlag(run, "settled")}>
           {flags.settled ? <CircleCheck size={13} /> : <Circle size={13} />}
         </button>
-        <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run.id, "archived")}>
+        <button className="icon" title={flags.archived ? "Unarchive" : "Archive"} aria-label={flags.archived ? "Unarchive" : "Archive"} onClick={() => toggleFlag(run, "archived")}>
           {flags.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
         </button>
       </span>
@@ -564,6 +568,12 @@ function useRuns(signedIn: boolean) {
   }, [signedIn, fetchRuns]);
 
   const reload = useCallback(() => fetchRuns(true), [fetchRuns]);
+  // A8: flags live on the daemon. A toggle reloads the list, and this browser's flags from
+  // before move up once the runs they name are listed.
+  useEffect(() => setRunsReloader(reload), [reload]);
+  useEffect(() => {
+    if (data.length) migrateLocalFlags(data);
+  }, [data]);
   return { data, reload };
 }
 

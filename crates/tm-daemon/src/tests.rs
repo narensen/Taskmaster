@@ -2647,6 +2647,70 @@ mod http {
         assert_eq!(client.get("/api/search/runs?q=a").await.1["hits"], json!([]), "too short to search");
     }
 
+    /// Poll a run until its flags say `settled` is `want`.
+    async fn flags_settle(client: &Client, id: &str, want: bool) -> Value {
+        for _ in 0..400 {
+            let (_, run) = client.get(&format!("/api/runs/{id}")).await;
+            if run["active"] == false && run["flags"]["settled"].as_bool().unwrap_or(false) == want {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("run {id} never had settled = {want}: {}", client.get(&format!("/api/runs/{id}")).await.1);
+    }
+
+    #[tokio::test]
+    async fn a_merged_run_settles_itself_unless_set_to_never_and_flags_live_on_the_daemon() {
+        let tmp = seeded("api-settle");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        // Settle merged runs at once, for the test; the default waits an hour.
+        assert_eq!(client.post("/api/settings", json!({ "settle_after_merge_mins": 0 })).await.0, 200);
+        assert_eq!(client.get("/api/settings").await.1["settle"], json!({ "after_merge_mins": 0, "idle_days": 7 }));
+
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "merged", "plan": planned, "yes": true })).await;
+        let run = flags_settle(&client, "merged", true).await;
+        assert_eq!(run["merged"], true);
+        assert_eq!((run["flags"]["settled_by"].as_str(), run["flags"]["settled_reason"].as_str()), (Some("taskmaster"), Some("merged")));
+        // The run list carries the same flags, so every device groups it the same way.
+        let listed = client.get("/api/runs").await.1;
+        let row = listed["runs"].as_array().unwrap().iter().find(|r| r["id"] == "merged").unwrap().clone();
+        assert_eq!(row["flags"]["settled"], true, "{row}");
+
+        // A run set to Never before it finishes stays out of Settled.
+        let planned = serde_json::to_value(plan(&[("b", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "kept", "plan": planned })).await;
+        for _ in 0..400 {
+            if client.get("/api/runs/kept").await.1["phase"] == "awaiting_approval" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let (status, set) = client.post("/api/runs/kept/flags", json!({ "never_settle": true, "pinned": true })).await;
+        assert_eq!(status, 200, "{set}");
+        assert_eq!(client.post("/api/runs/kept/approve", json!({})).await.0, 202);
+        let kept = client.settled("kept", "done").await;
+        assert_eq!(kept["merged"], true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let kept = client.get("/api/runs/kept").await.1;
+        assert_eq!(kept["flags"], json!({ "pinned": true, "never_settle": true }), "{kept}");
+
+        // Settling by hand removes the run's leftover worktrees; unsettling clears who and why.
+        let leftover = crate::git::worktree_dir(&tmp.0, "kept", "leftover");
+        git(&tmp.0, &["worktree", "add", "--detach", leftover.to_str().unwrap(), "HEAD"]);
+        assert!(leftover.is_dir());
+        let (_, set) = client.post("/api/runs/kept/flags", json!({ "settled": true })).await;
+        assert_eq!((set["flags"]["settled"].as_bool(), set["flags"]["settled_by"].as_str()), (Some(true), Some("you")));
+        assert!(!leftover.exists(), "the leftover worktree is removed");
+        assert!(!git_out(&tmp.0, &["worktree", "list"]).contains("leftover"));
+        let (_, set) = client.post("/api/runs/kept/flags", json!({ "settled": false, "archived": true })).await;
+        assert_eq!(set["flags"], json!({ "pinned": true, "archived": true, "never_settle": true }));
+        assert_eq!(client.post("/api/runs/nope/flags", json!({ "pinned": true })).await.0, 404);
+    }
+
     #[tokio::test]
     async fn paths_resolve_from_the_project_and_open_in_an_editor() {
         let tmp = repo("api-paths");

@@ -584,6 +584,30 @@ export interface AgentEntry {
   source?: string;
   path?: string;
   injection_flagged?: boolean;
+  /** P5: oversized (>2 KiB) output body omitted from the wire; fetch via `GET /api/runs/{id}/agents/{body_index}`. */
+  body_omitted?: boolean;
+  body_index?: number;
+  text_bytes?: number;
+  diff_bytes?: number;
+}
+
+export interface OlderCallSummary {
+  agent: AgentTag;
+  call: number;
+  start_index: number;
+  end_index: number;
+  entries: number;
+  ok: boolean | null;
+  seconds: number | null;
+}
+
+export interface CommandOutputFrame {
+  mode: "append" | "replace";
+  chunk?: string;
+  text?: string;
+  next_offset: number;
+  bytes: number;
+  truncated?: boolean;
 }
 
 export interface Note {
@@ -1333,8 +1357,26 @@ export const api = {
   errorography: () => call<Book>("GET", "/api/errorography"),
   scorecard: () => call<ModelScorecard>("GET", "/api/scorecard"),
 
-  agents: (id: string, after = 0) =>
-    call<{ next: number; entries: AgentEntry[] }>("GET", `/api/runs/${enc(id)}/agents?after=${after}`),
+  agents: (id: string, after = 0, opts?: { window?: "recent"; before?: number; stub?: boolean }) => {
+    const params = new URLSearchParams();
+    if (opts?.window) params.set("window", opts.window);
+    else if (opts?.before !== undefined) params.set("before", String(opts.before));
+    else params.set("after", String(after));
+    if (opts?.stub) params.set("stub", "1");
+    return call<{
+      next: number;
+      entries: AgentEntry[];
+      window_start?: number;
+      window_end?: number;
+      has_older?: boolean;
+      older_calls?: OlderCallSummary[];
+    }>("GET", `/api/runs/${enc(id)}/agents?${params}`);
+  },
+  agentEntry: (id: string, index: number) =>
+    call<{ index: number; text: string | null; diff: string | null; entry: AgentEntry }>(
+      "GET",
+      `/api/runs/${enc(id)}/agents/${index}`,
+    ),
   notes: (id: string) => call<{ notes: Note[] }>("GET", `/api/runs/${enc(id)}/notes`).then((r) => r.notes),
   addNote: (id: string, to: string, text: string, mode?: RunMode) =>
     call<Note>("POST", `/api/runs/${enc(id)}/notes`, mode ? { to, text, mode } : { to, text }),
@@ -1546,6 +1588,30 @@ export function followTerminal(
   });
   source.onerror = () => {
     if (source.readyState === EventSource.CLOSED) on.lost();
+  };
+  return () => source.close();
+}
+
+/** Per-row throttled live command output stream (100ms frames, 16 KiB append then tail replace, P5). */
+export function followCommandOutput(
+  runId: string,
+  toolId: string,
+  on: { frame: (frame: CommandOutputFrame) => void; done?: () => void },
+): () => void {
+  const params = new URLSearchParams({ tool_id: toolId });
+  const bearer = token();
+  if (bearer) params.set("token", bearer);
+  const source = new EventSource(`${server()}/api/runs/${enc(runId)}/output/stream?${params}`);
+  source.addEventListener("output", (message) => {
+    const frame = JSON.parse((message as MessageEvent<string>).data) as CommandOutputFrame;
+    on.frame(frame);
+  });
+  source.addEventListener("done", () => {
+    source.close();
+    on.done?.();
+  });
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) on.done?.();
   };
   return () => source.close();
 }

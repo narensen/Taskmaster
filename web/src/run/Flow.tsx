@@ -21,7 +21,7 @@ import {
   Square,
   SquareTerminal,
 } from "lucide-react";
-import type { DiffStat, DiffStats, Phase, Plan, RunDetail, ToolApproval } from "../api";
+import { api, followCommandOutput, type DiffStat, type DiffStats, type Phase, type Plan, type RunDetail, type ToolApproval } from "../api";
 import { tokens, usd } from "../format";
 import { KnownPath, Rich, looksLikePath } from "../paths";
 import { GlobFiles } from "./GlobFiles";
@@ -257,19 +257,77 @@ const DraftingPlan = memo(function DraftingPlan({ draft }: { draft: DraftPlan })
   );
 });
 
-const Step = memo(function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null; force: boolean }) {
+const Step = memo(function Step({
+  runId,
+  item,
+  seconds,
+  force,
+  running,
+}: {
+  runId: string;
+  item: ToolItem;
+  seconds: string | null;
+  force: boolean;
+  running?: boolean;
+}) {
   const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState<{ text?: string | null; diff?: string | null } | null>(null);
+  const [loadingBody, setLoadingBody] = useState(false);
+  const [liveOutput, setLiveOutput] = useState<string>("");
   const shown = force || open;
   const { label, kind } = verbOf(item.name);
   const target = item.target ?? "";
   const head = target.split(/\s+/)[0] ?? "";
-  const hasBody = item.input !== undefined || !!item.output || !!item.diff;
+  const hasBody = item.input !== undefined || !!item.output || !!item.diff || !!item.bodyOmitted || (!!running && !!item.id);
+
+  // P5: fetch oversized (>2 KiB) output body only when this step is expanded.
+  useEffect(() => {
+    if (!shown || !item.bodyOmitted || item.bodyIndex === undefined || loaded !== null) return;
+    let cancelled = false;
+    setLoadingBody(true);
+    api
+      .agentEntry(runId, item.bodyIndex)
+      .then((res) => {
+        if (!cancelled) setLoaded({ text: res.text, diff: res.diff });
+      })
+      .catch(() => {
+        if (!cancelled) setLoaded({ text: null, diff: null });
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingBody(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [shown, item.bodyOmitted, item.bodyIndex, loaded, runId]);
+
+  // P5: stream live command output only while this row is expanded (100ms throttled, 16 KiB cap).
+  useEffect(() => {
+    if (!shown || !running || !item.id || item.output || item.bodyOmitted) return;
+    return followCommandOutput(runId, item.id, {
+      frame: (frame) => {
+        if (frame.mode === "append" && frame.chunk) {
+          setLiveOutput((prev) => prev + frame.chunk);
+        } else if (frame.mode === "replace" && frame.text !== undefined) {
+          setLiveOutput(frame.text);
+        }
+      },
+    });
+  }, [shown, running, item.id, item.output, item.bodyOmitted, runId]);
+
+  const outputText = item.output ?? loaded?.text ?? (liveOutput || undefined);
+  const diffText = item.diff ?? loaded?.diff ?? undefined;
   const input =
     shown && item.input !== undefined
       ? typeof item.input === "string"
         ? item.input
         : JSON.stringify(item.input, null, 2)
       : "";
+  const sizeHint =
+    item.bodyOmitted && !loaded && (item.outputBytes || item.diffBytes)
+      ? `${Math.max(1, Math.round(((item.outputBytes ?? 0) + (item.diffBytes ?? 0)) / 1024))} KB`
+      : null;
+
   return (
     <div className={`step ${item.allowed === false ? "denied" : ""}`}>
       <button
@@ -285,16 +343,19 @@ const Step = memo(function Step({ item, seconds, force }: { item: ToolItem; seco
       <span className="step-target clip" title={target}>
         {target && looksLikePath(head) ? <KnownPath path={head} /> : target}
       </span>
-      <span className="step-dur">{item.allowed === false ? "refused" : (seconds ?? "")}</span>
-      {shown && (input || item.output || item.diff) && (
+      <span className="step-dur">
+        {item.allowed === false ? "refused" : sizeHint ? `${sizeHint}${seconds ? ` · ${seconds}` : ""}` : (seconds ?? "")}
+      </span>
+      {shown && (input || outputText || diffText || loadingBody) && (
         <div className="step-body">
           {input && <pre className="step-io">{input}</pre>}
-          {item.output && (
+          {loadingBody && <p className="flow-life">Loading output…</p>}
+          {outputText && (
             <pre className="step-io">
-              <Rich text={item.output} />
+              <Rich text={outputText} />
             </pre>
           )}
-          {item.diff && <pre className="step-io">{item.diff}</pre>}
+          {diffText && <pre className="step-io">{diffText}</pre>}
         </div>
       )}
     </div>
@@ -630,9 +691,11 @@ const VIRTUAL_STEPS_AFTER = 60;
 
 /** Lazy expanded activity inspector: only computed & mounted when the user clicks the headline. */
 const AgentActivity = memo(function AgentActivity({
+  runId,
   surface,
   force,
 }: {
+  runId: string;
   surface: Surface;
   force: boolean;
 }) {
@@ -686,9 +749,11 @@ const AgentActivity = memo(function AgentActivity({
     ) : row.item.t === "tool" ? (
       <Step
         key={row.key}
+        runId={runId}
         item={row.item}
         seconds={stepSeconds(row.call, row.index)}
         force={force}
+        running={!row.call.end}
       />
     ) : null;
 
@@ -969,7 +1034,7 @@ const AgentBlock = memo(function AgentBlock({
         </p>
       )}
 
-      {expanded && <AgentActivity surface={surface} force={false} />}
+      {expanded && <AgentActivity runId={detail.id} surface={surface} force={false} />}
 
       {master && (plan ?? (draft ? <DraftingPlan draft={draft} /> : null))}
       {ask}

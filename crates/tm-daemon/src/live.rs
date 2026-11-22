@@ -139,8 +139,132 @@ pub struct Live {
     writers: Mutex<HashMap<String, WriterHandle>>,
     calls: AtomicU64,
     hub: Arc<SignalHub>,
+    cmd_output: CommandOutputHub,
     /// Risky calls waiting for a person. Shared with every agent call of every run.
     pub approvals: Arc<crate::approvals::Approvals>,
+}
+
+/// Cap on live per-row command output before switching from append frames to tail replace (P5).
+pub const CMD_OUTPUT_CAP: usize = 16 * 1024;
+const MAX_CMD_BUFFERS: usize = 64;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CommandOutputFrame {
+    Append {
+        chunk: String,
+        next_offset: usize,
+        bytes: usize,
+    },
+    Replace {
+        text: String,
+        next_offset: usize,
+        bytes: usize,
+        truncated: bool,
+    },
+}
+
+struct CmdOutputBuf {
+    text: String,
+    total_bytes: usize,
+    truncated: bool,
+    seq: u64,
+    tx: watch::Sender<u64>,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct CommandOutputHub {
+    channels: Mutex<HashMap<(String, String), CmdOutputBuf>>,
+}
+
+impl CommandOutputHub {
+    fn push(&self, run: &str, tool_id: &str, chunk: &str) {
+        if chunk.is_empty() || tool_id.is_empty() {
+            return;
+        }
+        let mut map = self.channels.lock().unwrap();
+        if map.len() >= MAX_CMD_BUFFERS
+            && !map.contains_key(&(run.to_string(), tool_id.to_string()))
+            && let Some(oldest) = map.iter().min_by_key(|(_, b)| b.last_used).map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+        let entry = map.entry((run.to_string(), tool_id.to_string())).or_insert_with(|| {
+            let (tx, _) = watch::channel(0u64);
+            CmdOutputBuf {
+                text: String::new(),
+                total_bytes: 0,
+                truncated: false,
+                seq: 0,
+                tx,
+                last_used: Instant::now(),
+            }
+        });
+        entry.text.push_str(chunk);
+        entry.total_bytes = entry.total_bytes.saturating_add(chunk.len());
+        if entry.text.len() > CMD_OUTPUT_CAP {
+            let mut cut = entry.text.len() - CMD_OUTPUT_CAP;
+            while cut < entry.text.len() && !entry.text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            entry.text.drain(..cut);
+            entry.truncated = true;
+        }
+        entry.seq = entry.seq.saturating_add(1);
+        entry.last_used = Instant::now();
+        let seq = entry.seq;
+        let _ = entry.tx.send(seq);
+    }
+
+    fn subscribe(&self, run: &str, tool_id: &str) -> watch::Receiver<u64> {
+        let mut map = self.channels.lock().unwrap();
+        let entry = map.entry((run.to_string(), tool_id.to_string())).or_insert_with(|| {
+            let (tx, _) = watch::channel(0u64);
+            CmdOutputBuf {
+                text: String::new(),
+                total_bytes: 0,
+                truncated: false,
+                seq: 0,
+                tx,
+                last_used: Instant::now(),
+            }
+        });
+        entry.last_used = Instant::now();
+        entry.tx.subscribe()
+    }
+
+    fn frame(&self, run: &str, tool_id: &str, sent_offset: usize, sent_seq: u64) -> Option<(u64, CommandOutputFrame)> {
+        let map = self.channels.lock().unwrap();
+        let buf = map.get(&(run.to_string(), tool_id.to_string()))?;
+        if buf.seq == sent_seq && sent_offset >= buf.text.len() {
+            return None;
+        }
+        if !buf.truncated && sent_offset <= buf.text.len() && buf.text.is_char_boundary(sent_offset) {
+            let chunk = buf.text[sent_offset..].to_string();
+            if chunk.is_empty() {
+                return None;
+            }
+            Some((
+                buf.seq,
+                CommandOutputFrame::Append {
+                    chunk,
+                    next_offset: buf.text.len(),
+                    bytes: buf.total_bytes,
+                },
+            ))
+        } else {
+            Some((
+                buf.seq,
+                CommandOutputFrame::Replace {
+                    text: buf.text.clone(),
+                    next_offset: buf.text.len(),
+                    bytes: buf.total_bytes,
+                    truncated: buf.truncated,
+                },
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -167,6 +291,7 @@ impl Live {
             writers: Mutex::new(HashMap::new()),
             calls: AtomicU64::new(0),
             hub: Arc::new(SignalHub::new()),
+            cmd_output: CommandOutputHub::default(),
             approvals: Arc::default(),
         }
     }
@@ -219,9 +344,35 @@ impl Live {
         WriterHandle { tx, enqueued, flushed }
     }
 
+    /// Stream a live command output chunk into the per-row hub (P5) without writing it to the main SSE stream.
+    pub fn push_command_output(&self, run: &str, tool_id: &str, chunk: &str) {
+        self.cmd_output.push(run, tool_id, chunk);
+    }
+
+    pub fn subscribe_command_output(&self, run: &str, tool_id: &str) -> watch::Receiver<u64> {
+        self.cmd_output.subscribe(run, tool_id)
+    }
+
+    pub fn command_output_frame(
+        &self,
+        run: &str,
+        tool_id: &str,
+        sent_offset: usize,
+        sent_seq: u64,
+    ) -> Option<(u64, CommandOutputFrame)> {
+        self.cmd_output.frame(run, tool_id, sent_offset, sent_seq)
+    }
+
     /// Append one entry via this run's buffered writer. Never blocks the caller on disk I/O
     /// and never acquires the notes lock.
     pub fn push(&self, run: &str, agent: &Value, kind: &str, fields: Value) {
+        if kind == "output"
+            && let (Some(tool_id), Some(text)) = (fields["id"].as_str(), fields["text"].as_str())
+            && !tool_id.is_empty()
+            && !text.is_empty()
+        {
+            self.cmd_output.push(run, tool_id, text);
+        }
         let mut writers = self.writers.lock().unwrap();
         for _ in 0..2 {
             if !writers.contains_key(run) {
@@ -350,6 +501,13 @@ impl Live {
         }
 
         (total, result)
+    }
+
+    /// Read one transcript entry by index without cloning the rest of the transcript (P5).
+    pub fn read_at(&self, run: &str, index: usize) -> Option<Value> {
+        let _ = self.read(run, usize::MAX);
+        let cache = self.cache.lock().unwrap();
+        cache.get(run).and_then(|c| c.entries.get(index).cloned())
     }
 
     /// The run branch's last commit, kept when the branch is deleted after a merge, so

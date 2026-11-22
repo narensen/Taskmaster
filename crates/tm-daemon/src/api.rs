@@ -415,6 +415,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/review", post(review_run))
         .route("/api/commons/entries", get(commons_entries).post(commons_add))
         .route("/api/runs/{id}/agents", get(desk::agents))
+        .route("/api/runs/{id}/agents/{index}", get(desk::agent_entry))
+        .route("/api/runs/{id}/output/stream", get(desk::command_output_stream))
         .route("/api/runs/{id}/notes", get(desk::notes).post(desk::add_note))
         .route("/api/runs/{id}/notes/{note}", post(desk::edit_note))
         .route("/api/runs/{id}/terminal", post(desk::terminal))
@@ -1364,11 +1366,13 @@ async fn run_stream(
             }
 
             if read_agents {
-                let (agents_total, said) = feed.app.live.read(&feed.id, feed.agents_seen);
+                let start_idx = feed.agents_seen;
+                let (agents_total, said) = feed.app.live.read(&feed.id, start_idx);
                 feed.last_seq.agents = cur_seq.agents;
                 feed.last_agents_stat = feed.app.records().stat(&agents_key);
-                for entry in &said {
-                    feed.ready.push_back(SseEvent::default().event("agent").data(entry.to_string()));
+                for (offset, entry) in said.iter().enumerate() {
+                    let wire = desk::stub_large_output(entry, start_idx + offset);
+                    feed.ready.push_back(SseEvent::default().event("agent").data(wire.to_string()));
                 }
                 feed.agents_seen = agents_total.max(feed.agents_seen);
             }

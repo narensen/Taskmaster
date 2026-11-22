@@ -972,6 +972,21 @@ export function RunView({ id }: { id: string }) {
 
         {lens === "stream" && (
           <div className="run-thread">
+            {data.hasOlder && (
+              <div className="flow-earlier-bar" data-testid="load-older-bar">
+                <button
+                  type="button"
+                  className="ghost small"
+                  data-testid="load-older"
+                  disabled={data.loadingOlder}
+                  onClick={() => void data.loadOlder()}
+                >
+                  {data.loadingOlder
+                    ? "Loading earlier history…"
+                    : `Load earlier history (${data.olderCalls.length} earlier call${data.olderCalls.length === 1 ? "" : "s"})`}
+                </button>
+              </div>
+            )}
             {turns.slice(0, -1).map((t, i) => (
               <PastTurn key={t.n} turn={t} next={turns[i + 1]} entries={shown} detail={detail} ledger={ledgerEntries} />
             ))}

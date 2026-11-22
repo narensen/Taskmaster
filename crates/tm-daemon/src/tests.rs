@@ -4347,4 +4347,119 @@ async fn runs_delta_since_and_ledger_after_return_only_new_records() {
     drop(server);
 }
 
+#[tokio::test]
+async fn p5_window_recent_bounds_900_call_transcript_and_stubs_large_outputs() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call_raw(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+        let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+        (status, rest.to_string())
+    }
+
+    let tmp = seeded("p5-window");
+    let records = Records::files(&tmp.0);
+    let p = plan(&[("a", &[])]);
+    records.save_events("big", &[tm_core::Event::PlanReady(p)]).unwrap();
+
+    // Seed a 900-call transcript (> 2.5 MiB raw) plus a 50 KB output entry near the end.
+    let live = crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0)));
+    let padding = "x".repeat(2600);
+    for c in 1..=900u64 {
+        let tag = serde_json::json!({ "id": "page:a", "role": "worker", "page": "a", "call": c, "harness": "fixture" });
+        live.push("big", &tag, "start", serde_json::json!({}));
+        live.push("big", &tag, "text", serde_json::json!({ "text": format!("call {c} summary {padding}") }));
+        if c == 900 {
+            let huge = "L".repeat(52_000);
+            live.push("big", &tag, "tool", serde_json::json!({ "id": "t-huge", "name": "bash", "target": "cargo test" }));
+            live.push("big", &tag, "output", serde_json::json!({ "id": "t-huge", "text": huge }));
+        }
+        live.push("big", &tag, "end", serde_json::json!({ "ok": true }));
+    }
+    live.flush("big");
+
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired_raw) = call_raw(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let paired: serde_json::Value = serde_json::from_str(&paired_raw).unwrap();
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // 1) ?window=recent returns <= 1.2 MiB over the wire, never splits a call, and summarizes older calls.
+    let (st, win_raw) = call_raw(&addr, Some(&token), "GET", "/api/runs/big/agents?window=recent", None).await;
+    assert_eq!(st, 200);
+    assert!(
+        win_raw.len() <= 1_258_291,
+        "expected ?window=recent <= 1.2 MiB, got {} bytes",
+        win_raw.len()
+    );
+    let win: serde_json::Value = serde_json::from_str(&win_raw).unwrap();
+    assert_eq!(win["has_older"], true);
+    let window_start = win["window_start"].as_u64().unwrap();
+    assert!(window_start > 0);
+    let older = win["older_calls"].as_array().unwrap();
+    assert!(!older.is_empty());
+    let entries = win["entries"].as_array().unwrap();
+    // Window must start on a call boundary ("start" entry).
+    assert_eq!(entries[0]["kind"], "start");
+
+    // 2) The 50 KB output entry is stubbed on the wire, and GET /api/runs/big/agents/{index} returns the full 52 KB body.
+    let stub = entries
+        .iter()
+        .find(|e| e["kind"] == "output" && e["id"] == "t-huge")
+        .expect("stubbed output entry present");
+    assert_eq!(stub["body_omitted"], true);
+    assert!(stub.get("text").is_none());
+    let body_idx = stub["body_index"].as_u64().unwrap();
+    assert!(stub["bytes"].as_u64().unwrap() >= 52_000);
+
+    let (st, full_raw) = call_raw(&addr, Some(&token), "GET", &format!("/api/runs/big/agents/{body_idx}"), None).await;
+    assert_eq!(st, 200);
+    let full: serde_json::Value = serde_json::from_str(&full_raw).unwrap();
+    assert_eq!(full["text"].as_str().unwrap().len(), 52_000);
+
+    // 3) Pagination via ?before=<window_start> returns earlier calls without splitting them.
+    let (st, prev_raw) = call_raw(&addr, Some(&token), "GET", &format!("/api/runs/big/agents?before={window_start}"), None).await;
+    assert_eq!(st, 200);
+    let prev: serde_json::Value = serde_json::from_str(&prev_raw).unwrap();
+    assert_eq!(prev["window_end"].as_u64().unwrap(), window_start);
+    assert_eq!(prev["entries"].as_array().unwrap()[0]["kind"], "start");
+
+    // 4) CommandOutputHub appends up to 16 KiB and switches to tail-replace beyond 16 KiB.
+    live.push_command_output("big", "cmd-1", &"a".repeat(8000));
+    let (seq1, f1) = live.command_output_frame("big", "cmd-1", 0, 0).expect("first frame");
+    match f1 {
+        crate::live::CommandOutputFrame::Append { chunk, next_offset, .. } => {
+            assert_eq!(chunk.len(), 8000);
+            assert_eq!(next_offset, 8000);
+        }
+        other => panic!("expected Append, got {other:?}"),
+    }
+
+    live.push_command_output("big", "cmd-1", &"b".repeat(12000));
+    let (_seq2, f2) = live.command_output_frame("big", "cmd-1", 8000, seq1).expect("second frame");
+    match f2 {
+        crate::live::CommandOutputFrame::Replace { text, truncated, .. } => {
+            assert!(truncated);
+            assert!(text.len() <= crate::live::CMD_OUTPUT_CAP);
+            assert!(text.ends_with("bbbb"));
+        }
+        other => panic!("expected Replace, got {other:?}"),
+    }
+
+    drop(server);
+}
+
+
 

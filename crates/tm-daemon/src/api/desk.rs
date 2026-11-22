@@ -38,6 +38,7 @@
 //! reported as real.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -46,6 +47,8 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tm_core::{RunPhase, valid_key};
@@ -169,15 +172,284 @@ pub fn relative(project: &Path, full: &Path) -> String {
 
 // Agents and notes.
 
+/// Output bodies larger than this leave the wire as `{id, bytes}` and load on demand (P5).
+pub const LARGE_BODY_BYTES: usize = 2048;
+/// Target byte budget for `?window=recent` cold-open responses (never splits a call).
+const RECENT_WINDOW_BYTES: usize = 900 * 1024;
+/// Throttle interval for per-row live command output SSE frames.
+const CMD_OUTPUT_THROTTLE: Duration = Duration::from_millis(100);
+
+/// Replace oversized `output` bodies (`text` or `diff` > 2 KiB) with a stub pointing to
+/// `GET /api/runs/{id}/agents/{index}` so large command outputs never ride the main stream.
+pub fn stub_large_output(entry: &Value, index: usize) -> Value {
+    if entry["kind"].as_str() != Some("output") {
+        return entry.clone();
+    }
+    let text_len = entry["text"].as_str().map(str::len).unwrap_or(0);
+    let diff_len = entry["diff"].as_str().map(str::len).unwrap_or(0);
+    if text_len <= LARGE_BODY_BYTES && diff_len <= LARGE_BODY_BYTES {
+        return entry.clone();
+    }
+    let mut out = entry.clone();
+    if let Some(obj) = out.as_object_mut() {
+        if text_len > LARGE_BODY_BYTES {
+            obj.remove("text");
+            obj.insert("text_bytes".into(), json!(text_len));
+        }
+        if diff_len > LARGE_BODY_BYTES {
+            obj.remove("diff");
+            obj.insert("diff_bytes".into(), json!(diff_len));
+        }
+        obj.insert("bytes".into(), json!(text_len + diff_len));
+        obj.insert("body_omitted".into(), json!(true));
+        obj.insert("body_index".into(), json!(index));
+    }
+    out
+}
+
+fn call_key(entry: &Value) -> Option<String> {
+    let id = entry["agent"]["id"].as_str()?;
+    let call = entry["agent"]["call"].as_u64()?;
+    if id.is_empty() || id == "runtime" || id == "person" {
+        return None;
+    }
+    Some(format!("{id}#{call}"))
+}
+
+fn approx_entry_bytes(entry: &Value) -> usize {
+    serde_json::to_string(entry).map(|s| s.len() + 2).unwrap_or(256)
+}
+
+fn summarize_older_calls(entries: &[Value], before: usize) -> Vec<Value> {
+    struct Acc {
+        agent: Value,
+        call: u64,
+        start_index: usize,
+        end_index: usize,
+        entries: usize,
+        ok: Option<bool>,
+        seconds: Option<f64>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: HashMap<String, Acc> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate().take(before) {
+        let Some(key) = call_key(entry) else { continue };
+        let call_num = entry["agent"]["call"].as_u64().unwrap_or(0);
+        let acc = by_key.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            Acc {
+                agent: entry["agent"].clone(),
+                call: call_num,
+                start_index: idx,
+                end_index: idx,
+                entries: 0,
+                ok: None,
+                seconds: None,
+            }
+        });
+        // Prefer the fuller tag from the call's `start` entry when present.
+        if entry["kind"] == "start" {
+            acc.agent = entry["agent"].clone();
+        }
+        acc.end_index = idx;
+        acc.entries += 1;
+        if entry["kind"] == "end" {
+            acc.ok = entry["ok"].as_bool();
+            acc.seconds = entry["seconds"].as_f64();
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| by_key.remove(&k))
+        .map(|a| {
+            json!({
+                "agent": a.agent,
+                "call": a.call,
+                "start_index": a.start_index,
+                "end_index": a.end_index,
+                "entries": a.entries,
+                "ok": a.ok,
+                "seconds": a.seconds,
+            })
+        })
+        .collect()
+}
+
+/// Choose a start index within `0..end` whose stubbed entries fit in `budget` bytes without
+/// ever splitting an agent call across the boundary.
+fn bounded_window_start(entries: &[Value], end: usize, budget: usize) -> usize {
+    if end == 0 {
+        return 0;
+    }
+    // Map each call to its earliest entry index so including any entry of a call pulls in its start.
+    let mut call_first: HashMap<String, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate().take(end) {
+        if let Some(k) = call_key(e) {
+            call_first.entry(k).or_insert(i);
+        }
+    }
+    let mut used = 0usize;
+    let mut start = end;
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        let group_start = call_key(&entries[i])
+            .and_then(|k| call_first.get(&k).copied())
+            .unwrap_or(i)
+            .min(i);
+        // Compute the byte cost of pulling in `[group_start..=i]` together.
+        let mut chunk_bytes = 0usize;
+        for (j, raw) in entries.iter().enumerate().take(i + 1).skip(group_start) {
+            chunk_bytes += approx_entry_bytes(&stub_large_output(raw, j));
+        }
+        if used > 0 && used + chunk_bytes > budget {
+            break;
+        }
+        used += chunk_bytes;
+        start = group_start;
+        i = group_start;
+        if used >= budget {
+            break;
+        }
+    }
+    start
+}
+
 pub async fn agents(
     State(app): State<Arc<App>>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Reply {
     app.known(&id)?;
+    let window = query.get("window").map(String::as_str);
+    let before = query.get("before").and_then(|n| n.parse::<usize>().ok());
+
+    if window == Some("recent") || before.is_some() {
+        let (next, all) = app.live.read(&id, 0);
+        let end = before.map(|b| b.min(all.len())).unwrap_or(all.len());
+        let budget = query
+            .get("bytes")
+            .and_then(|n| n.parse::<usize>().ok())
+            .map(|b| b.clamp(16 * 1024, RECENT_WINDOW_BYTES))
+            .unwrap_or(RECENT_WINDOW_BYTES);
+        let start = bounded_window_start(&all, end, budget);
+        let older_calls = if start > 0 {
+            summarize_older_calls(&all, start)
+        } else {
+            Vec::new()
+        };
+        let slice: Vec<Value> = all
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+            .map(|(idx, e)| stub_large_output(e, idx))
+            .collect();
+        return ok(json!({
+            "next": next,
+            "window_start": start,
+            "window_end": end,
+            "has_older": start > 0,
+            "older_calls": older_calls,
+            "entries": slice,
+        }));
+    }
+
     let after = query.get("after").and_then(|n| n.parse().ok()).unwrap_or(0);
+    let stub = query.get("stub").map(String::as_str) == Some("1");
     let (next, entries) = app.live.read(&id, after);
+    let entries = if stub {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(offset, e)| stub_large_output(e, after + offset))
+            .collect()
+    } else {
+        entries
+    };
     ok(json!({ "next": next, "entries": entries }))
+}
+
+/// On-demand full body of a single transcript entry (`GET /api/runs/{id}/agents/{index}`, P5).
+pub async fn agent_entry(
+    State(app): State<Arc<App>>,
+    UrlPath((id, index)): UrlPath<(String, usize)>,
+) -> Reply {
+    app.known(&id)?;
+    let Some(entry) = app.live.read_at(&id, index) else {
+        return Err(fail(StatusCode::NOT_FOUND, "transcript entry not found"));
+    };
+    ok(json!({
+        "index": index,
+        "text": entry.get("text").cloned().unwrap_or(Value::Null),
+        "diff": entry.get("diff").cloned().unwrap_or(Value::Null),
+        "entry": entry,
+    }))
+}
+
+/// Per-row throttled SSE stream for a running command's live output (P5).
+/// Sends at most one frame every 100 ms; appends up to 16 KiB, then switches to tail replace.
+pub async fn command_output_stream(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    app.known(&id)?;
+    let tool_id = query
+        .get("tool_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "missing tool_id"))?;
+    let rx = app.live.subscribe_command_output(&id, &tool_id);
+    struct StateFeed {
+        app: Arc<App>,
+        run: String,
+        tool_id: String,
+        rx: tokio::sync::watch::Receiver<u64>,
+        sent_offset: usize,
+        sent_seq: u64,
+        done: bool,
+    }
+    let state = StateFeed {
+        app,
+        run: id,
+        tool_id,
+        rx,
+        sent_offset: 0,
+        sent_seq: 0,
+        done: false,
+    };
+    let stream = stream::unfold(state, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            if let Some((seq, frame)) = st.app.live.command_output_frame(&st.run, &st.tool_id, st.sent_offset, st.sent_seq) {
+                st.sent_seq = seq;
+                st.sent_offset = match &frame {
+                    crate::live::CommandOutputFrame::Append { next_offset, .. }
+                    | crate::live::CommandOutputFrame::Replace { next_offset, .. } => *next_offset,
+                };
+                let data = serde_json::to_string(&frame).unwrap_or_default();
+                tokio::time::sleep(CMD_OUTPUT_THROTTLE).await;
+                return Some((Ok(SseEvent::default().event("output").data(data)), st));
+            }
+            if !st.app.is_active(&st.run) {
+                st.done = true;
+                return Some((Ok(SseEvent::default().event("done").data("{}")), st));
+            }
+            tokio::select! {
+                changed = st.rx.changed() => {
+                    if changed.is_err() {
+                        st.done = true;
+                        return Some((Ok(SseEvent::default().event("done").data("{}")), st));
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 pub async fn notes(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {

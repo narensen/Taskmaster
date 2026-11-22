@@ -8,6 +8,7 @@ import {
   type AgentEntry,
   type AgentTag,
   type LedgerEntry,
+  type OlderCallSummary,
   type PagePlan,
   type PageState,
   type Plan,
@@ -33,6 +34,11 @@ export interface ToolItem {
   output?: string;
   /** A diff the harness attached. Absent when it sent none. */
   diff?: string;
+  /** P5: oversized output body omitted on wire and fetched on demand via GET /api/runs/{id}/agents/{bodyIndex}. */
+  bodyOmitted?: boolean;
+  bodyIndex?: number;
+  outputBytes?: number;
+  diffBytes?: number;
   at: string;
 }
 /** A lifecycle line: the agent stalled and was replaced, or was released when done. */
@@ -447,11 +453,17 @@ export class SurfaceBuilder {
           break;
         case "output": {
           const byTool = e.id ? findLastTool(call.items, (i) => i.id === e.id) : undefined;
-          const open = byTool ?? findLastTool(call.items, (i) => i.output === undefined && i.diff === undefined);
+          const open = byTool ?? findLastTool(call.items, (i) => i.output === undefined && i.diff === undefined && !i.bodyOmitted);
           if (open) {
             const change: Partial<ToolItem> = {};
             if (e.text) change.output = mergeChunk(open.output, e.text);
             if (e.diff) change.diff = mergeChunk(open.diff, e.diff);
+            if (e.body_omitted) {
+              change.bodyOmitted = true;
+              if (e.body_index !== undefined) change.bodyIndex = e.body_index;
+              if (e.text_bytes !== undefined || e.bytes !== undefined) change.outputBytes = e.text_bytes ?? e.bytes;
+              if (e.diff_bytes !== undefined) change.diffBytes = e.diff_bytes;
+            }
             replace(call, open, change);
           } else if (e.text) call.items.push({ t: "text", text: e.text, at: e.at });
           break;
@@ -687,6 +699,11 @@ export interface RunData {
   entries: AgentEntry[];
   /** Monotonic counter bumped whenever entries are appended or replaced. */
   entriesVersion: number;
+  /** P5: true when older calls exist before the bounded recent window. */
+  hasOlder: boolean;
+  olderCalls: OlderCallSummary[];
+  loadingOlder: boolean;
+  loadOlder: () => Promise<void>;
   ledger: { totals: Totals; entries: LedgerEntry[] } | null;
   notes: Note[];
   error: unknown;
@@ -715,6 +732,10 @@ export function useRun(id: string): RunData {
   // Zero-copy append buffer: streamed batches push in place and bump entriesVersion once per frame.
   const entriesRef = useRef<AgentEntry[]>([]);
   const [entriesVersion, setEntriesVersion] = useState(0);
+  const windowStartRef = useRef(0);
+  const [hasOlder, setHasOlder] = useState(false);
+  const [olderCalls, setOlderCalls] = useState<OlderCallSummary[]>([]);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [ledger, setLedger] = useState<RunData["ledger"]>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   const [error, setError] = useState<unknown>(null);
@@ -837,13 +858,32 @@ export function useRun(id: string): RunData {
     // While the stream is open it delivers the entries itself.
     if (stop.current) return;
     try {
-      const ag = await api.agents(id, counts.current.entries);
+      const ag = await api.agents(id, counts.current.entries, { stub: true });
       if (!ag.entries.length || ag.next <= counts.current.entries) return;
       counts.current.entries = ag.next;
       entriesRef.current.push(...ag.entries);
       setEntriesVersion((v) => v + 1);
     } catch {
       // The poll below picks it up.
+    }
+  }, [id]);
+
+  const loadOlder = useCallback(async () => {
+    const before = windowStartRef.current;
+    if (before <= 0) return;
+    setLoadingOlder(true);
+    try {
+      const ag = await api.agents(id, 0, { before });
+      const nextStart = ag.window_start ?? 0;
+      windowStartRef.current = nextStart;
+      setHasOlder(!!ag.has_older && nextStart > 0);
+      setOlderCalls(ag.older_calls ?? []);
+      if (ag.entries.length) {
+        entriesRef.current = [...ag.entries, ...entriesRef.current];
+        setEntriesVersion((v) => v + 1);
+      }
+    } finally {
+      setLoadingOlder(false);
     }
   }, [id]);
 
@@ -886,6 +926,9 @@ export function useRun(id: string): RunData {
   useEffect(() => {
     let stale = false;
     counts.current = { events: 0, entries: 0 };
+    windowStartRef.current = 0;
+    setHasOlder(false);
+    setOlderCalls([]);
     loaded.current = false;
     pending.current = [];
     if (frame.current) {
@@ -898,9 +941,12 @@ export function useRun(id: string): RunData {
     setPlanArrived(false);
     void (async () => {
       try {
-        const [ev, ag] = await Promise.all([api.events(id), api.agents(id)]);
+        const [ev, ag] = await Promise.all([api.events(id), api.agents(id, 0, { window: "recent" })]);
         if (stale) return;
         counts.current = { events: ev.next, entries: ag.next };
+        windowStartRef.current = ag.window_start ?? 0;
+        setHasOlder(!!ag.has_older && (ag.window_start ?? 0) > 0);
+        setOlderCalls(ag.older_calls ?? []);
         setEvents(ev.events);
         entriesRef.current = ag.entries;
         setEntriesVersion((v) => v + 1);
@@ -925,7 +971,10 @@ export function useRun(id: string): RunData {
       try {
         const d = await api.run(id);
         setDetail(d);
-        const [ev, ag] = await Promise.all([api.events(id, counts.current.events), api.agents(id, counts.current.entries)]);
+        const [ev, ag] = await Promise.all([
+          api.events(id, counts.current.events),
+          api.agents(id, counts.current.entries, { stub: true }),
+        ]);
         if (ev.events.length || ag.entries.length || d.active) {
           if (ag.entries.length) {
             counts.current.entries = ag.next;
@@ -948,7 +997,25 @@ export function useRun(id: string): RunData {
 
   const patch = useCallback((change: Partial<RunDetail>) => setDetailState((d) => (d ? { ...d, ...change } : d)), []);
 
-  return { detail, events, entries: entriesRef.current, entriesVersion, ledger, notes, error, planArrived, reload, refollow, reloadNotes, catchUp, patch };
+  return {
+    detail,
+    events,
+    entries: entriesRef.current,
+    entriesVersion,
+    hasOlder,
+    olderCalls,
+    loadingOlder,
+    loadOlder,
+    ledger,
+    notes,
+    error,
+    planArrived,
+    reload,
+    refollow,
+    reloadNotes,
+    catchUp,
+    patch,
+  };
 }
 
 /**

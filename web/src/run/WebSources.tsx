@@ -2,7 +2,7 @@
 // fetched source URLs, local docs lookups, and planner research decisions.
 
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, BookOpen, Globe, Search } from "lucide-react";
+import { AlertTriangle, BookOpen, Globe, Search, ShieldAlert } from "lucide-react";
 import { api, type AgentEntry, type ResearchNote, type WebActivityItem } from "../api";
 import { ExternalLink } from "../paths";
 
@@ -23,7 +23,7 @@ function safeHttps(url: string | undefined): string | null {
 }
 
 function itemKey(item: WebActivityItem): string {
-  return `${item.at}|${item.agent?.id ?? ""}|${item.kind}|${item.query ?? ""}|${item.url ?? ""}|${item.package ?? ""}`;
+  return `${item.at}|${item.agent?.id ?? ""}|${item.kind}|${item.query ?? ""}|${item.url ?? ""}|${item.package ?? ""}|${item.ecosystem ?? ""}`;
 }
 
 export function WebSources({
@@ -63,7 +63,7 @@ export function WebSources({
     };
     for (const it of fetched) push(it);
     for (const e of entries) {
-      if (e.kind === "web_search" || e.kind === "web_fetch" || e.kind === "docs") {
+      if (e.kind === "web_search" || e.kind === "web_fetch" || e.kind === "docs" || e.kind === "advisories") {
         push(e as WebActivityItem);
       }
     }
@@ -76,6 +76,7 @@ export function WebSources({
   const searches = items.filter((i) => i.kind === "web_search").length;
   const fetches = items.filter((i) => i.kind === "web_fetch").length;
   const localDocs = items.filter((i) => i.kind === "docs").length;
+  const advisoryChecks = items.filter((i) => i.kind === "advisories").length;
   const flagged = items.filter((i) => i.injection_flagged).length;
 
   return (
@@ -89,6 +90,7 @@ export function WebSources({
           {searches > 0 && <span>{searches} search{searches === 1 ? "" : "es"}</span>}
           {fetches > 0 && <span>{fetches} fetch{fetches === 1 ? "" : "es"}</span>}
           {localDocs > 0 && <span>{localDocs} local docs</span>}
+          {advisoryChecks > 0 && <span>{advisoryChecks} advisory check{advisoryChecks === 1 ? "" : "s"}</span>}
           {flagged > 0 && (
             <span className="web-sources-flag" data-testid="web-sources-injection-flag">
               <AlertTriangle size={12} aria-hidden />
@@ -130,12 +132,20 @@ export function WebSources({
                       <Search size={12} aria-hidden />
                     ) : item.kind === "docs" ? (
                       <BookOpen size={12} aria-hidden />
+                    ) : item.kind === "advisories" ? (
+                      <ShieldAlert size={12} aria-hidden />
                     ) : (
                       <Globe size={12} aria-hidden />
                     )}
                     <span className="strong">{agentLabel(item)}</span>
                     <span className="ops-chip">
-                      {item.kind === "web_search" ? "search" : item.kind === "docs" ? "local docs" : "fetch"}
+                      {item.kind === "web_search"
+                        ? "search"
+                        : item.kind === "docs"
+                          ? "local docs"
+                          : item.kind === "advisories"
+                            ? "advisories"
+                            : "fetch"}
                     </span>
                     {item.cached && <span className="ops-chip">cached</span>}
                     {item.injection_flagged && (
@@ -192,6 +202,32 @@ export function WebSources({
                       {item.symbol ? ` · ${item.symbol}` : ""}
                     </span>
                     {item.path && <span className="muted mono"> ({item.path})</span>}
+                  </div>
+                )}
+
+                {item.kind === "advisories" && (
+                  <div className="web-sources-detail small">
+                    <span className="mono">
+                      {item.ecosystem ? `${item.ecosystem}: ` : ""}
+                      {item.package}
+                      {item.version ? `@${item.version}` : ""}
+                    </span>
+                    {typeof item.count === "number" && (
+                      <span className="muted">
+                        {" "}
+                        · {item.count === 0 ? "no known advisories" : `${item.count} advisor${item.count === 1 ? "y" : "ies"}`}
+                      </span>
+                    )}
+                    {item.advisories && item.advisories.length > 0 && (
+                      <ul className="web-sources-links">
+                        {item.advisories.slice(0, 5).map((adv, i) => (
+                          <li key={i} className="small">
+                            <span className="mono">{adv.id}</span>
+                            {adv.summary ? ` — ${adv.summary}` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 )}
               </li>

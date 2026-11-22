@@ -48,11 +48,11 @@ const DEFAULT_WEB: WebAccessSettings = {
     verifier: { search: false, fetch: false },
   },
   allowlist: [],
-  planner_max_searches: 6,
+  planner_max_searches: 5,
   planner_max_fetches: 8,
   max_fetch_bytes: 2 * 1024 * 1024,
   cache_ttl_secs: 86400,
-  cache_max_mb: 100,
+  cache_max_mb: 128,
 };
 
 export function WebAccessSection() {
@@ -65,6 +65,9 @@ export function WebAccessSection() {
 
   const data: WebAccessPayload | null = loaded.data ?? null;
   const cfg: WebAccessSettings = draft ?? data?.web_access ?? DEFAULT_WEB;
+  const hasKey = data?.providers_with_keys
+    ? data.providers_with_keys.includes(cfg.provider)
+    : Boolean(data?.has_api_key && cfg.provider === data?.web_access.provider);
   const domainsValue = allowText ?? cfg.allowlist.join(", ");
   const providers = data?.providers?.length ? data.providers : ["searxng", "brave", "tavily", "exa", "native"];
 
@@ -196,18 +199,18 @@ export function WebAccessSection() {
               autoComplete="new-password"
               aria-label="Web provider API key"
               data-testid="web-access-key"
-              placeholder={data?.has_api_key ? "Enter a new key to replace the vaulted one" : "Paste API key (stored in OS vault)"}
+              placeholder={hasKey ? "Enter a new key to replace the vaulted one" : "Paste API key (stored in OS vault)"}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
             />
           </label>
           <div className="row gap wrap web-access-key-meta">
-            {data?.has_api_key && (
+            {hasKey && (
               <span className="ops-chip" data-testid="web-access-key-saved">
-                Saved in vault ({data.vault_backend})
+                Saved in vault ({data?.vault_backend})
               </span>
             )}
-            {data?.has_api_key && (
+            {hasKey && (
               <button type="button" className="ghost small" disabled={saving} onClick={() => void clearKey()}>
                 Clear key
               </button>

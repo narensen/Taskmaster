@@ -56,7 +56,23 @@ pub fn parse(value: &Value) -> Vec<Hit> {
                 .filter(|e| !e.is_empty())
                 .or_else(|| item.pointer("/engines/0").and_then(Value::as_str).map(str::to_string))
                 .unwrap_or_default();
-            Some(Hit { title, url, content: text(item, &["content", "snippet", "description"]), engine })
+            let content = Some(text(item, &["content", "snippet", "description", "text"]))
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    item.get("highlights")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" … ")
+                        })
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_default();
+            Some(Hit { title, url, content, engine })
         })
         .collect()
 }
@@ -75,6 +91,33 @@ mod tests {
         assert_eq!(hits[1].content, "");
         assert_eq!(hits[2].engine, "bing");
         assert!(hits.iter().all(|h| h.url.starts_with("http")));
+    }
+
+    #[test]
+    fn parses_brave_tavily_and_exa_shapes() {
+        let brave = parse(&json!({
+            "web": {
+                "results": [{ "title": "Axum", "url": "https://docs.rs/axum", "description": "Web framework" }]
+            }
+        }));
+        assert_eq!(brave.len(), 1);
+        assert_eq!(brave[0].content, "Web framework");
+
+        let tavily = parse(&json!({
+            "results": [{ "title": "React 19", "url": "https://react.dev", "content": "Actions and hooks" }]
+        }));
+        assert_eq!(tavily.len(), 1);
+        assert_eq!(tavily[0].content, "Actions and hooks");
+
+        let exa = parse(&json!({
+            "results": [{
+                "title": "Tokio Docs",
+                "url": "https://tokio.rs",
+                "highlights": ["Async runtime for Rust", "spawn_blocking handles blocking I/O"]
+            }]
+        }));
+        assert_eq!(exa.len(), 1);
+        assert_eq!(exa[0].content, "Async runtime for Rust … spawn_blocking handles blocking I/O");
     }
 
     #[test]

@@ -125,6 +125,18 @@ test("Settings Web access persists provider, vaulted key, roles, allowlist and R
       source: "local",
       path: "node_modules/react/index.d.ts",
     },
+    {
+      at: "2026-11-22T10:00:04Z",
+      agent: { id: "reviewer", role: "reviewer" },
+      kind: "advisories",
+      ecosystem: "npm",
+      package: "semver",
+      version: "7.5.1",
+      count: 1,
+      advisories: [{ id: "GHSA-c2qf-rxjj-qqgw", summary: "ReDoS in semver range parsing" }],
+      url: "https://api.osv.dev/v1/query",
+      injection_flagged: false,
+    },
   ];
   writeFileSync(join(targetDir, "agents.jsonl"), webEntries.map((e) => JSON.stringify(e)).join("\n") + "\n");
 
@@ -140,4 +152,6 @@ test("Settings Web access persists provider, vaulted key, roles, allowlist and R
   await expect(sources).toContainText("untrusted prompt pattern flagged");
   await expect(sources).toContainText("react@19.0.0");
   await expect(sources).toContainText("useActionState");
+  await expect(sources).toContainText("GHSA-c2qf-rxjj-qqgw");
+  await expect(sources).toContainText("semver@7.5.1");
 });

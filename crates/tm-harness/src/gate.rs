@@ -61,13 +61,24 @@ pub struct WorktreeGate {
     shell: bool,
     /// Hosts a fetch may reach, such as the package indexes.
     fetch_hosts: Vec<String>,
+    /// Allow the harness's built-in web search tool when provider is set to `native`.
+    native_search: bool,
 }
 
 impl WorktreeGate {
     pub fn new(root: impl Into<PathBuf>, allowed_tool_prefixes: Vec<String>) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root));
-        WorktreeGate { root, allowed_tool_prefixes, readable: Vec::new(), read_only: false, browser: None, shell: false, fetch_hosts: Vec::new() }
+        WorktreeGate {
+            root,
+            allowed_tool_prefixes,
+            readable: Vec::new(),
+            read_only: false,
+            browser: None,
+            shell: false,
+            fetch_hosts: Vec::new(),
+            native_search: false,
+        }
     }
 
     /// Allow shell commands. Give this only to an agent that runs inside the sandbox.
@@ -79,6 +90,12 @@ impl WorktreeGate {
     /// Allow fetches from these hosts and their subdomains, and from nowhere else.
     pub fn with_fetch_hosts(mut self, hosts: &[&str]) -> Self {
         self.fetch_hosts = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+        self
+    }
+
+    /// Allow the harness's native web search tool (used when Web access provider is `native`).
+    pub fn with_native_search(mut self) -> Self {
+        self.native_search = true;
         self
     }
 
@@ -114,6 +131,9 @@ impl WorktreeGate {
     /// anything else, such as a read outside the worktree or any edit by a read-only
     /// agent, which stay refused.
     pub fn risk(&self, request: &PermissionRequest) -> Option<&'static str> {
+        if self.native_search && is_native_search_tool(request) {
+            return None;
+        }
         if self.read_only {
             return None;
         }
@@ -167,6 +187,9 @@ impl PermissionGate for WorktreeGate {
             };
             return if allowed { Decision::Allow } else { Decision::Deny };
         }
+        if self.native_search && is_native_search_tool(request) {
+            return Decision::Allow;
+        }
         if self.allowed_tool_prefixes.iter().any(|p| request.tool.starts_with(p.as_str())) {
             return Decision::Allow;
         }
@@ -189,6 +212,24 @@ impl PermissionGate for WorktreeGate {
             _ => Decision::Deny,
         }
     }
+}
+
+/// True when `request` invokes a harness's built-in web search tool (never edits or shell).
+fn is_native_search_tool(request: &PermissionRequest) -> bool {
+    if matches!(request.kind, ToolKind::Edit | ToolKind::Execute | ToolKind::Browser) {
+        return false;
+    }
+    let norm = request.tool.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(
+        norm.as_str(),
+        "web_search"
+            | "websearch"
+            | "search_web"
+            | "google_search"
+            | "bing_search"
+            | "brave_search"
+            | "internet_search"
+    )
 }
 
 /// Whether `url` is on `origin` (`scheme://host:port`), or is a path on it.
@@ -365,5 +406,32 @@ mod tests {
         let req = request("view_file", ToolKind::Read, &[via_link.to_str().unwrap()]);
         assert_eq!(g.decide(&req), Decision::Deny);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn native_search_passthrough_allows_search_only() {
+        let search = PermissionRequest {
+            tool: "WebSearch".into(),
+            kind: ToolKind::Fetch,
+            paths: vec![],
+            command: None,
+            url: None,
+        };
+        let fetch = PermissionRequest {
+            tool: "WebFetch".into(),
+            kind: ToolKind::Fetch,
+            paths: vec![],
+            command: None,
+            url: Some("https://example.com".into()),
+        };
+        // Denied by default.
+        assert_eq!(gate().read_only().decide(&search), Decision::Deny);
+        // Allowed when opted in, including for read-only roles (planner/reviewer).
+        let g = gate().read_only().with_native_search();
+        assert_eq!(g.decide(&search), Decision::Allow);
+        assert!(g.risk(&search).is_none());
+        // Does not widen WebFetch or shell.
+        assert_eq!(g.decide(&fetch), Decision::Deny);
+        assert_eq!(g.decide(&request("run_command", ToolKind::Execute, &[])), Decision::Deny);
     }
 }

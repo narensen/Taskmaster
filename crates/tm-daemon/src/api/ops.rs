@@ -535,6 +535,11 @@ fn web_access_payload(project: &std::path::Path) -> Value {
     let provider = web.provider_norm();
     let vault = crate::web_access::default_vault();
     let has_api_key = crate::web_access::load_api_key(&vault, &provider).is_some();
+    let providers_with_keys: Vec<&str> = crate::web_access::WebAccessSettings::PROVIDERS
+        .iter()
+        .copied()
+        .filter(|p| crate::web_access::load_api_key(&vault, p).is_some())
+        .collect();
     let cache = crate::web_access::WebCache::new(
         crate::web_access::WebCache::default_dir(),
         web.cache_ttl_secs,
@@ -546,6 +551,7 @@ fn web_access_payload(project: &std::path::Path) -> Value {
     json!({
         "web_access": web,
         "has_api_key": has_api_key,
+        "providers_with_keys": providers_with_keys,
         "vault_backend": vault.backend_name(),
         "derived_allowlist": derived,
         "advisory_hosts": crate::web_access::ADVISORY_HOSTS,

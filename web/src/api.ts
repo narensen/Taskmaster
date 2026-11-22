@@ -516,7 +516,8 @@ export interface AgentEntry {
     | "restarted"
     | "web_search"
     | "web_fetch"
-    | "docs";
+    | "docs"
+    | "advisories";
   /** Tool call id, on a `tool_call` and on the `output` that belongs to it. */
   id?: string;
   text?: string;
@@ -1082,6 +1083,7 @@ export interface WebCacheStats {
 export interface WebAccessPayload {
   web_access: WebAccessSettings;
   has_api_key: boolean;
+  providers_with_keys?: string[];
   vault_backend: string;
   derived_allowlist: string[];
   advisory_hosts: string[];
@@ -1107,7 +1109,7 @@ export interface WebAccessUpdate {
 export interface WebActivityItem {
   at: string;
   agent: AgentTag;
-  kind: "web_search" | "web_fetch" | "docs";
+  kind: "web_search" | "web_fetch" | "docs" | "advisories";
   provider?: string;
   query?: string;
   hits?: number;
@@ -1118,11 +1120,13 @@ export interface WebActivityItem {
   bytes?: number;
   cached?: boolean;
   package?: string;
-  version?: string;
+  version?: string | null;
   ecosystem?: string;
   symbol?: string | null;
   source?: string;
   path?: string;
+  count?: number;
+  advisories?: { id: string; aliases?: string[]; summary?: string }[];
   injection_flagged?: boolean;
 }
 

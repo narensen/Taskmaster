@@ -7016,3 +7016,53 @@ button.glob-file:hover { color: var(--ink); border-color: var(--line-strong); ba
   display: flex;
   gap: 6px;
 }
+
+/* O2: Design Mode capture chips & iframe cue */
+.design-capture-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.design-capture-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line-2, var(--line));
+  background: var(--surface-2, var(--surface));
+  color: var(--ink);
+  max-width: 100%;
+}
+.design-capture-selector {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.live-preview-frame.is-design-mode {
+  cursor: crosshair;
+  outline: 1px dashed var(--ink);
+}
+
+/* O3: Batched review pinned comments */
+.review-pin {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  margin: 2px 0;
+  border-left: 2px solid var(--ink);
+  background: var(--surface-2, var(--surface));
+  font-size: 12px;
+}
+.review-pin.is-draft {
+  border-left-style: dashed;
+}
+.review-pin.is-resolved {
+  opacity: 0.55;
+  text-decoration: line-through;
+  border-left-color: var(--muted);
+}

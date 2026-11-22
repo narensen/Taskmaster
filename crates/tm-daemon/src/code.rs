@@ -83,6 +83,8 @@ const references = (symbol) => call("references", { symbol: String(symbol) });
 const sh = (command) => call("sh", { command });
 const check = () => call("check", {});
 const browser = (action, args = {}) => call("browser", { action, args });
+const status = (text) => call("status", { text: String(text ?? "") });
+const wait = (opts) => call("wait", opts && typeof opts === "object" ? opts : {});
 
 async function runBody(code) {
   const logs = [];
@@ -94,7 +96,7 @@ async function runBody(code) {
     fn = new AsyncFunction(
       "read", "write", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
       "readMany", "test", "testAffected", "probe", "diagnostics", "outline", "definition", "references",
-      "sh", "check", "browser", "console", "require",
+      "sh", "check", "browser", "status", "wait", "console", "require",
       `return (async () => {\n${code}\n})();`
     );
   } catch (err) {
@@ -105,7 +107,7 @@ async function runBody(code) {
     const result = await fn(
       read, write, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
       readMany, test, testAffected, probe, diagnostics, outline, definition, references,
-      sh, check, browser, scopedConsole, require
+      sh, check, browser, status, wait, scopedConsole, require
     );
     send({ done: true, result: result === undefined ? null : result, logs });
   } catch (err) {
@@ -207,11 +209,92 @@ struct Scope {
     warm: tokio::sync::Mutex<Option<WarmNode>>,
 }
 
+/// Shared status-line MCP extension (O6): lets any agent (with or without Code Mode) publish a
+/// concise one-line status shown on its card and mission node ahead of the derived headline.
+pub struct StatusTools {
+    live: Arc<crate::live::Live>,
+    tags: Mutex<HashMap<String, Value>>,
+}
+
+impl StatusTools {
+    pub fn new(live: Arc<crate::live::Live>) -> Self {
+        Self { live, tags: Mutex::new(HashMap::new()) }
+    }
+
+    /// Record the full transcript agent tag for a grant scope (`master`, `a`, `a/part`, etc.).
+    pub fn register_tag(&self, scope: &str, tag: Value) {
+        self.tags.lock().unwrap().insert(scope.to_string(), tag);
+    }
+
+    /// Publish a one-line status update into the run's transcript for `grant`.
+    pub fn set_status(&self, grant: &Grant, raw: &str) -> String {
+        let first_line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        let cleaned: String = first_line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(160)
+            .collect();
+        if cleaned.is_empty() {
+            return String::new();
+        }
+        let scope = grant.agent();
+        let tag = self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
+            let id = match scope.as_str() {
+                "master" | "reviewer" | "verifier" => scope.clone(),
+                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
+                other => format!("page:{other}"),
+            };
+            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
+        });
+        self.live.push(&grant.run, &tag, "status", json!({ "text": cleaned }));
+        cleaned
+    }
+}
+
+#[async_trait::async_trait]
+impl Extension for StatusTools {
+    fn tools(&self, _grant: &Grant) -> Vec<Value> {
+        vec![json!({
+            "name": "set_status",
+            "description": "Set a short one-line status describing what you are doing right now (shown on your agent card and mission node).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Short one-line status (max 160 chars)" }
+                },
+                "required": ["text"]
+            }
+        })]
+    }
+
+    async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
+        if name != "set_status" {
+            return None;
+        }
+        let text = args["text"].as_str().unwrap_or("");
+        let set = self.set_status(grant, text);
+        Some(json!({
+            "content": [{ "type": "text", "text": if set.is_empty() { "status cleared".to_string() } else { format!("status: {set}") } }],
+            "isError": false
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct CodeRuntimeCtx {
+    live: Arc<crate::live::Live>,
+    records: crate::store::Records,
+    status: Arc<StatusTools>,
+}
+
 pub struct CodeTools {
     node: PathBuf,
     bwrap: Option<PathBuf>,
     scopes: Mutex<HashMap<String, Arc<Scope>>>,
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
+    runtime: Mutex<Option<CodeRuntimeCtx>>,
     /// How long one script may run.
     script_limit: Duration,
     /// How long one `sh` or `test` call may run.
@@ -228,9 +311,15 @@ impl CodeTools {
             bwrap,
             scopes: Mutex::new(HashMap::new()),
             browsers,
+            runtime: Mutex::new(None),
             script_limit: Duration::from_secs(SCRIPT_SECS),
             sh_limit: Duration::from_secs(SH_SECS),
         }))
+    }
+
+    /// Attach run-scoped `Live`, `Records`, and `StatusTools` so `status()` and `wait()` work.
+    pub fn attach_runtime(&self, live: Arc<crate::live::Live>, records: crate::store::Records, status: Arc<StatusTools>) {
+        *self.runtime.lock().unwrap() = Some(CodeRuntimeCtx { live, records, status });
     }
 
     /// [`CodeTools::new`] with the time limits from the settings (seconds; 0 keeps the default).
@@ -830,9 +919,229 @@ impl CodeTools {
                 let refs = crate::lsp::find_references(&scope.cwd, sym, 60);
                 Ok(serde_json::to_value(refs)?)
             }
+            "status" => {
+                let text = args["text"].as_str().unwrap_or("");
+                let ctx = self.runtime.lock().unwrap().clone();
+                let set = match ctx {
+                    Some(ctx) => ctx.status.set_status(grant, text),
+                    None => text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect(),
+                };
+                Ok(json!({ "ok": true, "status": set }))
+            }
+            "wait" => self.wait_op(grant, scope, args).await,
             other => bail!("no function `{other}`"),
         }
     }
+
+    /// H4: `wait({ url, port, log, agent, timeout })` — poll a local dev server, TCP port,
+    /// log file/transcript line, or sibling unit state without sleep loops.
+    async fn wait_op(&self, grant: &Grant, scope: &Scope, args: &Value) -> anyhow::Result<Value> {
+        let timeout_ms = args
+            .get("timeoutMs")
+            .or_else(|| args.get("timeout_ms"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                args.get("timeout").and_then(|v| {
+                    if let Some(secs) = v.as_f64() {
+                        // Treat numbers <= 600 as seconds, larger values as milliseconds.
+                        if secs <= 600.0 { Some((secs.max(0.05) * 1000.0) as u64) } else { Some(secs as u64) }
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(30_000)
+            .clamp(50, 120_000);
+        let url = args.get("url").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let port = args.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok());
+        let agent = args.get("agent").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let log_spec: Option<(Option<PathBuf>, String)> = match args.get("log") {
+            Some(Value::String(pat)) if !pat.is_empty() => {
+                let file = args
+                    .get("file")
+                    .or_else(|| args.get("path"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|raw| if Path::new(raw).is_absolute() { PathBuf::from(raw) } else { scope.cwd.join(raw) });
+                Some((file, pat.clone()))
+            }
+            Some(Value::Object(obj)) => {
+                let pat = obj
+                    .get("pattern")
+                    .or_else(|| obj.get("contains"))
+                    .or_else(|| obj.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if pat.is_empty() {
+                    None
+                } else {
+                    let file = obj
+                        .get("path")
+                        .or_else(|| obj.get("file"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|raw| if Path::new(raw).is_absolute() { PathBuf::from(raw) } else { scope.cwd.join(raw) });
+                    Some((file, pat))
+                }
+            }
+            _ => None,
+        };
+
+        if url.is_none() && port.is_none() && agent.is_none() && log_spec.is_none() {
+            bail!("wait requires at least one of `url`, `port`, `log`, or `agent`");
+        }
+        if let Some((Some(ref log_file), _)) = log_spec {
+            self.allowed(scope, "wait", ToolKind::Read, Some(log_file), None).await?;
+        }
+        if let Some(ref u) = url {
+            validate_local_wait_url(u)?;
+        }
+
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(timeout_ms);
+        let ctx = self.runtime.lock().unwrap().clone();
+        loop {
+            let mut all_ready = true;
+            let mut detail = serde_json::Map::new();
+
+            if let Some(p) = port {
+                let open = tokio::time::timeout(Duration::from_millis(250), tokio::net::TcpStream::connect(("127.0.0.1", p)))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                if open {
+                    detail.insert("port".into(), json!(p));
+                } else {
+                    all_ready = false;
+                }
+            }
+
+            if all_ready
+                && let Some(ref u) = url
+            {
+                match probe_local_http(u).await {
+                    Some(status) if (100..500).contains(&status) => {
+                        detail.insert("url".into(), json!(u));
+                        detail.insert("status".into(), json!(status));
+                    }
+                    _ => {
+                        all_ready = false;
+                    }
+                }
+            }
+
+            if all_ready
+                && let Some((ref log_file, ref pattern)) = log_spec
+            {
+                let matched_line = if let Some(file) = log_file {
+                    std::fs::read_to_string(file)
+                        .ok()
+                        .and_then(|text| text.lines().find(|l| l.contains(pattern.as_str())).map(str::to_string))
+                } else if let Some(ref ctx) = ctx {
+                    let (_, entries) = ctx.live.read(&grant.run, 0);
+                    entries.iter().rev().find_map(|e| {
+                        let s = e.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        s.contains(pattern.as_str()).then(|| s.chars().take(240).collect::<String>())
+                    })
+                } else {
+                    None
+                };
+                if let Some(line) = matched_line {
+                    detail.insert("log".into(), json!(line));
+                } else {
+                    all_ready = false;
+                }
+            }
+
+            if all_ready
+                && let Some(ref target) = agent
+            {
+                let page_id = target
+                    .strip_prefix("page:")
+                    .or_else(|| target.strip_prefix("unit:"))
+                    .unwrap_or(target.as_str());
+                let state = ctx.as_ref().and_then(|ctx| {
+                    let events = ctx.records.events(&grant.run).ok()?;
+                    let run = tm_core::Run::replay(1, events);
+                    run.pages.get(page_id).map(|p| p.state)
+                });
+                match state {
+                    Some(tm_core::PageState::Passed) => {
+                        detail.insert("agent".into(), json!(page_id));
+                        detail.insert("state".into(), json!("passed"));
+                    }
+                    Some(tm_core::PageState::Failed) => {
+                        return Ok(json!({
+                            "ok": false,
+                            "timeout": false,
+                            "agent": page_id,
+                            "state": "failed",
+                            "waited_ms": started.elapsed().as_millis() as u64,
+                        }));
+                    }
+                    _ => {
+                        all_ready = false;
+                    }
+                }
+            }
+
+            if all_ready {
+                detail.insert("ok".into(), json!(true));
+                detail.insert("waited_ms".into(), json!(started.elapsed().as_millis() as u64));
+                return Ok(Value::Object(detail));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(json!({
+                    "ok": false,
+                    "timeout": true,
+                    "waited_ms": started.elapsed().as_millis() as u64,
+                    "reason": "condition did not become ready before timeout"
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    }
+}
+
+fn validate_local_wait_url(url: &str) -> anyhow::Result<(String, u16, String)> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow::anyhow!("wait({{ url }}) only supports local http:// URLs"))?;
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = if let Some(inner) = host_port.strip_prefix('[') {
+        let (h, tail) = inner.split_once(']').ok_or_else(|| anyhow::anyhow!("invalid IPv6 host in `{url}`"))?;
+        let p = tail.strip_prefix(':').map(|s| s.parse::<u16>()).transpose()?.unwrap_or(80);
+        (h.to_string(), p)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        (h.to_string(), p.parse::<u16>().with_context(|| format!("invalid port in `{url}`"))?)
+    } else {
+        (host_port.to_string(), 80)
+    };
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        bail!("wait({{ url }}) only permits loopback addresses (got `{host}`)");
+    }
+    Ok((host, port, path.to_string()))
+}
+
+async fn probe_local_http(url: &str) -> Option<u16> {
+    let (host, port, path) = validate_local_wait_url(url).ok()?;
+    let addr = if host == "localhost" { "127.0.0.1".to_string() } else { host.clone() };
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(300),
+        tokio::net::TcpStream::connect((addr.as_str(), port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut first = String::new();
+    tokio::time::timeout(Duration::from_millis(400), reader.read_line(&mut first)).await.ok()?.ok()?;
+    first.split_whitespace().nth(1)?.parse::<u16>().ok()
 }
 
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
@@ -1130,7 +1439,7 @@ impl Extension for CodeTools {
         };
         let description = if scope.read_only {
             "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
-             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), check(), and console.log. \
+             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), check(), status(text), wait({url, port, log, agent, timeout}), and console.log. \
              Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
         } else {
             "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
@@ -1138,6 +1447,7 @@ impl Extension for CodeTools {
              applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
              grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), sh(command), \
              test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
+             status(text) to set a live one-line status, wait({url, port, log, agent, timeout}) to wait for a server/port/log/sibling unit, \
              and console.log. Paths are relative to your worktree. The same permissions as your own tools apply. \
              Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
         };

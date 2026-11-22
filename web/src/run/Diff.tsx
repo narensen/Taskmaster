@@ -8,6 +8,7 @@ import { KnownPath, openPathMenu, resolvedPath } from "../paths";
 import { toast } from "../overlay";
 import { prefs, setPrefs, usePrefs } from "../prefs";
 import { globMatch } from "./model";
+import { useReviewComments } from "./reviewDrafts";
 
 export type Scope = "attempt" | "page" | "run";
 
@@ -123,7 +124,7 @@ export function DiffTab({
   const [find, setFind] = useState("");
   const [hit, setHit] = useState(0);
   const [comment, setComment] = useState<{ file: string; line: number; text: string } | null>(null);
-  const [queued, setQueued] = useState<{ file: string; line: number; text: string }[]>([]);
+  const { comments, drafts, sending: sendingDrafts, addDraft, removeComment, toggleResolve, sendDrafts } = useReviewComments(run);
   const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
   const [fullFiles, setFullFiles] = useState<Record<string, boolean>>({});
   const body = useRef<HTMLDivElement>(null);
@@ -202,22 +203,35 @@ export function DiffTab({
     return pages.find((pg) => globMatch(pg.owned_glob, file))?.id ?? null;
   };
 
+  const ownerTarget = (file: string): string => {
+    const pg = owner(file);
+    return pg ? `page:${pg}` : "master";
+  };
+
   const viewedKey = (file: string) => `${run}:${file}`;
   const isViewed = (f: FileDiff) => p.viewed[viewedKey(f.path)] === f.hash;
 
-  const submit = async () => {
+  const submit = () => {
     if (!comment || !comment.text.trim()) return;
-    const to = owner(comment.file);
-    const where = to ? `On page ${to}, ` : "";
+    addDraft(comment.file, comment.line, comment.text.trim(), ownerTarget(comment.file));
+    setComment(null);
+  };
+
+  const sendAll = async () => {
     try {
-      await api.addNote(run, "master", `${where}Comment on ${comment.file}:${comment.line}: ${comment.text.trim()}`);
-      setQueued((q) => [...q, comment]);
-      toast("Sent to the master", "The master reads it before any worker does.");
-      setComment(null);
+      const res = await sendDrafts();
+      if (res.count > 0) {
+        toast(
+          `Sent ${res.owners} note${res.owners === 1 ? "" : "s"}`,
+          `${res.count} comment${res.count === 1 ? "" : "s"} grouped by owning worker in one turn.`,
+        );
+      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err));
     }
   };
+
+  const draftOwnerCount = useMemo(() => new Set(drafts.map((d) => d.owner)).size, [drafts]);
 
   return (
     <div className="diff-tab">
@@ -260,6 +274,18 @@ export function DiffTab({
           }}
         />
         {find && <span className="muted small">{hits ? `${(hit % hits) + 1}/${hits}` : "0/0"}</span>}
+        {drafts.length > 0 && (
+          <button
+            type="button"
+            className="primary small"
+            data-testid="send-review-notes"
+            disabled={sendingDrafts}
+            onClick={() => void sendAll()}
+            title={`Send ${drafts.length} draft comment${drafts.length === 1 ? "" : "s"} as ${draftOwnerCount} worker note${draftOwnerCount === 1 ? "" : "s"}`}
+          >
+            {sendingDrafts ? "Sending…" : `Send ${draftOwnerCount} note${draftOwnerCount === 1 ? "" : "s"} (${drafts.length})`}
+          </button>
+        )}
       </div>
       {error && <div className="tab-empty">{error}</div>}
       {!error && files.length === 0 && <div className="tab-empty">No changes in this scope.</div>}
@@ -324,7 +350,7 @@ export function DiffTab({
                       const target = l.new ?? l.old ?? 0;
                       const canComment = l.kind === "add" || l.kind === "ctx";
                       const open = comment && comment.file === f.path && comment.line === target && canComment;
-                      const done = queued.filter((q) => q.file === f.path && q.line === target);
+                      const pinned = comments.filter((q) => q.file === f.path && q.line === target);
                       return (
                         <FragmentRow key={i}>
                           <tr className={`dl ${l.kind}`}>
@@ -354,11 +380,29 @@ export function DiffTab({
                               </>
                             )}
                           </tr>
-                          {done.map((q, j) => (
-                            <tr key={`q${j}`} className="dl queued">
+                          {pinned.map((q) => (
+                            <tr key={q.id} className={`dl queued review-pin is-${q.status}`}>
                               <td colSpan={3}>
-                                <div className="draft small">
-                                  queued to {owner(q.file) ?? "?"}: {q.text}
+                                <div className="draft small row between gap">
+                                  <span>
+                                    <strong className="mono">{q.status}</strong> → <span className="mono">{q.owner}</span>: {q.text}
+                                  </span>
+                                  <span className="row gap">
+                                    {q.status === "draft" ? (
+                                      <button type="button" className="ghost small" onClick={() => removeComment(q.id)}>
+                                        Remove
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        className="ghost small"
+                                        data-testid="resolve-review-comment"
+                                        onClick={() => toggleResolve(q.id)}
+                                      >
+                                        {q.status === "resolved" ? "Reopen" : "Resolve"}
+                                      </button>
+                                    )}
+                                  </span>
                                 </div>
                               </td>
                             </tr>
@@ -370,20 +414,20 @@ export function DiffTab({
                                   <textarea
                                     autoFocus
                                     rows={2}
-                                    placeholder={`Fix text for the ${owner(f.path) ?? "?"} worker, about line ${target}`}
+                                    placeholder={`Draft comment for ${ownerTarget(f.path)}, about line ${target}`}
                                     value={comment.text}
                                     onChange={(e) => setComment({ ...comment, text: e.target.value })}
                                     onKeyDown={(e) => {
                                       if (e.key === "Enter" && !e.shiftKey) {
                                         e.preventDefault();
-                                        void submit();
+                                        submit();
                                       }
                                       if (e.key === "Escape") setComment(null);
                                     }}
                                   />
                                   <div className="row gap">
-                                    <button className="primary small" onClick={() => void submit()}>
-                                      Queue to worker
+                                    <button className="primary small" onClick={submit}>
+                                      Add draft
                                     </button>
                                     <button className="ghost small" onClick={() => setComment(null)}>
                                       Cancel

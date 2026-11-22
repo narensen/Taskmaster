@@ -495,6 +495,122 @@ pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
+pub struct BatchCommentItem {
+    file: String,
+    line: u32,
+    text: String,
+    to: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct BatchNoteItem {
+    to: String,
+    text: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct BatchNotesBody {
+    /// Optional pre-grouped notes (`{ to, text }`).
+    notes: Vec<BatchNoteItem>,
+    /// Optional diff line comments (`{ file, line, text, to? }`) automatically grouped by owning worker.
+    comments: Vec<BatchCommentItem>,
+    mode: Option<String>,
+    queued: bool,
+}
+
+/// O3: Batched diff review — groups comments by owning worker (one note per worker carrying every
+/// line anchor) and wakes the run once so all comments become a single turn.
+pub async fn add_notes_batch(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<BatchNotesBody>,
+) -> Reply {
+    let run = app.known(&id)?;
+    let mode = body.mode.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    if let Some(mode) = mode
+        && crate::RunMode::parse(mode).is_none()
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, format!("unknown mode `{mode}`: use `auto`, `code` or `agent`")));
+    }
+
+    let mut to_send: Vec<(String, String)> = Vec::new();
+    for item in body.notes {
+        let to = item.to.trim();
+        let text = item.text.trim();
+        if !valid_recipient(to) {
+            return Err(fail(StatusCode::BAD_REQUEST, format!("invalid note recipient `{to}`")));
+        }
+        if !text.is_empty() {
+            to_send.push((to.to_string(), text.to_string()));
+        }
+    }
+
+    if !body.comments.is_empty() {
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        for c in body.comments {
+            let text = c.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let target = c
+                .to
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| valid_recipient(t))
+                .map(str::to_string)
+                .unwrap_or_else(|| owner_for_file(&run, c.file.trim()));
+            let anchor = if c.file.trim().is_empty() {
+                text.to_string()
+            } else if c.line > 0 {
+                format!("- {}:{} — {}", c.file.trim(), c.line, text)
+            } else {
+                format!("- {} — {}", c.file.trim(), text)
+            };
+            grouped.entry(target).or_default().push(anchor);
+        }
+        for (target, lines) in grouped {
+            let combined = format!("Review comments ({}):\n{}", lines.len(), lines.join("\n"));
+            to_send.push((target, combined));
+        }
+    }
+
+    if to_send.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "batch requires at least one note or comment"));
+    }
+
+    let mut created = Vec::with_capacity(to_send.len());
+    for (to, text) in to_send {
+        let note = app.live.add_note_full(&id, &to, &text, mode, body.queued)?;
+        created.push(note);
+    }
+    app.live.notify_events(&id);
+    app.wake_for_note(&id)?;
+    ok(json!({ "count": created.len(), "notes": created }))
+}
+
+fn owner_for_file(run: &tm_core::Run, file: &str) -> String {
+    if let Some(plan) = &run.plan {
+        for page in &plan.pages {
+            if let Ok(glob) = globset::Glob::new(&page.owned_glob)
+                && glob.compile_matcher().is_match(file)
+            {
+                return plan.agent_id(page, None);
+            }
+        }
+        for page in &plan.pages {
+            let prefix = page.owned_glob.split('*').next().unwrap_or("").trim_end_matches('/');
+            if !prefix.is_empty() && file.starts_with(prefix) {
+                return plan.agent_id(page, None);
+            }
+        }
+    }
+    "master".to_string()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
 pub struct EditNote {
     text: Option<String>,
     queued: Option<bool>,
@@ -1245,6 +1361,241 @@ pub async fn stop_preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<Stri
     app.known(&id)?;
     app.previews.stop(&id);
     ok(preview_view(&app, &id))
+}
+
+/// O2: Same-origin proxy for the run's running preview server so Design Mode can inspect,
+/// highlight, and capture DOM elements inside the iframe without cross-origin restrictions.
+pub async fn preview_proxy_root(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    preview_proxy_inner(app, id, String::new(), query, headers).await
+}
+
+pub async fn preview_proxy_path(
+    State(app): State<Arc<App>>,
+    UrlPath((id, path)): UrlPath<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    preview_proxy_inner(app, id, path, query, headers).await
+}
+
+async fn preview_proxy_inner(
+    app: Arc<App>,
+    id: String,
+    rel_path: String,
+    query: HashMap<String, String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let token = super::bearer(&headers).or(query.get("token").map(String::as_str));
+    // Allow tokenless asset sub-requests when the request comes from our same-origin proxy Referer.
+    let referer_ok = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|r| r.contains(&format!("/api/runs/{id}/preview/proxy")));
+    if !referer_ok && token.and_then(|t| app.auth.identify(t)).is_none() {
+        return fail(StatusCode::UNAUTHORIZED, "a token is required").into_response();
+    }
+    if app.known(&id).is_err() {
+        return fail(StatusCode::NOT_FOUND, "run not found").into_response();
+    }
+    let Some(status) = app.previews.status(&id).filter(|s| s.state == "running") else {
+        return fail(StatusCode::CONFLICT, "the preview is not running").into_response();
+    };
+    let port = status.port;
+    let target_path = if rel_path.is_empty() {
+        "/".to_string()
+    } else if rel_path.starts_with('/') {
+        rel_path
+    } else {
+        format!("/{rel_path}")
+    };
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return fail(StatusCode::BAD_GATEWAY, "could not reach the preview server").into_response(),
+    };
+    let req = format!(
+        "GET {target_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).await.is_err() {
+        return fail(StatusCode::BAD_GATEWAY, "preview write failed").into_response();
+    }
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw)).await;
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return fail(StatusCode::BAD_GATEWAY, "malformed preview response").into_response();
+    };
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let mut body = raw[split + 4..].to_vec();
+    let mut status_code = StatusCode::OK;
+    let mut content_type = "text/html; charset=utf-8".to_string();
+    let mut chunked = false;
+    for (idx, line) in head.lines().enumerate() {
+        if idx == 0 {
+            if let Some(code) = line.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()) {
+                status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+            }
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case("content-type") {
+                content_type = v.trim().to_string();
+            } else if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+        }
+    }
+    if chunked {
+        body = decode_chunked(&body);
+    }
+    if content_type.to_ascii_lowercase().starts_with("text/html") {
+        let html = String::from_utf8_lossy(&body);
+        if !html.contains("<base ") {
+            let base = format!("<base href=\"/api/runs/{id}/preview/proxy/\">");
+            let rewritten = if let Some(pos) = html.to_ascii_lowercase().find("<head>") {
+                format!("{}{}{}", &html[..pos + 6], base, &html[pos + 6..])
+            } else {
+                format!("{base}{html}")
+            };
+            body = rewritten.into_bytes();
+        }
+    }
+    (status_code, [(axum::http::header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+fn decode_chunked(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let Some(crlf) = input[i..].windows(2).position(|w| w == b"\r\n") else { break };
+        let size_str = String::from_utf8_lossy(&input[i..i + crlf]);
+        let size_hex = size_str.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else { break };
+        i += crlf + 2;
+        if size == 0 || i + size > input.len() {
+            break;
+        }
+        out.extend_from_slice(&input[i..i + size]);
+        i += size + 2;
+    }
+    out
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct PreviewCaptureBody {
+    selector: String,
+    outer_html: String,
+    #[serde(default)]
+    styles: HashMap<String, String>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    source_file: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    screenshot_data_url: Option<String>,
+}
+
+/// O2: Receive a Design Mode element capture from the preview iframe, resolve its owning worker
+/// (from `source_file`, `.map` source maps, route, and `owned_glob`), and return the capture chip.
+pub async fn preview_capture(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<PreviewCaptureBody>,
+) -> Reply {
+    let run = app.known(&id)?;
+    let selector = body.selector.trim().chars().take(240).collect::<String>();
+    if selector.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "selector is required"));
+    }
+    let outer_html: String = body.outer_html.trim().chars().take(800).collect();
+    let source_file = body
+        .source_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| resolve_source_map_file(&app.project(), &body.path));
+    let (owner, page) = resolve_preview_owner(
+        &run,
+        source_file.as_deref(),
+        body.path.trim(),
+        body.text.as_deref().unwrap_or(""),
+    );
+    ok(json!({
+        "owner": owner,
+        "page": page,
+        "source_file": source_file,
+        "selector": selector,
+        "outer_html": outer_html,
+        "styles": body.styles,
+        "path": body.path,
+        "screenshot_data_url": body.screenshot_data_url,
+    }))
+}
+
+fn resolve_source_map_file(project: &Path, route_path: &str) -> Option<String> {
+    let clean = route_path.trim_start_matches('/');
+    if clean.is_empty() {
+        return None;
+    }
+    let candidate = project.join(format!("{clean}.map"));
+    let raw = std::fs::read_to_string(candidate).ok()?;
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    parsed["sources"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_start_matches("../").trim_start_matches("./").to_string())
+}
+
+fn resolve_preview_owner(
+    run: &tm_core::Run,
+    source_file: Option<&str>,
+    route_path: &str,
+    _text: &str,
+) -> (String, Option<String>) {
+    let Some(plan) = &run.plan else {
+        return ("master".to_string(), None);
+    };
+    if let Some(sf) = source_file {
+        for page in &plan.pages {
+            if let Ok(glob) = globset::Glob::new(&page.owned_glob)
+                && glob.compile_matcher().is_match(sf)
+            {
+                return (plan.agent_id(page, None), Some(page.id.clone()));
+            }
+        }
+    }
+    let normalized_route = if route_path.is_empty() { "/" } else { route_path };
+    for page in &plan.pages {
+        if page.route == normalized_route || (!page.route.is_empty() && normalized_route.starts_with(&page.route) && page.route != "/") {
+            return (plan.agent_id(page, None), Some(page.id.clone()));
+        }
+    }
+    let seg = normalized_route.trim_matches('/').split('/').next().unwrap_or("");
+    if !seg.is_empty()
+        && let Some(page) = plan.pages.iter().find(|p| p.id.eq_ignore_ascii_case(seg))
+    {
+        return (plan.agent_id(page, None), Some(page.id.clone()));
+    }
+    if let Some(first) = plan.pages.first() {
+        return (plan.agent_id(first, None), Some(first.id.clone()));
+    }
+    ("master".to_string(), None)
 }
 
 // Approvals.

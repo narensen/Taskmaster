@@ -19,12 +19,13 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
-import { api, type DiffStats, type PrSyncReport, type ReviewJob, type RunDetail } from "../api";
+import { api, type DiffStats, type PreviewCapture, type PrSyncReport, type ReviewJob, type RunDetail } from "../api";
 import { toast } from "../overlay";
 import { ExternalLink } from "../paths";
 import { navigate } from "../router";
 import { parseDiff } from "./Diff";
 import { LivePreview } from "./LivePreview";
+import { useReviewComments } from "./reviewDrafts";
 
 export function ReviewLens({
   id,
@@ -32,12 +33,14 @@ export function ReviewLens({
   diffStats,
   ghReady,
   onReload,
+  onCapture,
 }: {
   id: string;
   detail: RunDetail;
   diffStats: DiffStats | null;
   ghReady: boolean;
   onReload: () => void;
+  onCapture?: (capture: PreviewCapture) => void;
 }) {
   const pages = detail.plan?.pages ?? [];
   const [scope, setScope] = useState<"run" | string>("run");
@@ -48,10 +51,10 @@ export function ReviewLens({
   const [viewed, setViewed] = useState<Set<string>>(() => new Set());
   const [showPreview, setShowPreview] = useState(false);
 
-  // Inline comment composer anchored to a clicked diff line
+  // Inline comment composer anchored to a clicked diff line (O3 batched drafts)
   const [commentAt, setCommentAt] = useState<{ file: string; line: number } | null>(null);
   const [commentText, setCommentText] = useState("");
-  const [sendingComment, setSendingComment] = useState(false);
+  const { comments, drafts, sending: sendingDrafts, addDraft, removeComment, toggleResolve, sendDrafts } = useReviewComments(id);
 
   // Ship actions
   const [prUrl, setPrUrl] = useState<string | null>(null);
@@ -100,21 +103,26 @@ export function ReviewLens({
     return pages[0] ? `page:${pages[0].id}` : "master";
   };
 
-  const submitComment = async () => {
+  const saveDraftComment = () => {
     if (!commentAt || !commentText.trim()) return;
-    setSendingComment(true);
+    addDraft(commentAt.file, commentAt.line, commentText.trim(), ownerForFile(commentAt.file));
+    setCommentAt(null);
+    setCommentText("");
+  };
+
+  const sendAllDrafts = async () => {
     try {
-      const target = ownerForFile(commentAt.file);
-      const body = `Review comment on ${commentAt.file}:${commentAt.line}:\n${commentText.trim()}`;
-      await api.addNote(id, target, body);
-      toast("Review note sent", `Routed to ${target}`, 2500);
-      setCommentAt(null);
-      setCommentText("");
-      onReload();
+      const res = await sendDrafts();
+      if (res.count > 0) {
+        toast(
+          `Sent ${res.owners} note${res.owners === 1 ? "" : "s"}`,
+          `${res.count} comment${res.count === 1 ? "" : "s"} grouped by owning worker in one turn.`,
+          3000,
+        );
+        onReload();
+      }
     } catch (err) {
-      toast("Could not send comment", err instanceof Error ? err.message : String(err));
-    } finally {
-      setSendingComment(false);
+      toast("Could not send review notes", err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -223,6 +231,20 @@ export function ReviewLens({
         </div>
 
         <div className="review-bar-actions">
+          {drafts.length > 0 && (
+            <button
+              type="button"
+              className="primary small"
+              data-testid="send-review-notes"
+              disabled={sendingDrafts}
+              onClick={() => void sendAllDrafts()}
+            >
+              <Send size={13} aria-hidden />{" "}
+              {sendingDrafts
+                ? "Sending…"
+                : `Send ${new Set(drafts.map((d) => d.owner)).size} note${new Set(drafts.map((d) => d.owner)).size === 1 ? "" : "s"} (${drafts.length})`}
+            </button>
+          )}
           <button
             type="button"
             className={`ghost small ${showPreview ? "on" : ""}`}
@@ -379,6 +401,7 @@ export function ReviewLens({
                     {file.lines.slice(0, 400).map((line, i) => {
                       const lineNo = line.new ?? line.old;
                       const isCommenting = commentAt?.file === file.path && commentAt?.line === lineNo && line.kind !== "hunk";
+                      const pinned = lineNo ? comments.filter((c) => c.file === file.path && c.line === lineNo) : [];
                       return (
                         <div key={i}>
                           <div className={`review-line kind-${line.kind}`}>
@@ -403,11 +426,34 @@ export function ReviewLens({
                             </span>
                             <span className="review-code">{line.text || " "}</span>
                           </div>
+                          {pinned.map((q) => (
+                            <div key={q.id} className={`review-inline-comment review-pin is-${q.status}`}>
+                              <div className="row between gap">
+                                <span className="small">
+                                  <strong className="mono">{q.status}</strong> → <span className="mono">{q.owner}</span>: {q.text}
+                                </span>
+                                {q.status === "draft" ? (
+                                  <button type="button" className="ghost small" onClick={() => removeComment(q.id)}>
+                                    Remove
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="ghost small"
+                                    data-testid="resolve-review-comment"
+                                    onClick={() => toggleResolve(q.id)}
+                                  >
+                                    {q.status === "resolved" ? "Reopen" : "Resolve"}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          ))}
                           {isCommenting && (
                             <div className="review-inline-comment">
                               <div className="row between">
                                 <span className="small muted">
-                                  Send fix note to <strong className="mono">{ownerForFile(file.path)}</strong> for{" "}
+                                  Draft comment for <strong className="mono">{ownerForFile(file.path)}</strong> on{" "}
                                   <code className="mono">{file.path}:{lineNo}</code>
                                 </span>
                                 <button type="button" className="icon" onClick={() => setCommentAt(null)} aria-label="Close">
@@ -422,17 +468,17 @@ export function ReviewLens({
                                   onChange={(e) => setCommentText(e.target.value)}
                                   placeholder="Explain what should change on this line…"
                                   onKeyDown={(e) => {
-                                    if (e.key === "Enter") void submitComment();
+                                    if (e.key === "Enter") saveDraftComment();
                                     if (e.key === "Escape") setCommentAt(null);
                                   }}
                                 />
                                 <button
                                   type="button"
                                   className="primary small"
-                                  disabled={sendingComment || !commentText.trim()}
-                                  onClick={() => void submitComment()}
+                                  disabled={!commentText.trim()}
+                                  onClick={saveDraftComment}
                                 >
-                                  <Send size={12} aria-hidden /> Queue fix
+                                  <Send size={12} aria-hidden /> Add draft
                                 </button>
                               </div>
                             </div>
@@ -450,7 +496,7 @@ export function ReviewLens({
         {/* Optional Split Live Preview */}
         {showPreview && (
           <aside className="review-preview-pane">
-            <LivePreview id={id} detail={detail} />
+            <LivePreview id={id} detail={detail} onCapture={onCapture} />
           </aside>
         )}
       </div>

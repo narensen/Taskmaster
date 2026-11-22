@@ -5728,3 +5728,427 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
 
 
 
+
+#[tokio::test]
+async fn o6_agent_status_writes_status_transcript_entry() {
+    use tm_dictionary::{Extension, Grant};
+
+    let tmp = repo("o6-status");
+    let store: Arc<dyn crate::Store> = Arc::new(crate::FileStore::in_project(&tmp.0));
+    let records = crate::store::Records::new(store.clone());
+    let live = Arc::new(crate::live::Live::new(store));
+    let status = Arc::new(crate::code::StatusTools::new(live.clone()));
+    status.register_tag(
+        "page:a",
+        serde_json::json!({ "id": "page:a", "role": "worker", "page": "a", "harness": "fake", "call": 1 }),
+    );
+    let grant = Grant {
+        run: "r-o6".into(),
+        page: "a".into(),
+        unit: String::new(),
+    };
+
+    // 1. Direct MCP tool (`set_status`) works without Code Mode.
+    let res = status
+        .call(
+            &grant,
+            "set_status",
+            &serde_json::json!({ "text": "wiring form validation\nignored second line" }),
+        )
+        .await
+        .expect("set_status handled");
+    assert_ne!(res["isError"], true, "set_status error: {res}");
+
+    // 2. `status(text)` inside `run_code` writes another status entry if node is available.
+    if let Some(code) = crate::code::CodeTools::new(None) {
+        code.attach_runtime(live.clone(), records.clone(), status.clone());
+        let gate: Arc<dyn PermissionGate> = Arc::new(tm_harness::WorktreeGate::new(&tmp.0, vec![]));
+        code.attach("a", &tmp.0, gate, None);
+        let out = code
+            .call(
+                &grant,
+                "run_code",
+                &serde_json::json!({ "code": "const r = await status('running visual checks'); return r;" }),
+            )
+            .await
+            .expect("run_code handled");
+        assert_ne!(out["isError"], true, "run_code status() failed: {out}");
+    }
+
+    let entries = records.transcript("r-o6").unwrap();
+    let statuses: Vec<&str> = entries
+        .iter()
+        .filter(|e| e["kind"] == "status")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert!(
+        statuses.contains(&"wiring form validation"),
+        "expected MCP status entry in transcript, got {entries:?}"
+    );
+    if crate::code::CodeTools::new(None).is_some() {
+        assert!(
+            statuses.contains(&"running visual checks"),
+            "expected run_code status entry in transcript, got {entries:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h4_wait_helper_waits_for_port_http_url_log_and_sibling_agent() {
+    use tokio::io::AsyncWriteExt;
+    use tm_dictionary::{Extension, Grant};
+
+    let Some(code) = crate::code::CodeTools::new(None) else {
+        return;
+    };
+
+    let tmp = repo("h4-wait");
+    let store: Arc<dyn crate::Store> = Arc::new(crate::FileStore::in_project(&tmp.0));
+    let records = crate::store::Records::new(store.clone());
+    let live = Arc::new(crate::live::Live::new(store));
+    let status = Arc::new(crate::code::StatusTools::new(live.clone()));
+    code.attach_runtime(live.clone(), records.clone(), status);
+    let gate: Arc<dyn PermissionGate> = Arc::new(tm_harness::WorktreeGate::new(&tmp.0, vec![]));
+    code.attach("b", &tmp.0, gate, None);
+
+    let grant = Grant {
+        run: "r-h4".into(),
+        page: "b".into(),
+        unit: String::new(),
+    };
+
+    // 1. Start a tiny loopback HTTP server on an ephemeral port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        for _ in 0..4 {
+            let Ok((mut s, _)) = listener.accept().await else { break };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+
+    // 2. Write a log line after 80ms so wait({ log }) actually polls until it appears.
+    let log_path = tmp.0.join("dev.log");
+    std::fs::write(&log_path, "booting...\n").unwrap();
+    let log_clone = log_path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = std::fs::write(&log_clone, "booting...\nServer READY on port\n");
+    });
+
+    // 3. Emit sibling page `a` PlanReady + PlanApproved + WorkerFinished(Passed) after 80ms.
+    let p = plan(&[("a", &[]), ("b", &[])]);
+    records
+        .save_events("r-h4", &[tm_core::Event::PlanReady(p.clone()), tm_core::Event::PlanApproved])
+        .unwrap();
+    let records_clone = records.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = records_clone.save_events(
+            "r-h4",
+            &[
+                tm_core::Event::PlanReady(p),
+                tm_core::Event::PlanApproved,
+                tm_core::Event::WorkerFinished {
+                    page: "a".into(),
+                    outcome: tm_core::WorkerOutcome::Passed,
+                },
+            ],
+        );
+    });
+
+    let script = format!(
+        r#"
+const byPort = await wait({{ port: {port}, timeout: 3 }});
+const byUrl = await wait({{ url: "http://127.0.0.1:{port}/health", timeout: 3 }});
+const byLog = await wait({{ log: {{ path: "dev.log", pattern: "READY" }}, timeout: 3 }});
+const byAgent = await wait({{ agent: "page:a", timeout: 3 }});
+const timedOut = await wait({{ log: {{ path: "dev.log", pattern: "NEVER_APPEARS" }}, timeoutMs: 120 }});
+return {{ byPort, byUrl, byLog, byAgent, timedOut }};
+"#
+    );
+
+    let out = code
+        .call(&grant, "run_code", &serde_json::json!({ "code": script }))
+        .await
+        .expect("run_code handled");
+    server.abort();
+
+    assert_ne!(out["isError"], true, "run_code wait() failed: {out}");
+    let text = out["content"][0]["text"].as_str().unwrap_or("");
+    let r: serde_json::Value = serde_json::from_str(text).expect("json result from run_code");
+    assert_eq!(r["byPort"]["ok"], true, "wait port failed: {r}");
+    assert_eq!(r["byUrl"]["ok"], true, "wait url failed: {r}");
+    assert_eq!(r["byUrl"]["status"], 200, "wait url status: {r}");
+    assert_eq!(r["byLog"]["ok"], true, "wait log failed: {r}");
+    assert!(
+        r["byLog"]["log"].as_str().unwrap_or("").contains("READY"),
+        "expected matched log line: {r}"
+    );
+    assert_eq!(r["byAgent"]["ok"], true, "wait agent failed: {r}");
+    assert_eq!(r["byAgent"]["state"], "passed", "wait agent state: {r}");
+    assert_eq!(r["timedOut"]["ok"], false, "expected timeout false: {r}");
+    assert_eq!(r["timedOut"]["timeout"], true, "expected timeout flag: {r}");
+}
+
+#[tokio::test]
+async fn o3_batched_diff_review_groups_three_comments_on_two_pages_into_two_notes_and_one_turn() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let parsed = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    async fn wait_idle(addr: &str, token: &str, run: &str) {
+        for _ in 0..160 {
+            let (_, detail) = call(addr, Some(token), "GET", &format!("/api/runs/{run}"), None).await;
+            if detail["active"] == false && matches!(detail["phase"].as_str(), Some("done") | Some("failed")) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    struct O3Harness;
+    #[async_trait]
+    impl Harness for O3Harness {
+        fn id(&self) -> &'static str {
+            "o3-harness"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let page = if task.brief.contains("app/b/") { "b" } else { "a" };
+            let file = task.cwd.join(format!("app/{page}/page.ts"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("export const p = '{page}';\n"))?;
+            let _ = events.send(HarnessEvent::Text { text: "updated".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("o3-batch-review");
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let mut opts = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    opts.harness = Arc::new(|_| Ok(Arc::new(O3Harness) as Arc<dyn Harness>));
+    let server = crate::api::Server::serve(opts).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // Turn 1: build pages `a` (app/a/**) and `b` (app/b/**).
+    let planned = serde_json::to_value(plan(&[("a", &[]), ("b", &[])])).unwrap();
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs",
+        Some(serde_json::json!({
+            "id": "r-o3",
+            "plan": planned,
+            "yes": true,
+            "roles": { "worker": "o3-harness", "mid": "o3-harness", "master": "o3-harness", "reviewer": "o3-harness", "verifier": "o3-harness" }
+        })),
+    )
+    .await;
+    assert_eq!(st, 202);
+    wait_idle(&addr, &token, "r-o3").await;
+
+    // Send 3 line comments across 2 pages in one batch; expect 2 notes and 1 follow-up turn.
+    let (status, resp) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs/r-o3/notes/batch",
+        Some(serde_json::json!({
+            "comments": [
+                { "file": "app/a/page.ts", "line": 12, "text": "Rename button label" },
+                { "file": "app/a/helper.ts", "line": 4, "text": "Handle null case" },
+                { "file": "app/b/page.ts", "line": 22, "text": "Fix alignment" }
+            ],
+            "mode": "agent"
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "batch notes failed: {resp}");
+    assert_eq!(resp["count"], 2, "3 comments on 2 pages must group into 2 notes: {resp}");
+    let notes = resp["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 2);
+    let note_a = notes.iter().find(|n| n["to"] == "page:a").expect("note for page:a");
+    let note_b = notes.iter().find(|n| n["to"] == "page:b").expect("note for page:b");
+    let text_a = note_a["text"].as_str().unwrap();
+    let text_b = note_b["text"].as_str().unwrap();
+    assert!(
+        text_a.contains("app/a/page.ts:12") && text_a.contains("app/a/helper.ts:4"),
+        "note_a missing anchors: {text_a}"
+    );
+    assert!(text_b.contains("app/b/page.ts:22"), "note_b missing anchor: {text_b}");
+
+    wait_idle(&addr, &token, "r-o3").await;
+    let transcript = Records::files(&tmp.0).transcript("r-o3").unwrap();
+    let turn_entries: Vec<_> = transcript.iter().filter(|e| e["kind"] == "turn").collect();
+    assert_eq!(
+        turn_entries.len(),
+        1,
+        "batched comments must open exactly one turn, got {turn_entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn o2_preview_design_mode_proxy_and_capture_routes_h1_to_page_worker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn call_raw(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, body.to_string())
+    }
+
+    let tmp = repo("o2-design-mode");
+    std::fs::write(
+        tmp.0.join("index.html"),
+        "<!doctype html><html><head><title>Demo</title></head><body><h1 data-source=\"app/a/page.ts\">Hello World</h1></body></html>",
+    )
+    .unwrap();
+    git(&tmp.0, &["add", "index.html"]);
+    git(&tmp.0, &["commit", "-m", "add index.html"]);
+
+    struct O2Harness;
+    #[async_trait]
+    impl Harness for O2Harness {
+        fn id(&self) -> &'static str {
+            "o2-harness"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let page = if task.brief.contains("app/b/") { "b" } else { "a" };
+            let file = task.cwd.join(format!("app/{page}/page.ts"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "export const ok = true;\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let mut opts = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    opts.harness = Arc::new(|_| Ok(Arc::new(O2Harness) as Arc<dyn Harness>));
+    let server = crate::api::Server::serve(opts).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired_raw) = call_raw(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let paired: serde_json::Value = serde_json::from_str(&paired_raw).unwrap();
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // Run a 2-page build so `r-o2` has a real plan with `a` -> `app/a/**` and `b` -> `app/b/**`.
+    let planned = serde_json::to_value(plan(&[("a", &[]), ("b", &[])])).unwrap();
+    let (st, _) = call_raw(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs",
+        Some(serde_json::json!({
+            "id": "r-o2",
+            "plan": planned,
+            "yes": true,
+            "roles": { "worker": "o2-harness", "mid": "o2-harness", "master": "o2-harness", "reviewer": "o2-harness", "verifier": "o2-harness" }
+        })),
+    )
+    .await;
+    assert_eq!(st, 202);
+    for _ in 0..160 {
+        let (_, b) = call_raw(&addr, Some(&token), "GET", "/api/runs/r-o2", None).await;
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
+        if v["active"] == false && v["phase"] == "done" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Start preview (uses static fallback serving index.html).
+    let (st_start, body_start) = call_raw(&addr, Some(&token), "POST", "/api/runs/r-o2/preview", Some(serde_json::json!({}))).await;
+    assert!(matches!(st_start, 200 | 202), "preview start failed ({st_start}): {body_start}");
+    for _ in 0..40 {
+        let (_, b) = call_raw(&addr, Some(&token), "GET", "/api/runs/r-o2/preview", None).await;
+        if b.contains("\"running\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Fetch via same-origin preview proxy with ?token=... and verify base tag + h1.
+    let (st_proxy, html) = call_raw(
+        &addr,
+        None,
+        "GET",
+        &format!("/api/runs/r-o2/preview/proxy/?token={token}"),
+        None,
+    )
+    .await;
+    assert_eq!(st_proxy, 200, "preview proxy failed: {html}");
+    assert!(
+        html.contains("<base href=\"/api/runs/r-o2/preview/proxy/\">"),
+        "missing base tag in proxied html: {html}"
+    );
+    assert!(html.contains("Hello World"), "missing h1 content in proxied html: {html}");
+
+    // Capture the <h1> and verify it routes to owning worker `page:a`.
+    let (st_cap, cap_body) = call_raw(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs/r-o2/preview/capture",
+        Some(serde_json::json!({
+            "selector": "body > h1",
+            "outer_html": "<h1 data-source=\"app/a/page.ts\">Hello World</h1>",
+            "styles": { "font-size": "32px", "color": "rgb(255, 255, 255)" },
+            "path": "/",
+            "source_file": "app/a/page.ts"
+        })),
+    )
+    .await;
+    assert_eq!(st_cap, 200, "preview capture failed: {cap_body}");
+    let cap: serde_json::Value = serde_json::from_str(&cap_body).unwrap();
+    assert_eq!(cap["owner"], "page:a");
+    assert_eq!(cap["page"], "a");
+    assert_eq!(cap["selector"], "body > h1");
+
+    // Stop preview cleanly.
+    let _ = call_raw(&addr, Some(&token), "POST", "/api/runs/r-o2/preview/stop", Some(serde_json::json!({}))).await;
+}

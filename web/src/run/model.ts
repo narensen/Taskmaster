@@ -86,6 +86,8 @@ export interface Surface {
   tag: AgentTag | null;
   /** `stopped`: a call was still open when the run was cancelled or ended. */
   state: "waiting" | "working" | "done" | "failed" | "stopped";
+  /** Latest explicit status set by the agent via status(text) / set_status (O6). */
+  statusLine?: string;
   summary: SurfaceSummary;
   tokens: number;
   /** The same tokens, split four ways, from each finished call's usage. */
@@ -192,6 +194,7 @@ function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
   let toolCount = 0;
   let lastTool: ToolItem | null = null;
   let latestThought: string | null = null;
+  let latestStatus: string | null = null;
   let lastError: string | null = null;
   let latestStart: string | null = null;
   let latestEnd: string | null = null;
@@ -203,6 +206,8 @@ function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
     for (const item of call.items) {
       if (item.t === "thought" && item.text.trim()) {
         latestThought = item.text;
+      } else if (item.t === "life" && item.text.startsWith("Status: ")) {
+        latestStatus = item.text.slice("Status: ".length).trim() || latestStatus;
       } else if (item.t === "tool") {
         toolCount++;
         lastTool = item;
@@ -221,6 +226,7 @@ function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
       }
     }
   }
+  if (s.statusLine) latestStatus = s.statusLine;
 
   const editedFiles = [...editedSet];
   const readFiles = [...readSet];
@@ -233,6 +239,8 @@ function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
     headline = lastTool ? `Stopped while ${toolHeadline(lastTool).replace(/^\w/, (c) => c.toLowerCase())}` : "Stopped";
   } else if (s.state === "failed" || lastError) {
     headline = lastError ? cleanLine(lastError, 96) || "Failed" : "Failed";
+  } else if (latestStatus && (open || s.state === "working" || s.state === "done")) {
+    headline = cleanLine(latestStatus, 120) || latestStatus;
   } else if (open) {
     if (lastTool) {
       headline = toolHeadline(lastTool);
@@ -476,6 +484,14 @@ export class SurfaceBuilder {
           const open = findLastTool(call.items, (i) => i.allowed === undefined && i.name === targetName);
           if (open) replace(call, open, { allowed: e.allowed });
           else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed, at: e.at });
+          break;
+        }
+        case "status": {
+          const text = (e.text ?? "").trim();
+          if (text) {
+            s.statusLine = text;
+            call.items.push({ t: "life", text: `Status: ${text}`, at: e.at });
+          }
           break;
         }
         case "stalled":

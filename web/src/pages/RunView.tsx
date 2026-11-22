@@ -3,9 +3,9 @@
 // and accessed files. A toggleable side panel holds files, diff, preview, and terminal.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertCircle, ArrowDown, Check, FileDiff, GitBranch, GitMerge, Link2, Loader2, MessageSquareText, Network, PanelRight } from "lucide-react";
+import { Activity, AlertCircle, ArrowDown, Check, Crosshair, FileDiff, GitBranch, GitMerge, Link2, Loader2, MessageSquareText, Network, PanelRight, X } from "lucide-react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
-import { api, type DiffStats, type ReviewJob, type RunDetail } from "../api";
+import { api, type DiffStats, type PreviewCapture, type ReviewJob, type RunDetail } from "../api";
 import { takeAttachments } from "../App";
 import { setRunContext } from "../commands";
 import { CancelControl, type ActiveWorkerItem } from "../components/CancelControl";
@@ -289,7 +289,18 @@ export function RunView({ id }: { id: string }) {
   const [sheet, setSheet] = useState(false);
   const [cite, setCite] = useState<{ x: number; y: number; text: string } | null>(null);
   const [citeNote, setCiteNote] = useState("");
+  const [designCaptures, setDesignCaptures] = useState<PreviewCapture[]>([]);
   const [pr, setPr] = useState<string | null>(null);
+  useEffect(() => {
+    setDesignCaptures([]);
+  }, [id]);
+  const handleDesignCapture = useCallback((capture: PreviewCapture) => {
+    setDesignCaptures((prev) => {
+      const exists = prev.some((c) => c.selector === capture.selector && c.path === capture.path);
+      return exists ? prev : [...prev, capture];
+    });
+    composer.current?.focus();
+  }, []);
   const [panelOpen, setPanelOpenState] = useState(() => prefs().runPanel);
   const setPanelOpen = useCallback((open: boolean) => {
     setPanelOpenState(open);
@@ -665,16 +676,51 @@ export function RunView({ id }: { id: string }) {
 
   const send = async (message: { text: string; chips: Chip[]; attachments: Chip[] }, opts?: { alt?: boolean }) => {
     const text = messageText(message);
-    if (!text) return;
-    const to = noteTarget(message.chips);
+    if (!text && designCaptures.length === 0) return;
+    const explicitChipTarget = message.chips.some((c) => c.kind === "agent" || c.kind === "page");
+    const explicitTo = noteTarget(message.chips);
     // A note on a finished run starts a new turn below; on an active run Enter uses the
     // person's Queue/Steer default and Ctrl/Cmd+Enter does the other (A1).
     const finished = !!detail && !detail.active && (detail.phase === "done" || detail.phase === "failed");
     const active = !!detail?.active;
     const defaultQueue = p.chatSendMode !== "steer";
     const queued = active ? (opts?.alt ? !defaultQueue : defaultQueue) : false;
+    const mode = finished || queued ? runMode : undefined;
     try {
-      await api.addNote(id, to, text, finished || queued ? runMode : undefined, queued);
+      if (designCaptures.length > 0) {
+        const byOwner = new Map<string, PreviewCapture[]>();
+        for (const cap of designCaptures) {
+          const target = explicitChipTarget ? explicitTo : cap.owner || "master";
+          const listForOwner = byOwner.get(target) ?? [];
+          listForOwner.push(cap);
+          byOwner.set(target, listForOwner);
+        }
+        const notesBatch = [...byOwner.entries()].map(([owner, caps]) => {
+          const sections = caps.map((c) => {
+            const stylePairs = Object.entries(c.styles)
+              .slice(0, 8)
+              .map(([k, v]) => `${k}: ${v}`)
+              .join("; ");
+            const lines = [
+              `[Design capture] selector: \`${c.selector}\` (${c.path})`,
+              c.source_file ? `source: ${c.source_file}` : null,
+              stylePairs ? `styles: ${stylePairs}` : null,
+              c.outer_html ? `html: ${c.outer_html.slice(0, 400)}` : null,
+            ].filter(Boolean);
+            return lines.join("\n");
+          });
+          const body = [text, ...sections].filter(Boolean).join("\n\n");
+          return { to: owner, text: body };
+        });
+        if (notesBatch.length === 1) {
+          await api.addNote(id, notesBatch[0]!.to, notesBatch[0]!.text, mode, queued);
+        } else {
+          await api.addNotesBatch(id, { notes: notesBatch, mode, queued });
+        }
+        setDesignCaptures([]);
+      } else {
+        await api.addNote(id, explicitTo, text, mode, queued);
+      }
       composer.current?.clear();
       data.reloadNotes();
       if (finished) {
@@ -715,7 +761,7 @@ export function RunView({ id }: { id: string }) {
         {panelReady && tab === "diff" && <DiffTab run={id} detail={detail} request={diffRequest} />}
         {panelReady && tab === "preview" && (
           <div className="preview-stack">
-            <LivePreview id={id} detail={detail} />
+            <LivePreview id={id} detail={detail} onCapture={handleDesignCapture} />
             <BrowserTab run={id} detail={detail} entries={entries} />
           </div>
         )}
@@ -969,6 +1015,7 @@ export function RunView({ id }: { id: string }) {
             detail={detail}
             diffStats={diffStats}
             ghReady={!!gh}
+            onCapture={handleDesignCapture}
             onReload={() => {
               void data.reload();
               data.reloadNotes();
@@ -1171,6 +1218,31 @@ export function RunView({ id }: { id: string }) {
         </button>
       )}
       <div className="composer-bar">
+        {designCaptures.length > 0 && (
+          <div className="design-capture-chips" data-testid="design-capture-chips">
+            {designCaptures.map((cap, idx) => (
+              <span
+                key={`${cap.path}:${cap.selector}:${idx}`}
+                className="design-capture-chip mono small"
+                data-testid="design-capture-chip"
+                data-owner={cap.owner}
+                title={cap.source_file ? `${cap.selector} (${cap.source_file}) → ${cap.owner}` : `${cap.selector} → ${cap.owner}`}
+              >
+                <Crosshair size={11} aria-hidden />
+                <span className="design-capture-selector">{cap.selector}</span>
+                <span className="muted">→ {cap.owner}</span>
+                <button
+                  type="button"
+                  className="ghost icon-btn"
+                  aria-label={`Remove captured element ${cap.selector}`}
+                  onClick={() => setDesignCaptures((prev) => prev.filter((_, i) => i !== idx))}
+                >
+                  <X size={11} aria-hidden />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         <Composer
           ref={composer}
           bus

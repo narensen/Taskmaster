@@ -380,6 +380,8 @@ struct Driver {
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     /// `run_code` for each page being built, when Code Mode is on and Node is here.
     code: Option<Arc<crate::code::CodeTools>>,
+    /// Status-line MCP extension (O6) always available to every agent.
+    status_tools: Arc<crate::code::StatusTools>,
     /// Mid-tier checks running beside the build (see `checker.rs`).
     checks: JoinSet<CheckDone>,
     /// Pages already given to the checker: each is checked once.
@@ -542,6 +544,10 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
     // Code Mode: run_code, beside the browser, on the same server.
     let code = if config.code_mode { crate::code::CodeTools::with_limits(browsers.clone(), config.code_script_secs, config.code_sh_secs) } else { None };
+    let status_tools = Arc::new(crate::code::StatusTools::new(live.clone()));
+    if let Some(code) = &code {
+        code.attach_runtime(live.clone(), records.clone(), status_tools.clone());
+    }
     // Daemon-served web_search, web_fetch, and local-first docs() (Phase 1).
     let loaded_settings = crate::settings::Settings::load(&project).unwrap_or_default();
     let web_tools = crate::web_access::WebTools::new(
@@ -558,6 +564,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     if let Some(code) = &code {
         extensions.push(code.clone());
     }
+    extensions.push(status_tools.clone());
     extensions.push(web_tools);
     mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
@@ -629,6 +636,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         small: false,
         browsers,
         code,
+        status_tools,
         checks: JoinSet::new(),
         checked: BTreeSet::new(),
         early: JoinSet::new(),
@@ -4728,6 +4736,11 @@ impl Driver {
             "branch": self.branch,
             "call": self.live.next_call(),
         });
+        let scope_key = agent
+            .strip_prefix("page:")
+            .or_else(|| agent.strip_prefix("unit:"))
+            .unwrap_or(agent);
+        self.status_tools.register_tag(scope_key, tag.clone());
         request.feed = Some(Feed { live: self.live.clone(), run: self.id.clone(), agent: tag });
         request.stall = Some(if self.small { SMALL_STALL } else { STALL });
     }

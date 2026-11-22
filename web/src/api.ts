@@ -546,6 +546,8 @@ export interface AgentEntry {
     | "released"
     | "restarted"
     | "turn"
+    | "status"
+    | "session"
     | "web_search"
     | "web_fetch"
     | "docs"
@@ -691,6 +693,17 @@ export interface PreviewView {
   reason?: string | null;
   output?: string | null;
   started?: string | null;
+}
+
+export interface PreviewCapture {
+  owner: string;
+  page?: string | null;
+  source_file?: string | null;
+  selector: string;
+  outer_html: string;
+  styles: Record<string, string>;
+  path: string;
+  screenshot_data_url?: string | null;
 }
 
 export interface EditorInfo {
@@ -1437,6 +1450,15 @@ export const api = {
     if (queued) body.queued = true;
     return call<Note>("POST", `/api/runs/${enc(id)}/notes`, body);
   },
+  addNotesBatch: (
+    id: string,
+    payload: {
+      notes?: { to: string; text: string }[];
+      comments?: { file: string; line: number; text: string; to?: string }[];
+      mode?: RunMode;
+      queued?: boolean;
+    },
+  ) => call<{ count: number; notes: Note[] }>("POST", `/api/runs/${enc(id)}/notes/batch`, payload),
   editNote: (id: string, note: string, text?: string, queued?: boolean) => {
     const body: Record<string, unknown> = {};
     if (text !== undefined) body.text = text;
@@ -1481,6 +1503,22 @@ export const api = {
   preview: (id: string) => call<PreviewView>("GET", `/api/runs/${enc(id)}/preview`),
   startPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview`, {}),
   stopPreview: (id: string) => call<PreviewView>("POST", `/api/runs/${enc(id)}/preview/stop`, {}),
+  previewProxyUrl: (id: string) => {
+    const t = token();
+    return `/api/runs/${enc(id)}/preview/proxy/${t ? `?token=${enc(t)}` : ""}`;
+  },
+  previewCapture: (
+    id: string,
+    body: {
+      selector: string;
+      outer_html: string;
+      styles: Record<string, string>;
+      path: string;
+      source_file?: string | null;
+      text?: string | null;
+      screenshot_data_url?: string | null;
+    },
+  ) => call<PreviewCapture>("POST", `/api/runs/${enc(id)}/preview/capture`, body),
   settings: () => call<DaemonSettings>("GET", "/api/settings"),
   editors: () => call<{ editors: EditorInfo[]; default: string }>("GET", "/api/editors"),
   open: (body: { path: string; line?: number; column?: number; editor?: string; reveal?: boolean }) =>

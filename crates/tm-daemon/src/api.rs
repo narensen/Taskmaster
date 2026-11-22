@@ -422,6 +422,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/agents/{index}", get(desk::agent_entry))
         .route("/api/runs/{id}/output/stream", get(desk::command_output_stream))
         .route("/api/runs/{id}/notes", get(desk::notes).post(desk::add_note))
+        .route("/api/runs/{id}/notes/batch", post(desk::add_notes_batch))
         .route("/api/runs/{id}/notes/{note}", post(desk::edit_note))
         .route("/api/runs/{id}/rewind", post(rewind_run))
         .route("/api/runs/{id}/terminal", post(desk::terminal))
@@ -430,6 +431,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/pr", post(desk::open_pr))
         .route("/api/runs/{id}/preview", get(desk::preview).post(desk::start_preview))
         .route("/api/runs/{id}/preview/stop", post(desk::stop_preview))
+        .route("/api/runs/{id}/preview/capture", post(desk::preview_capture))
         .route("/api/approvals", get(desk::approvals))
         .route("/api/approvals/{id}/{decision}", post(desk::decide))
         .route("/api/settings", get(desk::settings).post(desk::update_settings))
@@ -514,6 +516,9 @@ fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/metrics", get(ops::prometheus_metrics))
         .route("/api/runs/{id}/stream", get(run_stream))
+        .route("/api/runs/{id}/preview/proxy", get(desk::preview_proxy_root))
+        .route("/api/runs/{id}/preview/proxy/", get(desk::preview_proxy_root))
+        .route("/api/runs/{id}/preview/proxy/{*path}", get(desk::preview_proxy_path))
         .route("/api/setup/jobs/{id}/stream", get(setup::stream_job))
         .route("/api/terminals/{id}/stream", get(terms::stream))
         .route("/api/health", get(health))
@@ -580,7 +585,7 @@ async fn idempotency_guard(State(app): State<Arc<App>>, request: Request, next: 
     response
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(super) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 

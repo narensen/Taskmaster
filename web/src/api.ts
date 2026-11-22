@@ -1383,6 +1383,20 @@ export const api = {
     const query = [harness ? `harness=${enc(harness)}` : "", fresh ? "fresh=1" : ""].filter(Boolean).join("&");
     return call<{ providers: Provider[] }>("GET", `/api/providers${query ? `?${query}` : ""}`).then((r) => r.providers);
   },
+  /** Provider 5-hour and 7-day usage windows reported by provider CLIs (O4). */
+  providerUsage: () =>
+    call<{
+      usage: {
+        provider: string;
+        window_5h?: { pct: number; resets_at?: string };
+        window_7d?: { pct: number; resets_at?: string };
+        source: string;
+        updated_at: string;
+        warning: boolean;
+      }[];
+      oauth_polling: boolean;
+      warning_threshold_pct: number;
+    }>("GET", "/api/providers/usage"),
   setup: () => call<{ providers: ProviderStatus[]; runtimes: RuntimeStatus[]; jobs: SetupJob[] }>("GET", "/api/setup"),
   startProviderJob: (id: string, action: SetupAction) => call<SetupJob>("POST", `/api/setup/providers/${enc(id)}/${action}`, {}),
   installRuntime: (id: string) => call<SetupJob>("POST", `/api/setup/runtimes/${enc(id)}/install`, {}),

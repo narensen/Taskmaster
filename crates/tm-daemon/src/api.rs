@@ -402,6 +402,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/workers/{page}/restart", post(restart_worker))
         .route("/api/search", get(web_search))
         .route("/api/providers", get(providers))
+        .route("/api/providers/usage", get(provider_usage))
         .route("/api/templates", get(templates))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/open", post(open_project))
@@ -976,6 +977,7 @@ impl App {
         config.package_indexes = saved.sandbox.package_indexes;
         config.prices = crate::settings::price_table(&saved);
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
+        config.warm_idle = std::time::Duration::from_secs(saved.agents.warm_idle_secs);
         let policy = crate::policy::Policy::load(&self.project());
         let policy_cap = policy.max_run_cost_usd.filter(|v| v.is_finite() && *v > 0.0);
         let req_or_saved = request
@@ -1314,7 +1316,13 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     // A request that names roles but no models does not inherit the saved models, which belong to the saved harnesses.
     let mut models: Models = if body.roles.is_empty() { with_defaults(&saved.models, body.models).map_err(bad_request)? } else { with_defaults(&Models::default(), body.models).map_err(bad_request)? };
     let mut roles = Roles::resolve(&crate::settings::Settings::saved_roles(&app.project()), &body.roles).map_err(bad_request)?;
-    roles.resolve_auto(&app.records(), &mut models, "normal", "general");
+    roles.resolve_auto_with_usage(
+        &app.records(),
+        &mut models,
+        "normal",
+        "general",
+        &app.live.usage.near_limit(),
+    );
     app.check_models_cached(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
@@ -1830,6 +1838,15 @@ async fn providers(State(app): State<Arc<App>>, Query(query): Query<HashMap<Stri
         None => app.providers.reports(fresh).await,
     };
     ok(json!({ "providers": reports }))
+}
+
+async fn provider_usage(State(app): State<Arc<App>>) -> Reply {
+    let saved = crate::settings::Settings::load(&app.project()).unwrap_or_default();
+    ok(json!({
+        "usage": app.live.usage.snapshot(),
+        "oauth_polling": saved.usage.oauth_polling,
+        "warning_threshold_pct": crate::usage::WARNING_THRESHOLD_PCT,
+    }))
 }
 
 impl App {

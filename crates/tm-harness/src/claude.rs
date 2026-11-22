@@ -140,10 +140,27 @@ impl ClaudeCode {
         let read = async {
             let mut lines = BufReader::new(stdout).lines();
             let mut session_id: Option<String> = resume.map(str::to_string);
+            let mut emitted_session = false;
+            if let Some(id) = session_id.as_deref() {
+                let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
+                emitted_session = true;
+            }
             while let Some(line) = lines.next_line().await? {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
                 if let Some(id) = msg["session_id"].as_str().filter(|s| !s.is_empty()) {
+                    let changed = session_id.as_deref() != Some(id);
                     session_id = Some(id.to_string());
+                    if !emitted_session || changed {
+                        let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
+                        emitted_session = true;
+                    }
+                }
+                if (msg["type"].as_str() == Some("rate_limit_event")
+                    || msg.get("rate_limit_info").is_some()
+                    || msg.get("rate_limits").is_some())
+                    && let Some(report) = crate::parse_rate_limit_value(&msg, "claude-cli")
+                {
+                    let _ = events.send(HarnessEvent::RateLimit(report)).await;
                 }
                 match msg["type"].as_str() {
                     Some("assistant") => {
@@ -251,6 +268,16 @@ impl crate::Session for ClaudeSession {
         Ok(summary)
     }
 
+    fn session_id(&self) -> Option<&str> {
+        Some(&self.session_id)
+    }
+
+    fn detach(mut self: Box<Self>) -> Option<String> {
+        // Keep the persisted JSONL session file on disk so a later repair or restart can resume it.
+        self.cleaned = true;
+        Some(self.session_id.clone())
+    }
+
     async fn close(mut self: Box<Self>) -> crate::Freed {
         self.cleanup();
         crate::Freed::default()
@@ -286,6 +313,26 @@ impl Harness for ClaudeCode {
                 (Ok(summary), None)
             }
             Ok((summary, None)) => (Ok(summary), None),
+            Err(err) => (Err(err), None),
+        }
+    }
+
+    async fn resume_kept(
+        &self,
+        session_id: &str,
+        prompt: String,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        match self.execute(&task, &prompt, true, Some(session_id), events, task.timeout).await {
+            Ok((summary, next_id)) if summary.ok => {
+                let id = next_id.unwrap_or_else(|| session_id.to_string());
+                let kept: Box<dyn crate::Session> =
+                    Box::new(ClaudeSession { harness: self.clone(), task, session_id: id, cleaned: false });
+                (Ok(summary), Some(kept))
+            }
+            Ok((summary, _)) => (Ok(summary), None),
             Err(err) => (Err(err), None),
         }
     }

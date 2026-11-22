@@ -567,6 +567,64 @@ function useRuns(signedIn: boolean) {
   return { data, reload };
 }
 
+const UsageMeter = memo(function UsageMeter({ signedIn }: { signedIn: boolean }) {
+  const [items, setItems] = useState<
+    {
+      provider: string;
+      window_5h?: { pct: number; resets_at?: string };
+      window_7d?: { pct: number; resets_at?: string };
+      warning: boolean;
+    }[]
+  >([]);
+
+  useEffect(() => {
+    if (!signedIn) return;
+    let alive = true;
+    const load = () => {
+      if (document.visibilityState !== "visible") return;
+      api
+        .providerUsage()
+        .then((res) => {
+          if (alive) setItems(res.usage ?? []);
+        })
+        .catch(() => {});
+    };
+    const initial = window.setTimeout(load, 1200);
+    const interval = window.setInterval(load, 30_000);
+    return () => {
+      alive = false;
+      window.clearTimeout(initial);
+      window.clearInterval(interval);
+    };
+  }, [signedIn]);
+
+  if (!items.length) return null;
+  return (
+    <div className="usage-meter" aria-label="Provider usage">
+      {items.map((u) => {
+        const w5 = u.window_5h ? `${Math.round(u.window_5h.pct)}%` : null;
+        const w7 = u.window_7d ? `${Math.round(u.window_7d.pct)}%` : null;
+        const tip = [
+          u.window_5h ? `5h: ${Math.round(u.window_5h.pct)}%${u.window_5h.resets_at ? ` (resets ${u.window_5h.resets_at})` : ""}` : null,
+          u.window_7d ? `7d: ${Math.round(u.window_7d.pct)}%${u.window_7d.resets_at ? ` (resets ${u.window_7d.resets_at})` : ""}` : null,
+          u.warning ? "Near limit (Auto routes away)" : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        return (
+          <div key={u.provider} className={`usage-pill ${u.warning ? "warn" : ""}`} title={tip} data-warning={u.warning ? "true" : undefined}>
+            <span className="usage-name">{u.provider}</span>
+            <span className="usage-vals mono">
+              {w5 && <span>5h {w5}</span>}
+              {w7 && <span>7d {w7}</span>}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
 export function App() {
   const path = usePath();
   const signedIn = useSignedIn();
@@ -725,6 +783,7 @@ export function App() {
               })}
             </nav>
             <RunList runs={runs.data} path={path} onPick={closeDrawer} />
+            <UsageMeter signedIn={signedIn} />
           </aside>
           {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
           <main className="main">

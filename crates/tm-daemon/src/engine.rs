@@ -407,6 +407,12 @@ struct Driver {
     /// Builders whose sessions are still open, by agent (`page` or `page/unit`), oldest
     /// first. A repair of that unit on the same tier is sent to it as a follow-up turn.
     warm: VecDeque<(String, Warm)>,
+    /// Warm sessions detached after sitting idle past `warm_idle` (O7); resumed by provider
+    /// session id if a repair comes back for the same unit and harness.
+    hibernated: HashMap<String, Hibernated>,
+    /// Provider session ids recovered from the run's transcript on daemon restart (H2),
+    /// keyed by `(agent_id, harness_id)`.
+    resumed_sessions: HashMap<(String, String), String>,
     /// Snapshot of Phase 1 web access settings taken at run start so the shared prefix
     /// and role permissions stay deterministic for every agent in this run.
     web_access: crate::web_access::WebAccessSettings,
@@ -426,6 +432,23 @@ struct Warm {
     session: Box<dyn tm_harness::Session>,
     worktree: PathBuf,
     tier: Tier,
+    harness: String,
+    last_used: Instant,
+}
+
+/// A warm session released after sitting idle, kept only as its resumable provider session id (O7).
+struct Hibernated {
+    session_id: String,
+    worktree: PathBuf,
+    tier: Tier,
+    harness: String,
+}
+
+/// How a spawned worker executes its turn.
+enum WorkerExec {
+    Fresh,
+    Warm(Warm),
+    Resume { session_id: String, prompt: String },
 }
 
 /// Open builder sessions a run keeps at most; the oldest is closed first.
@@ -562,6 +585,12 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         }
     }
 
+    let resumed_sessions = if !events.is_empty() {
+        recover_resumed_sessions(&live, &id)
+    } else {
+        HashMap::new()
+    };
+
     let mut driver = Driver {
         config,
         tree: project.clone(),
@@ -612,6 +641,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         project_memory: String::new(),
         next_plan: None,
         warm: VecDeque::new(),
+        hibernated: HashMap::new(),
+        resumed_sessions,
         web_access: loaded_settings.web_access,
         release_nudged: BTreeSet::new(),
         race_pages: HashMap::new(),
@@ -689,6 +720,9 @@ impl Driver {
         for (_, warm) in std::mem::take(&mut self.warm) {
             let _ = warm.session.close().await;
             self.drop_worktree(&warm.worktree);
+        }
+        for (_, hib) in std::mem::take(&mut self.hibernated) {
+            self.drop_worktree(&hib.worktree);
         }
         if let Some(code) = &self.code {
             code.detach_all();
@@ -1687,6 +1721,9 @@ impl Driver {
                     let _ = warm.session.close().await;
                     self.drop_worktree(&warm.worktree);
                 }
+                for (_, hib) in std::mem::take(&mut self.hibernated) {
+                    self.drop_worktree(&hib.worktree);
+                }
                 if ok {
                     self.write_project_md("taskmaster: every phase landed")?;
                     self.checkpoint("done");
@@ -1769,7 +1806,8 @@ impl Driver {
             None
         };
 
-        let mut prepared: Vec<(AgentRequest, PathBuf, Option<Warm>)> = Vec::new();
+        self.evict_idle_warm();
+        let mut prepared: Vec<(AgentRequest, PathBuf, WorkerExec)> = Vec::new();
         let mut failure = None;
         if let Some(alt_harness) = race_alt {
             // Spawn primary + alternate provider in sibling worktrees.
@@ -1791,7 +1829,7 @@ impl Driver {
                     if built.is_err() {
                         self.drop_worktree(&worktree);
                     }
-                    built.map(|request| (request, worktree, None))
+                    built.map(|request| (request, worktree, WorkerExec::Fresh))
                 });
                 match step {
                     Ok(done) => prepared.push(done),
@@ -1821,7 +1859,7 @@ impl Driver {
                     match step {
                         Ok(request) => {
                             let worktree = warm.worktree.clone();
-                            prepared.push((request, worktree, Some(warm)));
+                            prepared.push((request, worktree, WorkerExec::Warm(warm)));
                             continue;
                         }
                         Err(err) => {
@@ -1830,12 +1868,48 @@ impl Driver {
                         }
                     }
                 }
+                // O7: If the warm session was released after sitting idle, resume it by its saved provider session id.
+                let hib = if errors.is_some() { self.take_hibernated(&key, tier) } else { None };
+                if let Some(hib) = hib {
+                    let follow_prompt = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
+                    let step = git::sync_worktree(&hib.worktree, &self.tree)
+                        .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), hib.worktree.clone()));
+                    match step {
+                        Ok(request) => {
+                            let worktree = hib.worktree.clone();
+                            prepared.push((
+                                request,
+                                worktree,
+                                WorkerExec::Resume { session_id: hib.session_id, prompt: follow_prompt },
+                            ));
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("taskmaster: hibernated session for {key} could not be synced ({err:#}); starting fresh");
+                            self.drop_worktree(&hib.worktree);
+                        }
+                    }
+                }
+                let unit_id = (units.len() > 1).then_some(unit.id.as_str());
+                let agent_key = self.agent_id(&page, unit_id);
                 let step = self.fresh_worktree(&label).and_then(|worktree| {
                     let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
                     if built.is_err() {
                         self.drop_worktree(&worktree);
                     }
-                    built.map(|request| (request, worktree, None))
+                    built.map(|request| {
+                        // H2: After a daemon restart, resume the unit's recorded provider session id
+                        // with a short continuation turn instead of resending the full brief.
+                        let harness_id = crate::usage::canonical_provider(request.harness.id());
+                        let exec = match self.resumed_sessions.remove(&(agent_key.clone(), harness_id)) {
+                            Some(session_id) => WorkerExec::Resume {
+                                session_id,
+                                prompt: "the daemon restarted; continue".to_string(),
+                            },
+                            None => WorkerExec::Fresh,
+                        };
+                        (request, worktree, exec)
+                    })
                 });
                 match step {
                     Ok(done) => prepared.push(done),
@@ -1870,7 +1944,7 @@ impl Driver {
             let tx = guard.entry(page.clone()).or_insert_with(|| tokio::sync::watch::channel(0u64).0);
             tx.subscribe()
         });
-        for (index, (mut request, worktree, warm)) in prepared.into_iter().enumerate() {
+        for (index, (mut request, worktree, exec)) in prepared.into_iter().enumerate() {
             // Each unit is its own agent: `page:<page>/<unit>` when the page is split.
             let unit_idx = if is_race { 0 } else { index };
             let unit = (!is_race && units.len() > 1).then(|| units[unit_idx].id.as_str());
@@ -1880,7 +1954,7 @@ impl Driver {
                 self.agent_id(&page, unit)
             };
             self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[unit_idx].owned_glob));
-            if !is_race && units.len() == 1 && warm.is_none() {
+            if !is_race && units.len() == 1 && matches!(exec, WorkerExec::Fresh) {
                 self.offer_browser(&page, &worktree, &mut request);
             }
             // Every builder and every repair gets run_code when Code Mode is on.
@@ -1900,8 +1974,12 @@ impl Driver {
             bill.language = infer_glob_language(&units[unit_idx].owned_glob);
             let (page, slots) = (page.clone(), self.slots.clone());
             let mut rx = restart_rx.clone();
-            if warm.is_some() {
-                eprintln!("taskmaster: sending the repair of {agent} to its open session");
+            match &exec {
+                WorkerExec::Warm(_) => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
+                WorkerExec::Resume { session_id, .. } => {
+                    eprintln!("taskmaster: resuming {agent} on provider session {session_id}");
+                }
+                WorkerExec::Fresh => {}
             }
             self.jobs.spawn(async move {
                 let permit = slots.acquire_owned().await.ok();
@@ -1916,9 +1994,10 @@ impl Driver {
                 };
                 let result = tokio::select! {
                     asked = async {
-                        match warm {
-                            Some(warm) => follow(request, warm.session).await,
-                            None => ask(request).await,
+                        match exec {
+                            WorkerExec::Warm(warm) => follow(request, warm.session).await,
+                            WorkerExec::Resume { session_id, prompt } => resume_or_ask(request, session_id, prompt).await,
+                            WorkerExec::Fresh => ask(request).await,
                         }
                     } => asked.map(|answer| WorkerJob::Finished(Box::new(Product { answer, bill, worktree }))),
                     _ = restart_wait => Ok(WorkerJob::Restarted(worktree)),
@@ -2577,16 +2656,60 @@ impl Driver {
             match product.answer.kept.take() {
                 Some(session) if back => {
                     let key = if units.len() > 1 { units.get(index).map_or(page.to_string(), |u| format!("{page}/{}", u.id)) } else { page.to_string() };
-                    self.keep_warm(key, Warm { session, worktree: product.worktree.clone(), tier });
+                    let harness = crate::usage::canonical_provider(&product.bill.harness);
+                    self.keep_warm(
+                        key,
+                        Warm {
+                            session,
+                            worktree: product.worktree.clone(),
+                            tier,
+                            harness,
+                            last_used: Instant::now(),
+                        },
+                    );
                 }
                 _ => self.drop_worktree(&product.worktree),
             }
         }
+        self.evict_idle_warm();
         outcome
+    }
+
+    /// Release warm sessions idle longer than `config.warm_idle` (O7). Sessions with a
+    /// resumable provider session id are detached and kept in `hibernated` so a later repair
+    /// can resume by id instead of starting cold.
+    fn evict_idle_warm(&mut self) {
+        let idle_limit = self.config.warm_idle;
+        if idle_limit.is_zero() {
+            return;
+        }
+        let mut kept = VecDeque::with_capacity(self.warm.len());
+        while let Some((key, warm)) = self.warm.pop_front() {
+            if warm.last_used.elapsed() >= idle_limit {
+                let Warm { session, worktree, tier, harness, .. } = warm;
+                if let Some(session_id) = session.detach() {
+                    if let Some(old) = self.hibernated.insert(
+                        key.clone(),
+                        Hibernated { session_id, worktree, tier, harness },
+                    ) {
+                        self.drop_worktree(&old.worktree);
+                    }
+                    eprintln!("taskmaster: released idle warm session for {key} (kept resumable id)");
+                } else {
+                    self.drop_worktree(&worktree);
+                }
+            } else {
+                kept.push_back((key, warm));
+            }
+        }
+        self.warm = kept;
     }
 
     /// Keep a builder's session open for its repair, closing the oldest past [`MAX_WARM`].
     fn keep_warm(&mut self, key: String, warm: Warm) {
+        if let Some(old) = self.hibernated.remove(&key) {
+            self.drop_worktree(&old.worktree);
+        }
         if let Some(at) = self.warm.iter().position(|(k, _)| *k == key)
             && let Some((_, old)) = self.warm.remove(at)
         {
@@ -2594,21 +2717,42 @@ impl Driver {
         }
         self.warm.push_back((key, warm));
         while self.warm.len() > MAX_WARM {
-            if let Some((_, old)) = self.warm.pop_front() {
-                // Dropping the session stops the agent and everything it started.
-                self.drop_worktree(&old.worktree);
+            if let Some((evicted_key, old)) = self.warm.pop_front() {
+                let Warm { session, worktree, tier, harness, .. } = old;
+                if let Some(session_id) = session.detach() {
+                    if let Some(prev) = self.hibernated.insert(
+                        evicted_key,
+                        Hibernated { session_id, worktree, tier, harness },
+                    ) {
+                        self.drop_worktree(&prev.worktree);
+                    }
+                } else {
+                    self.drop_worktree(&worktree);
+                }
             }
         }
     }
 
     /// The warm session for a unit, when it ran on `tier`; one on another tier is closed.
     fn take_warm(&mut self, key: &str, tier: Tier) -> Option<Warm> {
+        self.evict_idle_warm();
         let at = self.warm.iter().position(|(k, _)| k == key)?;
         let (_, warm) = self.warm.remove(at)?;
         if warm.tier == tier {
             return Some(warm);
         }
         self.drop_worktree(&warm.worktree);
+        None
+    }
+
+    /// A previously hibernated warm session for `key` on `tier` and matching harness (O7).
+    fn take_hibernated(&mut self, key: &str, tier: Tier) -> Option<Hibernated> {
+        let hib = self.hibernated.remove(key)?;
+        let expected = crate::usage::canonical_provider(self.harness_for(tier).id());
+        if hib.tier == tier && hib.harness == expected {
+            return Some(hib);
+        }
+        self.drop_worktree(&hib.worktree);
         None
     }
 
@@ -5515,20 +5659,35 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
 }
 
 /// Read an agent's events as they come: the text is the answer, everything goes to the
-/// run's transcript, refused calls are kept with what they asked for, and a commit budget's
-/// watcher sees the tool calls and thoughts.
+/// run's transcript, refused calls are kept with what they asked for, a commit budget's
+/// watcher sees the tool calls and thoughts, and provider session ids / rate limits are tracked.
+#[cfg(test)]
 pub(crate) fn collect_events(
+    tee: Option<(Arc<Live>, String, serde_json::Value)>,
+    watching: Option<Arc<std::sync::Mutex<Watched>>>,
+    rx: mpsc::Receiver<HarnessEvent>,
+    heard: Arc<std::sync::Mutex<Instant>>,
+) -> tokio::task::JoinHandle<(String, Vec<String>)> {
+    let inner = collect_events_full(tee, watching, rx, heard);
+    tokio::spawn(async move {
+        let (text, refused, _) = inner.await.unwrap_or_default();
+        (text, refused)
+    })
+}
+
+fn collect_events_full(
     tee: Option<(Arc<Live>, String, serde_json::Value)>,
     watching: Option<Arc<std::sync::Mutex<Watched>>>,
     mut rx: mpsc::Receiver<HarnessEvent>,
     heard: Arc<std::sync::Mutex<Instant>>,
-) -> tokio::task::JoinHandle<(String, Vec<String>)> {
+) -> tokio::task::JoinHandle<(String, Vec<String>, Option<String>)> {
     tokio::spawn(async move {
         // The answer is only the text. Thoughts and tool calls go to the transcript.
         let mut text = String::new();
         // What each tool was last asked to do, so a refusal can say what was refused.
         let mut asked: HashMap<String, String> = HashMap::new();
         let mut refused: Vec<String> = Vec::new();
+        let mut session_id: Option<String> = None;
         // Text and thought fragments are written as one transcript line per message, or
         // per [`MERGE_FOR`] of a long one, not one line per streamed fragment.
         let mut merging: Option<(&'static str, String, Instant)> = None;
@@ -5559,6 +5718,9 @@ pub(crate) fn collect_events(
                     if refused.len() < 20 && !refused.contains(&what) {
                         refused.push(what);
                     }
+                }
+                HarnessEvent::SessionStarted { session_id: sid } if !sid.is_empty() => {
+                    session_id = Some(sid.clone());
                 }
                 _ => {}
             }
@@ -5611,6 +5773,16 @@ pub(crate) fn collect_events(
                         }
                         live.push(run, agent, "output", fields);
                     }
+                    HarnessEvent::SessionStarted { session_id: sid } if !sid.is_empty() => {
+                        live.push(run, agent, "session", serde_json::json!({ "session_id": sid }));
+                    }
+                    HarnessEvent::SessionStarted { .. } => {}
+                    HarnessEvent::RateLimit(report) => {
+                        let provider = agent.get("harness").and_then(|v| v.as_str()).unwrap_or("");
+                        if !provider.is_empty() {
+                            live.usage.record_report(provider, report);
+                        }
+                    }
                 }
             }
             if let HarnessEvent::Text { text: chunk } = event
@@ -5619,8 +5791,58 @@ pub(crate) fn collect_events(
                 }
         }
         flush(&mut merging);
-        (text, refused)
+        (text, refused, session_id)
     })
+}
+
+/// Recover the latest recorded provider session id per `(agent_id, canonical_harness)` from
+/// an existing run transcript so an interrupted unit can resume after a daemon restart (H2).
+fn recover_resumed_sessions(live: &Live, run: &str) -> HashMap<(String, String), String> {
+    let mut map = HashMap::new();
+    let mut refs: HashMap<String, (String, String)> = HashMap::new();
+    let (_, entries) = live.read(run, 0);
+    for entry in &entries {
+        let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "start"
+            && let Some(obj) = entry.get("agent").and_then(|v| v.as_object())
+            && let Some(id) = obj.get("id").and_then(|v| v.as_str())
+            && let Some(harness) = obj.get("harness").and_then(|v| v.as_str())
+        {
+            let canon = crate::usage::canonical_provider(harness);
+            if let Some(call) = obj.get("call").and_then(|v| v.as_u64()) {
+                refs.insert(format!("{id}#{call}"), (id.to_string(), canon.clone()));
+            }
+            refs.insert(id.to_string(), (id.to_string(), canon));
+        }
+        if !matches!(kind, "start" | "session" | "end") {
+            continue;
+        }
+        let Some(sid) = entry.get("session_id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let resolved = match entry.get("agent") {
+            Some(serde_json::Value::String(tag)) => refs.get(tag).cloned(),
+            Some(serde_json::Value::Object(obj)) => {
+                let id = obj.get("id").and_then(|v| v.as_str());
+                let harness = obj.get("harness").and_then(|v| v.as_str());
+                let call = obj.get("call").and_then(|v| v.as_u64());
+                match (id, harness) {
+                    (Some(id), Some(harness)) => {
+                        Some((id.to_string(), crate::usage::canonical_provider(harness)))
+                    }
+                    (Some(id), None) => call
+                        .and_then(|c| refs.get(&format!("{id}#{c}")).cloned())
+                        .or_else(|| refs.get(id).cloned()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(key) = resolved {
+            map.insert(key, sid.to_string());
+        }
+    }
+    map
 }
 
 /// The longest a streamed message is held before its text so far is written to the transcript.
@@ -5664,18 +5886,26 @@ fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop 
 /// transcript under the same agent, and the session stays open for the next repair.
 async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>) -> anyhow::Result<Answer> {
     if let Some(feed) = &request.feed {
-        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": request.brief, "follow_up": true }));
+        let mut start = serde_json::json!({ "brief": request.brief, "follow_up": true });
+        if let Some(sid) = session.session_id() {
+            start["session_id"] = serde_json::json!(sid);
+        }
+        feed.live.push(&feed.run, &feed.agent, "start", start);
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
     let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events(tee, None, rx, heard.clone());
+    let collect = collect_events_full(tee, None, rx, heard.clone());
     let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
     let run = session.follow_up(request.brief.clone(), tx, request.timeout).await;
-    let (text, refused) = collect.await.unwrap_or_default();
+    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
     if let Some(feed) = &request.feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64(), "follow_up": true });
+        if let Some(sid) = &final_sid {
+            end["session_id"] = serde_json::json!(sid);
+        }
         match &run {
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
@@ -5716,6 +5946,92 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
         refused,
         kept: summary.ok.then_some(session),
     })
+}
+
+/// Resume a previously recorded provider session by id with a short prompt (H2 restart resume
+/// and O7 hibernated warm-session resume). If the provider cannot resume that session, falls
+/// back cleanly to a fresh `ask(request)` with the full brief.
+async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String) -> anyhow::Result<Answer> {
+    let gate = gate_for(&request);
+    let task = WorkerTask {
+        brief: request.brief.clone(),
+        cwd: request.cwd.clone(),
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        dictionary: request.dictionary.clone(),
+        timeout: request.timeout,
+        stall: request.stall,
+        read_only: request.read_only,
+        code_mode: request.code_mode,
+        shell: request.shell.clone().filter(|_| !request.read_only),
+    };
+    if let Some(feed) = &request.feed {
+        feed.live.push(
+            &feed.run,
+            &feed.agent,
+            "start",
+            serde_json::json!({ "brief": prompt, "session_id": session_id, "resumed": true }),
+        );
+    }
+    let (tx, rx) = mpsc::channel(256);
+    let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
+    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let _beat = heartbeat(who_of(&request), heard);
+    let started = Instant::now();
+    let (run, kept) = request.harness.resume_kept(&session_id, prompt, task, gate, tx).await;
+    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let final_sid = captured_sid
+        .or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)))
+        .unwrap_or(session_id);
+    if let Some(feed) = &request.feed {
+        let mut end = serde_json::json!({
+            "seconds": started.elapsed().as_secs_f64(),
+            "session_id": final_sid,
+            "resumed": true,
+        });
+        match &run {
+            Ok(summary) => {
+                end["ok"] = serde_json::json!(summary.ok);
+                end["denied"] = serde_json::json!(summary.denied);
+                end["cost_usd"] = serde_json::json!(summary.cost_usd);
+                if summary.usage.total() > 0 {
+                    end["usage"] = serde_json::json!(summary.usage);
+                }
+            }
+            Err(err) => {
+                end["ok"] = serde_json::json!(false);
+                end["error"] = serde_json::json!(format!("{err:#}"));
+            }
+        }
+        if !refused.is_empty() {
+            end["refused"] = serde_json::json!(refused);
+        }
+        feed.live.push(&feed.run, &feed.agent, "end", end);
+    }
+    match run {
+        Ok(summary) => {
+            if let Some(hit) = reply::limit_of(&text) {
+                return Err(reported_limit(&request, hit).into());
+            }
+            Ok(Answer {
+                text,
+                ok: summary.ok,
+                usage: summary.usage,
+                cost_usd: summary.cost_usd,
+                seconds: started.elapsed().as_secs_f64(),
+                refused,
+                kept: if request.keep && summary.ok { kept } else { None },
+            })
+        }
+        Err(err) => {
+            if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                return Err(reported_limit(&request, hit).into());
+            }
+            eprintln!("taskmaster: resuming session failed ({err:#}); falling back to fresh brief");
+            ask(request).await
+        }
+    }
 }
 
 /// The gate an agent's tool calls (and its run_code calls) are put to.
@@ -5772,7 +6088,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
     let watching = request.commit.is_some().then(|| watch.clone());
     let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events(tee, watching, rx, heard.clone());
+    let collect = collect_events_full(tee, watching, rx, heard.clone());
     let _beat = heartbeat(who_of(request), heard);
     let started = Instant::now();
     let mut kept = None;
@@ -5804,7 +6120,8 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             }
         }
     };
-    let (text, refused) = collect.await.unwrap_or_default();
+    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let final_sid = captured_sid.or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)));
     let run = run.map_err(|err| match err.downcast::<Overrun>() {
         Ok(over) => {
             let notes = tail_chars(&watch.lock().unwrap().thoughts, OVERRUN_NOTES);
@@ -5814,11 +6131,13 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     });
     if let Some(feed) = &feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64() });
+        if let Some(sid) = &final_sid {
+            end["session_id"] = serde_json::json!(sid);
+        }
         match &run {
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
                 end["denied"] = serde_json::json!(summary.denied);
-                end["cost_usd"] = serde_json::json!(summary.cost_usd);
                 end["cost_usd"] = serde_json::json!(summary.cost_usd);
                 let usage = &summary.usage;
                 // Only a provider that reports usage gets a meter.

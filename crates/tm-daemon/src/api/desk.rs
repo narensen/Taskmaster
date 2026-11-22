@@ -1385,6 +1385,10 @@ pub struct SettingsBody {
     telemetry: Option<bool>,
     /// Seconds one agent call may run; 0 is no limit.
     agent_timeout_secs: Option<u64>,
+    /// Seconds an idle warm session is kept before detaching (O7); 0 disables idle release.
+    warm_idle_secs: Option<u64>,
+    /// Opt-in OAuth usage polling (O4). Off by default.
+    usage_oauth_polling: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1470,6 +1474,15 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         }
         save_setting(&app.project(), "agents", json!({ "timeout_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
+    if let Some(secs) = body.warm_idle_secs {
+        if secs > 24 * 3600 {
+            return Err(fail(StatusCode::BAD_REQUEST, "warm_idle_secs is at most 86400"));
+        }
+        save_setting(&app.project(), "agents", json!({ "warm_idle_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(on) = body.usage_oauth_polling {
+        save_setting(&app.project(), "usage", json!({ "oauth_polling": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
     if !changes.is_empty() {
         save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
         app.live.approvals.set_policy(policy);
@@ -1552,7 +1565,13 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
             "available": tm_harness::sandbox::bwrap_usable(),
         },
         "telemetry": { "enabled": role_defaults.telemetry.enabled },
-        "agents": { "timeout_secs": role_defaults.agents.timeout_secs },
+        "agents": {
+            "timeout_secs": role_defaults.agents.timeout_secs,
+            "warm_idle_secs": role_defaults.agents.warm_idle_secs,
+        },
+        "usage": {
+            "oauth_polling": role_defaults.usage.oauth_polling,
+        },
         "web_access": {
             "enabled": role_defaults.web_access.enabled,
             "provider": role_defaults.web_access.provider_norm(),

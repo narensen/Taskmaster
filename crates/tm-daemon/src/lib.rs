@@ -63,6 +63,7 @@ mod static_site;
 pub mod search;
 pub mod settings;
 pub mod skills;
+pub mod usage;
 pub mod sqlite;
 pub mod store;
 pub mod supply_chain;
@@ -182,11 +183,26 @@ impl Roles {
     /// Resolve `"auto"` on the worker role using the project's stratified ledger scorecard
     /// (Item 5.3), falling back to `mid` when no model has enough history yet.
     pub fn resolve_auto(&mut self, records: &crate::store::Records, models: &mut Models, difficulty: &str, language: &str) {
+        self.resolve_auto_with_usage(records, models, difficulty, language, &std::collections::BTreeSet::new());
+    }
+
+    /// [`Roles::resolve_auto`], routing away from any provider near its usage limit (O4).
+    pub fn resolve_auto_with_usage(
+        &mut self,
+        records: &crate::store::Records,
+        models: &mut Models,
+        difficulty: &str,
+        language: &str,
+        near_limit: &std::collections::BTreeSet<String>,
+    ) {
         if !self.worker.eq_ignore_ascii_case("auto") {
             return;
         }
-        if let Ok(Some(picked)) = records.auto_route(crate::store::SCORECARD_RUNS, Some(difficulty), Some(language))
+        let is_near = |h: &str| near_limit.contains(&crate::usage::canonical_provider(h));
+        if let Ok(Some(picked)) =
+            records.auto_route_excluding(crate::store::SCORECARD_RUNS, Some(difficulty), Some(language), near_limit)
             && HARNESSES.contains(&picked.harness.as_str())
+            && !is_near(&picked.harness)
         {
             self.worker = picked.harness;
             if models.worker.is_none() {
@@ -194,6 +210,14 @@ impl Roles {
             }
             return;
         }
+        // Prefer mid, then master, then reviewer/verifier, skipping providers near their limit.
+        for candidate in [&self.mid, &self.master, &self.reviewer, &self.verifier] {
+            if !candidate.is_empty() && !candidate.eq_ignore_ascii_case("auto") && !is_near(candidate) {
+                self.worker = candidate.clone();
+                return;
+            }
+        }
+        // If every configured role is near its limit, fall back to mid/master.
         self.worker = if !self.mid.is_empty() && !self.mid.eq_ignore_ascii_case("auto") {
             self.mid.clone()
         } else {
@@ -387,6 +411,8 @@ pub struct Config {
     pub best_of_n: bool,
     /// Optional explicit second harness for Best-of-N races (defaults to mid/master when distinct).
     pub best_of_n_alt: Option<Arc<dyn Harness>>,
+    /// Release warm builder sessions idle longer than this (O7). Zero disables idle eviction.
+    pub warm_idle: Duration,
 }
 
 /// How an active run should stop when cancelled.
@@ -464,6 +490,7 @@ impl Config {
             prices: crate::settings::built_in_prices(),
             best_of_n: false,
             best_of_n_alt: None,
+            warm_idle: Duration::from_secs(crate::settings::DEFAULT_WARM_IDLE_SECS),
         }
     }
 }

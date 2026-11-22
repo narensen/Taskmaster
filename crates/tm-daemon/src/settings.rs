@@ -45,9 +45,19 @@ pub struct Settings {
     pub sandbox: SandboxSettings,
     /// Agent internet access, per-role switches, allowlist, budgets, and cache (Phase 1).
     pub web_access: crate::web_access::WebAccessSettings,
+    /// Provider usage meter settings (O4). OAuth polling is opt-in and off by default.
+    pub usage: UsageSettings,
     /// Dollars per million tokens, by model id or harness id, for calls whose harness
     /// reports no price. Grok's are built in (see [`built_in_prices`]).
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+}
+
+/// Provider usage meter settings (O4).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UsageSettings {
+    /// Opt-in OAuth usage polling. Off by default; CLI-reported rate-limit events are always read.
+    pub oauth_polling: bool,
 }
 
 /// Prices Taskmaster knows without a settings file: Grok Build's, as the benchmark's grader
@@ -81,6 +91,9 @@ impl Default for SandboxSettings {
     }
 }
 
+/// Default idle duration before a warm session is detached and its process freed (O7): 10 minutes.
+pub const DEFAULT_WARM_IDLE_SECS: u64 = 600;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
@@ -88,11 +101,17 @@ pub struct AgentSettings {
     pub timeout_secs: u64,
     /// Optional per-run USD spend cap. 0 means no limit.
     pub budget_usd: f64,
+    /// Seconds a warm builder session may sit idle before being released (O7). 0 disables idle release.
+    pub warm_idle_secs: u64,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
-        AgentSettings { timeout_secs: DEFAULT_AGENT_SECS, budget_usd: 0.0 }
+        AgentSettings {
+            timeout_secs: DEFAULT_AGENT_SECS,
+            budget_usd: 0.0,
+            warm_idle_secs: DEFAULT_WARM_IDLE_SECS,
+        }
     }
 }
 

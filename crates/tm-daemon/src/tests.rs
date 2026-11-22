@@ -5293,6 +5293,435 @@ async fn a2_rewind_restores_checkpoint_and_drops_later_turns_from_view_and_next_
     drop(server);
 }
 
+#[tokio::test]
+async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let parsed = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    let tmp = repo("o4-usage");
+
+    struct RateLimitHarness;
+    #[async_trait]
+    impl Harness for RateLimitHarness {
+        fn id(&self) -> &'static str {
+            "claude-code"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let _ = events
+                .send(HarnessEvent::RateLimit(tm_harness::RateLimitReport {
+                    window_5h_pct: Some(85.0),
+                    reset_5h: Some("2026-11-22T23:00:00Z".into()),
+                    window_7d_pct: Some(40.0),
+                    reset_7d: Some("2026-11-28T00:00:00Z".into()),
+                    source: Some("claude-cli".into()),
+                }))
+                .await;
+            let page_file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+            std::fs::write(&page_file, "export const a = 1;\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RateLimitHarness);
+    let h_clone = h.clone();
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let mut options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    options.harness = Arc::new(move |_| Ok(h_clone.clone()));
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // Seed ledger history so claude and codex both have clean worker history (claude slightly cheaper/preferred).
+    let records = Records::files(&tmp.0);
+    for i in 0..4 {
+        records
+            .charge(
+                "hist-claude",
+                &tm_core::LedgerEntry {
+                    at: "2026-11-22T10:00:00Z".into(),
+                    agent: Some(format!("page:p{i}")),
+                    role: tm_core::Role::Worker,
+                    harness: "claude".into(),
+                    model: Some("claude-sonnet".into()),
+                    page: Some(format!("p{i}")),
+                    ok: true,
+                    input: 100,
+                    output: 50,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: Some(0.01),
+                    seconds: 1.0,
+                    refused: Vec::new(),
+                    unit: None,
+                    priced_by: None,
+                    brief_hash: None,
+                    difficulty: Some("normal".into()),
+                    language: Some("general".into()),
+                },
+            )
+            .unwrap();
+        records
+            .charge(
+                "hist-codex",
+                &tm_core::LedgerEntry {
+                    at: "2026-11-22T10:00:00Z".into(),
+                    agent: Some(format!("page:q{i}")),
+                    role: tm_core::Role::Worker,
+                    harness: "codex".into(),
+                    model: Some("gpt-5".into()),
+                    page: Some(format!("q{i}")),
+                    ok: true,
+                    input: 200,
+                    output: 100,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: Some(0.05),
+                    seconds: 2.0,
+                    refused: Vec::new(),
+                    unit: None,
+                    priced_by: None,
+                    brief_hash: None,
+                    difficulty: Some("normal".into()),
+                    language: Some("general".into()),
+                },
+            )
+            .unwrap();
+    }
+
+    // Run once so the fixture harness emits its 85% rate-limit event.
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs",
+        Some(serde_json::json!({
+            "id": "r-o4",
+            "plan": plan(&[("a", &[])]),
+            "yes": true,
+            "roles": { "worker": "claude", "mid": "claude", "master": "claude", "reviewer": "claude", "verifier": "claude" }
+        })),
+    )
+    .await;
+    assert_eq!(st, 202);
+    for _ in 0..80 {
+        let (_, r) = call(&addr, Some(&token), "GET", "/api/runs/r-o4", None).await;
+        if r["active"] == false {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // GET /api/providers/usage shows claude at 85% with warning = true and oauth_polling = false.
+    let (st, body) = call(&addr, Some(&token), "GET", "/api/providers/usage", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(body["oauth_polling"], false);
+    let usage = body["usage"].as_array().unwrap();
+    let claude = usage.iter().find(|u| u["provider"] == "claude").expect("claude usage entry");
+    assert_eq!(claude["window_5h"]["pct"].as_f64(), Some(85.0));
+    assert_eq!(claude["warning"], true);
+
+    // Roles::resolve_auto_with_usage skips claude (near limit) and selects codex instead.
+    let mut near = std::collections::BTreeSet::new();
+    near.insert("claude".to_string());
+    let mut roles = crate::Roles {
+        worker: "auto".into(),
+        mid: "claude".into(),
+        master: "codex".into(),
+        reviewer: "claude".into(),
+        verifier: "claude".into(),
+    };
+    let mut models = crate::Models::default();
+    roles.resolve_auto_with_usage(&records, &mut models, "normal", "general", &near);
+    assert_eq!(roles.worker, "codex", "Auto must skip claude at 85% and pick codex");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resending_brief() {
+    let tmp = repo("h2-resume");
+
+    struct ResumingHarness {
+        fresh_briefs: Mutex<Vec<String>>,
+        resumed_calls: Mutex<Vec<(String, String)>>,
+        interrupt_once: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for ResumingHarness {
+        fn id(&self) -> &'static str {
+            "claude-code"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.fresh_briefs.lock().unwrap().push(task.brief.clone());
+            let _ = events
+                .send(HarnessEvent::SessionStarted { session_id: "sess-h2-restart".into() })
+                .await;
+            if self.interrupt_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // Simulate daemon crash/restart mid-turn right after recording the session id.
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                anyhow::bail!("simulated daemon restart mid-worker");
+            }
+            let page_file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+            std::fs::write(&page_file, "export const a = 'fresh';\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            (self.run(task, gate, events).await, None)
+        }
+        async fn resume_kept(
+            &self,
+            session_id: &str,
+            prompt: String,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            self.resumed_calls.lock().unwrap().push((session_id.to_string(), prompt));
+            let _ = events
+                .send(HarnessEvent::SessionStarted { session_id: session_id.to_string() })
+                .await;
+            let page_file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+            std::fs::write(&page_file, "export const a = 'resumed';\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "continued after restart".into() }).await;
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None }),
+                None,
+            )
+        }
+    }
+
+    let rh = Arc::new(ResumingHarness {
+        fresh_briefs: Mutex::new(Vec::new()),
+        resumed_calls: Mutex::new(Vec::new()),
+        interrupt_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let h: Arc<dyn Harness> = rh.clone();
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+
+    // First drive: worker records session id `sess-h2-restart`, then we cancel mid-flight to simulate restart.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut cfg1 = Config::new(&tmp.0);
+    cfg1.run_id = "r-h2".into();
+    cfg1.plan = Some(plan(&[("a", &[])]));
+    cfg1.yes = true;
+    cfg1.checks = false;
+    cfg1.runtime_checks = false;
+    cfg1.browser = false;
+    cfg1.code_mode = false;
+    cfg1.cancel = cancel_rx;
+    let first = tokio::spawn(crate::drive(cfg1, harnesses.clone()));
+    // Wait until session id is recorded in transcript, then abort/cancel.
+    let store: Arc<dyn crate::Store> = Arc::new(crate::FileStore::in_project(&tmp.0));
+    let live_check = crate::live::Live::new(store);
+    for _ in 0..80 {
+        let (_, entries) = live_check.read("r-h2", 0);
+        if entries.iter().any(|e| e.get("session_id").and_then(|v| v.as_str()) == Some("sess-h2-restart")) {
+            let _ = cancel_tx.send(true);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let _ = first.await;
+    let fresh_before = rh.fresh_briefs.lock().unwrap().len();
+    assert!(fresh_before >= 1, "first run must have invoked worker once");
+
+    // Second drive (after restart): resumes the in-flight page using `sess-h2-restart` without resending the full brief.
+    let mut cfg2 = Config::new(&tmp.0);
+    cfg2.run_id = "r-h2".into();
+    cfg2.yes = true;
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.browser = false;
+    cfg2.code_mode = false;
+    let out = crate::drive(cfg2, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let resumed = rh.resumed_calls.lock().unwrap();
+    assert_eq!(resumed.len(), 1, "restarted worker must resume via resume_kept");
+    assert_eq!(resumed[0].0, "sess-h2-restart");
+    assert!(resumed[0].1.contains("daemon restarted"), "resume prompt was: {}", resumed[0].1);
+    assert_eq!(
+        rh.fresh_briefs.lock().unwrap().len(),
+        fresh_before,
+        "full brief must not be resent on successful session resume"
+    );
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'resumed';\n");
+}
+
+#[tokio::test]
+async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() {
+    let tmp = repo("o7-hibernate");
+
+    let detached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follow_ups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resumed_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct FakeKeptSession {
+        sid: String,
+        detached: Arc<std::sync::atomic::AtomicBool>,
+        follow_ups: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for FakeKeptSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.follow_ups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some(&self.sid)
+        }
+        fn detach(self: Box<Self>) -> Option<String> {
+            self.detached.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(self.sid.clone())
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct HibernateHarness {
+        detached: Arc<std::sync::atomic::AtomicBool>,
+        follow_ups: Arc<std::sync::atomic::AtomicUsize>,
+        resumed_ids: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Harness for HibernateHarness {
+        fn id(&self) -> &'static str {
+            "claude-code"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let _ = events
+                .send(HarnessEvent::SessionStarted { session_id: "sess-o7-warm".into() })
+                .await;
+            // Write a file outside owned glob `app/a/**` to trigger CheckFailed -> repair turn.
+            std::fs::write(task.cwd.join("outside.txt"), "oops\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "first try".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(FakeKeptSession {
+                sid: "sess-o7-warm".into(),
+                detached: self.detached.clone(),
+                follow_ups: self.follow_ups.clone(),
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }),
+                Some(sess),
+            )
+        }
+        async fn resume_kept(
+            &self,
+            session_id: &str,
+            _prompt: String,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            self.resumed_ids.lock().unwrap().push(session_id.to_string());
+            // Remove stray file and write the valid owned file.
+            let _ = std::fs::remove_file(task.cwd.join("outside.txt"));
+            let page_file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+            std::fs::write(&page_file, "export const a = 'repaired-by-id';\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "fixed via resume".into() }).await;
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None }),
+                None,
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(HibernateHarness {
+        detached: detached.clone(),
+        follow_ups: follow_ups.clone(),
+        resumed_ids: resumed_ids.clone(),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "r-o7".into();
+    cfg.plan = Some(plan(&[("a", &[])]));
+    cfg.yes = true;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    cfg.code_mode = false;
+    // Immediate idle eviction (1 ns) forces the warm session to detach after turn 1 and resume by id on repair.
+    cfg.warm_idle = Duration::from_nanos(1);
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert!(detached.load(std::sync::atomic::Ordering::SeqCst), "idle warm session must be detached");
+    assert_eq!(follow_ups.load(std::sync::atomic::Ordering::SeqCst), 0, "detached session must not receive live follow_up");
+    assert_eq!(*resumed_ids.lock().unwrap(), vec!["sess-o7-warm".to_string()]);
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'repaired-by-id';\n");
+}
+
+
 
 
 

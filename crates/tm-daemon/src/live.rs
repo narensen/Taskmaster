@@ -142,6 +142,8 @@ pub struct Live {
     cmd_output: CommandOutputHub,
     /// Risky calls waiting for a person. Shared with every agent call of every run.
     pub approvals: Arc<crate::approvals::Approvals>,
+    /// Provider rate-limit / usage window tracker populated from CLI reports (O4).
+    pub usage: crate::usage::UsageTracker,
 }
 
 /// Cap on live per-row command output before switching from append frames to tail replace (P5).
@@ -297,6 +299,7 @@ impl Live {
             hub: Arc::new(SignalHub::new()),
             cmd_output: CommandOutputHub::default(),
             approvals: Arc::default(),
+            usage: crate::usage::UsageTracker::new(),
         }
     }
 

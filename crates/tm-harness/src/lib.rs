@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -263,6 +263,140 @@ impl Usage {
     }
 }
 
+/// Rate-limit / usage window reported by a provider CLI (O4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitReport {
+    /// Utilization percentage (0.0..=100.0) of the 5-hour rolling window, if reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_5h_pct: Option<f64>,
+    /// Reset time of the 5-hour window (ISO-8601 or CLI label), if reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_5h: Option<String>,
+    /// Utilization percentage (0.0..=100.0) of the 7-day rolling window, if reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_7d_pct: Option<f64>,
+    /// Reset time of the 7-day window (ISO-8601 or CLI label), if reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_7d: Option<String>,
+    /// Source label (`"cli"`, `"event"`, `"oauth"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl RateLimitReport {
+    pub fn is_empty(&self) -> bool {
+        self.window_5h_pct.is_none() && self.window_7d_pct.is_none()
+    }
+}
+
+/// Normalize a utilization ratio (0..=1) or percentage (0..=100) into 0..=100.
+fn normalize_pct(v: f64, is_ratio_hint: bool) -> Option<f64> {
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    let pct = if is_ratio_hint && v <= 1.0 { v * 100.0 } else { v };
+    Some(pct.clamp(0.0, 100.0))
+}
+
+fn read_window(obj: &Value) -> (Option<f64>, Option<String>) {
+    let pct = obj
+        .get("used_percent")
+        .or_else(|| obj.get("usedPercent"))
+        .or_else(|| obj.get("percent"))
+        .or_else(|| obj.get("pct"))
+        .and_then(|v| v.as_f64())
+        .and_then(|v| normalize_pct(v, false))
+        .or_else(|| {
+            obj.get("utilization")
+                .and_then(|v| v.as_f64())
+                .and_then(|v| normalize_pct(v, true))
+        });
+    let reset = obj
+        .get("resets_at")
+        .or_else(|| obj.get("resetsAt"))
+        .or_else(|| obj.get("reset_at"))
+        .or_else(|| obj.get("reset"))
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+        .filter(|s| !s.trim().is_empty());
+    (pct, reset)
+}
+
+/// Extract rate-limit / usage window data from a CLI JSON event (Claude, Codex, or ACP).
+pub fn parse_rate_limit_value(val: &Value, source: &str) -> Option<RateLimitReport> {
+    let container = val
+        .get("rate_limit_info")
+        .or_else(|| val.get("rate_limits"))
+        .or_else(|| val.get("rateLimits"))
+        .or_else(|| val.get("rateLimit"))
+        .or_else(|| val.get("info").and_then(|i| i.get("rate_limits")))
+        .or_else(|| val.get("usage").and_then(|u| u.get("rate_limits")))
+        .unwrap_or(val);
+
+    let mut report = RateLimitReport { source: Some(source.to_string()), ..Default::default() };
+
+    if let Some(w5) = container
+        .get("five_hour")
+        .or_else(|| container.get("fiveHour"))
+        .or_else(|| container.get("primary"))
+        .or_else(|| container.get("window_5h"))
+    {
+        let (pct, reset) = read_window(w5);
+        report.window_5h_pct = pct;
+        report.reset_5h = reset;
+    }
+    if let Some(w7) = container
+        .get("seven_day")
+        .or_else(|| container.get("sevenDay"))
+        .or_else(|| container.get("weekly"))
+        .or_else(|| container.get("secondary"))
+        .or_else(|| container.get("window_7d"))
+    {
+        let (pct, reset) = read_window(w7);
+        report.window_7d_pct = pct;
+        report.reset_7d = reset;
+    }
+
+    // Single-window flat shape (e.g. Claude `rate_limit_info: { rateLimitType: "five_hour", utilization: 0.85, resetsAt: ... }`).
+    if report.is_empty() {
+        let (pct, reset) = read_window(container);
+        if let Some(pct) = pct {
+            let kind = container
+                .get("rateLimitType")
+                .or_else(|| container.get("rate_limit_type"))
+                .or_else(|| container.get("window"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("five_hour");
+            if kind.contains("seven") || kind.contains("week") || kind.contains("7d") {
+                report.window_7d_pct = Some(pct);
+                report.reset_7d = reset;
+            } else {
+                report.window_5h_pct = Some(pct);
+                report.reset_5h = reset;
+            }
+        }
+    }
+
+    if let Some(pct) = container.get("window_5h_pct").and_then(|v| v.as_f64()) {
+        report.window_5h_pct = normalize_pct(pct, false);
+    }
+    if let Some(pct) = container.get("window_7d_pct").and_then(|v| v.as_f64()) {
+        report.window_7d_pct = normalize_pct(pct, false);
+    }
+    if let Some(r) = container.get("reset_5h").and_then(|v| v.as_str()) {
+        report.reset_5h = Some(r.to_string());
+    }
+    if let Some(r) = container.get("reset_7d").and_then(|v| v.as_str()) {
+        report.reset_7d = Some(r.to_string());
+    }
+
+    (!report.is_empty()).then_some(report)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HarnessEvent {
@@ -273,6 +407,10 @@ pub enum HarnessEvent {
     /// An empty `text` with a `diff` is still a result. This is never a substitute for a thought.
     ToolResult { id: String, text: String, diff: Option<String> },
     PermissionDecided { tool: String, allowed: bool },
+    /// The provider assigned or resumed a session id for this call (H2 / O7).
+    SessionStarted { session_id: String },
+    /// Rate-limit / usage window reported by the provider CLI (O4).
+    RateLimit(RateLimitReport),
 }
 
 /// Keep a tool result small enough for the transcript. The cut is marked, and nothing is added.
@@ -307,6 +445,17 @@ pub trait Session: Send + Sync {
     /// Send one more turn. Events go to `events` until the turn ends.
     async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary>;
 
+    /// The provider's resumable session id, if this session can be resumed later by id (H2 / O7).
+    fn session_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Release the in-memory session/process while leaving any on-disk provider session intact
+    /// so it can be resumed later by id (O7). Returns the resumable session id, if any.
+    fn detach(self: Box<Self>) -> Option<String> {
+        self.session_id().map(str::to_string)
+    }
+
     /// End the session and free the agent and everything it started.
     async fn close(self: Box<Self>) -> Freed;
 }
@@ -324,6 +473,20 @@ pub trait Harness: Send + Sync {
         events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
         (self.run(task, gate, events).await, None)
+    }
+
+    /// Resume a previously recorded provider session by id with a short follow-up prompt
+    /// (H2 restart resume and O7 hibernated warm-session resume). Returns an error when the
+    /// harness does not support session resume so the caller can fall back to a fresh brief.
+    async fn resume_kept(
+        &self,
+        _session_id: &str,
+        _prompt: String,
+        _task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        _events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
+        (Err(anyhow::anyhow!("{} does not support resuming a session by id", self.id())), None)
     }
 
     /// Whether a command this agent runs stays inside an OS sandbox confined to its worktree

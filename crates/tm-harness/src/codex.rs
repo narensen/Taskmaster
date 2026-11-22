@@ -101,12 +101,29 @@ impl Codex {
         let read = async {
             let mut lines = BufReader::new(stdout).lines();
             let mut thread_id: Option<String> = resume.map(str::to_string);
+            let mut emitted_session = false;
+            if let Some(id) = thread_id.as_deref() {
+                let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
+                emitted_session = true;
+            }
             while let Some(line) = lines.next_line().await? {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
                 if msg["type"].as_str() == Some("thread.started")
                     && let Some(id) = msg["thread_id"].as_str().filter(|s| !s.is_empty())
                 {
+                    let changed = thread_id.as_deref() != Some(id);
                     thread_id = Some(id.to_string());
+                    if !emitted_session || changed {
+                        let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
+                        emitted_session = true;
+                    }
+                }
+                if (msg.get("rate_limits").is_some()
+                    || msg.get("info").and_then(|i| i.get("rate_limits")).is_some()
+                    || msg["type"].as_str() == Some("rate_limit"))
+                    && let Some(report) = crate::parse_rate_limit_value(&msg, "codex-cli")
+                {
+                    let _ = events.send(HarnessEvent::RateLimit(report)).await;
                 }
                 match msg["type"].as_str() {
                     Some("item.completed") => {
@@ -218,6 +235,16 @@ impl crate::Session for CodexSession {
         Ok(summary)
     }
 
+    fn session_id(&self) -> Option<&str> {
+        Some(&self.thread_id)
+    }
+
+    fn detach(mut self: Box<Self>) -> Option<String> {
+        // Leave the rollout JSONL intact on disk so a later repair or restart can resume it.
+        self.cleaned = true;
+        Some(self.thread_id.clone())
+    }
+
     async fn close(mut self: Box<Self>) -> crate::Freed {
         self.cleanup();
         crate::Freed::default()
@@ -255,6 +282,26 @@ impl Harness for Codex {
                 (Ok(summary), None)
             }
             Ok((summary, None)) => (Ok(summary), None),
+            Err(err) => (Err(err), None),
+        }
+    }
+
+    async fn resume_kept(
+        &self,
+        session_id: &str,
+        prompt: String,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        match self.execute(&task, &prompt, true, Some(session_id), events, task.timeout).await {
+            Ok((summary, next_id)) if summary.ok => {
+                let id = next_id.unwrap_or_else(|| session_id.to_string());
+                let kept: Box<dyn crate::Session> =
+                    Box::new(CodexSession { harness: self.clone(), task, thread_id: id, cleaned: false });
+                (Ok(summary), Some(kept))
+            }
+            Ok((summary, _)) => (Ok(summary), None),
             Err(err) => (Err(err), None),
         }
     }

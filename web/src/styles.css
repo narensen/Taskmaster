@@ -6987,3 +6987,32 @@ button.glob-file:hover { color: var(--ink); border-color: var(--line-strong); ba
   opacity: 0.92;
 }
 
+
+/* O4: Provider usage meter in the sidebar footer */
+.usage-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+}
+.usage-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+}
+.usage-pill.warn {
+  color: var(--ink);
+  border-color: var(--ink);
+  font-weight: 600;
+}
+.usage-vals {
+  display: flex;
+  gap: 6px;
+}

@@ -120,7 +120,7 @@ impl Harness for AcpHarness {
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let (result, kept) = self.start(task, gate, events, false).await;
+        let (result, kept) = self.start(task, gate, events, false, None).await;
         debug_assert!(kept.is_none());
         result
     }
@@ -131,7 +131,18 @@ impl Harness for AcpHarness {
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
-        self.start(task, gate, events, true).await
+        self.start(task, gate, events, true, None).await
+    }
+
+    async fn resume_kept(
+        &self,
+        session_id: &str,
+        prompt: String,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        self.start(task, gate, events, true, Some((session_id.to_string(), prompt))).await
     }
 }
 
@@ -144,6 +155,7 @@ impl AcpHarness {
         gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
         keep: bool,
+        resume: Option<(String, String)>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         let mut command = match self.command(&task) {
             Ok(command) => command,
@@ -173,7 +185,7 @@ impl AcpHarness {
             cost: None,
         };
         let timeout = task.timeout;
-        let result = match tokio::time::timeout(timeout, session.drive(task)).await {
+        let result = match tokio::time::timeout(timeout, session.drive(task, resume)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
         };
@@ -218,6 +230,10 @@ impl crate::Session for Kept {
         result
     }
 
+    fn session_id(&self) -> Option<&str> {
+        self.session.id.as_deref()
+    }
+
     async fn close(mut self: Box<Self>) -> crate::Freed {
         match self.group.take() {
             Some(group) => group.release(&mut self.child).await,
@@ -256,7 +272,7 @@ struct Session {
 }
 
 impl Session {
-    async fn drive(&mut self, task: WorkerTask) -> anyhow::Result<RunSummary> {
+    async fn drive(&mut self, task: WorkerTask, resume: Option<(String, String)>) -> anyhow::Result<RunSummary> {
         let init = json!({
             "protocolVersion": 1,
             // The agent uses its own file tools; the gate confines them.
@@ -281,6 +297,15 @@ impl Session {
                 })
             })
             .collect();
+
+        if let Some((session_id, prompt)) = resume {
+            let load = json!({ "sessionId": session_id, "cwd": task.cwd, "mcpServers": mcp_servers });
+            self.call("session/load", load).await?;
+            let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
+            self.id = Some(session_id);
+            return self.prompt(prompt).await;
+        }
+
         let new = json!({ "cwd": task.cwd, "mcpServers": mcp_servers });
         let session = self.call("session/new", new).await?;
         let session_id =
@@ -299,6 +324,7 @@ impl Session {
             self.call(method, params).await.with_context(|| format!("could not select model `{model}`"))?;
         }
 
+        let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
         self.id = Some(session_id);
         self.prompt(task.framed_brief()).await
     }
@@ -359,6 +385,9 @@ impl Session {
                 track_tool(&mut self.tools, &params["update"]);
                 if let Some(cost) = running_cost(&params["update"]) {
                     self.cost = Some(cost);
+                }
+                if let Some(report) = crate::parse_rate_limit_value(&params["update"], "acp") {
+                    let _ = self.events.send(HarnessEvent::RateLimit(report)).await;
                 }
                 for event in update_events(&params["update"]) {
                     let _ = self.events.send(event).await;
@@ -842,6 +871,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let (first, kept) = harness.run_kept(task, gate, tx).await;
         assert!(first.unwrap().ok);
+        assert_eq!(rx.recv().await, Some(HarnessEvent::SessionStarted { session_id: "s".into() }));
         assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "first".into() }));
         // The turn is over for the caller: its event channel closes even though the session
         // stays open. (A kept sender here once hung every builder after its first turn.)

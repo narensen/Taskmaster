@@ -446,6 +446,30 @@ impl Records {
         Ok(tm_core::auto_route(&self.recent_ledgers(recent)?, difficulty, language))
     }
 
+    /// [`Records::auto_route`] excluding providers near their usage limit (O4).
+    pub fn auto_route_excluding(
+        &self,
+        recent: usize,
+        difficulty: Option<&str>,
+        language: Option<&str>,
+        exclude: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<Option<tm_core::ModelScore>> {
+        let ledgers = self.recent_ledgers(recent)?;
+        if exclude.is_empty() {
+            return Ok(tm_core::auto_route(&ledgers, difficulty, language));
+        }
+        let filtered: Vec<Vec<tm_core::LedgerEntry>> = ledgers
+            .into_iter()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|e| !exclude.contains(&crate::usage::canonical_provider(&e.harness)))
+                    .collect()
+            })
+            .collect();
+        Ok(tm_core::auto_route(&filtered, difficulty, language))
+    }
+
     /// Stratified per-(model, difficulty, language) scores for the UI/API.
     pub fn stratified_scores(&self, recent: usize) -> anyhow::Result<Vec<tm_core::StratifiedScore>> {
         Ok(tm_core::stratified_scores(&self.recent_ledgers(recent)?))

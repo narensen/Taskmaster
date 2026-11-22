@@ -60,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
                     println!("gate   {} {tool}", if allowed { "ALLOW" } else { "DENY " });
                 }
                 HarnessEvent::Text { text } => said.push_str(&text),
-                HarnessEvent::Thought { .. } => {}
+                HarnessEvent::Thought { .. }
+                | HarnessEvent::SessionStarted { .. }
+                | HarnessEvent::RateLimit(_) => {}
                 HarnessEvent::ToolResult { id, text, diff } => {
                     let text: String = text.chars().take(120).collect();
                     println!("result {id} {text}");

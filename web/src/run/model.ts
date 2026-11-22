@@ -336,6 +336,8 @@ export class SurfaceBuilder {
   private byId = new Map<string, Surface>();
   /** Where each call sits: its agent, and its index in that agent's calls. */
   private where = new Map<string, { id: string; index: number }>();
+  /** Full agent tag seen on `start` (or richest tag seen) per `id#call`, for P2 compact entries. */
+  private tags = new Map<string, AgentTag>();
   private dirtySummary = new Set<string>();
 
   /** Read from entry `from` on, for a turn that starts there. */
@@ -358,6 +360,19 @@ export class SurfaceBuilder {
     if (end <= this.seen) return this;
     const touched = new Set<string>();
     const fresh = new Set<string>();
+    const resolveTag = (key: string, incoming: AgentTag): AgentTag => {
+      const prev = this.tags.get(key);
+      if (!prev) {
+        this.tags.set(key, incoming);
+        return incoming;
+      }
+      if (incoming.role || incoming.harness || incoming.model || incoming.page || incoming.unit || incoming.worktree || incoming.owned_glob) {
+        const merged = { ...prev, ...incoming };
+        this.tags.set(key, merged);
+        return merged;
+      }
+      return prev;
+    };
     // A surface and a call are copied once per batch, the first time the batch touches them.
     const surface = (id: string): Surface => {
       let s = this.byId.get(id);
@@ -376,10 +391,10 @@ export class SurfaceBuilder {
       }
       return s;
     };
-    const callOf = (s: Surface, key: string, e: AgentEntry): Call => {
+    const callOf = (s: Surface, key: string, e: AgentEntry, tag: AgentTag): Call => {
       const at = this.where.get(key);
       if (!at) {
-        const call: Call = { call: e.agent.call ?? 0, tag: e.agent, items: [], at: e.at };
+        const call: Call = { call: e.agent.call ?? 0, tag, items: [], at: e.at };
         this.where.set(key, { id: s.id, index: s.calls.length });
         s.calls.push(call);
         fresh.add(key);
@@ -391,6 +406,7 @@ export class SurfaceBuilder {
         s.calls[at.index] = call;
         fresh.add(key);
       }
+      if (call.tag !== tag) call.tag = tag;
       return call;
     };
     const replace = <T extends Item>(call: Call, item: T, change: Partial<T>): T => {
@@ -405,9 +421,11 @@ export class SurfaceBuilder {
       if (id === "runtime" || id === "person") continue;
       // Run-level lines (cancelling, budget, plan review) carry no call: they are not an agent at work.
       if (e.agent.call == null && !CALL_KINDS.has(e.kind)) continue;
+      const key = `${e.agent.id}#${e.agent.call ?? 0}`;
+      const tag = resolveTag(key, e.agent);
       const s = surface(id);
-      const call = callOf(s, `${e.agent.id}#${e.agent.call ?? 0}`, e);
-      s.tag = e.agent;
+      const call = callOf(s, key, e, tag);
+      s.tag = tag;
       const last = call.items[call.items.length - 1];
       switch (e.kind) {
         case "start":

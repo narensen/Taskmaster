@@ -486,6 +486,17 @@ impl Live {
     }
 }
 
+use std::collections::HashSet;
+
+/// Coalesce consecutive text/thought deltas up to this size before forcing an entry.
+const COALESCE_MAX_BYTES: usize = 16 * 1024;
+
+struct CoalescedDelta {
+    agent: Value,
+    text: String,
+    started_at: Instant,
+}
+
 struct RunWriterState {
     run: String,
     key: String,
@@ -498,6 +509,11 @@ struct RunWriterState {
     fallback_batch: Vec<String>,
     buffered_bytes: usize,
     pending_lines: usize,
+    /// Calls whose full `agent` tag has already been written on `start` (P2).
+    announced: HashSet<(String, u64)>,
+    /// Coalescing buffer for consecutive `text`/`thought` deltas within the 50ms window (P2).
+    coalesce: HashMap<(String, u64, String), CoalescedDelta>,
+    /// Split-secret carry window held across delta emissions (P3).
     carry: HashMap<(String, u64, String), CarryEntry>,
 }
 
@@ -516,6 +532,8 @@ impl RunWriterState {
             fallback_batch: Vec::new(),
             buffered_bytes: 0,
             pending_lines: 0,
+            announced: HashSet::new(),
+            coalesce: HashMap::new(),
             carry: HashMap::new(),
         }
     }
@@ -536,15 +554,40 @@ impl RunWriterState {
         }
     }
 
+    fn compact_agent(&mut self, agent: &Value, kind: &str) -> Value {
+        let id = agent["id"].as_str().unwrap_or("");
+        let call = agent["call"].as_u64().unwrap_or(0);
+        if call == 0 || id.is_empty() || id == "runtime" || id == "person" {
+            return agent.clone();
+        }
+        let key = (id.to_string(), call);
+        if kind == "start" {
+            self.announced.insert(key);
+            return agent.clone();
+        }
+        if kind == "released" {
+            return agent.clone();
+        }
+        if self.announced.contains(&key) {
+            json!({ "id": id, "call": call })
+        } else {
+            agent.clone()
+        }
+    }
+
     fn write_line(&mut self, agent: &Value, kind: &str, mut fields: Value) {
         if !fields.is_object() {
             fields = json!({});
         }
         crate::secrets::redact_json(&mut fields);
+        let written_agent = self.compact_agent(agent, kind);
         let object = fields.as_object_mut().expect("an object");
         object.insert("at".into(), json!(rfc3339_now()));
-        object.insert("agent".into(), agent.clone());
+        object.insert("agent".into(), written_agent);
         object.insert("kind".into(), json!(kind));
+        if kind == "start" {
+            object.insert("v".into(), json!(2));
+        }
         let line = serde_json::to_string(&fields).unwrap_or_default();
         self.ensure_open();
         if let Some(writer) = self.out.as_mut() {
@@ -559,6 +602,49 @@ impl RunWriterState {
         }
         self.buffered_bytes += line.len() + 1;
         self.pending_lines += 1;
+    }
+
+    fn emit_text_with_carry(&mut self, key: (String, u64, String), agent: &Value, delta: &str) {
+        let combined = match self.carry.remove(&key) {
+            Some(prev) => format!("{}{delta}", prev.text),
+            None => delta.to_string(),
+        };
+        let kind = key.2.clone();
+        if let Some(split) = crate::secrets::potential_secret_tail_start(&combined) {
+            let tail = combined[split..].to_string();
+            self.carry.insert(key, CarryEntry { agent: agent.clone(), text: tail, at: Instant::now() });
+            if split == 0 {
+                return;
+            }
+            self.write_line(agent, &kind, json!({ "text": &combined[..split] }));
+        } else {
+            self.write_line(agent, &kind, json!({ "text": combined }));
+        }
+    }
+
+    fn flush_coalesced_key(&mut self, key: &(String, u64, String)) {
+        if let Some(buf) = self.coalesce.remove(key)
+            && !buf.text.is_empty()
+        {
+            self.emit_text_with_carry(key.clone(), &buf.agent, &buf.text);
+        }
+    }
+
+    fn flush_coalesced_for(&mut self, agent_id: &str, call: u64) {
+        for kind in ["text", "thought"] {
+            let key = (agent_id.to_string(), call, kind.to_string());
+            self.flush_coalesced_key(&key);
+        }
+    }
+
+    fn flush_all_coalesced(&mut self) {
+        let mut items: Vec<((String, u64, String), CoalescedDelta)> = self.coalesce.drain().collect();
+        items.sort_by_key(|(_, v)| v.started_at);
+        for (key, buf) in items {
+            if !buf.text.is_empty() {
+                self.emit_text_with_carry(key, &buf.agent, &buf.text);
+            }
+        }
     }
 
     fn flush_carry_for(&mut self, agent_id: &str, call: u64) {
@@ -588,41 +674,47 @@ impl RunWriterState {
         }
     }
 
-    fn handle_entry(&mut self, seq: u64, agent: Value, kind: String, mut fields: Value) {
+    fn handle_entry(&mut self, seq: u64, agent: Value, kind: String, fields: Value) {
         self.seen_seq = self.seen_seq.max(seq);
         let agent_id = agent["id"].as_str().unwrap_or("").to_string();
         let call = agent["call"].as_u64().unwrap_or(0);
 
-        if (kind == "text" || kind == "thought")
-            && let Some(delta) = fields.get("text").and_then(Value::as_str)
-        {
-            let key = (agent_id, call, kind.clone());
-            let combined = match self.carry.remove(&key) {
-                Some(prev) => format!("{}{delta}", prev.text),
-                None => delta.to_string(),
+        let discrete = kind_is_discrete(&kind);
+        let only_text = !discrete
+            && fields.as_object().is_some_and(|m| m.len() == 1 && m.get("text").and_then(Value::as_str).is_some());
+
+        if only_text {
+            let delta = fields["text"].as_str().unwrap_or("");
+            // Switching between text and thought for the same call preserves ordering.
+            let other_kind = if kind == "text" { "thought" } else { "text" };
+            self.flush_coalesced_key(&(agent_id.clone(), call, other_kind.to_string()));
+
+            let key = (agent_id, call, kind);
+            let flush_now = {
+                let entry = self.coalesce.entry(key.clone()).or_insert_with(|| CoalescedDelta {
+                    agent: agent.clone(),
+                    text: String::new(),
+                    started_at: Instant::now(),
+                });
+                entry.text.push_str(delta);
+                entry.text.len() >= COALESCE_MAX_BYTES
             };
-            if let Some(split) = crate::secrets::potential_secret_tail_start(&combined) {
-                let tail = combined[split..].to_string();
-                self.carry.insert(key, CarryEntry { agent: agent.clone(), text: tail, at: Instant::now() });
-                if split == 0 {
-                    return;
-                }
-                fields["text"] = json!(&combined[..split]);
-            } else {
-                fields["text"] = json!(combined);
+            if flush_now {
+                self.flush_coalesced_key(&key);
             }
-            self.write_line(&agent, &kind, fields);
         } else {
+            self.flush_coalesced_for(&agent_id, call);
             self.flush_carry_for(&agent_id, call);
             self.write_line(&agent, &kind, fields);
         }
 
-        if (kind != "text" && kind != "thought") || self.buffered_bytes >= WRITER_FLUSH_BYTES {
+        if discrete || self.buffered_bytes >= WRITER_FLUSH_BYTES {
             self.flush_disk();
         }
     }
 
     fn flush_disk(&mut self) {
+        self.flush_all_coalesced();
         if self.pending_lines > 0 {
             if let Some(writer) = self.out.as_mut() {
                 if let Err(err) = writer.flush() {
@@ -644,6 +736,10 @@ impl RunWriterState {
     }
 }
 
+fn kind_is_discrete(kind: &str) -> bool {
+    kind != "text" && kind != "thought"
+}
+
 fn run_writer_loop(
     run: String,
     store: Arc<dyn Store>,
@@ -653,7 +749,7 @@ fn run_writer_loop(
 ) {
     let mut state = RunWriterState::new(run, store, hub, flushed_seq);
     loop {
-        let timeout = if state.pending_lines > 0 {
+        let timeout = if state.pending_lines > 0 || !state.coalesce.is_empty() {
             WRITER_FLUSH_INTERVAL
         } else if !state.carry.is_empty() {
             CARRY_IDLE_FLUSH
@@ -667,7 +763,7 @@ fn run_writer_loop(
                     WriterCmd::Entry { seq, agent, kind, fields } => state.handle_entry(seq, agent, kind, fields),
                     WriterCmd::Flush { ack } => acks.push(ack),
                 }
-                // Drain any already-queued entries so sequential pushes batch and split secrets combine.
+                // Drain any already-queued entries so sequential pushes batch, coalesce, and catch split secrets.
                 while let Ok(more) = rx.try_recv() {
                     match more {
                         WriterCmd::Entry { seq, agent, kind, fields } => state.handle_entry(seq, agent, kind, fields),
@@ -682,7 +778,7 @@ fn run_writer_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if state.pending_lines > 0 {
+                if state.pending_lines > 0 || !state.coalesce.is_empty() {
                     state.flush_disk();
                 } else if !state.carry.is_empty() {
                     state.flush_stale_carry(false);
@@ -692,6 +788,7 @@ fn run_writer_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                state.flush_all_coalesced();
                 state.flush_stale_carry(true);
                 state.flush_disk();
                 break;
@@ -904,9 +1001,65 @@ mod tests {
         }
         live.flush("busy");
         let elapsed = started.elapsed();
-        let (total, _) = live.read("busy", 0);
-        assert_eq!(total, 10_000);
+        let (total, entries) = live.read("busy", 0);
+        // 10,000 rapid text deltas across 8 workers coalesce into far fewer entries without losing text.
+        assert!(total > 0 && total < 10_000, "expected coalescing, got {total} entries");
+        let bytes: usize = entries.iter().filter_map(|e| e["text"].as_str().map(str::len)).sum();
+        assert!(bytes >= 80_000, "expected all text preserved, got {bytes} bytes");
         assert!(elapsed < Duration::from_secs(10), "10,000 pushes took {elapsed:?}");
+    }
+
+    #[test]
+    fn compact_tags_and_coalescing_shrink_transcript_and_old_format_still_reads() {
+        let store = tmp("p2-compact");
+        let live = Live::new(store.clone());
+        let full_tag = json!({
+            "id": "page:home",
+            "call": 42,
+            "role": "worker",
+            "harness": "claude",
+            "model": "claude-sonnet-4-6",
+            "page": "home",
+            "unit": "layout",
+            "owned_glob": "web/src/pages/Home.tsx",
+            "worktree": "/tmp/example-project/.taskmaster/worktrees/page-home-layout",
+            "branch": "tm/run-1/page-home"
+        });
+        live.push("r1", &full_tag, "start", json!({ "brief": "Build home page" }));
+        for i in 0..50 {
+            live.push("r1", &full_tag, "thought", json!({ "text": format!("step {i} checking layout; ") }));
+        }
+        live.push("r1", &full_tag, "end", json!({ "ok": true }));
+        live.flush("r1");
+
+        let raw = store.read("runs/r1/agents.jsonl").unwrap().unwrap();
+        let (total, entries) = live.read("r1", 0);
+        assert!(total <= 10, "expected coalesced entries, got {total}");
+        assert_eq!(entries[0]["kind"], "start");
+        assert_eq!(entries[0]["v"], 2);
+        assert_eq!(entries[0]["agent"]["harness"], "claude");
+        // Subsequent entries carry compact {id, call} only.
+        let thought = entries.iter().find(|e| e["kind"] == "thought").unwrap();
+        assert_eq!(thought["agent"], json!({ "id": "page:home", "call": 42 }));
+        let end = entries.iter().find(|e| e["kind"] == "end").unwrap();
+        assert_eq!(end["agent"], json!({ "id": "page:home", "call": 42 }));
+        // Compare against uncoalesced old-format size (~50 * (340B tag + text)).
+        let old_estimate = 50 * (full_tag.to_string().len() + 80);
+        assert!(raw.len() * 3 < old_estimate, "expected >=3x smaller: new={} old~={}", raw.len(), old_estimate);
+
+        // Old-format transcripts (v1, full agent tag on every line, no `v` field) still read cleanly.
+        let legacy_line = json!({
+            "at": "2026-01-01T00:00:00Z",
+            "agent": full_tag,
+            "kind": "thought",
+            "text": "legacy thought"
+        })
+        .to_string();
+        store.append("runs/legacy/agents.jsonl", &legacy_line).unwrap();
+        let (ltotal, lentries) = live.read("legacy", 0);
+        assert_eq!(ltotal, 1);
+        assert_eq!(lentries[0]["agent"]["harness"], "claude");
+        assert_eq!(lentries[0]["text"], "legacy thought");
     }
 
     #[test]

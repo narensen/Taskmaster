@@ -21,6 +21,7 @@ pub mod attachments;
 pub mod auth;
 mod browser;
 pub mod audit;
+pub mod checkpoints;
 pub mod commons;
 mod checker;
 mod code;

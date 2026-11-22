@@ -1071,6 +1071,7 @@ export function Flow({
   onTool,
   onFocusAgent,
   turn,
+  onEditFromHere,
 }: {
   detail: RunDetail;
   list: Surface[];
@@ -1088,8 +1089,11 @@ export function Flow({
   approvals?: ToolApproval[];
   onTool?: (id: string, allow: boolean) => void;
   onFocusAgent?: (agentId: string) => void;
+  onEditFromHere?: (turn: number, revertFiles: boolean) => void;
 }) {
+  const [confirmRewind, setConfirmRewind] = useState(false);
   const later = !!turn && turn.n > 1;
+  const turnNum = turn?.n ?? 1;
   const prompt = (later ? turn.text : detail.prompt)?.trim();
   const idPrefix = turn?.past ? `t${turn.n}-` : "";
   const pending = approvals ?? [];
@@ -1161,11 +1165,53 @@ export function Flow({
           data-testid={later ? "turn-prompt" : undefined}
           tabIndex={-1}
         >
-          {later && (
-            <span className="user-prompt-label">
-              Follow-up{turn.mode ? ` · ${turn.mode === "agent" ? "one agent" : turn.mode === "code" ? "master and workers" : turn.mode}` : ""}
-            </span>
-          )}
+          <div className="row between gap wrap">
+            {later ? (
+              <span className="user-prompt-label">
+                Follow-up{turn.mode ? ` · ${turn.mode === "agent" ? "one agent" : turn.mode === "code" ? "master and workers" : turn.mode}` : ""}
+              </span>
+            ) : (
+              <span className="user-prompt-label">Request</span>
+            )}
+            {onEditFromHere && !detail.active && (
+              confirmRewind ? (
+                <span className="row gap small" data-testid={`rewind-choices-${turnNum}`}>
+                  <button
+                    type="button"
+                    className="ghost small"
+                    onClick={() => {
+                      setConfirmRewind(false);
+                      onEditFromHere(turnNum, false);
+                    }}
+                  >
+                    Keep changes
+                  </button>
+                  <button
+                    type="button"
+                    className="small"
+                    onClick={() => {
+                      setConfirmRewind(false);
+                      onEditFromHere(turnNum, true);
+                    }}
+                  >
+                    Revert files too
+                  </button>
+                  <button type="button" className="link small" onClick={() => setConfirmRewind(false)}>
+                    Cancel
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="link small muted"
+                  data-testid={`edit-from-here-${turnNum}`}
+                  onClick={() => setConfirmRewind(true)}
+                >
+                  Edit from here
+                </button>
+              )
+            )}
+          </div>
           <div className="user-prompt-body" data-agent-text="you">
             <Rich text={prompt} />
           </div>

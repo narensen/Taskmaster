@@ -996,7 +996,26 @@ export function RunView({ id }: { id: string }) {
               </div>
             )}
             {turns.slice(0, -1).map((t, i) => (
-              <PastTurn key={t.n} turn={t} next={turns[i + 1]} entries={shown} detail={detail} ledger={ledgerEntries} />
+              <PastTurn
+                key={t.n}
+                turn={t}
+                next={turns[i + 1]}
+                entries={shown}
+                detail={detail}
+                ledger={ledgerEntries}
+                onEditFromHere={(turnNum, revertFiles) => {
+                  void api
+                    .rewind(id, turnNum, revertFiles)
+                    .then((res) => {
+                      if (res.message) composer.current?.setText(res.message);
+                      composer.current?.focus();
+                      data.reloadNotes();
+                      void data.reload();
+                      toast(revertFiles ? `Rewound to turn ${turnNum} and reverted files` : `Rewound to turn ${turnNum} (kept changes)`);
+                    })
+                    .catch((err) => toast("Could not rewind", err instanceof Error ? err.message : String(err)));
+                }}
+              />
             ))}
             <Flow
               turn={turns.length > 1 ? { n: current.n, text: current.text, mode: current.mode, past: false } : undefined}
@@ -1011,6 +1030,22 @@ export function RunView({ id }: { id: string }) {
               onRestartWorker={(page) => void restartWorker(page)}
               approvals={toolApprovals.list}
               onTool={toolApprovals.answer}
+              onEditFromHere={
+                detail.active
+                  ? undefined
+                  : (turnNum, revertFiles) => {
+                      void api
+                        .rewind(id, turnNum, revertFiles)
+                        .then((res) => {
+                          if (res.message) composer.current?.setText(res.message);
+                          composer.current?.focus();
+                          data.reloadNotes();
+                          void data.reload();
+                          toast(revertFiles ? `Rewound to turn ${turnNum} and reverted files` : `Rewound to turn ${turnNum} (kept changes)`);
+                        })
+                        .catch((err) => toast("Could not rewind", err instanceof Error ? err.message : String(err)));
+                    }
+              }
               ask={
                 phase === "awaiting_approval" ? (
                   <ApprovalAsk

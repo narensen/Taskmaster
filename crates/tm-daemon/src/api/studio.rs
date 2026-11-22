@@ -362,7 +362,8 @@ pub(super) async fn checkpoints(
 ) -> Reply {
     app.known(&id)?;
     let list = collect_checkpoints(&app, &id);
-    ok(json!({ "checkpoints": list }))
+    let turns = crate::checkpoints::list(&app.project(), &id);
+    ok(json!({ "checkpoints": list, "turn_checkpoints": turns }))
 }
 
 #[derive(Deserialize, Default)]

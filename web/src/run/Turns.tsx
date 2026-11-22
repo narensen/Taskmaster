@@ -19,6 +19,7 @@ export const PastTurn = memo(function PastTurn({
   entries,
   detail,
   ledger,
+  onEditFromHere,
 }: {
   turn: Turn;
   /** The turn after this one, which bounds this one's spend. */
@@ -26,6 +27,7 @@ export const PastTurn = memo(function PastTurn({
   entries: AgentEntry[];
   detail: RunDetail;
   ledger: LedgerEntry[];
+  onEditFromHere?: (turn: number, revertFiles: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [blown, setBlown] = useState<Set<string>>(() => new Set());
@@ -72,7 +74,15 @@ export const PastTurn = memo(function PastTurn({
       </button>
       {open && (
         <div className="past-turn-body">
-          <Flow detail={past} list={list} focus={null} blown={blown} onToggleAgent={toggle} turn={{ n: turn.n, text: turn.text, mode: turn.mode, past: true }} />
+          <Flow
+            detail={past}
+            list={list}
+            focus={null}
+            blown={blown}
+            onToggleAgent={toggle}
+            turn={{ n: turn.n, text: turn.text, mode: turn.mode, past: true }}
+            onEditFromHere={detail.active ? undefined : onEditFromHere}
+          />
         </div>
       )}
     </section>

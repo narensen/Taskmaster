@@ -5117,6 +5117,183 @@ async fn h1_pending_approval_marks_run_blocked_needs_you_and_approving_clears_it
     drop(server);
 }
 
+#[tokio::test]
+async fn a2_rewind_restores_checkpoint_and_drops_later_turns_from_view_and_next_brief() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let parsed = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    async fn wait_idle(addr: &str, token: &str, run: &str) {
+        for _ in 0..160 {
+            let (_, detail) = call(addr, Some(token), "GET", &format!("/api/runs/{run}"), None).await;
+            if detail["active"] == false && matches!(detail["phase"].as_str(), Some("done") | Some("failed")) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("run {run} did not settle in time");
+    }
+
+    struct MultiTurnHarness {
+        briefs: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for MultiTurnHarness {
+        fn id(&self) -> &'static str {
+            "a2-harness"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            if task.brief.contains("TURN3_BAD_TASK") {
+                let _ = events.send(HarnessEvent::Text { text: "TURN3_AGENT_MARKER".into() }).await;
+                std::fs::write(&file, "export const v = 'turn3-bad';\n")?;
+                std::fs::write(task.cwd.join("app/a/extra.ts"), "export const extra = true;\n")?;
+            } else if task.brief.contains("TURN3_FIXED_TASK") {
+                std::fs::write(&file, "export const v = 'turn3-fixed';\n")?;
+            } else if task.brief.contains("TURN2_TASK") {
+                let _ = events.send(HarnessEvent::Text { text: "TURN2_AGENT_MARKER".into() }).await;
+                std::fs::write(&file, "export const v = 'turn2';\n")?;
+            } else {
+                std::fs::write(&file, "export const v = 'turn1';\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("a2-rewind");
+    let h = Arc::new(MultiTurnHarness { briefs: Mutex::new(Vec::new()) });
+    let h_clone = h.clone();
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let mut options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    options.harness = Arc::new(move |_| Ok(h_clone.clone() as Arc<dyn Harness>));
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // Turn 1
+    let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs",
+        Some(serde_json::json!({
+            "id": "r-a2",
+            "plan": planned,
+            "yes": true,
+            "roles": { "worker": "a2-harness", "mid": "a2-harness", "master": "a2-harness", "reviewer": "a2-harness", "verifier": "a2-harness" }
+        })),
+    )
+    .await;
+    assert_eq!(st, 202);
+    wait_idle(&addr, &token, "r-a2").await;
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const v = 'turn1';\n");
+
+    // Turn 2
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs/r-a2/notes",
+        Some(serde_json::json!({ "to": "master", "text": "TURN2_TASK", "mode": "agent" })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    wait_idle(&addr, &token, "r-a2").await;
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const v = 'turn2';\n");
+
+    // Turn 3 (bad turn that modifies page.ts and adds extra.ts)
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs/r-a2/notes",
+        Some(serde_json::json!({ "to": "master", "text": "TURN3_BAD_TASK", "mode": "agent" })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    wait_idle(&addr, &token, "r-a2").await;
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const v = 'turn3-bad';\n");
+    assert!(tmp.0.join("app/a/extra.ts").exists());
+
+    // Verify checkpoints exist for turns 1, 2, 3.
+    let (st, ckpts) = call(&addr, Some(&token), "GET", "/api/runs/r-a2/checkpoints", None).await;
+    assert_eq!(st, 200);
+    let turns: Vec<u64> = ckpts["turn_checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["turn"].as_u64())
+        .collect();
+    assert!(turns.contains(&1) && turns.contains(&2) && turns.contains(&3), "missing checkpoints: {turns:?}");
+
+    // Rewind from turn 3 with `revert_files: true`: restores turn 2's files and drops turn 3's agents.
+    let (st, rewound) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs/r-a2/rewind",
+        Some(serde_json::json!({ "turn": 3, "revert_files": true })),
+    )
+    .await;
+    assert_eq!(st, 200, "rewind failed: {rewound}");
+    assert_eq!(rewound["message"], "TURN3_BAD_TASK");
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const v = 'turn2';\n");
+    assert!(!tmp.0.join("app/a/extra.ts").exists(), "file created in turn 3 must be removed on revert");
+
+    // Transcript no longer contains turn 3's agent marker.
+    let (st, agents) = call(&addr, Some(&token), "GET", "/api/runs/r-a2/agents", None).await;
+    assert_eq!(st, 200);
+    let dump = agents.to_string();
+    assert!(dump.contains("TURN2_AGENT_MARKER"), "turn 2 must remain in view");
+    assert!(!dump.contains("TURN3_AGENT_MARKER"), "turn 3 must be gone from view");
+    assert!(!dump.contains("TURN3_BAD_TASK"), "turn 3 message must be gone from view");
+
+    // Next turn brief does not carry turn 3's dropped message.
+    let before_count = h.briefs.lock().unwrap().len();
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs/r-a2/notes",
+        Some(serde_json::json!({ "to": "master", "text": "TURN3_FIXED_TASK", "mode": "agent" })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    wait_idle(&addr, &token, "r-a2").await;
+    let briefs = h.briefs.lock().unwrap();
+    let new_brief = &briefs[before_count];
+    assert!(new_brief.contains("TURN3_FIXED_TASK"));
+    assert!(!new_brief.contains("TURN3_BAD_TASK"));
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const v = 'turn3-fixed';\n");
+
+    drop(server);
+}
+
+
 
 
 

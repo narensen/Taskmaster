@@ -555,6 +555,13 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         return Ok(Outcome::NeedsApproval { summary });
     }
 
+    if !crate::checkpoints::exists(&project, &id, 1) {
+        let _ = crate::checkpoints::capture(&project, &id, 1);
+        if let Some(ref b) = meta.branch {
+            let _ = crate::checkpoints::capture_branch(&project, &id, 1, b);
+        }
+    }
+
     let mut driver = Driver {
         config,
         tree: project.clone(),
@@ -5126,6 +5133,10 @@ impl Driver {
     fn open_turn(&mut self) -> anyhow::Result<()> {
         let pending: Vec<crate::live::Note> = self.live.notes(&self.id).into_iter().filter(|note| !note.delivered).collect();
         let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
+        let _ = crate::checkpoints::capture(&self.project, &self.id, turn);
+        if let Some(ref b) = self.branch {
+            let _ = crate::checkpoints::capture_branch(&self.project, &self.id, turn, b);
+        }
         let mode = crate::turns::turn_mode(&pending, self.config.mode);
         if mode != crate::RunMode::Agent {
             self.live.unqueue_all(&self.id);

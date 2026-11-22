@@ -669,6 +669,41 @@ impl Live {
         }
     }
 
+    /// Remove notes by id (used when rewinding a run to an earlier turn, A2).
+    pub fn remove_notes(&self, run: &str, ids: &[String]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.notes_lock.lock().unwrap();
+        let mut notes = self.notes(run);
+        let before = notes.len();
+        notes.retain(|n| !ids.contains(&n.id));
+        if notes.len() != before {
+            self.save_notes(run, &notes)?;
+        }
+        Ok(())
+    }
+
+    /// Truncate `agents.jsonl` to the first `keep` entries and reset the in-memory cache (A2).
+    pub fn truncate_transcript(&self, run: &str, keep: usize) -> anyhow::Result<usize> {
+        self.flush(run);
+        let (_, entries) = self.read(run, 0);
+        let dropped = entries.len().saturating_sub(keep);
+        let mut buf = Vec::new();
+        for entry in entries.iter().take(keep) {
+            let mut stripped = entry.clone();
+            if let Some(obj) = stripped.as_object_mut() {
+                obj.remove("index");
+            }
+            serde_json::to_writer(&mut buf, &stripped)?;
+            buf.push(b'\n');
+        }
+        self.store.write(&Self::key(run, "agents.jsonl"), &buf)?;
+        self.cache.lock().unwrap().remove(run);
+        self.hub.notify_agents(run);
+        Ok(dropped)
+    }
+
     /// True when an undelivered note matches `pred`.
     pub fn has_pending_where(&self, run: &str, pred: impl Fn(&Note) -> bool) -> bool {
         self.notes(run).iter().any(|note| !note.delivered && pred(note))

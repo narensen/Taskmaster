@@ -79,6 +79,7 @@ pub fn run_gc(
             if over_count || over_age {
                 let bytes = dir_size(&path);
                 if std::fs::remove_dir_all(&path).is_ok() {
+                    crate::checkpoints::prune_run(project, &id);
                     report.removed_runs.push(id);
                     report.bytes_freed += bytes;
                 }

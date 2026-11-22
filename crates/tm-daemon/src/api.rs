@@ -422,6 +422,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/output/stream", get(desk::command_output_stream))
         .route("/api/runs/{id}/notes", get(desk::notes).post(desk::add_note))
         .route("/api/runs/{id}/notes/{note}", post(desk::edit_note))
+        .route("/api/runs/{id}/rewind", post(rewind_run))
         .route("/api/runs/{id}/terminal", post(desk::terminal))
         .route("/api/runs/{id}/diff", get(desk::diff))
         .route("/api/runs/{id}/diff-stats", get(desk::diff_stats))
@@ -1067,6 +1068,10 @@ impl App {
         let request = self.request_for(id)?;
         let mut events = self.records().events(id)?;
         let turn = events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
+        let _ = crate::checkpoints::capture(&self.project(), id, turn);
+        if let Some(branch) = self.records().meta(id).ok().flatten().and_then(|m| m.branch) {
+            let _ = crate::checkpoints::capture_branch(&self.project(), id, turn, &branch);
+        }
         let mode = crate::turns::turn_mode(&pending, request.mode);
         let mut taken: Vec<String> = Vec::new();
         let appended = match events.last() {
@@ -1557,6 +1562,129 @@ fn waiting(run: &Run) -> Result<(), ApiError> {
         return Ok(());
     }
     Err(fail(StatusCode::CONFLICT, "this run has no plan waiting for approval"))
+}
+
+#[derive(Deserialize)]
+struct RewindBody {
+    turn: usize,
+    #[serde(default)]
+    revert_files: bool,
+}
+
+async fn rewind_run(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<RewindBody>,
+) -> Reply {
+    app.known(&id)?;
+    if body.turn == 0 {
+        return Err(fail(StatusCode::BAD_REQUEST, "turn must be 1 or greater"));
+    }
+    if app.is_active(&id) {
+        return Err(fail(StatusCode::CONFLICT, "cannot rewind a run while it is active"));
+    }
+    if body.revert_files && !app.active.lock().unwrap().is_empty() {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "cannot revert files while another run is building in this checkout",
+        ));
+    }
+
+    // Read full transcript and locate the turn boundary.
+    app.live.flush(&id);
+    let (_, entries) = app.live.read(&id, 0);
+    let mut message = String::new();
+    let mut keep_entries = entries.len();
+    let mut drop_note_ids: Vec<String> = Vec::new();
+    if body.turn == 1 {
+        keep_entries = 0;
+        message = app
+            .records()
+            .request(&id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.prompt)
+            .unwrap_or_default();
+        for e in &entries {
+            if e["kind"].as_str() == Some("turn")
+                && let Some(arr) = e["notes"].as_array()
+            {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        drop_note_ids.push(s.to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        let mut found = false;
+        for (idx, e) in entries.iter().enumerate() {
+            if e["kind"].as_str() == Some("turn")
+                && let Some(t) = e["turn"].as_u64()
+                && (t as usize) >= body.turn
+            {
+                if !found && (t as usize) == body.turn {
+                    keep_entries = idx;
+                    message = e["text"].as_str().unwrap_or("").to_string();
+                    found = true;
+                } else if !found {
+                    keep_entries = idx;
+                    found = true;
+                }
+                if let Some(arr) = e["notes"].as_array() {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            drop_note_ids.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Revert files BEFORE mutating events/transcript if requested, so missing checkpoint fails cleanly.
+    if body.revert_files {
+        crate::checkpoints::restore(&app.project(), &id, body.turn)
+            .map_err(|err| fail(StatusCode::CONFLICT, format!("cannot restore checkpoint for turn {}: {err:#}", body.turn)))?;
+        if let Some(branch) = app.records().meta(&id)?.and_then(|m| m.branch) {
+            let _ = crate::checkpoints::restore_branch(&app.project(), &id, body.turn, &branch);
+        }
+    }
+
+    // Truncate events.jsonl before `body.turn`.
+    let mut events = app.records().events(&id)?;
+    if body.turn == 1 {
+        events.clear();
+    } else {
+        let target_idx = body.turn - 2; // 0th FollowUp/AgentTurn = turn 2, 1st = turn 3, ...
+        let mut seen = 0usize;
+        if let Some(pos) = events.iter().position(|ev| {
+            if matches!(ev, Event::FollowUp | Event::AgentTurn { .. }) {
+                let hit = seen == target_idx;
+                seen += 1;
+                hit
+            } else {
+                false
+            }
+        }) {
+            events.truncate(pos);
+        }
+    }
+    app.records().save_events(&id, &events)?;
+
+    let dropped_entries = app.live.truncate_transcript(&id, keep_entries)?;
+    let _ = app.live.remove_notes(&id, &drop_note_ids);
+    crate::checkpoints::prune_from(&app.project(), &id, body.turn + 1);
+    app.summary_cache.lock().unwrap().remove(&(app.project(), id.clone()));
+    app.live.notify_events(&id);
+
+    ok(json!({
+        "ok": true,
+        "turn": body.turn,
+        "message": message,
+        "reverted_files": body.revert_files,
+        "dropped_entries": dropped_entries,
+    }))
 }
 
 #[derive(Deserialize, Default)]

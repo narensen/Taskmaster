@@ -1429,6 +1429,16 @@ export const api = {
     if (queued !== undefined) body.queued = queued;
     return call<{ notes: Note[] }>("POST", `/api/runs/${enc(id)}/notes/${enc(note)}`, body);
   },
+  turnCheckpoints: (id: string) =>
+    call<{ turn_checkpoints: { turn: number; commit: string }[] }>("GET", `/api/runs/${enc(id)}/checkpoints`).then(
+      (r) => r.turn_checkpoints,
+    ),
+  rewind: (id: string, turn: number, revertFiles: boolean) =>
+    call<{ ok: boolean; turn: number; message: string; reverted_files: boolean; dropped_entries: number }>(
+      "POST",
+      `/api/runs/${enc(id)}/rewind`,
+      { turn, revert_files: revertFiles },
+    ),
   terminal: (id: string, command: string) =>
     call<{ ok: boolean; code: number | null; output: string }>("POST", `/api/runs/${enc(id)}/terminal`, { command }),
   diff: (id: string, scope: "run" | "page", page?: string) =>

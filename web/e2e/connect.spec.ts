@@ -40,6 +40,13 @@ test("an outside agent gets a token and a setup that works", async ({ open, page
   await page.getByTestId("agent-test").click();
   await expect(page.getByTestId("agent-test-result")).toContainText(/It works: \d+ tools/);
   await expect(page.getByTestId("device-row").filter({ hasText: "Claude Code (test)" })).toHaveAttribute("data-kind", "agent");
+  // The skill install line points at this daemon's /skill.md, which answers without a token.
+  const skill = page.getByTestId("agent-skill");
+  await expect(skill).toContainText("~/.claude/skills/taskmaster/SKILL.md");
+  const href = await skill.getByRole("link", { name: "same file" }).getAttribute("href");
+  const served = await fetch(href!);
+  expect(served.status).toBe(200);
+  expect(await served.text()).toContain("name: taskmaster");
 });
 
 test("a prompt link fills New Run without sending, and drops hidden characters", async ({ open, page }) => {

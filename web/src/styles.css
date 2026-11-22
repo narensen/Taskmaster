@@ -7150,3 +7150,7 @@ button.run-opt-row { justify-content: flex-start; white-space: normal; }
 .composer-actions:has(.run-opt) { flex-wrap: wrap; row-gap: 4px; }
 .flow-top-status .goal-status { flex: none; }
 .flow-top-status .goal-cond { max-width: 150px; }
+
+/* Connect: the skill for outside agents (A10). */
+.connect-skill { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.connect-skill p { margin: 0; }

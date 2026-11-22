@@ -2198,6 +2198,24 @@ mod http {
         assert_eq!(agent.post("/api/pairing", json!({})).await.0, 403);
         assert_eq!(agent.post(&format!("/api/devices/{laptop_id}/revoke"), json!({})).await.0, 403);
 
+        // The skill for outside agents is served without a token and names exactly the
+        // tools the server offers, and tells the agent to stop without a token.
+        let (status, skill) = anon.text("/skill.md").await;
+        assert_eq!(status, 200);
+        assert!(skill.starts_with("---\nname: taskmaster\n"), "{skill}");
+        let offered = crate::api::connect::tool_names();
+        for name in &offered {
+            assert!(skill.contains(&format!("`{name}`")), "the skill does not mention {name}");
+        }
+        let mentioned: std::collections::BTreeSet<&str> = skill
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.starts_with("taskmaster_") && word.len() > "taskmaster_".len())
+            .collect();
+        for word in mentioned {
+            assert!(offered.iter().any(|name| name == word), "the skill names {word}, which the server does not offer");
+        }
+        assert!(skill.contains("401 or 403, **stop**"), "{skill}");
+
         // A pairing link opens a page even without the web app.
         let (status, page) = anon.text("/pair").await;
         assert_eq!(status, 200);

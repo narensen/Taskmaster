@@ -555,6 +555,20 @@ pub async fn mcp(State(app): State<Arc<App>>, body: String) -> Response {
     Json(reply).into_response()
 }
 
+/// The skill that teaches an outside agent these tools (A10), as shipped in the repository.
+pub const SKILL: &str = include_str!("../../../../skills/taskmaster/SKILL.md");
+
+/// `GET /skill.md`: the skill, for `curl … -o ~/.claude/skills/taskmaster/SKILL.md`. It holds
+/// no secret, so it needs no token.
+pub async fn skill() -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")], SKILL).into_response()
+}
+
+/// The tool names the MCP server offers, for the skill's own check.
+pub fn tool_names() -> Vec<String> {
+    tools().as_array().map(|list| list.iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()).unwrap_or_default()
+}
+
 /// This server never pushes, so it offers no stream.
 pub async fn mcp_no_stream() -> StatusCode {
     StatusCode::METHOD_NOT_ALLOWED

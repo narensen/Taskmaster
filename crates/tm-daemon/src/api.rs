@@ -144,7 +144,7 @@ use tm_harness::{HARNESSES, Harness};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
-mod connect;
+pub(crate) mod connect;
 mod desk;
 mod hosts;
 mod ops;
@@ -523,6 +523,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/terminals/{id}/stream", get(terms::stream))
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
+        .route("/skill.md", get(connect::skill))
         .merge(private)
         .fallback(frontend)
         .layer(middleware::from_fn(json_errors))

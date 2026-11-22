@@ -480,6 +480,7 @@ function AgentsCard({ view, devices, onChange }: { view: ConnectView | null; dev
   const token = minted?.token ?? "<token>";
   const shown = useMemo(() => snippet(client, url, token), [client, url, token]);
   const masked = minted && !reveal ? shown.split(minted.token).join(`${minted.token.slice(0, 6)}…`) : shown;
+  const skillCommand = `mkdir -p ~/.claude/skills/taskmaster && curl -fsS ${base}skill.md -o ~/.claude/skills/taskmaster/SKILL.md`;
 
   const mint = async () => {
     setBusy(true);
@@ -572,6 +573,21 @@ function AgentsCard({ view, devices, onChange }: { view: ConnectView | null; dev
           )}
         </div>
         {minted && <p className="small connect-warn">Copy it now: the token is not shown again. Anyone with it can start runs here.</p>}
+        <div className="connect-skill" data-testid="agent-skill">
+          <div className="connect-subhead">Teach it the tools</div>
+          <p className="muted small">
+            A skill tells the agent when to use Taskmaster and to stop if its token is missing. Claude Code reads skills from{" "}
+            <code>~/.claude/skills</code>; other agents take the{" "}
+            <a href={`${base}skill.md`} target="_blank" rel="noreferrer">
+              same file
+            </a>{" "}
+            wherever they read instructions.
+          </p>
+          <pre className="connect-snippet mono">{skillCommand}</pre>
+          <div className="connect-cmd-row">
+            <CopyButton text={skillCommand} what="Skill install" testId="agent-skill-copy" />
+          </div>
+        </div>
         {routes[route]?.kind === "this-computer" && routes.length === 1 && (
           <p className="muted small">The address is this computer's, so the agent must run here. For an agent on another machine, start the daemon with --lan or --tailscale.</p>
         )}

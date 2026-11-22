@@ -954,6 +954,7 @@ impl App {
             app.record_outcome(&id, result);
             app.active.lock().unwrap().remove(&id);
             app.summary_cache.lock().unwrap().remove(&(app.project(), id.clone()));
+            app.live.notify_events(&id);
             // A note can land in the moment the driver stops. Pick it up once the run is idle.
             if let Err(err) = app.wake_for_note(&id) {
                 eprintln!("taskmaster: run {id}: a note was not picked up: {}", err.1);
@@ -1009,6 +1010,7 @@ impl App {
         };
         if appended {
             self.records().save_events(id, &events)?;
+            self.live.notify_events(id);
         }
         // The lock is held through start so a second note cannot start a second driver.
         match self.start(id, request, Decision::Continue) {
@@ -1017,6 +1019,7 @@ impl App {
                 if appended {
                     events.pop();
                     let _ = self.records().save_events(id, &events);
+                    self.live.notify_events(id);
                     self.live.return_held(&notes, id, &taken);
                 }
                 Err(err)
@@ -1227,7 +1230,13 @@ struct Feed {
     agents_seen: usize,
     ready: VecDeque<SseEvent>,
     over: bool,
-    wake: tokio::sync::broadcast::Receiver<String>,
+    seq: tokio::sync::watch::Receiver<crate::live::RunSeq>,
+    last_seq: crate::live::RunSeq,
+    last_events_stat: Option<(u64, u128)>,
+    last_agents_stat: Option<(u64, u128)>,
+    cached_events: Vec<Event>,
+    initialized: bool,
+    check_stat: bool,
 }
 
 async fn run_stream(
@@ -1244,9 +1253,26 @@ async fn run_stream(
     let resume = headers.get("last-event-id").and_then(|value| value.to_str().ok()).map(str::to_string);
     let seen = resume.or_else(|| query.get("after").cloned()).and_then(|n| n.parse().ok()).unwrap_or(0);
     let agents_seen = query.get("agents_after").and_then(|n| n.parse().ok()).unwrap_or(0);
-    let wake = app.live.subscribe();
-    let feed = Feed { app, id, seen, agents_seen, ready: VecDeque::new(), over: false, wake };
+    let seq = app.live.watch(&id);
+    let last_seq = *seq.borrow();
+    let feed = Feed {
+        app,
+        id,
+        seen,
+        agents_seen,
+        ready: VecDeque::new(),
+        over: false,
+        seq,
+        last_seq,
+        last_events_stat: None,
+        last_agents_stat: None,
+        cached_events: Vec::new(),
+        initialized: false,
+        check_stat: false,
+    };
     let events = stream::unfold(feed, |mut feed| async move {
+        let events_key = format!("runs/{}/events.jsonl", feed.id);
+        let agents_key = format!("runs/{}/agents.jsonl", feed.id);
         loop {
             if let Some(event) = feed.ready.pop_front() {
                 return Some((Ok(event), feed));
@@ -1254,38 +1280,76 @@ async fn run_stream(
             if feed.over {
                 return None;
             }
-            // Read "is it running" before the log: anything written while it ran is then
-            // in the log we read, so the last events are not missed.
+            // Read "is it running" before checking the sequence/files: anything written
+            // while it ran is then seen before emitting `idle`.
             let active = feed.app.is_active(&feed.id);
-            let events = feed.app.records().events(&feed.id).unwrap_or_default();
-            let (agents_total, said) = feed.app.live.read(&feed.id, feed.agents_seen);
-            for entry in &said {
-                feed.ready.push_back(SseEvent::default().event("agent").data(entry.to_string()));
+            let cur_seq = *feed.seq.borrow_and_update();
+
+            let mut read_agents = !feed.initialized || cur_seq.agents != feed.last_seq.agents;
+            let mut read_events = !feed.initialized || cur_seq.events != feed.last_seq.events;
+            if feed.check_stat || !active {
+                feed.check_stat = false;
+                let records = feed.app.records();
+                if !read_agents {
+                    let st = records.stat(&agents_key);
+                    if st.is_none() || st != feed.last_agents_stat {
+                        read_agents = true;
+                    }
+                }
+                if !read_events {
+                    let st = records.stat(&events_key);
+                    if st.is_none() || st != feed.last_events_stat {
+                        read_events = true;
+                    }
+                }
             }
-            feed.agents_seen = agents_total.max(feed.agents_seen);
-            if !said.is_empty() {
+
+            if read_agents {
+                let (agents_total, said) = feed.app.live.read(&feed.id, feed.agents_seen);
+                feed.last_seq.agents = cur_seq.agents;
+                feed.last_agents_stat = feed.app.records().stat(&agents_key);
+                for entry in &said {
+                    feed.ready.push_back(SseEvent::default().event("agent").data(entry.to_string()));
+                }
+                feed.agents_seen = agents_total.max(feed.agents_seen);
+            }
+
+            if read_events {
+                let records = feed.app.records();
+                let events = records.events(&feed.id).unwrap_or_default();
+                feed.last_seq.events = cur_seq.events;
+                feed.last_events_stat = records.stat(&events_key);
+                if events.len() > feed.seen {
+                    for (index, event) in events.iter().enumerate().skip(feed.seen) {
+                        let body = serde_json::to_string(event).unwrap_or_default();
+                        feed.ready.push_back(SseEvent::default().event("event").id((index + 1).to_string()).data(body));
+                    }
+                    feed.seen = events.len();
+                }
+                feed.cached_events = events;
+            }
+
+            feed.initialized = true;
+
+            if !feed.ready.is_empty() {
                 continue;
             }
-            if events.len() > feed.seen {
-                for (index, event) in events.iter().enumerate().skip(feed.seen) {
-                    let body = serde_json::to_string(event).unwrap_or_default();
-                    feed.ready.push_back(SseEvent::default().event("event").id((index + 1).to_string()).data(body));
-                }
-                feed.seen = events.len();
-            } else if !active {
-                let phase = Run::replay_with(feed.app.parallel(&feed.id), feed.app.focused(&feed.id), events).phase;
+            if !active {
+                let phase = Run::replay_with(feed.app.parallel(&feed.id), feed.app.focused(&feed.id), feed.cached_events.clone()).phase;
                 feed.ready.push_back(SseEvent::default().event("idle").data(json!({ "phase": phase }).to_string()));
                 feed.over = true;
             } else {
-                // Wake instantly whenever this run emits a live entry, with a short fallback
-                // tick for run-level event log writes and cross-process updates.
+                // Wake ONLY when this run changes; a slow stat-gated tick covers writers in
+                // another process without reading files when nothing moved.
                 tokio::select! {
-                    msg = feed.wake.recv() => {
-                        if let Ok(run_id) = msg && run_id != feed.id {
-                            continue;
+                    changed = feed.seq.changed() => {
+                        if changed.is_err() {
+                            feed.check_stat = true;
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        feed.check_stat = true;
+                    }
                 }
             }
         }

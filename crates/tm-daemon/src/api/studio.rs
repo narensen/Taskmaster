@@ -193,6 +193,7 @@ pub(super) async fn update_plan(
     let mut events = records.events(&id)?;
     events.push(Event::PlanReady(body.plan.clone()));
     records.save_events(&id, &events)?;
+    app.live.notify_events(&id);
     if let Some(mut req) = records.request(&id)?
         && req.plan.is_some()
     {

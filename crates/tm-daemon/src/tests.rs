@@ -4247,6 +4247,7 @@ async fn web_access_api_persists_settings_vaults_api_key_and_serves_run_web_acti
             "injection_flagged": false
         }),
     );
+    live.flush("run-web-ui");
     let (st, activity) = call(&addr, Some(&token), "GET", "/api/runs/run-web-ui/web", None).await;
     assert_eq!(st, 200);
     let items = activity["items"].as_array().unwrap();

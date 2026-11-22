@@ -13,29 +13,132 @@
 //! can edit or remove it until then.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::store::Store;
 use crate::time::rfc3339_now;
 
-#[derive(Default)]
+/// Maximum number of runs kept in memory in [`Live::cache`] (P4).
+pub const MAX_CACHED_RUNS: usize = 8;
+/// Cached runs idle longer than this are evicted on the next read (P4).
+const CACHE_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Per-run writer flush interval (P3).
+const WRITER_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+/// Per-run writer byte threshold before an immediate flush (P3).
+const WRITER_FLUSH_BYTES: usize = 64 * 1024;
+/// How long a held split-secret carry waits with no follow-up delta before flushing.
+const CARRY_IDLE_FLUSH: Duration = Duration::from_millis(250);
+/// How long an idle per-run writer thread waits before exiting cleanly.
+const WRITER_IDLE_EXIT: Duration = Duration::from_secs(5);
+
+/// Per-run monotonic sequence counters for `events.jsonl` and `agents.jsonl` (P1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunSeq {
+    pub events: u64,
+    pub agents: u64,
+}
+
 struct Cached {
     /// Bytes of the file already parsed.
     offset: u64,
     entries: Vec<Value>,
+    last_used: Instant,
+    use_seq: u64,
+}
+
+impl Default for Cached {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            entries: Vec::new(),
+            last_used: Instant::now(),
+            use_seq: 0,
+        }
+    }
+}
+
+enum WriterCmd {
+    Entry {
+        seq: u64,
+        agent: Value,
+        kind: String,
+        fields: Value,
+    },
+    Flush {
+        ack: mpsc::SyncSender<()>,
+    },
+}
+
+struct WriterHandle {
+    tx: mpsc::Sender<WriterCmd>,
+    enqueued: Arc<AtomicU64>,
+    flushed: Arc<AtomicU64>,
+}
+
+struct CarryEntry {
+    agent: Value,
+    text: String,
+    at: Instant,
+}
+
+struct SignalHub {
+    signals: Mutex<HashMap<String, watch::Sender<RunSeq>>>,
+    wake: broadcast::Sender<String>,
+}
+
+impl SignalHub {
+    fn new() -> Self {
+        let (wake, _) = broadcast::channel(512);
+        Self {
+            signals: Mutex::new(HashMap::new()),
+            wake,
+        }
+    }
+
+    fn watch(&self, run: &str) -> watch::Receiver<RunSeq> {
+        let mut map = self.signals.lock().unwrap();
+        let tx = map
+            .entry(run.to_string())
+            .or_insert_with(|| watch::channel(RunSeq::default()).0);
+        tx.subscribe()
+    }
+
+    fn notify_agents(&self, run: &str) {
+        {
+            let mut map = self.signals.lock().unwrap();
+            let tx = map
+                .entry(run.to_string())
+                .or_insert_with(|| watch::channel(RunSeq::default()).0);
+            tx.send_modify(|seq| seq.agents = seq.agents.saturating_add(1));
+        }
+        let _ = self.wake.send(run.to_string());
+    }
+
+    fn notify_events(&self, run: &str) {
+        let mut map = self.signals.lock().unwrap();
+        let tx = map
+            .entry(run.to_string())
+            .or_insert_with(|| watch::channel(RunSeq::default()).0);
+        tx.send_modify(|seq| seq.events = seq.events.saturating_add(1));
+    }
 }
 
 pub struct Live {
     store: Arc<dyn Store>,
     cache: Mutex<HashMap<String, Cached>>,
-    write: Mutex<()>,
+    cache_seq: AtomicU64,
+    /// Serializes note read-modify-writes and turn wakeups without ever blocking transcript pushes.
+    notes_lock: Mutex<()>,
+    writers: Mutex<HashMap<String, WriterHandle>>,
     calls: AtomicU64,
-    wake: broadcast::Sender<String>,
+    hub: Arc<SignalHub>,
     /// Risky calls waiting for a person. Shared with every agent call of every run.
     pub approvals: Arc<crate::approvals::Approvals>,
 }
@@ -56,20 +159,41 @@ pub struct Note {
 
 impl Live {
     pub fn new(store: Arc<dyn Store>) -> Self {
-        let (wake, _) = broadcast::channel(512);
         Live {
             store,
             cache: Mutex::new(HashMap::new()),
-            write: Mutex::new(()),
+            cache_seq: AtomicU64::new(0),
+            notes_lock: Mutex::new(()),
+            writers: Mutex::new(HashMap::new()),
             calls: AtomicU64::new(0),
-            wake,
+            hub: Arc::new(SignalHub::new()),
             approvals: Arc::default(),
         }
     }
 
+    /// Subscribe to per-run sequence notifications for `run` only (P1).
+    pub fn watch(&self, run: &str) -> watch::Receiver<RunSeq> {
+        self.hub.watch(run)
+    }
+
+    /// Notify watchers of `run` that `events.jsonl` or active state changed.
+    pub fn notify_events(&self, run: &str) {
+        self.hub.notify_events(run);
+    }
+
+    /// Notify watchers of `run` that `agents.jsonl` changed.
+    pub fn notify_agents(&self, run: &str) {
+        self.hub.notify_agents(run);
+    }
+
     /// Subscribe to immediate notifications whenever a run receives a new transcript entry.
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
-        self.wake.subscribe()
+        self.hub.wake.subscribe()
+    }
+
+    /// How many runs are currently held in the transcript cache.
+    pub fn cached_runs(&self) -> usize {
+        self.cache.lock().unwrap().len()
     }
 
     fn key(run: &str, name: &str) -> String {
@@ -81,29 +205,66 @@ impl Live {
         self.calls.fetch_add(1, Ordering::Relaxed) + 1 + std::process::id() as u64 * 1_000_000
     }
 
-    /// Append one entry. A failure to write is reported and otherwise ignored: the
-    /// transcript is a view, and a run must not stop because of it.
+    fn spawn_writer(&self, run: &str) -> WriterHandle {
+        let (tx, rx) = mpsc::channel::<WriterCmd>();
+        let enqueued = Arc::new(AtomicU64::new(0));
+        let flushed = Arc::new(AtomicU64::new(0));
+        let store = self.store.clone();
+        let hub = self.hub.clone();
+        let run_id = run.to_string();
+        let flushed_bg = flushed.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("tm-live-{}", &run_id[..run_id.len().min(16)]))
+            .spawn(move || run_writer_loop(run_id, store, hub, rx, flushed_bg));
+        WriterHandle { tx, enqueued, flushed }
+    }
+
+    /// Append one entry via this run's buffered writer. Never blocks the caller on disk I/O
+    /// and never acquires the notes lock.
     pub fn push(&self, run: &str, agent: &Value, kind: &str, fields: Value) {
-        let guard = self.write.lock().unwrap();
-        self.push_held(&guard, run, agent, kind, fields);
+        let mut writers = self.writers.lock().unwrap();
+        for _ in 0..2 {
+            if !writers.contains_key(run) {
+                let handle = self.spawn_writer(run);
+                writers.insert(run.to_string(), handle);
+            }
+            let handle = writers.get(run).expect("just inserted");
+            let seq = handle.enqueued.fetch_add(1, Ordering::SeqCst) + 1;
+            let cmd = WriterCmd::Entry {
+                seq,
+                agent: agent.clone(),
+                kind: kind.to_string(),
+                fields: fields.clone(),
+            };
+            if handle.tx.send(cmd).is_ok() {
+                return;
+            }
+            // The idle writer exited; respawn once and resend.
+            writers.remove(run);
+        }
     }
 
     /// [`Live::push`] for a caller that already holds [`Live::write_lock`].
-    pub fn push_held(&self, _held: &std::sync::MutexGuard<'_, ()>, run: &str, agent: &Value, kind: &str, mut fields: Value) {
-        if !fields.is_object() {
-            fields = json!({});
+    pub fn push_held(&self, _held: &std::sync::MutexGuard<'_, ()>, run: &str, agent: &Value, kind: &str, fields: Value) {
+        self.push(run, agent, kind, fields);
+    }
+
+    /// Ensure all entries pushed to `run` so far have been flushed to the store.
+    pub fn flush(&self, run: &str) {
+        let tx = {
+            let writers = self.writers.lock().unwrap();
+            let Some(handle) = writers.get(run) else {
+                return;
+            };
+            if handle.enqueued.load(Ordering::SeqCst) <= handle.flushed.load(Ordering::SeqCst) {
+                return;
+            }
+            handle.tx.clone()
+        };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if tx.send(WriterCmd::Flush { ack: ack_tx }).is_ok() {
+            let _ = ack_rx.recv();
         }
-        crate::secrets::redact_json(&mut fields);
-        let object = fields.as_object_mut().expect("an object");
-        object.insert("at".into(), json!(rfc3339_now()));
-        object.insert("agent".into(), agent.clone());
-        object.insert("kind".into(), json!(kind));
-        let line = serde_json::to_string(&fields).unwrap_or_default();
-        if let Err(err) = self.store.append(&Self::key(run, "agents.jsonl"), &line) {
-            eprintln!("taskmaster: the agent transcript of {run} was not written: {err}");
-            return;
-        }
-        let _ = self.wake.send(run.to_string());
     }
 
     /// End every agent call of `run` that started and has no `end`, marked stopped. An agent
@@ -130,16 +291,29 @@ impl Live {
         for (_, agent) in &open {
             self.push(run, agent, "end", json!({ "ok": false, "stopped": true, "error": why }));
         }
+        if !open.is_empty() {
+            self.flush(run);
+        }
         open.len()
     }
 
     /// Every entry after the first `after`, and how many there are in all.
     pub fn read(&self, run: &str, after: usize) -> (usize, Vec<Value>) {
+        self.flush(run);
+        let now = Instant::now();
+        let seq = self.cache_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut cache = self.cache.lock().unwrap();
         let cached = cache.entry(run.to_string()).or_default();
+        cached.last_used = now;
+        cached.use_seq = seq;
         if let Ok(Some((len, fresh))) = self.store.read_from(&Self::key(run, "agents.jsonl"), cached.offset) {
             if len < cached.offset {
-                *cached = Cached::default();
+                *cached = Cached {
+                    offset: 0,
+                    entries: Vec::new(),
+                    last_used: now,
+                    use_seq: seq,
+                };
             }
             if !fresh.is_empty() {
                 // Only whole lines: a writer may be part way through the last one.
@@ -157,7 +331,25 @@ impl Live {
         }
         let total = cached.entries.len();
         let from = after.min(total);
-        (total, cached.entries[from..].to_vec())
+        let result = cached.entries[from..].to_vec();
+
+        // Evict stale and least-recently-used runs (P4).
+        cache.retain(|k, entry| k == run || now.saturating_duration_since(entry.last_used) <= CACHE_IDLE_TTL);
+        while cache.len() > MAX_CACHED_RUNS {
+            let victim = cache
+                .iter()
+                .filter(|(k, _)| k.as_str() != run)
+                .min_by_key(|(_, entry)| entry.use_seq)
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(key) => {
+                    cache.remove(&key);
+                }
+                None => break,
+            }
+        }
+
+        (total, result)
     }
 
     /// The run branch's last commit, kept when the branch is deleted after a merge, so
@@ -187,7 +379,7 @@ impl Live {
 
     /// Hold the note lock across a check-then-append, so two wakes cannot both start a run.
     pub fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.write.lock().unwrap()
+        self.notes_lock.lock().unwrap()
     }
 
     pub fn add_note(&self, run: &str, to: &str, text: &str) -> anyhow::Result<Note> {
@@ -196,7 +388,7 @@ impl Live {
 
     /// [`Live::add_note`] with the mode a new turn should run in (see [`Note::mode`]).
     pub fn add_note_as(&self, run: &str, to: &str, text: &str, mode: Option<&str>) -> anyhow::Result<Note> {
-        let _guard = self.write.lock().unwrap();
+        let _guard = self.notes_lock.lock().unwrap();
         let mut notes = self.notes(run);
         let note = Note {
             id: crate::secret::random_hex(4)?,
@@ -213,7 +405,7 @@ impl Live {
 
     /// Change or remove a note that has not been delivered. `None` removes it.
     pub fn edit_note(&self, run: &str, id: &str, text: Option<&str>) -> anyhow::Result<bool> {
-        let _guard = self.write.lock().unwrap();
+        let _guard = self.notes_lock.lock().unwrap();
         let mut notes = self.notes(run);
         let Some(index) = notes.iter().position(|note| note.id == id && !note.delivered) else {
             return Ok(false);
@@ -230,7 +422,7 @@ impl Live {
 
     /// Undelivered notes matching `pred`, marked delivered. A note is read once.
     pub fn take_fresh_where(&self, run: &str, pred: impl Fn(&Note) -> bool) -> Vec<Note> {
-        let guard = self.write.lock().unwrap();
+        let guard = self.notes_lock.lock().unwrap();
         self.take_fresh_held(&guard, run, pred)
     }
 
@@ -274,7 +466,7 @@ impl Live {
     /// The undelivered notes for `to`, marked delivered. `workers` notes are kept for
     /// every later worker as well, so they are returned whether delivered or not.
     pub fn take_notes(&self, run: &str, to: &[&str]) -> Vec<String> {
-        let _guard = self.write.lock().unwrap();
+        let _guard = self.notes_lock.lock().unwrap();
         let mut notes = self.notes(run);
         let mut out = Vec::new();
         for note in notes.iter_mut() {
@@ -291,6 +483,220 @@ impl Live {
             let _ = self.save_notes(run, &notes);
         }
         out
+    }
+}
+
+struct RunWriterState {
+    run: String,
+    key: String,
+    store: Arc<dyn Store>,
+    hub: Arc<SignalHub>,
+    flushed_seq: Arc<AtomicU64>,
+    seen_seq: u64,
+    out: Option<BufWriter<Box<dyn Write + Send>>>,
+    opened: bool,
+    fallback_batch: Vec<String>,
+    buffered_bytes: usize,
+    pending_lines: usize,
+    carry: HashMap<(String, u64, String), CarryEntry>,
+}
+
+impl RunWriterState {
+    fn new(run: String, store: Arc<dyn Store>, hub: Arc<SignalHub>, flushed_seq: Arc<AtomicU64>) -> Self {
+        let key = Live::key(&run, "agents.jsonl");
+        Self {
+            run,
+            key,
+            store,
+            hub,
+            flushed_seq,
+            seen_seq: 0,
+            out: None,
+            opened: false,
+            fallback_batch: Vec::new(),
+            buffered_bytes: 0,
+            pending_lines: 0,
+            carry: HashMap::new(),
+        }
+    }
+
+    fn ensure_open(&mut self) {
+        if self.opened {
+            return;
+        }
+        self.opened = true;
+        match self.store.open_append(&self.key) {
+            Ok(Some(writer)) => {
+                self.out = Some(BufWriter::with_capacity(WRITER_FLUSH_BYTES, writer));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("taskmaster: the agent transcript of {} could not be opened: {err}", self.run);
+            }
+        }
+    }
+
+    fn write_line(&mut self, agent: &Value, kind: &str, mut fields: Value) {
+        if !fields.is_object() {
+            fields = json!({});
+        }
+        crate::secrets::redact_json(&mut fields);
+        let object = fields.as_object_mut().expect("an object");
+        object.insert("at".into(), json!(rfc3339_now()));
+        object.insert("agent".into(), agent.clone());
+        object.insert("kind".into(), json!(kind));
+        let line = serde_json::to_string(&fields).unwrap_or_default();
+        self.ensure_open();
+        if let Some(writer) = self.out.as_mut() {
+            if let Err(err) = writer.write_all(line.as_bytes()).and_then(|_| writer.write_all(b"\n")) {
+                eprintln!("taskmaster: the agent transcript of {} was not written: {err}", self.run);
+                self.out = None;
+                self.opened = false;
+                return;
+            }
+        } else {
+            self.fallback_batch.push(line.clone());
+        }
+        self.buffered_bytes += line.len() + 1;
+        self.pending_lines += 1;
+    }
+
+    fn flush_carry_for(&mut self, agent_id: &str, call: u64) {
+        for kind in ["text", "thought"] {
+            if let Some(held) = self.carry.remove(&(agent_id.to_string(), call, kind.to_string()))
+                && !held.text.is_empty()
+            {
+                self.write_line(&held.agent, kind, json!({ "text": held.text }));
+            }
+        }
+    }
+
+    fn flush_stale_carry(&mut self, force: bool) {
+        let now = Instant::now();
+        let keys: Vec<(String, u64, String)> = self
+            .carry
+            .iter()
+            .filter(|(_, entry)| force || now.saturating_duration_since(entry.at) >= CARRY_IDLE_FLUSH)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
+            if let Some(held) = self.carry.remove(&key)
+                && !held.text.is_empty()
+            {
+                self.write_line(&held.agent, &key.2, json!({ "text": held.text }));
+            }
+        }
+    }
+
+    fn handle_entry(&mut self, seq: u64, agent: Value, kind: String, mut fields: Value) {
+        self.seen_seq = self.seen_seq.max(seq);
+        let agent_id = agent["id"].as_str().unwrap_or("").to_string();
+        let call = agent["call"].as_u64().unwrap_or(0);
+
+        if (kind == "text" || kind == "thought")
+            && let Some(delta) = fields.get("text").and_then(Value::as_str)
+        {
+            let key = (agent_id, call, kind.clone());
+            let combined = match self.carry.remove(&key) {
+                Some(prev) => format!("{}{delta}", prev.text),
+                None => delta.to_string(),
+            };
+            if let Some(split) = crate::secrets::potential_secret_tail_start(&combined) {
+                let tail = combined[split..].to_string();
+                self.carry.insert(key, CarryEntry { agent: agent.clone(), text: tail, at: Instant::now() });
+                if split == 0 {
+                    return;
+                }
+                fields["text"] = json!(&combined[..split]);
+            } else {
+                fields["text"] = json!(combined);
+            }
+            self.write_line(&agent, &kind, fields);
+        } else {
+            self.flush_carry_for(&agent_id, call);
+            self.write_line(&agent, &kind, fields);
+        }
+
+        if (kind != "text" && kind != "thought") || self.buffered_bytes >= WRITER_FLUSH_BYTES {
+            self.flush_disk();
+        }
+    }
+
+    fn flush_disk(&mut self) {
+        if self.pending_lines > 0 {
+            if let Some(writer) = self.out.as_mut() {
+                if let Err(err) = writer.flush() {
+                    eprintln!("taskmaster: the agent transcript of {} was not flushed: {err}", self.run);
+                    self.out = None;
+                    self.opened = false;
+                }
+            } else if !self.fallback_batch.is_empty() {
+                let batch = std::mem::take(&mut self.fallback_batch);
+                if let Err(err) = self.store.append_batch(&self.key, &batch) {
+                    eprintln!("taskmaster: the agent transcript of {} was not written: {err}", self.run);
+                }
+            }
+            self.buffered_bytes = 0;
+            self.pending_lines = 0;
+            self.hub.notify_agents(&self.run);
+        }
+        self.flushed_seq.store(self.seen_seq, Ordering::SeqCst);
+    }
+}
+
+fn run_writer_loop(
+    run: String,
+    store: Arc<dyn Store>,
+    hub: Arc<SignalHub>,
+    rx: mpsc::Receiver<WriterCmd>,
+    flushed_seq: Arc<AtomicU64>,
+) {
+    let mut state = RunWriterState::new(run, store, hub, flushed_seq);
+    loop {
+        let timeout = if state.pending_lines > 0 {
+            WRITER_FLUSH_INTERVAL
+        } else if !state.carry.is_empty() {
+            CARRY_IDLE_FLUSH
+        } else {
+            WRITER_IDLE_EXIT
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(cmd) => {
+                let mut acks = Vec::new();
+                match cmd {
+                    WriterCmd::Entry { seq, agent, kind, fields } => state.handle_entry(seq, agent, kind, fields),
+                    WriterCmd::Flush { ack } => acks.push(ack),
+                }
+                // Drain any already-queued entries so sequential pushes batch and split secrets combine.
+                while let Ok(more) = rx.try_recv() {
+                    match more {
+                        WriterCmd::Entry { seq, agent, kind, fields } => state.handle_entry(seq, agent, kind, fields),
+                        WriterCmd::Flush { ack } => acks.push(ack),
+                    }
+                }
+                if !acks.is_empty() {
+                    state.flush_disk();
+                    for ack in acks {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if state.pending_lines > 0 {
+                    state.flush_disk();
+                } else if !state.carry.is_empty() {
+                    state.flush_stale_carry(false);
+                    state.flush_disk();
+                } else {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                state.flush_stale_carry(true);
+                state.flush_disk();
+                break;
+            }
+        }
     }
 }
 
@@ -392,5 +798,128 @@ mod tests {
         let (len2, b2) = store.read_from("a.jsonl", len1).unwrap().unwrap();
         assert!(len2 > len1);
         assert_eq!(b2, br#"{"n":2}"#.iter().copied().chain([b'\n']).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn watch_only_wakes_for_its_own_run_and_does_not_read_others() {
+        struct CountingStore {
+            inner: Arc<dyn Store>,
+            reads: Arc<Mutex<HashMap<String, usize>>>,
+        }
+        impl Store for CountingStore {
+            fn read(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.reads.lock().unwrap().entry(key.to_string()).or_default() += 1;
+                self.inner.read(key)
+            }
+            fn read_from(&self, key: &str, offset: u64) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+                *self.reads.lock().unwrap().entry(key.to_string()).or_default() += 1;
+                self.inner.read_from(key, offset)
+            }
+            fn write(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.inner.write(key, bytes)
+            }
+            fn append(&self, key: &str, line: &str) -> anyhow::Result<()> {
+                self.inner.append(key, line)
+            }
+            fn append_batch(&self, key: &str, lines: &[String]) -> anyhow::Result<()> {
+                self.inner.append_batch(key, lines)
+            }
+            fn open_append(&self, key: &str) -> anyhow::Result<Option<Box<dyn Write + Send>>> {
+                self.inner.open_append(key)
+            }
+            fn remove(&self, key: &str) -> anyhow::Result<()> {
+                self.inner.remove(key)
+            }
+            fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+                self.inner.list(prefix)
+            }
+            fn stat(&self, key: &str) -> Option<(u64, u128)> {
+                self.inner.stat(key)
+            }
+        }
+
+        let reads = Arc::new(Mutex::new(HashMap::new()));
+        let store: Arc<dyn Store> = Arc::new(CountingStore { inner: tmp("p1-watch"), reads: reads.clone() });
+        let live = Live::new(store);
+        let mut rx_a = live.watch("run-a");
+        let _ = live.read("run-a", 0);
+        reads.lock().unwrap().clear();
+
+        let agent = json!({ "id": "worker", "call": 1 });
+        for i in 0..1000 {
+            live.push("run-b", &agent, "text", json!({ "text": format!("chunk {i} ") }));
+        }
+        live.flush("run-b");
+
+        // Watching run-a must never wake or read run-a's files because of run-b's traffic.
+        let woke = tokio::time::timeout(Duration::from_millis(80), rx_a.changed()).await;
+        assert!(woke.is_err(), "run-a watcher woke on run-b traffic");
+        assert_eq!(reads.lock().unwrap().get("runs/run-a/agents.jsonl").copied().unwrap_or(0), 0);
+        assert_eq!(reads.lock().unwrap().get("runs/run-a/events.jsonl").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn a_secret_split_across_two_text_deltas_is_redacted() {
+        let live = Live::new(tmp("p3-split-secret"));
+        let agent = json!({ "id": "worker", "call": 7 });
+        live.push("r1", &agent, "text", json!({ "text": "token=sk-ant-123456" }));
+        live.push("r1", &agent, "text", json!({ "text": "7890abcdef done" }));
+        let (_, entries) = live.read("r1", 0);
+        let combined: String = entries.iter().filter_map(|e| e["text"].as_str()).collect();
+        assert!(combined.contains("•••"), "expected redaction in `{combined}`");
+        assert!(!combined.contains("sk-ant-"), "raw prefix leaked in `{combined}`");
+        assert!(!combined.contains("7890abcdef"), "raw suffix leaked in `{combined}`");
+
+        // Also when separated by a flush between deltas.
+        let agent2 = json!({ "id": "worker", "call": 8 });
+        live.push("r1", &agent2, "text", json!({ "text": "Authorization: Bearer abcdef" }));
+        live.flush("r1");
+        live.push("r1", &agent2, "text", json!({ "text": "1234567890 ok" }));
+        live.push("r1", &agent2, "end", json!({ "ok": true }));
+        let (_, entries) = live.read("r1", 0);
+        let all: String = entries.iter().map(Value::to_string).collect();
+        assert!(!all.contains("abcdef1234567890"), "bearer token leaked across flush: {all}");
+        assert!(all.contains("Bearer •••"), "expected bearer redaction: {all}");
+    }
+
+    #[test]
+    fn concurrent_pushes_do_not_block_notes_and_keep_high_throughput() {
+        let live = Arc::new(Live::new(tmp("p3-throughput")));
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let live = live.clone();
+            handles.push(std::thread::spawn(move || {
+                let agent = json!({ "id": format!("page:{t}"), "call": t as u64 + 1 });
+                for i in 0..1250 {
+                    live.push("busy", &agent, "text", json!({ "text": format!("line {i} ok ") }));
+                }
+            }));
+        }
+        // Notes lock is independent of transcript pushes.
+        let note = live.add_note("busy", "master", "check layout").unwrap();
+        assert_eq!(note.text, "check layout");
+        for h in handles {
+            h.join().unwrap();
+        }
+        live.flush("busy");
+        let elapsed = started.elapsed();
+        let (total, _) = live.read("busy", 0);
+        assert_eq!(total, 10_000);
+        assert!(elapsed < Duration::from_secs(10), "10,000 pushes took {elapsed:?}");
+    }
+
+    #[test]
+    fn transcript_cache_evicts_oldest_runs_past_cap() {
+        let live = Live::new(tmp("p4-lru"));
+        let agent = json!({ "id": "master", "call": 1 });
+        for i in 0..20 {
+            let run = format!("run-{i:02}");
+            live.push(&run, &agent, "text", json!({ "text": "hello" }));
+            let (total, _) = live.read(&run, 0);
+            assert_eq!(total, 1);
+            assert!(live.cached_runs() <= MAX_CACHED_RUNS, "cache grew to {}", live.cached_runs());
+        }
+        assert_eq!(live.cached_runs(), MAX_CACHED_RUNS);
     }
 }

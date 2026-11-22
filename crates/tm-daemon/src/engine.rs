@@ -593,7 +593,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     }
     driver.grant_pages()?;
     driver.pull_commons();
-    driver.r#loop().await
+    let outcome = driver.r#loop().await;
+    driver.live.flush(&driver.id);
+    outcome
 }
 
 /// Wait until a `Force` cancellation signal arrives (or pend forever if no mode watcher exists).
@@ -4468,7 +4470,9 @@ impl Driver {
     }
 
     fn save_events(&self) -> anyhow::Result<()> {
-        self.records.save_events(&self.id, &self.events)
+        self.records.save_events(&self.id, &self.events)?;
+        self.live.notify_events(&self.id);
+        Ok(())
     }
 
     fn save_changes(&self) -> anyhow::Result<()> {

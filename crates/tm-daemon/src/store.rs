@@ -58,6 +58,17 @@ pub trait Store: Send + Sync {
     fn write(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()>;
     /// Add one line to a record that is a list of lines.
     fn append(&self, key: &str, line: &str) -> anyhow::Result<()>;
+    /// Add several lines to a record in one write when supported.
+    fn append_batch(&self, key: &str, lines: &[String]) -> anyhow::Result<()> {
+        for line in lines {
+            self.append(key, line)?;
+        }
+        Ok(())
+    }
+    /// Open a persistent append handle for a buffered per-run writer, when supported.
+    fn open_append(&self, _key: &str) -> anyhow::Result<Option<Box<dyn std::io::Write + Send>>> {
+        Ok(None)
+    }
     /// Removing a record that does not exist is not an error.
     fn remove(&self, key: &str) -> anyhow::Result<()>;
     /// The names directly under `prefix`, sorted.
@@ -151,6 +162,42 @@ impl Store for FileStore {
         // One write call, so a line is not interleaved with another writer's line.
         file.write_all(format!("{}\n", line.trim_end_matches('\n')).as_bytes())?;
         Ok(())
+    }
+
+    fn append_batch(&self, key: &str, lines: &[String]) -> anyhow::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let path = self.path(key)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        let total: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let mut buf = String::with_capacity(total);
+        for line in lines {
+            buf.push_str(line.trim_end_matches('\n'));
+            buf.push('\n');
+        }
+        file.write_all(buf.as_bytes())?;
+        Ok(())
+    }
+
+    fn open_append(&self, key: &str) -> anyhow::Result<Option<Box<dyn std::io::Write + Send>>> {
+        let path = self.path(key)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        Ok(Some(Box::new(file)))
     }
 
     fn remove(&self, key: &str) -> anyhow::Result<()> {
@@ -262,6 +309,10 @@ impl Records {
 
     pub fn run_ids(&self) -> anyhow::Result<Vec<String>> {
         self.store.list("runs")
+    }
+
+    pub fn stat(&self, key: &str) -> Option<(u64, u128)> {
+        self.store.stat(key)
     }
 
     /// Cheap metadata fingerprint of the files that determine a run's summary view.

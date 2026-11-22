@@ -6,38 +6,46 @@
 //! secret value plus common token patterns (`sk-…`, `ghp_…`, `Bearer …`) are scrubbed to
 //! `•••` across transcripts, logs, terminal output, and exports.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, RwLock};
 
 use serde_json::Value;
 
-static RUNTIME_SECRETS: LazyLock<RwLock<BTreeSet<String>>> = LazyLock::new(|| RwLock::new(BTreeSet::new()));
+static RUNTIME_SECRETS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Register a known secret value in memory so every transcript, log, and export scrubs it.
 pub fn register_secret(secret: &str) {
     let trimmed = secret.trim();
     if trimmed.len() >= 6 {
-        RUNTIME_SECRETS.write().unwrap().insert(trimmed.to_string());
+        let mut guard = RUNTIME_SECRETS.write().unwrap();
+        if !guard.iter().any(|existing| existing == trimmed) {
+            guard.push(trimmed.to_string());
+        }
     }
 }
 
 /// Snapshot of registered runtime secrets.
 pub fn registered_secrets() -> Vec<String> {
-    RUNTIME_SECRETS.read().unwrap().iter().cloned().collect()
+    RUNTIME_SECRETS.read().unwrap().clone()
 }
 
 /// Scrub all registered runtime secrets and common token patterns from `input`.
 pub fn redact_text(input: &str) -> String {
-    let extras = registered_secrets();
+    let extras = RUNTIME_SECRETS.read().unwrap();
     crate::policy::redact_text(input, &extras)
 }
 
 /// Scrub all registered runtime secrets and common token patterns in-place inside JSON.
 pub fn redact_json(value: &mut Value) {
-    let extras = registered_secrets();
+    let extras = RUNTIME_SECRETS.read().unwrap();
     crate::policy::redact_json(value, &extras);
+}
+
+/// Byte offset where a trailing partial secret begins, including registered runtime secrets.
+pub fn potential_secret_tail_start(input: &str) -> Option<usize> {
+    let extras = RUNTIME_SECRETS.read().unwrap();
+    crate::policy::potential_secret_tail_start(input, &extras)
 }
 
 /// Abstraction over secret storage (OS keychain or mode-0600 file fallback).

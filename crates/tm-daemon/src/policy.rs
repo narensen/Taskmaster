@@ -274,23 +274,158 @@ fn is_token_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
 }
 
-/// Scrub common API key / token formats, `Bearer <token>`, and any extra literal secrets.
-pub fn redact_text(input: &str, extra_literals: &[String]) -> String {
+use std::borrow::Cow;
+
+fn has_builtin_secret_trigger(bytes: &[u8]) -> bool {
+    // Every built-in pattern needs at least 15 bytes: `sk-` + 12 or `Bearer ` + 8.
+    if bytes.len() < 15 {
+        return false;
+    }
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 3 <= len {
+        match bytes[i] {
+            b'B' | b'b' if i + 7 <= len && &bytes[i + 1..i + 7] == b"earer " => return true,
+            b's' if &bytes[i + 1..i + 3] == b"k-" => return true,
+            b'x' if i + 4 <= len && &bytes[i + 1..i + 4] == b"ai-" => return true,
+            b'g' if i + 4 <= len
+                && (matches!(&bytes[i + 1..i + 4], b"hp_" | b"ho_" | b"hu_" | b"hs_")
+                    || (i + 6 <= len && &bytes[i + 1..i + 6] == b"lpat-")
+                    || (i + 11 <= len && &bytes[i + 1..i + 11] == b"ithub_pat_")) =>
+            {
+                return true;
+            }
+            b'A' if i + 4 <= len && matches!(&bytes[i + 1..i + 4], b"Iza" | b"KIA") => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Fast check before doing any allocations in [`redact_text_cow`].
+fn needs_redaction(input: &str, extra_literals: &[String]) -> bool {
+    if input.len() < 4 {
+        return false;
+    }
+    for secret in extra_literals {
+        let trimmed = secret.trim();
+        if trimmed.len() >= 4 && input.contains(trimmed) {
+            return true;
+        }
+    }
+    has_builtin_secret_trigger(input.as_bytes())
+}
+
+/// Scrub common API key / token formats, `Bearer <token>`, and any extra literal secrets,
+/// returning the input untouched with zero allocations when nothing matches.
+pub fn redact_text_cow<'a>(input: &'a str, extra_literals: &[String]) -> Cow<'a, str> {
+    if !needs_redaction(input, extra_literals) {
+        return Cow::Borrowed(input);
+    }
     let mut text = input.to_string();
     for secret in extra_literals {
         let trimmed = secret.trim();
-        if trimmed.len() >= 4 {
+        if trimmed.len() >= 4 && text.contains(trimmed) {
             text = text.replace(trimmed, "•••");
         }
     }
-    // Scrub `Bearer <token>`
-    text = redact_after_marker(&text, "Bearer ", 8);
-    text = redact_after_marker(&text, "bearer ", 8);
-    // Scrub known API key prefixes with at least 12 trailing token characters
-    for prefix in SECRET_PREFIXES {
-        text = redact_prefixed_token(&text, prefix, 12);
+    if text.contains("Bearer ") {
+        text = redact_after_marker(&text, "Bearer ", 8);
     }
-    text
+    if text.contains("bearer ") {
+        text = redact_after_marker(&text, "bearer ", 8);
+    }
+    for prefix in SECRET_PREFIXES {
+        if text.contains(prefix) {
+            text = redact_prefixed_token(&text, prefix, 12);
+        }
+    }
+    if text == input {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(text)
+    }
+}
+
+/// Scrub common API key / token formats, `Bearer <token>`, and any extra literal secrets.
+pub fn redact_text(input: &str, extra_literals: &[String]) -> String {
+    redact_text_cow(input, extra_literals).into_owned()
+}
+
+/// Byte offset where a trailing partial secret begins, so a streaming writer can hold that
+/// small tail until the next delta arrives and catch secrets split across two deltas.
+/// Returns `None` on normal text.
+pub fn potential_secret_tail_start(input: &str, extra_literals: &[String]) -> Option<usize> {
+    if input.is_empty() {
+        return None;
+    }
+    // Look only at the trailing window (up to 128 bytes, aligned to a UTF-8 char boundary).
+    let mut win_start = input.len().saturating_sub(128);
+    while win_start < input.len() && !input.is_char_boundary(win_start) {
+        win_start += 1;
+    }
+    let tail = &input[win_start..];
+    let mut hold: Option<usize> = None;
+    let mut consider = |abs_pos: usize| {
+        hold = Some(match hold {
+            Some(prev) => prev.min(abs_pos),
+            None => abs_pos,
+        });
+    };
+
+    // 1. A known prefix or `Bearer ` already present near the end with only token chars after it.
+    let bytes = tail.as_bytes();
+    let token_tail_start = {
+        let mut idx = bytes.len();
+        while idx > 0 && is_token_char(bytes[idx - 1]) {
+            idx -= 1;
+        }
+        idx
+    };
+    let word = &tail[token_tail_start..];
+    if !word.is_empty() {
+        // Check `Bearer <partial>` / `bearer <partial>`
+        if token_tail_start >= 7 {
+            let before = &tail[token_tail_start - 7..token_tail_start];
+            if before == "Bearer " || before == "bearer " {
+                consider(win_start + token_tail_start - 7);
+            }
+        }
+        // Check a word that starts with (or is a >=2-char prefix of) any known secret prefix.
+        for prefix in SECRET_PREFIXES {
+            if word.starts_with(prefix) || (word.len() >= 2 && prefix.starts_with(word)) {
+                consider(win_start + token_tail_start);
+                break;
+            }
+        }
+    }
+
+    // 2. Trailing >=2-char partial match of `Bearer `, `bearer `, or any extra registered secret.
+    for marker in ["Bearer ", "bearer "] {
+        let max_k = marker.len().min(tail.len());
+        for k in (2..=max_k).rev() {
+            if tail.ends_with(&marker[..k]) {
+                consider(input.len() - k);
+                break;
+            }
+        }
+    }
+    for secret in extra_literals {
+        let trimmed = secret.trim();
+        if trimmed.len() < 4 {
+            continue;
+        }
+        let max_k = (trimmed.len() - 1).min(tail.len());
+        for k in (2..=max_k).rev() {
+            let start = input.len() - k;
+            if input.is_char_boundary(start) && trimmed.starts_with(&input[start..]) {
+                consider(start);
+                break;
+            }
+        }
+    }
+    hold
 }
 
 fn redact_after_marker(input: &str, marker: &str, min_len: usize) -> String {
@@ -341,7 +476,11 @@ fn redact_prefixed_token(input: &str, prefix: &str, min_tail: usize) -> String {
 /// Recursively redact every string leaf inside a JSON value.
 pub fn redact_json(value: &mut Value, extra_literals: &[String]) {
     match value {
-        Value::String(s) => *s = redact_text(s, extra_literals),
+        Value::String(s) => {
+            if let Cow::Owned(clean) = redact_text_cow(s, extra_literals) {
+                *s = clean;
+            }
+        }
         Value::Array(items) => {
             for item in items {
                 redact_json(item, extra_literals);
@@ -396,5 +535,17 @@ redact_patterns = ["SUPER_SECRET_42"]
         assert!(!clean.contains("ghp_"), "{clean}");
         assert!(!clean.contains("MY_TOKEN_99"), "{clean}");
         assert!(clean.contains("Bearer •••"), "{clean}");
+    }
+
+    #[test]
+    fn redaction_borrows_clean_text_without_allocating() {
+        let clean = "Planning the header layout and checking existing styles in web/src/App.tsx";
+        let res = redact_text_cow(clean, &[]);
+        assert!(matches!(res, Cow::Borrowed(_)), "clean text should not allocate");
+        assert_eq!(res, clean);
+        let dirty = "token sk-ant-1234567890abcdef";
+        let res = redact_text_cow(dirty, &[]);
+        assert!(matches!(res, Cow::Owned(_)));
+        assert_eq!(res, "token •••");
     }
 }

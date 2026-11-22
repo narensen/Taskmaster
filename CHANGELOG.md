@@ -3,6 +3,36 @@
 What changed in each release, for the people who use Taskmaster. The section for a version is
 also its GitHub release notes (`scripts/release-notes.sh` takes it from here).
 
+## Unreleased
+
+### Faster runs
+
+- A unit the planner marks hard starts on the mid tier; an easy one builds at low effort.
+- A page that merges while others still build has its own files type-checked and linted at once,
+  and goes back to its worker straight away when they fail.
+- `eslint --fix` and `ruff --fix` run before the checks, and what they fix is committed.
+- A repair that fails exactly as the attempt before it goes up a tier at once.
+- A test step that fails once and passes when run again is reported as flaky, and costs no repair.
+- A long list of the same type error reaches a repair as three examples and a count.
+
+### Better results
+
+- Locked contract tests are every worker's acceptance check. When one fails, the units it imports
+  repair their code; the master no longer rewrites the test.
+- Errorography counts a check failure by its tool and code (`tsc TS2304`, `ruff F401`), and a fix
+  found on a higher tier is handed to the model that kept making the mistake.
+- A build or test step that is fixed becomes project memory every model is told on the next run.
+- The model scorecard recommends a worker at 85% first pass over three units or more, and marks a
+  model that needs a repair more often than not. A run that starts with such a worker says so.
+
+### Control
+
+- Undo takes a merged run back out of the project in one new commit, keeping later work. It is
+  refused, with the reason, when the run's files were edited since.
+- Cancel is graceful (finish what is running) or immediate, and a cancelled run can be resumed.
+- A run can have a spending cap.
+- The daemon log rotates at 8 MB.
+
 ## 0.1.5
 
 This release is about making the orchestration pay for itself. Workers test their own work, verify

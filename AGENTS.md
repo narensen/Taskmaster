@@ -27,6 +27,7 @@ Do not run `npx tsc` from the repository root. CI is `.github/workflows/ci.yml`:
 ## Working here
 
 - Make small local commits. Do not push, and do not open a pull request, unless the person asks.
+- One writer per checkout. A second thread working on this repository at the same time gets its own git worktree, so two agents never edit the same files.
 - Dark mode stays monochrome. New UI uses `--ink`, `--muted`, and `--line`. Leave status colours and the diff panel alone.
 - Append new CSS. Do not rewrite `web/src/styles.css`.
 - The home composer stays centred. The sidebar name stays Taskmaster.

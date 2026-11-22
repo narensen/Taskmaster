@@ -25,7 +25,7 @@
     "enabled": false
   },
   "code_mode": {
-    "enabled": false,
+    "enabled": true,
     "script_secs": 600,
     "sh_secs": 300
   },

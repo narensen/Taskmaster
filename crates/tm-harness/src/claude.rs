@@ -61,7 +61,8 @@ impl ClaudeCode {
         if !persist {
             args.push("--no-session-persistence".into());
         }
-        let shell = self.sandbox.is_some() && task.shell.is_some() && !task.read_only;
+        let full_access = !task.read_only && task.permission_mode == Some(crate::PermissionMode::FullAccess);
+        let shell = ((self.sandbox.is_some() && task.shell.is_some()) || full_access) && !task.read_only;
         let mut denied: Vec<&str> = if task.read_only {
             // With no edit tools and nobody to approve a prompt, the session can only read.
             vec!["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"]
@@ -73,7 +74,15 @@ impl ClaudeCode {
             vec!["Bash"]
         };
         denied.dedup();
-        args.extend(["--permission-mode".into(), if task.read_only { "default" } else { "acceptEdits" }.into()]);
+        // The stream cannot stop to ask, so Supervised and Auto-accept edits are honoured
+        // through `run_code` (Code Mode), which goes through the gate. With Claude Code's
+        // own tools they stay at `acceptEdits`: `default` would refuse every edit.
+        let permission = match task.permission_mode {
+            _ if task.read_only => "default",
+            Some(crate::PermissionMode::FullAccess) => "bypassPermissions",
+            _ => "acceptEdits",
+        };
+        args.extend(["--permission-mode".into(), permission.into()]);
         if !denied.is_empty() {
             args.push("--disallowedTools".into());
             args.extend(denied.iter().map(|t| t.to_string()));
@@ -444,6 +453,7 @@ mod tests {
             read_only,
             code_mode,
             shell: shell.then(crate::ShellScope::default),
+            permission_mode: None,
         }
     }
 
@@ -470,6 +480,28 @@ mod tests {
         let reader = sandboxed().args(&task(true, true, false));
         assert_eq!(after(&reader, "--disallowedTools"), ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
         assert!(after(&reader, "--allowedTools").is_empty());
+    }
+
+    #[test]
+    fn the_run_permission_mode_maps_onto_claude_flags() {
+        use crate::PermissionMode::*;
+        let with = |mode, read_only| {
+            let mut t = task(read_only, false, false);
+            t.permission_mode = Some(mode);
+            ClaudeCode { binary: "claude".into(), sandbox: None }.args(&t)
+        };
+        // Claude Code cannot stop to ask, so the asking modes keep its edits working.
+        for mode in [Supervised, AutoEdits, Auto] {
+            assert_eq!(after(&with(mode, false), "--permission-mode"), ["acceptEdits"], "{mode:?}");
+        }
+        // Full access lifts the prompts and gives Bash even without the sandbox.
+        let full = with(FullAccess, false);
+        assert_eq!(after(&full, "--permission-mode"), ["bypassPermissions"]);
+        assert!(!after(&full, "--disallowedTools").contains(&"Bash"), "{full:?}");
+        // A reader stays a reader whatever the run's mode.
+        let reader = with(FullAccess, true);
+        assert_eq!(after(&reader, "--permission-mode"), ["default"]);
+        assert!(after(&reader, "--disallowedTools").contains(&"Bash"));
     }
 
     #[test]

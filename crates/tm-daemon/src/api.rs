@@ -925,6 +925,8 @@ impl App {
             "parallel": self.parallel(id),
             "prompt_head": prompt_head,
             "mode": request.as_ref().map(|r| r.mode),
+            "permission_mode": request.as_ref().and_then(|r| r.permission_mode),
+            "goal": self.records().goal(id).ok().flatten(),
             "started_at": started_at,
             "last_at": last_at,
             "cancelled": cancelled,
@@ -1009,6 +1011,7 @@ impl App {
         config.models = request.models;
         config.template = request.template;
         config.mode = request.mode;
+        config.permission_mode = request.permission_mode;
         config.dictionary = Some(self.dictionary().clone());
         config.commons = Some(self.commons().clone());
         config.store = self.store.clone();
@@ -1043,15 +1046,103 @@ impl App {
             };
             app.live.close_open_calls(&id, why);
             app.record_outcome(&id, result);
+            // A4: If this run has an active goal and no human note is already queued, check
+            // the goal while the run is still marked active so polling clients do not observe
+            // a premature idle window before the follow-up Agent turn starts.
+            app.evaluate_goal(&id, budget_usd).await;
             app.active.lock().unwrap().remove(&id);
             app.summary_cache.lock().unwrap().remove(&(app.project(), id.clone()));
             app.live.notify_events(&id);
-            // A note can land in the moment the driver stops. Pick it up once the run is idle.
+            // A note (from a person or from an unmet goal) wakes the next turn now.
             if let Err(err) = app.wake_for_note(&id) {
                 eprintln!("taskmaster: run {id}: a note was not picked up: {}", err.1);
             }
         });
         Ok(())
+    }
+
+    /// A4: after a turn, check the run's goal. While it does not hold, queue an Agent turn
+    /// with the failure as its task, up to the goal's turn cap or the run's budget. Runs while
+    /// the run is still marked active, so a client never sees it idle between turns.
+    async fn evaluate_goal(self: &Arc<Self>, id: &str, budget_usd: Option<f64>) {
+        let Ok(Some(request)) = self.records().request(id) else { return };
+        let Some(goal) = request.goal else { return };
+        let Ok(Some(run)) = self.replay(id) else { return };
+        if !matches!(run.phase, RunPhase::Done | RunPhase::Failed) || run.pages.is_empty() {
+            return;
+        }
+        let prev = self.records().goal(id).ok().flatten().unwrap_or_else(|| crate::goals::GoalProgress::initial(&goal));
+        if matches!(prev.state.as_str(), "met" | "stopped") {
+            return;
+        }
+        // A Stop, a typed limit, or a note the person already left comes first.
+        let cancelled = self.records().events(id).ok().and_then(|events| events.last().cloned()) == Some(tm_core::Event::Cancelled);
+        let status = self.records().status(id).ok().flatten().unwrap_or(Value::Null);
+        let limited = status.get("limit").is_some_and(|limit| !limit.is_null());
+        if cancelled || limited || self.live.notes(id).iter().any(|note| !note.delivered) {
+            return;
+        }
+        if let Some(cap) = budget_usd.filter(|cap| cap.is_finite() && *cap > 0.0) {
+            let spent = totals(&self.records().ledger(id).unwrap_or_default()).cost_usd;
+            if spent >= cap {
+                let why = format!("stopped: ${spent:.2} spent of the ${cap:.2} budget");
+                self.finish_goal(id, prev, "stopped", why);
+                return;
+            }
+        }
+        let mut checking = prev.clone();
+        checking.state = "checking".into();
+        let _ = self.records().save_goal(id, &checking);
+        self.live.notify_events(id);
+
+        let branch = self.records().meta(id).ok().flatten().and_then(|meta| meta.branch);
+        let merged = status["merged"].as_bool().unwrap_or(false);
+        let check = crate::goals::check_goal(&self.project(), branch.as_deref(), merged, id, &goal, &self.previews).await;
+        let stopped_meanwhile = self.active.lock().unwrap().get(id).is_some_and(|active| *active.cancel.borrow());
+        if stopped_meanwhile {
+            self.finish_goal(id, prev, "stopped", "stopped: the run was cancelled during the goal check".into());
+            return;
+        }
+        let next = crate::goals::next_progress(&prev, &check);
+        let _ = self.records().save_goal(id, &next);
+        self.push_goal(id, &next, check.met, &check.detail);
+        if !check.met && next.state == "active" {
+            let task = crate::goals::follow_up_prompt(&goal, next.attempts, &check);
+            if let Err(err) = self.live.add_note_full(id, "master", &task, Some("agent"), false) {
+                eprintln!("taskmaster: run {id}: the goal's next turn was not queued: {err:#}");
+            }
+        }
+    }
+
+    fn finish_goal(&self, id: &str, mut progress: crate::goals::GoalProgress, state: &str, why: String) {
+        progress.state = state.into();
+        progress.last_check = Some(why.clone());
+        progress.checked_at = Some(crate::time::rfc3339_now());
+        let _ = self.records().save_goal(id, &progress);
+        self.push_goal(id, &progress, false, &why);
+    }
+
+    /// The check's outcome as a daemon line: the Terminal tab shows it with the daemon's
+    /// other commands, and the stream builder leaves it out of the agents.
+    fn push_goal(&self, id: &str, progress: &crate::goals::GoalProgress, met: bool, detail: &str) {
+        let head = match progress.state.as_str() {
+            "met" => format!("goal met: {}", progress.condition),
+            "stopped" => format!("goal not met, stopped after {} of {} turns: {}", progress.attempts, progress.max_turns, progress.condition),
+            _ => format!("goal not met yet ({} of {} turns): {}", progress.attempts, progress.max_turns, progress.condition),
+        };
+        self.live.push(
+            id,
+            &json!({ "id": "runtime", "role": "runtime" }),
+            "goal",
+            json!({
+                "text": format!("{head}\n{detail}"),
+                "ok": met,
+                "condition": progress.condition,
+                "attempt": progress.attempts,
+                "max_turns": progress.max_turns,
+                "state": progress.state,
+            }),
+        );
     }
 
     /// A note on a finished run starts the master again. The event is written before the
@@ -1281,6 +1372,12 @@ struct NewRun {
     max_cost_usd: Option<f64>,
     /// `auto` (the default), `code` (master and workers) or `agent` (one agent).
     mode: Option<String>,
+    /// Per-run permission mode (`supervised`, `auto_edits`, `auto`, `full_access`) (A3).
+    permission_mode: Option<String>,
+    /// Goal condition checked after each turn until met or capped (A4).
+    goal: Option<String>,
+    /// Maximum goal verification attempts / turns (default 5, capped at 20).
+    goal_max_turns: Option<u32>,
 }
 
 /// The run mode a request names. A missing one is `auto`.
@@ -1290,6 +1387,40 @@ fn mode_of(text: Option<&str>) -> Result<crate::RunMode, ApiError> {
         Some(text) => crate::RunMode::parse(text)
             .ok_or_else(|| fail(StatusCode::BAD_REQUEST, format!("unknown mode `{text}`: use `auto`, `code` or `agent`"))),
     }
+}
+
+/// Parse an optional per-run permission mode (A3).
+fn permission_mode_of(text: Option<&str>) -> Result<Option<tm_harness::PermissionMode>, ApiError> {
+    match text.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(text) => tm_harness::PermissionMode::parse(text).map(Some).ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                format!("unknown permission_mode `{text}`: use `supervised`, `auto_edits`, `auto` or `full_access`"),
+            )
+        }),
+    }
+}
+
+/// A4: the goal comes from the `goal` field or a leading `/goal <condition>` line, which is
+/// taken off the prompt. The field wins when both are sent.
+fn prompt_and_goal(prompt: Option<String>, goal: Option<&str>, max_turns: Option<u32>) -> (Option<String>, Option<crate::goals::GoalSpec>) {
+    let (prompt, parsed) = match prompt {
+        Some(text) => {
+            let (clean, goal) = crate::goals::extract_goal(&text);
+            (Some(clean), goal)
+        }
+        None => (None, None),
+    };
+    let goal = goal.and_then(|text| crate::goals::GoalSpec::new(text, max_turns)).or_else(|| {
+        parsed.map(|mut spec| {
+            if let Some(cap) = max_turns {
+                spec.max_turns = cap.clamp(1, crate::goals::MAX_ALLOWED_TURNS);
+            }
+            spec
+        })
+    });
+    (prompt, goal)
 }
 
 /// The saved defaults with the request's own choices laid over them.
@@ -1312,10 +1443,11 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     if app.replay(&id)?.is_some() {
         return Err(fail(StatusCode::CONFLICT, format!("run `{id}` already exists")));
     }
-    let prompt = body.prompt.filter(|text| !text.trim().is_empty());
-    if prompt.is_some() == body.plan.is_some() {
+    let raw_prompt = body.prompt.filter(|text| !text.trim().is_empty());
+    if raw_prompt.is_some() == body.plan.is_some() {
         return Err(fail(StatusCode::BAD_REQUEST, "send a prompt or a plan, and not both"));
     }
+    let (prompt, goal) = prompt_and_goal(raw_prompt, body.goal.as_deref(), body.goal_max_turns);
     let saved = crate::settings::Settings::load(&app.project()).unwrap_or_default();
     let bad_request = |err: anyhow::Error| fail(StatusCode::BAD_REQUEST, format!("{err:#}"));
     // A request that names roles but no models does not inherit the saved models, which belong to the saved harnesses.
@@ -1332,6 +1464,7 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     }
+    let permission_mode = permission_mode_of(body.permission_mode.as_deref())?;
     let request = RunRequest {
         prompt,
         plan: body.plan,
@@ -1342,10 +1475,15 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
         template: body.template,
         max_cost_usd: body.max_cost_usd,
         mode: mode_of(body.mode.as_deref())?,
+        permission_mode,
+        goal: goal.clone(),
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
-    app.start(&id, request.clone(), decision)?;
     app.records().save_request(&id, &request)?;
+    if let Some(spec) = &goal {
+        app.records().save_goal(&id, &crate::goals::GoalProgress::initial(spec))?;
+    }
+    app.start(&id, request, decision)?;
     accepted(json!({ "id": id }))
 }
 
@@ -1356,6 +1494,7 @@ async fn show_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> 
     view["plan"] = json!(run.plan);
     view["prompt"] = json!(request.prompt);
     view["mode"] = json!(request.mode);
+    view["permission_mode"] = json!(request.permission_mode);
     view["roles"] = json!(request.roles);
     view["models"] = json!(request.models);
     ok(view)
@@ -1896,6 +2035,11 @@ struct NewProject {
     max_cost_usd: Option<f64>,
     /// `auto`, `code` or `agent`, as on a new run.
     mode: Option<String>,
+    /// As on a new run (A3).
+    permission_mode: Option<String>,
+    /// As on a new run (A4).
+    goal: Option<String>,
+    goal_max_turns: Option<u32>,
     /// Open the new project in this daemon. Defaults to true when a prompt or plan is sent.
     switch: Option<bool>,
 }
@@ -1977,7 +2121,7 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
     let from = app.project();
     crate::git::init_repo(&dest, Some(&from)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     let path = dest.canonicalize().map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
-    let prompt = body.prompt.filter(|text| !text.trim().is_empty());
+    let (prompt, goal) = prompt_and_goal(body.prompt.filter(|text| !text.trim().is_empty()), body.goal.as_deref(), body.goal_max_turns);
     let switch = body.switch.unwrap_or(prompt.is_some() || body.plan.is_some());
     if !switch {
         return ok(json!({ "project": path.display().to_string() }));
@@ -2009,10 +2153,15 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
         template: body.template,
         max_cost_usd: body.max_cost_usd,
         mode: mode_of(body.mode.as_deref())?,
+        permission_mode: permission_mode_of(body.permission_mode.as_deref())?,
+        goal: goal.clone(),
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
-    app.start(&id, request.clone(), decision)?;
     app.records().save_request(&id, &request)?;
+    if let Some(spec) = &goal {
+        app.records().save_goal(&id, &crate::goals::GoalProgress::initial(spec))?;
+    }
+    app.start(&id, request, decision)?;
     accepted(json!({ "id": id, "project": path.display().to_string() }))
 }
 

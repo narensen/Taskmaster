@@ -410,6 +410,14 @@ impl Records {
         self.save(&format!("runs/{run}/plan.json"), plan)
     }
 
+    pub fn goal(&self, run: &str) -> anyhow::Result<Option<crate::goals::GoalProgress>> {
+        self.load(&format!("runs/{run}/goal.json"))
+    }
+
+    pub fn save_goal(&self, run: &str, progress: &crate::goals::GoalProgress) -> anyhow::Result<()> {
+        self.save(&format!("runs/{run}/goal.json"), progress)
+    }
+
     /// A damaged line is skipped: losing one price must not stop a run from resuming.
     pub fn ledger(&self, run: &str) -> anyhow::Result<Vec<LedgerEntry>> {
         let Some(bytes) = self.store.read(&format!("runs/{run}/ledger.jsonl"))? else { return Ok(Vec::new()) };

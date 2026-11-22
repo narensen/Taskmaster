@@ -16,13 +16,14 @@ import {
   Zap,
 } from "lucide-react";
 import { RoleMark } from "../marks";
-import { api, type DoctorReport } from "../api";
+import { api, type DoctorReport, type PermissionMode } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
 import { Field, Problem, useAction, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { RoleDeck } from "../components/RoleDeck";
 import { ModePicker, useRunMode } from "../components/ModePicker";
+import { GoalButton, PermissionPicker, type GoalChoice } from "../components/RunOptions";
 import { promptLink, readPromptLink } from "../promptLink";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { ProviderLogo, providerName } from "../providers/logos";
@@ -56,6 +57,8 @@ export function NewRun() {
   };
   const [yes, setYes] = useState(false);
   const [runMode, setRunMode] = useRunMode();
+  const [permission, setPermission] = useState<PermissionMode | null>(null);
+  const [goal, setGoal] = useState<GoalChoice | null>(null);
   const [remember, setRemember] = useState(false);
   const [budgetCap, setBudgetCap] = useState<string>("");
   const [issueOpen, setIssueOpen] = useState(false);
@@ -102,6 +105,12 @@ export function NewRun() {
       toast(
         "Hidden characters removed",
         `The link's prompt had ${link.removed} character${link.removed === 1 ? "" : "s"} you could not see, which can hide instructions for an agent. Read it before you send.`,
+        10000,
+      );
+    if (link.goal)
+      toast(
+        "Goal left out",
+        `The link asked for the goal “${link.goal}”. A goal can run a command on this machine, so set it yourself with Goal if you want it.`,
         10000,
       );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -181,7 +190,7 @@ export function NewRun() {
       const parallel = resolvePages(pages, max ?? 32);
       const parsedCap = budgetCap.trim() ? Number(budgetCap.trim()) : undefined;
       const max_cost_usd = parsedCap && Number.isFinite(parsedCap) && parsedCap > 0 ? parsedCap : undefined;
-      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models, max_cost_usd, mode: runMode });
+      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models, max_cost_usd, mode: runMode, permission_mode: permission ?? undefined, goal: goal?.condition, goal_max_turns: goal?.maxTurns });
       for (const att of stagedFiles) {
         await api.addAttachment(id, { name: att.name, mime: att.mime, data_base64: att.data_base64 }).catch(() => {});
       }
@@ -277,6 +286,8 @@ export function NewRun() {
             <div className="composer-foot">
               <div className="composer-actions">
                 <ModePicker value={runMode} onChange={setRunMode} />
+                <PermissionPicker value={permission} onChange={setPermission} />
+                <GoalButton value={goal} onChange={setGoal} />
                 <button
                   type="button"
                   className="icon composer-link-btn"

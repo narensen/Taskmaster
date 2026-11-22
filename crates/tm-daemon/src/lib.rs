@@ -33,6 +33,7 @@ mod eval;
 pub mod eval_suite;
 pub mod gates;
 mod git;
+pub mod goals;
 mod hosts;
 pub mod issues;
 mod log;
@@ -318,6 +319,12 @@ pub struct RunRequest {
     pub template: Option<String>,
     /// Who does the work: see [`RunMode`]. Runs saved before modes existed are `Auto`.
     pub mode: RunMode,
+    /// Optional per-run permission mode overriding Settings (A3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<tm_harness::PermissionMode>,
+    /// Optional goal verified after each turn until met or capped (A4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<goals::GoalSpec>,
 }
 
 /// Optional model names passed through to the harness. The harness id is the default.
@@ -413,6 +420,8 @@ pub struct Config {
     pub best_of_n_alt: Option<Arc<dyn Harness>>,
     /// Release warm builder sessions idle longer than this (O7). Zero disables idle eviction.
     pub warm_idle: Duration,
+    /// Optional per-run permission mode overriding Settings (A3).
+    pub permission_mode: Option<tm_harness::PermissionMode>,
 }
 
 /// How an active run should stop when cancelled.
@@ -491,6 +500,7 @@ impl Config {
             best_of_n: false,
             best_of_n_alt: None,
             warm_idle: Duration::from_secs(crate::settings::DEFAULT_WARM_IDLE_SECS),
+            permission_mode: None,
         }
     }
 }

@@ -151,6 +151,8 @@ struct AgentRequest {
     native_search: bool,
     /// Keep the agent's session open after its turn, for a repair to follow up in.
     keep: bool,
+    /// Optional per-run permission mode (A3).
+    permission_mode: Option<tm_harness::PermissionMode>,
 }
 
 /// When a planner has looked and thought long enough. It is stopped after `tools` tool
@@ -540,6 +542,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         };
         Arc::new(Live::new(store))
     });
+    live.approvals.set_run_mode(&run_id, config.permission_mode);
     // Workers on a web page get a browser on that page's own preview.
     let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
     // Code Mode: run_code, beside the browser, on the same server.
@@ -2589,6 +2592,7 @@ impl Driver {
             fetch: false,
             native_search: false,
             keep: false,
+            permission_mode: self.config.permission_mode,
         };
         self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
         let bill = request.bill(Role::Checker, Some(page));
@@ -3816,6 +3820,7 @@ impl Driver {
             fetch: self.config.package_indexes,
             native_search: false,
             keep: false,
+            permission_mode: self.config.permission_mode,
         };
         self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
@@ -3925,6 +3930,7 @@ impl Driver {
             fetch: self.config.package_indexes,
             native_search: false,
             keep: false,
+            permission_mode: self.config.permission_mode,
         };
         self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
@@ -4157,6 +4163,7 @@ impl Driver {
             fetch: self.config.package_indexes,
             native_search: false,
             keep: true,
+            permission_mode: self.config.permission_mode,
         })
     }
 
@@ -4711,6 +4718,7 @@ impl Driver {
             fetch: false,
             native_search: false,
             keep: false,
+            permission_mode: self.config.permission_mode,
         })
     }
 
@@ -5977,6 +5985,7 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
         read_only: request.read_only,
         code_mode: request.code_mode,
         shell: request.shell.clone().filter(|_| !request.read_only),
+        permission_mode: request.permission_mode,
     };
     if let Some(feed) = &request.feed {
         feed.live.push(
@@ -6066,6 +6075,9 @@ fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
     if request.native_search {
         gate = gate.with_native_search();
     }
+    if request.permission_mode == Some(tm_harness::PermissionMode::FullAccess) && !request.read_only {
+        gate = gate.with_full_access();
+    }
     for dir in HARNESS_STATE_DIRS {
         gate = gate.with_readable(format!("{home}/{dir}"));
     }
@@ -6089,6 +6101,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         read_only: request.read_only,
         code_mode: request.code_mode,
         shell: request.shell.clone().filter(|_| !request.read_only),
+        permission_mode: request.permission_mode,
     };
     let feed = &request.feed;
     if let Some(feed) = &feed {

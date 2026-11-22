@@ -24,6 +24,18 @@ export interface PromptLink {
   mode: RunMode | null;
   /** How many hidden characters were taken out. */
   removed: number;
+  /** A leading `/goal` line the link carried, taken out: a goal's check runs on this machine. */
+  goal: string | null;
+}
+
+/** Take a leading `/goal …` line off a link's prompt. The daemon reads that line as a goal,
+ * and a goal can name a command it runs here, so a link may not set one. */
+export function dropGoalLine(text: string): { text: string; goal: string | null } {
+  const lines = text.replace(/^\s+/, "").split("\n");
+  const first = lines[0] ?? "";
+  const m = /^\/goal[ \t]+(.+)$/.exec(first.trim());
+  if (!m) return { text, goal: null };
+  return { text: lines.slice(1).join("\n").trim(), goal: m[1]!.trim() };
 }
 
 /** The prompt a link carries, from a URL's query. `null` when it carries none. */
@@ -31,9 +43,10 @@ export function readPromptLink(search: string): PromptLink | null {
   const params = new URLSearchParams(search);
   const raw = params.get("prompt");
   if (!raw || !raw.trim()) return null;
-  const { text, removed } = stripHidden(raw.slice(0, MAX));
+  const { text: visible, removed } = stripHidden(raw.slice(0, MAX));
+  const { text, goal } = dropGoalLine(visible);
   const mode = params.get("mode");
-  return { prompt: text, mode: mode === "auto" || mode === "code" || mode === "agent" ? mode : null, removed };
+  return { prompt: text, mode: mode === "auto" || mode === "code" || mode === "agent" ? mode : null, removed, goal };
 }
 
 /** A link that opens New Run on this daemon with `prompt` ready to send. */

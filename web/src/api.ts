@@ -191,6 +191,23 @@ export interface RunSummary {
   /** First and last ledger timestamps, for the sidebar's clocks. */
   started_at?: string | null;
   last_at?: string | null;
+  /** The run's own permission mode, when it set one; otherwise Settings applies (A3). */
+  permission_mode?: PermissionMode | null;
+  /** The goal checked after each turn, and how far it got (A4). */
+  goal?: GoalProgress | null;
+}
+
+/** Per-run permission mode chosen in the composer (A3). `null` follows Settings. */
+export type PermissionMode = "supervised" | "auto_edits" | "auto" | "full_access";
+
+/** A goal's progress: `checking` while the daemon tests it after a turn. */
+export interface GoalProgress {
+  condition: string;
+  max_turns: number;
+  attempts: number;
+  state: "active" | "checking" | "met" | "stopped";
+  last_check?: string | null;
+  checked_at?: string | null;
 }
 
 export interface RunLimit {
@@ -475,6 +492,9 @@ export type RunMode = "auto" | "code" | "agent";
 
 export interface NewRun {
   mode?: RunMode;
+  permission_mode?: PermissionMode;
+  goal?: string;
+  goal_max_turns?: number;
   prompt?: string;
   id?: string;
   yes?: boolean;
@@ -488,6 +508,9 @@ export interface NewRun {
 
 export interface NewProject {
   mode?: RunMode;
+  permission_mode?: PermissionMode;
+  goal?: string;
+  goal_max_turns?: number;
   name: string;
   prompt?: string;
   yes?: boolean;

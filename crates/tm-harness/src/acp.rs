@@ -734,6 +734,7 @@ mod tests {
             read_only: true,
             code_mode: false,
             shell: None,
+            permission_mode: None,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
         task.effort = Some("low".into());
@@ -836,6 +837,7 @@ mod tests {
             read_only: true,
             code_mode: false,
             shell: None,
+            permission_mode: None,
         };
         let (tx, _rx) = mpsc::channel(8);
         let started = std::time::Instant::now();
@@ -866,6 +868,7 @@ mod tests {
             read_only: false,
             code_mode: false,
             shell: None,
+            permission_mode: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![]));
         let (tx, mut rx) = mpsc::channel(32);
@@ -996,6 +999,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             read_only: false,
             code_mode: true,
             shell: None,
+            permission_mode: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
         let (tx, mut rx) = mpsc::channel(16);

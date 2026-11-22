@@ -57,7 +57,13 @@ impl Codex {
         }
         if resume.is_none() {
             args.extend(["-C".into(), task.cwd.display().to_string()]);
-            let sandbox = if task.read_only || enforce_code_mode { "read-only" } else { "workspace-write" };
+            let sandbox = if task.read_only || enforce_code_mode {
+                "read-only"
+            } else if task.permission_mode == Some(crate::PermissionMode::FullAccess) {
+                "danger-full-access"
+            } else {
+                "workspace-write"
+            };
             args.extend(["--sandbox".into(), sandbox.into()]);
         }
         if let Some(model) = &task.model {
@@ -457,6 +463,7 @@ mod tests {
             read_only: false,
             code_mode: true,
             shell: None,
+            permission_mode: None,
         };
         let stateless = harness.args_with(&task, "initial", false, None);
         assert!(stateless.contains(&"--ephemeral".to_string()));
@@ -491,10 +498,25 @@ mod tests {
             read_only: false,
             code_mode: true,
             shell: None,
+            permission_mode: None,
         };
         let args = harness.args_with(&task, "build", false, None);
         assert!(args.windows(2).any(|w| w == ["--disable", "shell_tool"]), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]), "{args:?}");
+
+        // Full access opens Codex's own sandbox for a builder with its own tools, and only then.
+        let mut own_tools = task.clone();
+        own_tools.code_mode = false;
+        let sandbox = |t: &WorkerTask| {
+            let args = harness.args_with(t, "build", false, None);
+            args.windows(2).find(|w| w[0] == "--sandbox").map(|w| w[1].clone()).unwrap_or_default()
+        };
+        assert_eq!(sandbox(&own_tools), "workspace-write");
+        own_tools.permission_mode = Some(crate::PermissionMode::FullAccess);
+        assert_eq!(sandbox(&own_tools), "danger-full-access");
+        let mut reader = own_tools.clone();
+        reader.read_only = true;
+        assert_eq!(sandbox(&reader), "read-only");
     }
 
     #[test]

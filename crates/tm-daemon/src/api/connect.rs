@@ -446,6 +446,11 @@ async fn call_tool(app: &Arc<App>, name: &str, args: &Value) -> Result<Value, St
         }
         "taskmaster_start_run" => {
             let prompt = arg(args, "prompt")?;
+            // A goal's check runs on this machine outside the agents' sandbox, so only the
+            // person sets one, in the app.
+            if crate::goals::extract_goal(prompt).1.is_some() {
+                return Err("a /goal line is set in the Taskmaster app, not by an outside agent; send the prompt without it".into());
+            }
             let request = json!({
                 "prompt": prompt,
                 "mode": args["mode"].as_str().unwrap_or("auto"),

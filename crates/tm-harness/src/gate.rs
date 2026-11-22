@@ -63,6 +63,8 @@ pub struct WorktreeGate {
     fetch_hosts: Vec<String>,
     /// Allow the harness's built-in web search tool when provider is set to `native`.
     native_search: bool,
+    /// Full-access per-run permission mode: bypass confinement refusals for non-read-only tasks.
+    full_access: bool,
 }
 
 impl WorktreeGate {
@@ -78,7 +80,14 @@ impl WorktreeGate {
             shell: false,
             fetch_hosts: Vec::new(),
             native_search: false,
+            full_access: false,
         }
+    }
+
+    /// Allow full access (shell, network, and edits) for non-read-only tasks when explicitly selected.
+    pub fn with_full_access(mut self) -> Self {
+        self.full_access = true;
+        self
     }
 
     /// Allow shell commands. Give this only to an agent that runs inside the sandbox.
@@ -100,7 +109,7 @@ impl WorktreeGate {
     }
 
     pub fn allows_shell(&self) -> bool {
-        self.shell && !self.read_only
+        (self.shell || self.full_access) && !self.read_only
     }
 
     /// Refuse every edit, for reviewers and verifiers.
@@ -134,7 +143,7 @@ impl WorktreeGate {
         if self.native_search && is_native_search_tool(request) {
             return None;
         }
-        if self.read_only {
+        if self.read_only || self.full_access {
             return None;
         }
         match request.kind {
@@ -186,6 +195,9 @@ impl PermissionGate for WorktreeGate {
                 (None, _) => false,
             };
             return if allowed { Decision::Allow } else { Decision::Deny };
+        }
+        if self.full_access && !self.read_only {
+            return Decision::Allow;
         }
         if self.native_search && is_native_search_tool(request) {
             return Decision::Allow;

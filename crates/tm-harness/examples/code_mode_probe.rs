@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         read_only: false,
         code_mode: true,
         shell: None,
+        permission_mode: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let printer = tokio::spawn(async move {

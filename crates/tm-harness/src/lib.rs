@@ -190,6 +190,42 @@ pub struct DictionaryAccess {
     pub bearer_token: String,
 }
 
+/// Per-run permission mode chosen in the composer or inherited from Settings (A3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Ask before every tool call (except Dictionary).
+    Supervised,
+    /// Auto-accept edits in the worktree, still ask for shell commands, fetches, and out-of-glob writes.
+    AutoEdits,
+    /// Standard Taskmaster confinement without interactive prompts (worktree edits + sandboxed shell allowed).
+    #[default]
+    Auto,
+    /// Bypass prompts and worktree shell/network refusals for non-read-only tasks.
+    FullAccess,
+}
+
+impl PermissionMode {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+            "supervised" | "always" | "always-ask" | "ask" => Some(Self::Supervised),
+            "auto-edits" | "auto-accept-edits" | "accept-edits" | "risky" | "ask-risky" => Some(Self::AutoEdits),
+            "auto" | "never" | "default" | "" => Some(Self::Auto),
+            "full-access" | "full" | "bypass" | "bypass-permissions" => Some(Self::FullAccess),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Supervised => "supervised",
+            Self::AutoEdits => "auto_edits",
+            Self::Auto => "auto",
+            Self::FullAccess => "full_access",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerTask {
     pub brief: String,
@@ -209,6 +245,8 @@ pub struct WorkerTask {
     pub code_mode: bool,
     /// A sandboxed shell for a builder. `None` keeps the shell off.
     pub shell: Option<ShellScope>,
+    /// Optional per-run permission mode mapped onto provider flags and the daemon gate (A3).
+    pub permission_mode: Option<PermissionMode>,
 }
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a read-only agent.

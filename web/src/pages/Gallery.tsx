@@ -4,7 +4,7 @@
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
 import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
-import { api, callAt, type RunSummary } from "../api";
+import { api, callAt, type PermissionMode, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { modelLabel } from "../components/ProviderPicker";
@@ -24,6 +24,7 @@ import { dropOnRun } from "../App";
 import { consumeCloneRequest } from "../commands";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
 import { ModePicker, useRunMode } from "../components/ModePicker";
+import { GoalButton, PermissionPicker, type GoalChoice } from "../components/RunOptions";
 import { openProject } from "../openProject";
 import { Problem, useAction, useLoad } from "../ui";
 
@@ -360,6 +361,8 @@ export function Gallery() {
   const [allOpen, setAllOpen] = useState(false);
   const [mode, setMode] = useState<"new" | "clone">("new");
   const [runMode, setRunMode] = useRunMode();
+  const [permission, setPermission] = useState<PermissionMode | null>(null);
+  const [goal, setGoal] = useState<GoalChoice | null>(null);
   const [newName, setNewName] = useState("");
   const [cloneUrl, setCloneUrl] = useState("");
   const [cloneName, setCloneName] = useState("");
@@ -416,7 +419,7 @@ export function Gallery() {
       for (let n = 1; n <= 6 && !created; n++) {
         const name = n === 1 ? base : `${base}-${n}`;
         try {
-          created = await api.createProject({ name, prompt, roles, models: chosen, parallel, mode: runMode });
+          created = await api.createProject({ name, prompt, roles, models: chosen, parallel, mode: runMode, permission_mode: permission ?? undefined, goal: goal?.condition, goal_max_turns: goal?.maxTurns });
         } catch (err) {
           const taken = err instanceof Error && /already exists/.test(err.message);
           if (!taken || typed) throw err;
@@ -558,6 +561,8 @@ export function Gallery() {
                   <Paperclip size={16} />
                 </button>
                 <ModePicker value={runMode} onChange={setRunMode} />
+                <PermissionPicker value={permission} onChange={setPermission} />
+                <GoalButton value={goal} onChange={setGoal} />
               </div>
               <div className="composer-end">
                 <button type="button" className={`model-pill ${rolesOpen ? "on" : ""}`} aria-expanded={rolesOpen} title="Roles and pages" onClick={() => setRolesOpen((v) => !v)}>

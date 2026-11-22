@@ -2333,7 +2333,7 @@ mod http {
         let (status, paired) = client.post("/api/pair", json!({ "code": code })).await;
         assert_eq!(status, 200, "{paired}");
         client.token = Some(paired["token"].as_str().unwrap().to_string());
-        assert_eq!(client.get("/api/runs").await.1, json!({ "runs": [] }));
+        assert_eq!(client.get("/api/runs").await.1["runs"], json!([]));
 
         // Nothing is built until the plan is approved.
         let planned = serde_json::to_value(plan(&[("a", &["greet"]), ("b", &["greet"])])).unwrap();
@@ -2540,6 +2540,64 @@ mod http {
         assert_eq!((turns[1]["mode"].as_str(), turns[1]["turn"].as_u64()), (Some("agent"), Some(3)));
         assert_eq!(turns[1]["text"], "the preview is blank: add the dev script");
         assert_eq!(turns[1]["agent"]["id"], "person");
+    }
+
+    /// Poll a run until its goal has settled (`met` or `stopped`) and the run is idle.
+    async fn goal_settled(client: &Client, id: &str) -> Value {
+        for _ in 0..800 {
+            let (_, run) = client.get(&format!("/api/runs/{id}")).await;
+            let state = run["goal"]["state"].as_str().unwrap_or("");
+            if matches!(state, "met" | "stopped") && run["active"] == false {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the goal of {id} never settled: {}", client.get(&format!("/api/runs/{id}")).await.1);
+    }
+
+    #[tokio::test]
+    async fn a_goal_keeps_a_run_going_until_it_holds_and_stops_at_its_cap() {
+        let tmp = repo("api-goal");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+
+        // The first turn builds page a; only the second turn's agent writes the file the goal
+        // looks for, so the goal fails once, then holds.
+        let goal = "`test -f app/agent-2/page.ts` passes";
+        let (status, made) = client.post("/api/runs", json!({ "id": "goal", "plan": planned, "yes": true, "goal": goal, "goal_max_turns": 3 })).await;
+        assert_eq!(status, 202, "{made}");
+        let run = goal_settled(&client, "goal").await;
+        assert_eq!(run["goal"]["state"], "met", "{run}");
+        assert_eq!(run["goal"]["attempts"], 2);
+        assert_eq!(run["goal"]["condition"], goal);
+        let briefs = world.calls.lock().unwrap().clone();
+        let fixer = briefs.iter().find(|brief| brief.contains("agent-2")).expect("an unmet goal starts an Agent turn");
+        assert!(fixer.contains("Goal not yet met (attempt 1/3)") && fixer.contains("test -f app/agent-2/page.ts"), "{fixer}");
+        assert!(!briefs.iter().any(|brief| brief.contains("agent-3")), "a met goal starts no further turn");
+        let (_, said) = client.get("/api/runs/goal/agents").await;
+        let checks: Vec<&Value> = said["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "goal").collect();
+        assert_eq!(checks.len(), 2, "each check is a daemon line");
+        assert_eq!((checks[0]["ok"].as_bool(), checks[1]["ok"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(checks[1]["agent"]["id"], "runtime");
+
+        // A goal that never holds stops at its cap: two checks, one extra turn.
+        let planned = serde_json::to_value(plan(&[("b", &[])])).unwrap();
+        let (status, _) = client
+            .post("/api/runs", json!({ "id": "never", "prompt": null, "plan": planned, "yes": true, "goal": "`test -f never.txt`", "goal_max_turns": 2 }))
+            .await;
+        assert_eq!(status, 202);
+        let run = goal_settled(&client, "never").await;
+        assert_eq!((run["goal"]["state"].as_str(), run["goal"]["attempts"].as_u64()), (Some("stopped"), Some(2)), "{run}");
+        let (_, said) = client.get("/api/runs/never/agents").await;
+        let turns = said["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "turn").count();
+        assert_eq!(turns, 1, "the cap stops the goal after one extra turn");
+
+        // A /goal line on the prompt is the same as the field, and leaves the prompt.
+        let (spec_prompt, spec) = crate::goals::extract_goal("/goal the preview opens\nMake the hero bigger");
+        assert_eq!((spec_prompt.as_str(), spec.map(|g| g.condition)), ("Make the hero bigger", Some("the preview opens".to_string())));
     }
 
     #[tokio::test]
@@ -3018,6 +3076,64 @@ mod http {
         let before = live.read("r1", 0).0;
         assert_eq!(gate.decide_async(&read).await, Decision::Deny);
         assert_eq!(live.read("r1", 0).0, before);
+    }
+
+    #[tokio::test]
+    async fn a_run_permission_mode_overrides_the_settings_policy_for_that_run_only() {
+        use tm_harness::{Decision, PermissionMode, PermissionRequest, ToolKind, WorktreeGate};
+        let tmp = repo("approval-run-mode");
+        let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));
+        // Settings say never ask; this run asks for Auto-accept edits.
+        live.approvals.set_policy(crate::approvals::Policy { mode: crate::approvals::Mode::Never, timeout: Duration::from_millis(80) });
+        live.approvals.set_run_mode("edits", Some(PermissionMode::AutoEdits));
+        let gate = |run: &str, inner: WorktreeGate| crate::approvals::ApprovalGate::new(inner, live.clone(), run.into(), json!({ "id": "w" }));
+        let edit = PermissionRequest { tool: "Edit".into(), kind: ToolKind::Edit, paths: vec![tmp.0.join("index.html")], command: None, url: None };
+        let shell = PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some("npm i".into()), url: None };
+
+        // Auto-accept edits: an edit in the worktree passes without a question...
+        let edits = gate("edits", WorktreeGate::new(&tmp.0, vec![]));
+        assert_eq!(edits.decide_async(&edit).await, Decision::Allow);
+        assert_eq!(live.read("edits", 0).0, 0, "nothing was asked for the edit");
+        // ...and a shell command still waits for a person (here, until the timeout).
+        assert_eq!(edits.decide_async(&shell).await, Decision::Deny);
+        let (_, asked) = live.read("edits", 0);
+        assert_eq!(asked[0]["kind"], "approval_requested");
+        assert_eq!(asked[0]["reason"], "runs a shell command");
+
+        // Another run follows Settings: no question, and the gate's refusal stands.
+        let other = gate("other", WorktreeGate::new(&tmp.0, vec![]));
+        assert_eq!(other.decide_async(&shell).await, Decision::Deny);
+        assert_eq!(live.read("other", 0).0, 0);
+
+        // Supervised asks even about an edit in the worktree.
+        live.approvals.set_run_mode("watched", Some(PermissionMode::Supervised));
+        assert_eq!(gate("watched", WorktreeGate::new(&tmp.0, vec![])).decide_async(&edit).await, Decision::Deny);
+        assert_eq!(live.read("watched", 0).1[0]["reason"], "asks before every tool call");
+
+        // Full access lets a builder's shell through unasked; a reader stays refused.
+        live.approvals.set_run_mode("full", Some(PermissionMode::FullAccess));
+        assert_eq!(gate("full", WorktreeGate::new(&tmp.0, vec![])).decide_async(&shell).await, Decision::Allow);
+        assert_eq!(gate("full", WorktreeGate::new(&tmp.0, vec![]).read_only()).decide_async(&edit).await, Decision::Deny);
+        assert_eq!(live.read("full", 0).0, 0);
+
+        // Clearing the override puts the run back on Settings.
+        live.approvals.set_run_mode("edits", None);
+        assert_eq!(live.approvals.effective_mode("edits"), (crate::approvals::Mode::Never, false));
+    }
+
+    #[tokio::test]
+    async fn a_new_run_keeps_its_permission_mode_and_refuses_an_unknown_one() {
+        let tmp = repo("run-permission-mode");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        client.token = Some(client.post("/api/pair", json!({ "code": code })).await.1["token"].as_str().unwrap().to_string());
+        let planned = serde_json::to_value(plan(&[("home", &[])])).unwrap();
+        let (code, body) = client.post("/api/runs", json!({ "id": "bad", "plan": planned, "permission_mode": "yolo" })).await;
+        assert_eq!(code, 400, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("permission_mode"), "{body}");
+        let (code, _) = client.post("/api/runs", json!({ "id": "kept", "plan": planned, "permission_mode": "auto_edits" })).await;
+        assert_eq!(code, 202);
+        assert_eq!(client.get("/api/runs/kept").await.1["permission_mode"], "auto_edits");
     }
 
     fn script(dir: &Path, name: &str, log: &Path) -> PathBuf {
@@ -5775,6 +5891,8 @@ async fn o6_agent_status_writes_status_transcript_entry() {
         assert_ne!(out["isError"], true, "run_code status() failed: {out}");
     }
 
+    // The transcript writer buffers; read what it holds, not what reached the disk so far.
+    live.flush("r-o6");
     let entries = records.transcript("r-o6").unwrap();
     let statuses: Vec<&str> = entries
         .iter()

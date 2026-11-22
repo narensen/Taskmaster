@@ -40,9 +40,11 @@ pub enum Mode {
 impl Mode {
     pub fn parse(text: &str) -> Option<Mode> {
         match text.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "always" | "always-ask" | "ask" => Some(Mode::Always),
-            "risky" | "ask-risky" | "ask-for-risky" => Some(Mode::Risky),
-            "never" | "" | "off" => Some(Mode::Never),
+            "always" | "always-ask" | "ask" | "supervised" => Some(Mode::Always),
+            "risky" | "ask-risky" | "ask-for-risky" | "auto-edits" | "auto-accept-edits" | "accept-edits" => {
+                Some(Mode::Risky)
+            }
+            "never" | "" | "off" | "auto" => Some(Mode::Never),
             _ => None,
         }
     }
@@ -52,6 +54,14 @@ impl Mode {
             Mode::Always => "always",
             Mode::Risky => "risky",
             Mode::Never => "never",
+        }
+    }
+
+    pub fn to_permission_mode(self) -> tm_harness::PermissionMode {
+        match self {
+            Mode::Always => tm_harness::PermissionMode::Supervised,
+            Mode::Risky => tm_harness::PermissionMode::AutoEdits,
+            Mode::Never => tm_harness::PermissionMode::Auto,
         }
     }
 }
@@ -78,6 +88,8 @@ struct Pending {
 #[derive(Default)]
 pub struct Approvals {
     policy: RwLock<Policy>,
+    /// Per-run permission mode override set from RunRequest (A3).
+    run_modes: RwLock<BTreeMap<String, tm_harness::PermissionMode>>,
     pending: Mutex<BTreeMap<String, Pending>>,
     /// Runs that were cancelled and have not been started again: nothing more is asked.
     stopped: Mutex<std::collections::BTreeSet<String>>,
@@ -90,6 +102,31 @@ impl Approvals {
 
     pub fn set_policy(&self, policy: Policy) {
         *self.policy.write().unwrap() = policy;
+    }
+
+    /// Set or clear a per-run permission mode override (A3).
+    pub fn set_run_mode(&self, run: &str, mode: Option<tm_harness::PermissionMode>) {
+        let mut modes = self.run_modes.write().unwrap();
+        match mode {
+            Some(m) => {
+                modes.insert(run.to_string(), m);
+            }
+            None => {
+                modes.remove(run);
+            }
+        }
+    }
+
+    /// Effective `(approval_mode, full_access)` for `run`, consulting the per-run override
+    /// first and falling back to the global Settings policy.
+    pub fn effective_mode(&self, run: &str) -> (Mode, bool) {
+        match self.run_modes.read().unwrap().get(run).copied() {
+            Some(tm_harness::PermissionMode::Supervised) => (Mode::Always, false),
+            Some(tm_harness::PermissionMode::AutoEdits) => (Mode::Risky, false),
+            Some(tm_harness::PermissionMode::Auto) => (Mode::Never, false),
+            Some(tm_harness::PermissionMode::FullAccess) => (Mode::Never, true),
+            None => (self.policy().mode, false),
+        }
     }
 
     /// The questions waiting for an answer, oldest first, for one run or for all.
@@ -145,7 +182,11 @@ impl Approvals {
     /// as a pending `ToolKind::Fetch` approval until answered, cancelled, or timed out.
     pub async fn ask_fetch(&self, live: &Live, run: &str, agent: &Value, tool: &str, url: &str, reason: &str) -> bool {
         let policy = self.policy();
-        if ask_reason(policy.mode, ToolKind::Fetch, false).is_none() {
+        let (mode, full_access) = self.effective_mode(run);
+        if full_access {
+            return true;
+        }
+        if ask_reason(mode, ToolKind::Fetch, false).is_none() {
             return false;
         }
         if self.stopped.lock().unwrap().contains(run) {
@@ -255,7 +296,11 @@ impl PermissionGate for ApprovalGate {
     async fn decide_async(&self, request: &PermissionRequest) -> Decision {
         let base = self.inner.decide(request);
         let policy = self.approvals.policy();
-        let Some(reason) = self.question(request, base, policy.mode) else { return base };
+        let (mode, full_access) = self.approvals.effective_mode(&self.run);
+        if full_access && !self.inner.is_read_only() {
+            return Decision::Allow;
+        }
+        let Some(reason) = self.question(request, base, mode) else { return base };
 
         if self.approvals.stopped.lock().unwrap().contains(&self.run) {
             return Decision::Deny;

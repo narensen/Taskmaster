@@ -3,7 +3,7 @@
 // and accessed files. A toggleable side panel holds files, diff, preview, and terminal.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertCircle, ArrowDown, Check, Crosshair, FileDiff, GitBranch, GitMerge, Link2, Loader2, MessageSquareText, Network, PanelRight, X } from "lucide-react";
+import { Activity, AlertCircle, ArrowDown, Check, Crosshair, FileDiff, GitBranch, GitMerge, Link2, Loader2, MessageSquareText, Network, PanelRight, ShieldCheck, X } from "lucide-react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import { api, type DiffStats, type PreviewCapture, type ReviewJob, type RunDetail } from "../api";
 import { takeAttachments } from "../App";
@@ -30,6 +30,7 @@ import { TelemetryLens } from "../run/TelemetryLens";
 import { useRun, useSurfaces, useTurns } from "../run/model";
 import { PastTurn } from "../run/Turns";
 import { ModePicker, useRunMode } from "../components/ModePicker";
+import { GoalStatus, permissionLabel } from "../components/RunOptions";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
 import { WebSources } from "../run/WebSources";
@@ -825,6 +826,12 @@ export function RunView({ id }: { id: string }) {
               title={`Spend cap: ${usd(detail.spent.cost_usd)} of ${usd(detail.budget_usd)}`}
             >
               {usd(detail.spent.cost_usd)} / {usd(detail.budget_usd)}
+            </span>
+          )}
+          {detail.goal && <GoalStatus goal={detail.goal} />}
+          {detail.permission_mode && (
+            <span className={`flow-top-perm ${detail.permission_mode}`} data-testid="run-permission" title="This run's permission mode">
+              <ShieldCheck size={12} strokeWidth={1.9} aria-hidden /> {permissionLabel(detail.permission_mode)}
             </span>
           )}
         </div>

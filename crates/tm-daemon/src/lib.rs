@@ -54,6 +54,7 @@ pub mod repomap;
 pub mod reply;
 pub mod report;
 mod resume;
+pub mod run_index;
 pub mod retention;
 mod runtime;
 pub mod scheduler;

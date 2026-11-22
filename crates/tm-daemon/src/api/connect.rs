@@ -565,6 +565,7 @@ pub async fn skill() -> Response {
 }
 
 /// The tool names the MCP server offers, for the skill's own check.
+#[cfg(test)]
 pub fn tool_names() -> Vec<String> {
     tools().as_array().map(|list| list.iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()).unwrap_or_default()
 }

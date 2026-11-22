@@ -717,6 +717,8 @@ export interface RunData {
   entriesVersion: number;
   /** P5: true when older calls exist before the bounded recent window. */
   hasOlder: boolean;
+  /** The transcript index of the first entry held (P5 loads the recent window first). */
+  windowStart: number;
   olderCalls: OlderCallSummary[];
   loadingOlder: boolean;
   loadOlder: () => Promise<void>;
@@ -1019,6 +1021,8 @@ export function useRun(id: string): RunData {
     entries: entriesRef.current,
     entriesVersion,
     hasOlder,
+    /** The transcript index of the first entry held (P5 loads the recent window first). */
+    windowStart: windowStartRef.current,
     olderCalls,
     loadingOlder,
     loadOlder,

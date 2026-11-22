@@ -469,6 +469,58 @@ export function RunView({ id }: { id: string }) {
     [focusAgent],
   );
 
+  // A7: opened from a search hit (`?entry=…&agent=…&turn=…&q=…`). Load back to the entry,
+  // open its turn and its agent, then mark the words and scroll to them.
+  const [hit, setHit] = useState<{ entry: number; agent: string; turn: number; q: string } | null>(null);
+  const [revealTurn, setRevealTurn] = useState<{ n: number; agent: string } | null>(null);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const entry = Number(params.get("entry"));
+    setRevealTurn(null);
+    if (!params.has("entry") || !Number.isFinite(entry)) {
+      setHit(null);
+      return;
+    }
+    setHit({ entry, agent: params.get("agent") ?? "", turn: Number(params.get("turn")) || 1, q: params.get("q") ?? "" });
+    setLens("stream");
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [id]);
+  const hitLoaded = !!hit && !!detail && (hit.entry >= data.windowStart || !data.hasOlder);
+  useEffect(() => {
+    if (hit && detail && !hitLoaded && !data.loadingOlder) void data.loadOlder();
+  }, [hit, detail, hitLoaded, data.loadingOlder, data.loadOlder]);
+  useEffect(() => {
+    if (!hit || !hitLoaded) return;
+    const past = hit.turn < current.n && turns.some((t) => t.n === hit.turn);
+    if (past) setRevealTurn({ n: hit.turn, agent: hit.agent });
+    else if (hit.agent) inspectAgent(hit.agent);
+    const timers: number[] = [];
+    timers.push(
+      window.setTimeout(() => {
+        const agentEl = document.getElementById(`agent-${past ? `t${hit.turn}-` : ""}${hit.agent}`);
+        // Clearing the hit ends this effect's timers, so it is cleared last.
+        if (markWords(agentEl ?? runRef.current, hit.q)) return setHit(null);
+        // The words may be in the agent's raw output, which renders only once opened.
+        const raw = agentEl?.querySelector<HTMLDetailsElement>("details.agent-raw");
+        if (raw && !raw.open) {
+          raw.open = true;
+          timers.push(
+            window.setTimeout(() => {
+              if (!markWords(agentEl, hit.q)) agentEl?.scrollIntoView({ block: "center" });
+              setHit(null);
+            }, 120),
+          );
+        } else {
+          agentEl?.scrollIntoView({ block: "center" });
+          setHit(null);
+        }
+      }, 150),
+    );
+    return () => timers.forEach((t) => window.clearTimeout(t));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hitLoaded]);
+  useEffect(() => () => clearMarks(), [id]);
+
   const runHeadline = useMemo(() => {
     if (!detail) return "";
     if (detail.phase === "awaiting_approval") return "Plan ready — awaiting your approval";
@@ -1053,6 +1105,7 @@ export function RunView({ id }: { id: string }) {
               <PastTurn
                 key={t.n}
                 turn={t}
+                reveal={revealTurn?.n === t.n ? revealTurn.agent : null}
                 next={turns[i + 1]}
                 entries={shown}
                 detail={detail}
@@ -1396,4 +1449,36 @@ function UndoMerge({ id, undone, onDone }: { id: string; undone?: RunDetail["und
       </button>
     </span>
   );
+}
+
+/** Mark each word of `q` (three letters or more) inside `root` with the `run-hit`
+ * highlight, scroll to the first, and say whether any was found. The CSS Highlight API
+ * leaves React's DOM alone; without it, the first match is only scrolled to. */
+function markWords(root: HTMLElement | null, q: string): boolean {
+  if (!root) return false;
+  const terms = q.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length >= 3);
+  if (!terms.length) return false;
+  const ranges: Range[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode() as Text | null; node && ranges.length < 50; node = walker.nextNode() as Text | null) {
+    const lower = node.data.toLowerCase();
+    for (const term of terms) {
+      for (let at = lower.indexOf(term); at >= 0 && ranges.length < 50; at = lower.indexOf(term, at + term.length)) {
+        const range = document.createRange();
+        range.setStart(node, at);
+        range.setEnd(node, at + term.length);
+        ranges.push(range);
+      }
+    }
+  }
+  if (!ranges.length) return false;
+  const registry = (CSS as unknown as { highlights?: Map<string, unknown> }).highlights;
+  const HighlightCtor = (window as unknown as { Highlight?: new (...r: Range[]) => unknown }).Highlight;
+  if (registry && HighlightCtor) registry.set("run-hit", new HighlightCtor(...ranges));
+  ranges[0]!.startContainer.parentElement?.scrollIntoView({ block: "center" });
+  return true;
+}
+
+function clearMarks() {
+  (CSS as unknown as { highlights?: Map<string, unknown> }).highlights?.delete("run-hit");
 }

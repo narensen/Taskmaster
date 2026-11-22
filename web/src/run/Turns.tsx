@@ -2,7 +2,7 @@
 // changed. Opened, it is that turn's stream as it ended. The newest turn sits below the
 // older ones, so a run reads top to bottom like a conversation.
 
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { AlertCircle, Check, ChevronRight, Square } from "lucide-react";
 import type { AgentEntry, LedgerEntry, RunDetail } from "../api";
 import { Flow } from "./Flow";
@@ -20,8 +20,11 @@ export const PastTurn = memo(function PastTurn({
   detail,
   ledger,
   onEditFromHere,
+  reveal,
 }: {
   turn: Turn;
+  /** Open this turn with this agent expanded: a search hit landed in it (A7). */
+  reveal?: string | null;
   /** The turn after this one, which bounds this one's spend. */
   next: Turn | undefined;
   entries: AgentEntry[];
@@ -29,8 +32,13 @@ export const PastTurn = memo(function PastTurn({
   ledger: LedgerEntry[];
   onEditFromHere?: (turn: number, revertFiles: boolean) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const [blown, setBlown] = useState<Set<string>>(() => new Set());
+  const [open, setOpen] = useState(!!reveal);
+  const [blown, setBlown] = useState<Set<string>>(() => new Set(reveal ? [reveal] : []));
+  useEffect(() => {
+    if (!reveal) return;
+    setOpen(true);
+    setBlown((cur) => (cur.has(reveal) ? cur : new Set(cur).add(reveal)));
+  }, [reveal]);
   const until = next?.at ?? null;
   const list = useMemo(() => turnSurfaces(entries, turn, detail, ledger, until), [entries, turn, detail, ledger, until]);
   const past = useMemo<RunDetail>(

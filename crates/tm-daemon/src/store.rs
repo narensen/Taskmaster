@@ -54,6 +54,16 @@ pub trait Store: Send + Sync {
         }
         Ok(Some((len, bytes[start..].to_vec())))
     }
+    /// `len` bytes from `offset`, or fewer at the end of the record.
+    fn read_range(&self, key: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.read_from(key, offset)?.map(|(total, mut bytes)| {
+            if total < offset {
+                return Vec::new();
+            }
+            bytes.truncate(len);
+            bytes
+        }))
+    }
     /// Replace the record. A reader sees the old bytes or the new ones, never a mix.
     fn write(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()>;
     /// Add one line to a record that is a list of lines.
@@ -136,6 +146,19 @@ impl Store for FileStore {
             .with_context(|| format!("cannot read {}", path.display()))?;
         let end_len = start + buf.len() as u64;
         Ok(Some((end_len, buf)))
+    }
+
+    fn read_range(&self, key: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let path = self.path(key)?;
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("cannot open {}", path.display())),
+        };
+        file.seek(SeekFrom::Start(offset)).with_context(|| format!("cannot seek {}", path.display()))?;
+        let mut buf = Vec::with_capacity(len);
+        file.take(len as u64).read_to_end(&mut buf).with_context(|| format!("cannot read {}", path.display()))?;
+        Ok(Some(buf))
     }
 
     fn write(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -306,6 +329,11 @@ impl Records {
     }
 
     // One run.
+
+    /// The store underneath, for a reader that keeps its own offsets (the run search index).
+    pub fn store(&self) -> &Arc<dyn Store> {
+        &self.store
+    }
 
     pub fn run_ids(&self) -> anyhow::Result<Vec<String>> {
         self.store.list("runs")

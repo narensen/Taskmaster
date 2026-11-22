@@ -123,3 +123,21 @@ test("a merged run is undone from its header after one confirm, and says so afte
     await fetch(`${daemon.fixture!.url}/api/projects/open`, { method: "POST", headers, body: JSON.stringify({ path: before }) });
   }
 });
+
+test("Ctrl+K finds words an agent said and opens the run at them, marked", async ({ openFixture, page, daemon }) => {
+  test.setTimeout(60_000);
+  await finishedRun(daemon.fixture!, "said-search", "A bookshop with a cart");
+  await openFixture("/");
+  await page.keyboard.press("Control+k");
+  const palette = page.getByRole("dialog", { name: "Command palette" });
+  await expect(palette).toBeVisible();
+  await page.keyboard.type("stays mask");
+  const hit = palette.getByTestId("palette-said").filter({ hasText: "stays masked" }).first();
+  await expect(hit).toBeVisible();
+  await expect(hit).toContainText("A bookshop with a cart");
+  await hit.click();
+  await page.waitForURL(/\/runs\/said-search$/);
+  // The agent that said it is open, and its words are marked.
+  await expect.poll(() => page.evaluate(() => (CSS as unknown as { highlights?: Map<string, Set<unknown>> }).highlights?.get("run-hit")?.size ?? 0)).toBeGreaterThan(0);
+  await expect(page.locator(".agent-card.focused")).toContainText("stays masked");
+});

@@ -7154,3 +7154,11 @@ button.run-opt-row { justify-content: flex-start; white-space: normal; }
 /* Connect: the skill for outside agents (A10). */
 .connect-skill { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 .connect-skill p { margin: 0; }
+
+/* Search inside runs (A7): two lines per hit in the palette, and the words marked in the run. */
+.pal-said { align-items: flex-start; }
+.pal-said .pal-ico { margin-top: 2px; }
+.pal-said-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.pal-said-snippet { color: var(--ink); }
+.pal-said-where { color: var(--muted); font-size: var(--fs-xs); }
+::highlight(run-hit) { background-color: var(--ink); color: var(--bg); }

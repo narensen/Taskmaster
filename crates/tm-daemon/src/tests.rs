@@ -2203,7 +2203,7 @@ mod http {
         let (status, skill) = anon.text("/skill.md").await;
         assert_eq!(status, 200);
         assert!(skill.starts_with("---\nname: taskmaster\n"), "{skill}");
-        let offered = crate::api::connect::tool_names();
+        let offered = crate::api::mcp_tool_names();
         for name in &offered {
             assert!(skill.contains(&format!("`{name}`")), "the skill does not mention {name}");
         }
@@ -2616,6 +2616,35 @@ mod http {
         // A /goal line on the prompt is the same as the field, and leaves the prompt.
         let (spec_prompt, spec) = crate::goals::extract_goal("/goal the preview opens\nMake the hero bigger");
         assert_eq!((spec_prompt.as_str(), spec.map(|g| g.condition)), ("Make the hero bigger", Some("the preview opens".to_string())));
+    }
+
+    #[tokio::test]
+    async fn a_word_an_agent_said_finds_its_run_and_the_entry() {
+        let tmp = repo("api-search-runs");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "said", "plan": planned, "yes": true })).await;
+        client.settled("said", "done").await;
+
+        // Every fake agent thinks out loud before it answers: "thinking". Typed as a prefix.
+        let (status, found) = client.get("/api/search/runs?q=thinki").await;
+        assert_eq!(status, 200, "{found}");
+        let hits = found["hits"].as_array().unwrap();
+        assert!(!hits.is_empty() && hits.len() <= 3, "at most three hits from one run: {found}");
+        let hit = &hits[0];
+        assert_eq!(hit["run"], "said");
+        assert_eq!(hit["kind"], "thought", "{found}");
+        assert!(hit["agent"].as_str().is_some_and(|a| !a.is_empty()), "{hit}");
+        assert_eq!(hit["snippet"], "thinking");
+        // The entry index is the transcript's own: the run view opens at it.
+        let (_, entry) = client.get(&format!("/api/runs/said/agents/{}", hit["entry"])).await;
+        assert_eq!(entry["entry"]["kind"], "thought", "{entry}");
+        assert_eq!(entry["entry"]["agent"]["id"], hit["agent"], "{entry}");
+        assert_eq!(client.get("/api/search/runs?q=zzqqxx").await.1["hits"], json!([]));
+        assert_eq!(client.get("/api/search/runs?q=a").await.1["hits"], json!([]), "too short to search");
     }
 
     #[tokio::test]

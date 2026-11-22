@@ -197,6 +197,19 @@ export interface RunSummary {
   goal?: GoalProgress | null;
 }
 
+/** One match from searching inside runs (A7). */
+export interface RunSearchHit {
+  run: string;
+  /** The entry's index in the run's transcript. */
+  entry: number;
+  agent: string;
+  turn: number;
+  kind: string;
+  snippet: string;
+  at: string;
+  prompt_head: string | null;
+}
+
 /** Per-run permission mode chosen in the composer (A3). `null` follows Settings. */
 export type PermissionMode = "supervised" | "auto_edits" | "auto" | "full_access";
 
@@ -1461,6 +1474,9 @@ export const api = {
       older_calls?: OlderCallSummary[];
     }>("GET", `/api/runs/${enc(id)}/agents?${params}`);
   },
+  /** Words from the project's runs (A7): each hit names the run, the entry, the agent and the turn. */
+  searchRuns: (q: string, limit = 20) =>
+    call<{ hits: RunSearchHit[] }>("GET", `/api/search/runs?q=${encodeURIComponent(q)}&limit=${limit}`).then((r) => r.hits),
   agentEntry: (id: string, index: number) =>
     call<{ index: number; text: string | null; diff: string | null; entry: AgentEntry }>(
       "GET",

@@ -144,7 +144,7 @@ use tm_harness::{HARNESSES, Harness};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
-pub(crate) mod connect;
+mod connect;
 mod desk;
 mod hosts;
 mod ops;
@@ -297,6 +297,8 @@ struct App {
     skills_fetch: Arc<dyn crate::skills::Fetch>,
     /// Cached responses for POST requests carrying an `Idempotency-Key` header (Item 3.9).
     idempotency: Mutex<HashMap<String, IdempotencyEntry>>,
+    /// What agents said in each run, for search from Ctrl+K (A7).
+    run_index: Arc<crate::run_index::RunIndex>,
 }
 
 type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
@@ -355,6 +357,7 @@ impl Server {
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
             summary_cache: Mutex::new(HashMap::new()),
+            run_index: Arc::default(),
             runs_tracker: Mutex::new(RunsTracker::default()),
             addr,
             providers: Default::default(),
@@ -511,6 +514,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/devices/{id}/revoke", post(connect::revoke_device))
         .route("/mcp", post(connect::mcp).get(connect::mcp_no_stream))
         .route("/api/runs/{id}/web", get(ops::run_web_activity))
+        .route("/api/search/runs", get(search_runs))
         .route_layer(middleware::from_fn_with_state(app.clone(), idempotency_guard))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
@@ -2164,6 +2168,44 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
     }
     app.start(&id, request, decision)?;
     accepted(json!({ "id": id, "project": path.display().to_string() }))
+}
+
+/// The MCP server's tool names, for the check that the shipped skill names the same ones.
+#[cfg(test)]
+pub(crate) fn mcp_tool_names() -> Vec<String> {
+    connect::tool_names()
+}
+
+/// `GET /api/search/runs?q=…`: words from the project's runs (A7), each hit with the run,
+/// the entry, the agent and the turn, so the palette can open the run at it.
+async fn search_runs(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
+    let q: String = query.get("q").map(|q| q.trim().chars().take(200).collect()).unwrap_or_default();
+    let limit = query.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(20).clamp(1, 50);
+    let records = app.records();
+    let project = app.project();
+    let index = app.run_index.clone();
+    let found = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+        let runs = records.run_ids()?;
+        let hits = index.search(&project, records.store().as_ref(), &runs, &q, limit, 3);
+        // The request's first line names the run in the palette; read once per run.
+        let mut heads: HashMap<String, Option<String>> = HashMap::new();
+        Ok(hits
+            .iter()
+            .map(|hit| {
+                let head = heads.entry(hit.run.clone()).or_insert_with(|| {
+                    records.request(&hit.run).ok().flatten().and_then(|r| r.prompt).and_then(|p| {
+                        p.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(80).collect())
+                    })
+                });
+                let mut row = hit.to_json();
+                row["prompt_head"] = json!(head);
+                row
+            })
+            .collect())
+    })
+    .await
+    .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}")))??;
+    ok(json!({ "hits": found }))
 }
 
 async fn templates() -> Json<Value> {

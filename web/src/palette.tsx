@@ -3,10 +3,10 @@
 // provider" opens a second page with each provider and model for that seat.
 
 import { Command } from "cmdk";
-import { ArrowLeft, CornerDownLeft, FileText, Folder, Search } from "lucide-react";
+import { ArrowLeft, CornerDownLeft, FileText, Folder, MessageSquareText, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, type Skill } from "./api";
+import { api, type RunSearchHit, type Skill } from "./api";
 import { commands, useRunContext } from "./commands";
 import { skills } from "./composer";
 import { MOD } from "./desktop";
@@ -55,6 +55,20 @@ function best<T>(list: T[], q: string, text: (x: T) => string, limit: number): T
 export { openProject } from "./openProject";
 import { openProject } from "./openProject";
 
+/** Who said it, in the run view's words. */
+function agentName(agent: string): string {
+  if (agent === "person") return "you";
+  if (agent === "runtime") return "the daemon";
+  if (agent.startsWith("page:") || agent.startsWith("unit:")) return `worker ${agent.slice(5)}`;
+  return agent;
+}
+
+/** A run's page, opened at a search hit: the run view loads back to the entry and marks the words. */
+export function runAtHit(hit: Pick<RunSearchHit, "run" | "entry" | "agent" | "turn">, q: string): string {
+  const params = new URLSearchParams({ entry: String(hit.entry), agent: hit.agent, turn: String(hit.turn), q });
+  return `/runs/${encodeURIComponent(hit.run)}?${params}`;
+}
+
 export function Palette({ state, onClose }: { state: PaletteState; onClose: () => void }) {
   const [q, setQ] = useState(state.mode === "slash" ? "/" : "");
   const [page, setPage] = useState<"root" | "roles" | Seat>("root");
@@ -73,6 +87,26 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
 
   const onlyCommands = q.startsWith(">") || q.startsWith("/");
   const text = (onlyCommands ? q.slice(1) : q).trim().toLowerCase();
+
+  // A7: what was said inside runs, once the query has a word to look for. Waits for a
+  // pause in typing, and drops an answer that arrives after the query moved on.
+  const [said, setSaid] = useState<{ q: string; hits: RunSearchHit[] }>({ q: "", hits: [] });
+  const searchable = !onlyCommands && page === "root" && /[\p{L}\p{N}]{3}/u.test(text);
+  useEffect(() => {
+    if (!searchable) return;
+    let stale = false;
+    const timer = window.setTimeout(() => {
+      api
+        .searchRuns(text, 12)
+        .then((hits) => !stale && setSaid({ q: text, hits }))
+        .catch(() => !stale && setSaid({ q: text, hits: [] }));
+    }, 160);
+    return () => {
+      stale = true;
+      window.clearTimeout(timer);
+    };
+  }, [text, searchable]);
+  const saidHits = searchable && said.q === text ? said.hits : [];
   const go = (fn: () => void) => () => {
     onClose();
     fn();
@@ -187,6 +221,29 @@ export function Palette({ state, onClose }: { state: PaletteState; onClose: () =
                     <span className="pal-meta">
                       {phaseLabel(run)}
                       {!text && i < 9 ? ` · ${MOD} ${i + 1}` : ""}
+                    </span>
+                  </Command.Item>
+                ))}
+              </Command.Group>
+            )}
+            {saidHits.length > 0 && (
+              <Command.Group heading="In runs">
+                {saidHits.map((hit) => (
+                  <Command.Item
+                    key={`${hit.run}:${hit.entry}`}
+                    value={`said:${hit.run}:${hit.entry}`}
+                    className="pal-item pal-said"
+                    data-testid="palette-said"
+                    onMouseEnter={() => prefetchRun(hit.run)}
+                    onSelect={go(() => navigate(runAtHit(hit, text)))}
+                  >
+                    <MessageSquareText size={14} className="pal-ico" aria-hidden />
+                    <span className="pal-said-body">
+                      <span className="clip pal-said-snippet">{hit.snippet}</span>
+                      <span className="clip pal-said-where">
+                        {hit.prompt_head || hit.run} · {agentName(hit.agent)}
+                        {hit.turn > 1 ? ` · turn ${hit.turn}` : ""}
+                      </span>
                     </span>
                   </Command.Item>
                 ))}

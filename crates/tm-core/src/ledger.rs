@@ -88,6 +88,15 @@ pub struct LedgerEntry {
     /// was worked out from the price table. Missing when there is no price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priced_by: Option<String>,
+    /// Deterministic version hash of the brief template used for this call (Item 2.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    /// Planned difficulty of the unit built by this call (`easy`, `normal`, `hard`) (Item 5.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    /// Dominant language of the unit built by this call (e.g. `ts`, `rs`, `py`) (Item 5.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl LedgerEntry {
@@ -456,6 +465,145 @@ pub fn scorecard(runs: &[Vec<LedgerEntry>]) -> ModelScorecard {
     ModelScorecard { runs_sampled: runs.len(), models, recommended_worker, struggling }
 }
 
+/// Per-(model, difficulty, language) score for learned auto-routing (Item 5.3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StratifiedScore {
+    pub key: String,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub units_built: u64,
+    pub first_pass_units: u64,
+    pub first_pass_rate: f64,
+    pub avg_usd_per_call: f64,
+    pub priced_calls: u64,
+    pub avg_seconds: f64,
+}
+
+/// Pick the cheapest model hitting >= [`RECOMMEND_FIRST_PASS`] for `(difficulty, language)`
+/// over at least [`SCORE_MIN_UNITS`] units, falling back to the overall recommended worker
+/// when the specific slice has too few samples.
+pub fn auto_route(
+    runs: &[Vec<LedgerEntry>],
+    difficulty: Option<&str>,
+    language: Option<&str>,
+) -> Option<ModelScore> {
+    let diff_norm = difficulty.map(|d| d.trim().to_ascii_lowercase()).filter(|d| !d.is_empty());
+    let lang_norm = language.map(|l| l.trim().to_ascii_lowercase()).filter(|l| !l.is_empty());
+    let filtered: Vec<Vec<LedgerEntry>> = runs
+        .iter()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| {
+                    let diff_ok = match &diff_norm {
+                        Some(d) => e.difficulty.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(d.as_str()),
+                        None => true,
+                    };
+                    let lang_ok = match &lang_norm {
+                        Some(l) => e.language.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(l.as_str()),
+                        None => true,
+                    };
+                    diff_ok && lang_ok
+                })
+                .cloned()
+                .collect()
+        })
+        .filter(|v: &Vec<LedgerEntry>| !v.is_empty())
+        .collect();
+    let slice_card = scorecard(&filtered);
+    if let Some(key) = slice_card.recommended_worker.as_deref()
+        && let Some(score) = slice_card.score(key)
+    {
+        return Some(score.clone());
+    }
+    // Fallback to difficulty-only slice if language was too sparse.
+    if diff_norm.is_some() && lang_norm.is_some()
+        && let Some(score) = auto_route(runs, diff_norm.as_deref(), None)
+    {
+        return Some(score);
+    }
+    // Final fallback to overall scorecard recommendation.
+    let all = scorecard(runs);
+    all.recommended_worker.as_deref().and_then(|k| all.score(k)).cloned()
+}
+
+/// Build stratified `(model, difficulty, language)` rows from per-run ledgers.
+pub fn stratified_scores(runs: &[Vec<LedgerEntry>]) -> Vec<StratifiedScore> {
+    #[derive(Default)]
+    struct Acc {
+        harness: String,
+        model: Option<String>,
+        difficulty: Option<String>,
+        language: Option<String>,
+        units_built: u64,
+        first_pass_units: u64,
+        total_usd: f64,
+        priced_calls: u64,
+        calls: u64,
+        total_seconds: f64,
+    }
+    let mut map: BTreeMap<(String, String, String), Acc> = BTreeMap::new();
+    for entries in runs {
+        let mut agent_builds: BTreeMap<String, Vec<&LedgerEntry>> = BTreeMap::new();
+        for e in entries {
+            if matches!(e.role, Role::Worker | Role::Mid | Role::Master) && e.page.is_some() {
+                agent_builds.entry(e.agent()).or_default().push(e);
+            }
+        }
+        for calls in agent_builds.values() {
+            let Some(first) = calls.first() else { continue };
+            if first.difficulty.is_none() && first.language.is_none() {
+                continue;
+            }
+            let key = match &first.model {
+                Some(m) if !m.is_empty() => format!("{} {m}", first.harness),
+                _ => first.harness.clone(),
+            };
+            let diff_k = first.difficulty.as_deref().unwrap_or("").to_ascii_lowercase();
+            let lang_k = first.language.as_deref().unwrap_or("").to_ascii_lowercase();
+            let acc = map.entry((key, diff_k.clone(), lang_k.clone())).or_insert_with(|| Acc {
+                harness: first.harness.clone(),
+                model: first.model.clone().filter(|m| !m.is_empty()),
+                difficulty: if diff_k.is_empty() { None } else { Some(diff_k) },
+                language: if lang_k.is_empty() { None } else { Some(lang_k) },
+                ..Default::default()
+            });
+            acc.units_built += 1;
+            if calls.len() == 1 && first.ok {
+                acc.first_pass_units += 1;
+            }
+            for c in calls {
+                acc.calls += 1;
+                acc.total_seconds += c.seconds;
+                if let Some(usd) = c.cost_usd {
+                    acc.total_usd += usd;
+                    acc.priced_calls += 1;
+                }
+            }
+        }
+    }
+    map.into_iter()
+        .map(|((key, _, _), a)| StratifiedScore {
+            key,
+            harness: a.harness,
+            model: a.model,
+            difficulty: a.difficulty,
+            language: a.language,
+            units_built: a.units_built,
+            first_pass_units: a.first_pass_units,
+            first_pass_rate: if a.units_built > 0 { a.first_pass_units as f64 / a.units_built as f64 } else { 0.0 },
+            avg_usd_per_call: if a.priced_calls > 0 { a.total_usd / a.priced_calls as f64 } else { 0.0 },
+            priced_calls: a.priced_calls,
+            avg_seconds: if a.calls > 0 { a.total_seconds / a.calls as f64 } else { 0.0 },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,7 +626,39 @@ mod tests {
             agent: None,
             unit: None,
             priced_by: None,
+            brief_hash: None,
+            difficulty: None,
+            language: None,
         }
+    }
+
+    #[test]
+    fn auto_route_picks_cheapest_reliable_model_per_difficulty_and_language() {
+        let make_run = |harness: &str, cost: f64, diff: &str, lang: &str, repairs: &[usize]| -> Vec<LedgerEntry> {
+            ["a", "b", "c", "d"]
+                .iter()
+                .zip(repairs)
+                .flat_map(|(page, n)| {
+                    (0..=*n).map(move |_| LedgerEntry {
+                        page: Some((*page).into()),
+                        difficulty: Some(diff.into()),
+                        language: Some(lang.into()),
+                        ..entry(Role::Worker, harness, 100, 50, Some(cost))
+                    })
+                })
+                .collect()
+        };
+        let runs = vec![
+            // Cheap model excels on easy TypeScript, fails hard Rust.
+            make_run("fast", 0.01, "easy", "ts", &[0, 0, 0, 0]),
+            make_run("fast", 0.01, "hard", "rs", &[1, 2, 1, 0]),
+            // Strong model passes hard Rust first time.
+            make_run("strong", 0.15, "hard", "rs", &[0, 0, 0, 0]),
+            make_run("strong", 0.15, "easy", "ts", &[0, 0, 0, 0]),
+        ];
+        assert_eq!(auto_route(&runs, Some("easy"), Some("ts")).unwrap().harness, "fast");
+        assert_eq!(auto_route(&runs, Some("hard"), Some("rs")).unwrap().harness, "strong");
+        assert_eq!(stratified_scores(&runs).len(), 4);
     }
 
     /// One unit built by `harness`: a passing first call, then `repairs` more on the same agent.

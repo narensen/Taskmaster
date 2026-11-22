@@ -6,7 +6,5 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
-globset = "0.4"
-
-[dev-dependencies]
 serde_json.workspace = true
+globset = "0.4"

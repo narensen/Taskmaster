@@ -12,6 +12,13 @@ import { allowNotifications, tick } from "../notify";
 import { SHORTCUTS } from "../shell/Shortcuts";
 import type { RoleDefault } from "../prefs";
 import { Hosts } from "../settings/Hosts";
+import {
+  OperationsSection,
+  RemoteMeshSection,
+  SchedulesSection,
+  UserMcpSection,
+  WebhookNotificationsSection,
+} from "../settings/OpsPanels";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { appVersion, checkForUpdate, installUpdate, isDesktop, type AvailableUpdate } from "../desktop";
@@ -305,9 +312,10 @@ const TOC: { group: string; items: [string, string][] }[] = [
       ["tool-approvals", "Tool approvals"],
     ],
   },
-  { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"], ["logs", "Logs"], ["settings-file", "Settings file"]] },
+  { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"], ["mcp-servers", "User MCP servers"], ["logs", "Logs"], ["settings-file", "Settings file"]] },
+  { group: "Operations", items: [["schedules", "Scheduled runs"], ["remote-mesh", "Remote mesh"], ["operations", "Spend, GC & egress"]] },
   { group: "Appearance", items: [["motion", "Motion"], ["density", "Density"], ["theme", "Theme"]] },
-  { group: "Alerts", items: [["notifications", "Notifications"], ["sound", "Sound"]] },
+  { group: "Alerts", items: [["notifications", "Notifications"], ["daemon-alerts", "Daemon webhooks"], ["sound", "Sound"]] },
   { group: "Help", items: [["keybindings", "Keybindings"]] },
 ];
 
@@ -745,6 +753,11 @@ export function Settings() {
         <Hosts />
       </Section>
 
+      <UserMcpSection />
+      <SchedulesSection />
+      <RemoteMeshSection />
+      <OperationsSection />
+
       <Section title="Motion" note="The system's reduced-motion setting always wins.">
         <label className="check">
           <input type="checkbox" checked={p.motion} onChange={(e) => setPrefs({ motion: e.target.checked })} />
@@ -785,6 +798,8 @@ export function Settings() {
           />
         </div>
       </Section>
+
+      <WebhookNotificationsSection />
 
       <Section title="Sound" note="A very soft tick when a run finishes. Off unless you turn it on.">
         <div className="row between gap">

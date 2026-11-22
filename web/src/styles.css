@@ -6443,3 +6443,88 @@ button.cancel-worker-btn:hover:not(:disabled) {
   overflow-x: auto;
   color: var(--ink-2);
 }
+
+/* --- Phase 3-5 Operations panels, issue intake & attachments (monochrome) --- */
+.ops-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ops-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg-sunken);
+}
+.ops-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.ops-span-full {
+  grid-column: 1 / -1;
+}
+.ops-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+.ops-card {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg-sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ops-metric {
+  font-size: 16px;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ops-alert-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border: 1px solid var(--line-2, var(--line));
+  border-radius: 999px;
+  color: var(--ink);
+}
+.ops-subblock {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ask-issue-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg-sunken);
+}
+.ask-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.ops-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  color: var(--ink);
+  font-size: 12px;
+}

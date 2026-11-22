@@ -5,7 +5,9 @@ import {
   CheckCircle2,
   Coins,
   GitMerge,
+  Link2,
   ListChecks,
+  Paperclip,
   Settings2,
   ShieldAlert,
   Sparkles,
@@ -18,6 +20,7 @@ import { api, type DoctorReport } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
 import { Field, Problem, useAction, useLoad } from "../ui";
+import { toast } from "../overlay";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { ProviderLogo, providerName } from "../providers/logos";
@@ -52,6 +55,11 @@ export function NewRun() {
   const [yes, setYes] = useState(false);
   const [remember, setRemember] = useState(false);
   const [budgetCap, setBudgetCap] = useState<string>("");
+  const [issueOpen, setIssueOpen] = useState(false);
+  const [issueUrl, setIssueUrl] = useState("");
+  const [importingIssue, setImportingIssue] = useState(false);
+  const [stagedFiles, setStagedFiles] = useState<{ name: string; mime: string; data_base64: string; bytes: number }[]>([]);
+  const fileInput = useRef<HTMLInputElement>(null);
   const { choice, setSeat, missing, fresh } = useChoice(settings.data);
   const composer = useRef<ComposerHandle>(null);
   const action = useAction();
@@ -87,6 +95,53 @@ export function NewRun() {
     if (settings.data && missing.length) setAdvanced(true);
   }, [settings.data, missing.length]);
 
+  const importIssue = async () => {
+    const raw = issueUrl.trim();
+    if (!raw) return;
+    setImportingIssue(true);
+    try {
+      let res;
+      try {
+        res = await api.parseIssue(raw, true);
+      } catch {
+        res = await api.parseIssue(raw, false);
+      }
+      const nextPrompt =
+        res.prompt ??
+        `Resolve issue ${res.closing_link}\n\nAdd a regression test that reproduces the issue before verifying the fix.`;
+      composer.current?.setText(nextPrompt);
+      setIssueOpen(false);
+      setIssueUrl("");
+      toast("Issue imported", res.closing_link, 2500);
+    } catch (err) {
+      toast("Invalid issue URL", err instanceof Error ? err.message : String(err));
+    } finally {
+      setImportingIssue(false);
+    }
+  };
+
+  const onAttachFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const next: { name: string; mime: string; data_base64: string; bytes: number }[] = [];
+    for (const file of Array.from(files)) {
+      if (file.size > 4 * 1024 * 1024) {
+        toast("Attachment too large", `${file.name} exceeds 4 MB`);
+        continue;
+      }
+      const buf = await file.arrayBuffer();
+      let binary = "";
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i] ?? 0);
+      next.push({
+        name: file.name,
+        mime: file.type || "application/octet-stream",
+        data_base64: btoa(binary),
+        bytes: file.size,
+      });
+    }
+    if (next.length > 0) setStagedFiles((prev) => [...prev, ...next]);
+  };
+
   const submit = (message?: Message) => {
     const m = message ?? composer.current?.read();
     if (!m) return;
@@ -110,6 +165,10 @@ export function NewRun() {
       const parsedCap = budgetCap.trim() ? Number(budgetCap.trim()) : undefined;
       const max_cost_usd = parsedCap && Number.isFinite(parsedCap) && parsedCap > 0 ? parsedCap : undefined;
       const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models, max_cost_usd });
+      for (const att of stagedFiles) {
+        await api.addAttachment(id, { name: att.name, mime: att.mime, data_base64: att.data_base64 }).catch(() => {});
+      }
+      setStagedFiles([]);
       void afterStart(choice, settings.data, remember);
       runStarted(id);
       composer.current?.clear();
@@ -234,11 +293,70 @@ export function NewRun() {
             </div>
           }
         />
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          accept="image/*,.txt,.md,.json,.log,.csv"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            void onAttachFiles(e.target.files);
+            e.target.value = "";
+          }}
+        />
+        {stagedFiles.length > 0 && (
+          <div className="ask-attachments" data-testid="staged-attachments">
+            {stagedFiles.map((f, idx) => (
+              <span key={`${f.name}-${idx}`} className="ops-chip">
+                <Paperclip size={11} aria-hidden />
+                <span className="mono">{f.name}</span>
+                <button
+                  type="button"
+                  className="icon"
+                  aria-label={`Remove ${f.name}`}
+                  onClick={() => setStagedFiles((prev) => prev.filter((_, i) => i !== idx))}
+                >
+                  <X size={11} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        {issueOpen && (
+          <form
+            className="ask-issue-bar"
+            data-testid="issue-import-bar"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void importIssue();
+            }}
+          >
+            <input
+              className="grow mono"
+              placeholder="Paste GitHub or GitLab issue URL (e.g. https://github.com/org/repo/issues/42)"
+              value={issueUrl}
+              onChange={(e) => setIssueUrl(e.target.value)}
+              autoFocus
+            />
+            <button className="small" disabled={importingIssue || !issueUrl.trim()}>
+              {importingIssue ? "Importing…" : "Import"}
+            </button>
+            <button type="button" className="icon" onClick={() => setIssueOpen(false)} aria-label="Close issue import">
+              <X size={14} />
+            </button>
+          </form>
+        )}
         <div className="ask-options">
           <label className={`toggle-chip ${yes ? "on" : ""}`}>
             <input type="checkbox" checked={yes} onChange={(e) => setYes(e.target.checked)} />
             Build without asking me to approve the plan
           </label>
+          <button type="button" className="ghost small" onClick={() => setIssueOpen((v) => !v)} aria-expanded={issueOpen}>
+            <Link2 size={13} aria-hidden /> Import issue
+          </button>
+          <button type="button" className="ghost small" onClick={() => fileInput.current?.click()}>
+            <Paperclip size={13} aria-hidden /> Attach
+          </button>
           <button type="button" className="ghost small" onClick={() => setAdvanced((v) => !v)} aria-expanded={advanced}>
             <Settings2 size={13} aria-hidden /> Options
           </button>

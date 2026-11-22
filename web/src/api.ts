@@ -875,6 +875,136 @@ export interface RunBundle {
   };
 }
 
+export interface MonthlySpendReport {
+  current_month: string;
+  current_month_usd: number;
+  alert_threshold_usd?: number | null;
+  alert_triggered: boolean;
+  by_month: Record<string, number>;
+  total_runs: number;
+  total_calls: number;
+}
+
+export interface EgressEntry {
+  at: string;
+  run_id?: string | null;
+  host: string;
+  url: string;
+  allowed: boolean;
+  reason?: string | null;
+}
+
+export interface GcReport {
+  removed_runs: string[];
+  kept_runs: number;
+  worktrees_pruned: boolean;
+  bytes_freed: number;
+}
+
+export interface RemoteNode {
+  id: string;
+  name: string;
+  url: string;
+  kind: string;
+  labels: string[];
+  max_parallel: number;
+  enabled: boolean;
+  has_token: boolean;
+}
+
+export interface NodeHealth {
+  id: string;
+  reachable: boolean;
+  latency_ms: number;
+  version?: string | null;
+  error?: string | null;
+}
+
+export interface UserMcpServer {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  secret_env_keys: string[];
+  roles: string[];
+  enabled: boolean;
+  require_approval: boolean;
+}
+
+export interface NotificationConfig {
+  desktop: boolean;
+  webhook_url?: string | null;
+  on_approval: boolean;
+  on_limit: boolean;
+  on_finish: boolean;
+}
+
+export interface ScheduledRun {
+  id: string;
+  name: string;
+  schedule: string;
+  prompt: string;
+  enabled: boolean;
+  auto_approve: boolean;
+  max_cost_usd?: number | null;
+  last_run_at?: string | null;
+  last_run_id?: string | null;
+}
+
+export interface IssueParseResult {
+  issue: {
+    host?: string;
+    owner?: string;
+    repo?: string;
+    number?: number;
+    url?: string;
+    title?: string;
+    body?: string;
+    labels?: string[];
+    issue?: { host: string; owner: string; repo: string; number: number; url: string };
+  };
+  prompt?: string;
+  closing_link: string;
+}
+
+export interface AttachmentMeta {
+  id: string;
+  name: string;
+  mime: string;
+  bytes: number;
+  relative_path: string;
+}
+
+export interface CiCheck {
+  name: string;
+  state: string;
+  detail?: string | null;
+  url?: string | null;
+}
+
+export interface PrSyncReport {
+  checks: CiCheck[];
+  failing_checks: number;
+  comments_synced: number;
+  queued_notes: { target: string; text: string }[];
+}
+
+export interface StratifiedSlice {
+  difficulty: string;
+  language: string;
+  models: ModelScore[];
+  recommended?: string | null;
+}
+
+export interface EvalSuiteTask {
+  id: string;
+  category: string;
+  language: string;
+  difficulty: string;
+  prompt: string;
+  hidden_test_file: string;
+}
+
 export function searchWeb(q: string, endpoint: string) {
   const params = new URLSearchParams({ q });
   if (endpoint) params.set("endpoint", endpoint);
@@ -1021,6 +1151,55 @@ export const api = {
   reviewRun: (id: string) => call<{ id: string }>("POST", `/api/runs/${enc(id)}/review`, {}),
   cancelReview: (id: string) => call<{ id: string }>("POST", `/api/reviews/${enc(id)}/cancel`, {}),
   createReview: (body: NewReview) => call<{ id: string }>("POST", "/api/reviews", body),
+
+  // Phase 2-5 operations & workflow endpoints
+  monthlySpend: (threshold?: number) =>
+    call<{ spend: MonthlySpendReport }>("GET", `/api/metrics/spend${threshold != null ? `?threshold=${threshold}` : ""}`).then((r) => r.spend),
+  egressLog: (limit = 100) =>
+    call<{ entries: EgressEntry[] }>("GET", `/api/egress?limit=${limit}`).then((r) => r.entries),
+  runGc: (body?: { max_runs?: number; max_age_days?: number; prune_worktrees?: boolean }) =>
+    call<{ gc: GcReport }>("POST", "/api/gc", body ?? {}).then((r) => r.gc),
+  runners: () => call<{ runners: RemoteNode[] }>("GET", "/api/runners").then((r) => r.runners),
+  upsertRunner: (body: { id?: string; name: string; url: string; labels?: string[]; max_parallel?: number; enabled?: boolean; token?: string }) =>
+    call<{ runner: RemoteNode }>("POST", "/api/runners", body).then((r) => r.runner),
+  removeRunner: (id: string) => call<{ removed: boolean }>("POST", `/api/runners/${enc(id)}/remove`, {}),
+  probeRunner: (id: string) => call<{ health: NodeHealth }>("POST", `/api/runners/${enc(id)}/probe`, {}).then((r) => r.health),
+  environments: () => call<{ environments: RemoteNode[] }>("GET", "/api/environments").then((r) => r.environments),
+  upsertEnvironment: (body: { id?: string; name: string; url: string; labels?: string[]; max_parallel?: number; enabled?: boolean; token?: string }) =>
+    call<{ environment: RemoteNode }>("POST", "/api/environments", body).then((r) => r.environment),
+  removeEnvironment: (id: string) => call<{ removed: boolean }>("POST", `/api/environments/${enc(id)}/remove`, {}),
+  mcpServers: () => call<{ servers: UserMcpServer[] }>("GET", "/api/mcp").then((r) => r.servers),
+  upsertMcp: (body: { name: string; command: string; args?: string[]; env?: Record<string, string>; secret_env?: Record<string, string>; roles?: string[]; enabled?: boolean; require_approval?: boolean }) =>
+    call<{ server: UserMcpServer }>("POST", "/api/mcp", body).then((r) => r.server),
+  removeMcp: (name: string) => call<{ removed: boolean }>("POST", `/api/mcp/${enc(name)}/remove`, {}),
+  notifications: () => call<{ notifications: NotificationConfig }>("GET", "/api/notifications").then((r) => r.notifications),
+  updateNotifications: (cfg: NotificationConfig) =>
+    call<{ notifications: NotificationConfig }>("POST", "/api/notifications", cfg).then((r) => r.notifications),
+  testNotification: () => call<{ sent: boolean }>("POST", "/api/notifications/test", {}),
+  schedules: () => call<{ schedules: ScheduledRun[] }>("GET", "/api/schedules").then((r) => r.schedules),
+  upsertSchedule: (body: { id?: string; name: string; schedule: string; prompt: string; enabled?: boolean; auto_approve?: boolean; max_cost_usd?: number }) =>
+    call<{ schedule: ScheduledRun }>("POST", "/api/schedules", body).then((r) => r.schedule),
+  toggleSchedule: (id: string, enabled: boolean) =>
+    call<{ schedule: ScheduledRun }>("POST", `/api/schedules/${enc(id)}/toggle`, { enabled }).then((r) => r.schedule),
+  removeSchedule: (id: string) => call<{ removed: boolean }>("POST", `/api/schedules/${enc(id)}/remove`, {}),
+  parseIssue: (url: string, fetch = false) =>
+    call<IssueParseResult>("POST", "/api/issues/parse", { url, fetch }),
+  attachments: (id: string) =>
+    call<{ attachments: AttachmentMeta[] }>("GET", `/api/runs/${enc(id)}/attachments`).then((r) => r.attachments),
+  addAttachment: (id: string, body: { name: string; mime?: string; data_base64: string }) =>
+    call<{ attachment: AttachmentMeta }>("POST", `/api/runs/${enc(id)}/attachments`, body).then((r) => r.attachment),
+  prStatus: (id: string, pr?: string) =>
+    call<{ checks: CiCheck[] }>("GET", `/api/runs/${enc(id)}/pr/status${pr ? `?pr=${enc(pr)}` : ""}`).then((r) => r.checks),
+  prSync: (id: string, body?: { pr?: string; checks?: CiCheck[]; comments?: { path: string; line?: number; author: string; body: string }[] }) =>
+    call<{ sync: PrSyncReport }>("POST", `/api/runs/${enc(id)}/pr/sync`, body ?? {}).then((r) => r.sync),
+  stratifiedScorecard: (difficulty?: string, language?: string) => {
+    const params = new URLSearchParams();
+    if (difficulty) params.set("difficulty", difficulty);
+    if (language) params.set("language", language);
+    const qs = params.toString();
+    return call<{ slices: StratifiedSlice[]; auto_route?: ModelScore | null }>("GET", `/api/scorecard/stratified${qs ? `?${qs}` : ""}`);
+  },
+  evalSuite: () => call<{ tasks: EvalSuiteTask[] }>("GET", "/api/eval/suite").then((r) => r.tasks),
 };
 
 /**

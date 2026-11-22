@@ -29,6 +29,24 @@ if command -v npm >/dev/null; then
 else
   echo "npm is not installed, so the app was not built; serve shows its small built-in page" >&2
 fi
+case "$(uname -s)" in
+  Linux)
+    if [ -f scripts/taskmaster.service ]; then
+      svc_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+      mkdir -p "$svc_dir"
+      install -m 644 scripts/taskmaster.service "$svc_dir/taskmaster.service"
+      echo "installed systemd user unit in $svc_dir/taskmaster.service"
+    fi
+    ;;
+  Darwin)
+    if [ -f scripts/com.taskmaster.daemon.plist ]; then
+      plist_dir="$HOME/Library/LaunchAgents"
+      mkdir -p "$plist_dir"
+      install -m 644 scripts/com.taskmaster.daemon.plist "$plist_dir/com.taskmaster.daemon.plist"
+      echo "installed launchd agent in $plist_dir/com.taskmaster.daemon.plist"
+    fi
+    ;;
+esac
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "add $dir to your PATH to run them by name" ;;

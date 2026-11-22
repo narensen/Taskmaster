@@ -12,13 +12,14 @@ import {
   GitFork,
   GitPullRequest,
   MessageSquarePlus,
+  RefreshCw,
   RotateCcw,
   Search,
   Send,
   ShieldCheck,
   X,
 } from "lucide-react";
-import { api, type DiffStats, type ReviewJob, type RunDetail } from "../api";
+import { api, type DiffStats, type PrSyncReport, type ReviewJob, type RunDetail } from "../api";
 import { toast } from "../overlay";
 import { ExternalLink } from "../paths";
 import { navigate } from "../router";
@@ -54,6 +55,7 @@ export function ReviewLens({
 
   // Ship actions
   const [prUrl, setPrUrl] = useState<string | null>(null);
+  const [prSyncReport, setPrSyncReport] = useState<PrSyncReport | null>(null);
   const [reviewJob, setReviewJob] = useState<ReviewJob | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
@@ -143,6 +145,26 @@ export function ReviewLens({
     }
   };
 
+  const syncPr = async () => {
+    setBusyAction("pr-sync");
+    try {
+      const report = await api.prSync(id);
+      setPrSyncReport(report);
+      toast(
+        "PR CI synced",
+        report.failing_checks > 0
+          ? `${report.failing_checks} failing check(s) routed to owning units`
+          : `${report.checks.length} check(s) inspected`,
+        3000,
+      );
+      if (report.queued_notes.length > 0) onReload();
+    } catch (err) {
+      toast("PR sync failed", err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const undoMerge = async () => {
     setBusyAction("undo");
     try {
@@ -211,6 +233,11 @@ export function ReviewLens({
           <button type="button" className="small" disabled={busyAction !== null} onClick={() => void runReview()}>
             <ShieldCheck size={13} aria-hidden /> {busyAction === "review" ? "Starting…" : "AI Review"}
           </button>
+          {detail.plan && (
+            <button type="button" className="ghost small" disabled={busyAction !== null} onClick={() => void syncPr()}>
+              <RefreshCw size={13} aria-hidden /> {busyAction === "pr-sync" ? "Syncing…" : "Sync PR CI"}
+            </button>
+          )}
           <button type="button" className="ghost small" disabled={busyAction !== null} onClick={() => void forkRun()}>
             <GitFork size={13} aria-hidden /> Fork
           </button>
@@ -227,6 +254,21 @@ export function ReviewLens({
           {prUrl && <ExternalLink href={prUrl}>Open PR</ExternalLink>}
         </div>
       </header>
+
+      {prSyncReport && (
+        <div className="review-banner" data-testid="pr-sync-banner">
+          <RefreshCw size={14} aria-hidden />
+          <span>
+            PR CI: <strong>{prSyncReport.checks.length}</strong> check(s),{" "}
+            <strong>{prSyncReport.failing_checks}</strong> failing
+            {prSyncReport.queued_notes.length > 0 && ` · queued ${prSyncReport.queued_notes.length} repair note(s)`}
+          </span>
+          <span className="grow" />
+          <button type="button" className="icon" onClick={() => setPrSyncReport(null)} aria-label="Dismiss PR sync">
+            <X size={13} />
+          </button>
+        </div>
+      )}
 
       {reviewJob && (
         <div className="review-banner">

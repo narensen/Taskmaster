@@ -94,8 +94,10 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
           {view.output && <pre>{view.output}</pre>}
         </div>
       )}
-      {frame && live && view.url && (
+      {/* Only once it answers: a frame loaded while the server is starting stays broken. */}
+      {frame && view.state === "running" && view.url && (
         <iframe
+          key={`${view.url}:${view.started ?? ""}`}
           className="live-preview-frame"
           title="Live preview"
           src={view.url}

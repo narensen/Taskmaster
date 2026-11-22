@@ -473,7 +473,8 @@ export function MissionLens({
                 </div>
                 <GlobFiles glob={p.owned_glob} max={4} interactive={false} edited={node.surface?.summary.editedFiles} className="dag-node-files" />
                 <div className="dag-node-brief">
-                  {node.surface?.summary.headline || p.brief}
+                  {/* Until its agent's transcript has loaded, a unit shows its brief, not "Queued". */}
+                  {(node.surface && node.surface.calls.length > 0 ? node.surface.summary.headline : "") || p.brief}
                 </div>
                 <div className="dag-node-foot mono">
                   <span>{st ?? "queued"}</span>

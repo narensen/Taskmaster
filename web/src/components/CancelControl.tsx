@@ -1,14 +1,14 @@
 // Sophisticated 2-mode run stop control:
 // - Prevents accidental 1-click run destruction while workers are building.
-// - Offers Graceful stop ("finish current step, then stop") vs Immediate force stop
-//   (with inline 2-step arm confirmation during active builds).
+// - "Stop now" ends the run at once: agents, checks and sandboxes stop, spinners and
+//   clocks stop with them. "Finish current step, then stop" is the slower second choice.
 // - Shows a live draining pill with 1-click escalation to Force stop.
 // - Includes a targeted per-worker Restart escape hatch right inside the menu so a
 //   single stuck worker can be bounced without cancelling the whole run.
 
 import * as Popover from "@radix-ui/react-popover";
 import { ChevronDown, Clock, GitBranch, Loader2, RotateCw, Square, Zap } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type CancelMode, type RunDetail } from "../api";
 import { phaseLabel, spendLabel, usd } from "../format";
 import { toast } from "../overlay";
@@ -43,10 +43,8 @@ export function CancelControl({
   onRestartWorker?: (page: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [armedForce, setArmedForce] = useState(false);
   const [busy, setBusy] = useState<CancelMode | null>(null);
   const [localMode, setLocalMode] = useState<CancelMode | null>(null);
-  const armTimer = useRef<number | null>(null);
 
   const effectiveMode: CancelMode | null = detail.active ? (detail.cancelling ?? localMode) : null;
 
@@ -54,7 +52,6 @@ export function CancelControl({
   useEffect(() => {
     setLocalMode(null);
     setBusy(null);
-    setArmedForce(false);
     setOpen(false);
   }, [id]);
 
@@ -62,23 +59,9 @@ export function CancelControl({
     if (!detail.active || detail.cancelled) {
       setLocalMode(null);
       setBusy(null);
-      setArmedForce(false);
       setOpen(false);
     }
   }, [detail.active, detail.cancelled]);
-
-  // Reset inline force-arm confirmation when popover closes or after 6 seconds.
-  useEffect(() => {
-    if (!open) setArmedForce(false);
-  }, [open]);
-
-  useEffect(() => {
-    if (!armedForce) return;
-    armTimer.current = window.setTimeout(() => setArmedForce(false), 6000);
-    return () => {
-      if (armTimer.current !== null) window.clearTimeout(armTimer.current);
-    };
-  }, [armedForce]);
 
   // Close popover on viewport resize so it never detaches awkwardly.
   useEffect(() => {
@@ -89,7 +72,6 @@ export function CancelControl({
   }, [open]);
 
   const canGraceful = detail.active && detail.phase === "building";
-  const needsForceArm = detail.active && (detail.phase === "building" || activeWorkers.length > 0);
   const shortcut = useMemo(() => (isMac() ? "⌘." : "Ctrl+."), []);
 
   const passedCount = useMemo(() => detail.pages.filter((p) => p.state === "passed").length, [detail.pages]);
@@ -99,7 +81,6 @@ export function CancelControl({
     async (mode: CancelMode) => {
       if (busy) return;
       setBusy(mode);
-      setArmedForce(false);
       try {
         const res = await api.cancel(id, mode);
         const applied = res?.mode ?? mode;
@@ -173,18 +154,13 @@ export function CancelControl({
   }
 
   const workerCount = activeWorkers.length;
-  const forceTitle =
-    detail.phase === "awaiting_approval"
-      ? "Cancel run"
-      : detail.phase === "planning"
-        ? "Stop planning now"
-        : "Stop immediately";
+  const forceTitle = detail.phase === "awaiting_approval" ? "Cancel run" : "Stop now";
   const forceDesc =
     detail.phase === "awaiting_approval"
       ? "Discard this draft plan before any files are changed."
       : detail.phase === "planning"
-        ? "Interrupt planning immediately and close the session."
-        : "Aborts active agents, sandboxes, and worktrees now. Passed pages stay resumable.";
+        ? "Ends planning and closes the session."
+        : "Ends every agent, check and sandbox now. Passed pages stay; Resume picks up the rest.";
 
   // State A: Normal trigger + sophisticated Popover menu
   return (
@@ -243,7 +219,25 @@ export function CancelControl({
               </div>
 
               <div className="cancel-actions">
-                {canGraceful && (
+                <button
+                  type="button"
+                  className="cancel-opt cancel-opt-force"
+                  disabled={busy !== null}
+                  data-testid="cancel-force"
+                  onClick={() => void sendCancel("force")}
+                >
+                  {busy === "force" ? (
+                    <Loader2 size={14} className="spin-ico cancel-opt-ico" aria-hidden />
+                  ) : (
+                    <Square size={13} strokeWidth={2.2} className="cancel-opt-ico" aria-hidden />
+                  )}
+                  <span className="cancel-opt-body">
+                    <span className="cancel-opt-title">{forceTitle}</span>
+                    <span className="cancel-opt-desc">{forceDesc}</span>
+                  </span>
+                </button>
+
+                {canGraceful && workerCount > 0 && (
                   <button
                     type="button"
                     className="cancel-opt"
@@ -255,67 +249,8 @@ export function CancelControl({
                     <span className="cancel-opt-body">
                       <span className="cancel-opt-title">Finish current step, then stop</span>
                       <span className="cancel-opt-desc">
-                        Stops queued units now; lets{" "}
-                        {workerCount > 0
-                          ? `${workerCount} active worker${workerCount === 1 ? "" : "s"}`
-                          : "in-flight work"}{" "}
-                        finish and save cleanly.
+                        Stops queued units now; lets {workerCount} active worker{workerCount === 1 ? "" : "s"} finish and save.
                       </span>
-                    </span>
-                  </button>
-                )}
-
-                {armedForce ? (
-                  <div className="cancel-arm" role="alert" data-testid="cancel-force-confirm">
-                    <div className="cancel-arm-copy">
-                      <span className="cancel-arm-title">Abort in-flight work now?</span>
-                      <span className="cancel-arm-desc">
-                        Active workers stop immediately.{" "}
-                        {passedCount > 0
-                          ? `${passedCount} passed ${passedCount === 1 ? "page stays" : "pages stay"} resumable.`
-                          : "You can resume this run later."}
-                      </span>
-                    </div>
-                    <div className="cancel-arm-btns">
-                      <button
-                        type="button"
-                        className="ghost small"
-                        disabled={busy !== null}
-                        onClick={() => setArmedForce(false)}
-                      >
-                        Keep running
-                      </button>
-                      <button
-                        type="button"
-                        className="small cancel-arm-go"
-                        disabled={busy !== null}
-                        data-testid="cancel-force-submit"
-                        onClick={() => void sendCancel("force")}
-                      >
-                        {busy === "force" ? (
-                          <Loader2 size={12} className="spin-ico" aria-hidden />
-                        ) : (
-                          <Zap size={12} aria-hidden />
-                        )}
-                        <span>Confirm stop</span>
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    className="cancel-opt cancel-opt-force"
-                    disabled={busy !== null}
-                    data-testid="cancel-force"
-                    onClick={() => {
-                      if (needsForceArm) setArmedForce(true);
-                      else void sendCancel("force");
-                    }}
-                  >
-                    <Zap size={14} strokeWidth={1.8} className="cancel-opt-ico" aria-hidden />
-                    <span className="cancel-opt-body">
-                      <span className="cancel-opt-title">{forceTitle}</span>
-                      <span className="cancel-opt-desc">{forceDesc}</span>
                     </span>
                   </button>
                 )}

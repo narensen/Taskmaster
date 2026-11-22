@@ -23,6 +23,7 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  Square,
   Trash2,
   X,
 } from "lucide-react";
@@ -38,7 +39,10 @@ import {
 } from "../api";
 import { usd } from "../format";
 import { toast } from "../overlay";
-import type { Surface } from "./model";
+import { GlobFiles } from "./GlobFiles";
+import { shownPageState, type Surface } from "./model";
+
+type ShownState = PageState | "stopped" | undefined;
 
 interface DagNode {
   page: PagePlan;
@@ -51,7 +55,7 @@ interface DagNode {
 }
 
 const NODE_W = 248;
-const NODE_H = 122;
+const NODE_H = 148;
 const COL_GAP = 76;
 const ROW_GAP = 22;
 const PAD_X = 26;
@@ -79,7 +83,8 @@ function computeLayers(pages: PagePlan[]): Map<string, number> {
   return memo;
 }
 
-function statusClass(state: PageState | undefined): string {
+function statusClass(state: ShownState): string {
+  if (state === "stopped") return "st-stopped";
   if (state === "passed") return "st-passed";
   if (state === "building") return "st-building";
   if (state === "flagged") return "st-flagged";
@@ -87,7 +92,8 @@ function statusClass(state: PageState | undefined): string {
   return "st-queued";
 }
 
-function StateGlyph({ state }: { state: PageState | undefined }) {
+function StateGlyph({ state }: { state: ShownState }) {
+  if (state === "stopped") return <Square size={11} strokeWidth={2.2} className="dag-ico stopped" aria-hidden />;
   if (state === "passed") return <CheckCircle2 size={14} className="dag-ico passed" aria-hidden />;
   if (state === "building") return <Loader2 size={14} className="dag-ico building spin-ico" aria-hidden />;
   if (state === "flagged") return <AlertTriangle size={14} className="dag-ico flagged" aria-hidden />;
@@ -228,7 +234,7 @@ export function MissionLens({
       for (const dep of n.page.depends_on ?? []) {
         const src = nodeById.get(dep);
         if (!src) continue;
-        const st = src.view?.state;
+        const st = shownPageState(src.view?.state, detail);
         const tone = st === "passed" ? "edge-passed" : st === "failed" ? "edge-failed" : st === "building" ? "edge-building" : "edge-queued";
         edges.push({
           key: `${dep}->${n.page.id}`,
@@ -238,7 +244,7 @@ export function MissionLens({
         });
       }
       if (!dependents.has(n.page.id)) {
-        const st = n.view?.state;
+        const st = shownPageState(n.view?.state, detail);
         const tone = st === "passed" ? "edge-passed" : st === "failed" ? "edge-failed" : st === "building" ? "edge-building" : "edge-queued";
         edges.push({
           key: `${n.page.id}->verify`,
@@ -261,7 +267,7 @@ export function MissionLens({
       totalW,
       totalH,
     };
-  }, [activePlan, detail.pages, surfaces]);
+  }, [activePlan, detail, surfaces]);
 
   const selected = selectedId ? graph.nodeById.get(selectedId) ?? null : null;
 
@@ -330,7 +336,7 @@ export function MissionLens({
   }
 
   const passedCount = detail.pages.filter((p) => p.state === "passed").length;
-  const buildingCount = detail.pages.filter((p) => p.state === "building").length;
+  const buildingCount = detail.pages.filter((p) => shownPageState(p.state, detail) === "building").length;
   const failedCount = detail.pages.filter((p) => p.state === "failed" || p.state === "flagged").length;
 
   return (
@@ -436,7 +442,7 @@ export function MissionLens({
           {/* Parallel Unit Nodes */}
           {graph.nodes.map((node) => {
             const p = node.page;
-            const st = node.view?.state;
+            const st = shownPageState(node.view?.state, detail);
             const diff = diffStats?.pages[p.id];
             const isSel = selectedId === p.id;
             const diffBadge = p.difficulty?.toLowerCase();
@@ -465,9 +471,7 @@ export function MissionLens({
                     )}
                   </span>
                 </div>
-                <div className="dag-node-glob mono clip" title={p.owned_glob}>
-                  {p.owned_glob}
-                </div>
+                <GlobFiles glob={p.owned_glob} max={4} interactive={false} edited={node.surface?.summary.editedFiles} className="dag-node-files" />
                 <div className="dag-node-brief">
                   {node.surface?.summary.headline || p.brief}
                 </div>
@@ -534,9 +538,8 @@ export function MissionLens({
         <section className="mission-drawer" aria-label={`Unit ${selected.page.id} details`}>
           <header className="mission-drawer-head">
             <div className="row gap">
-              <StateGlyph state={selected.view?.state} />
+              <StateGlyph state={shownPageState(selected.view?.state, detail)} />
               <h3>{selected.page.id}</h3>
-              <code className="mono small muted">{selected.page.owned_glob}</code>
               {selected.page.difficulty && <span className="studio-pill tone-violet">{selected.page.difficulty}</span>}
               {selected.view?.tier && <span className="studio-pill tone-muted">tier: {selected.view.tier}</span>}
             </div>
@@ -567,6 +570,8 @@ export function MissionLens({
 
           <div className="mission-drawer-grid">
             <div className="mission-drawer-col">
+              <div className="mission-field-label">Files</div>
+              <GlobFiles glob={selected.page.owned_glob} edited={selected.surface?.summary.editedFiles} className="mission-drawer-files" />
               <div className="mission-field-label">Brief</div>
               <p className="mission-drawer-text">{selected.page.brief}</p>
               {selected.page.done && (

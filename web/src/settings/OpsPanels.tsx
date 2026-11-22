@@ -14,10 +14,14 @@ import { toast } from "../overlay";
 
 function OpsSection({ id, title, note, children }: { id: string; title: string; note?: string; children: ReactNode }) {
   return (
-    <section id={id} className="section">
-      <h2>{title}</h2>
-      {note && <p className="muted small section-note">{note}</p>}
-      {children}
+    <section id={id} className="settings-section" aria-labelledby={`h-${id}`}>
+      <div className="settings-head">
+        <h2 className="section-title" id={`h-${id}`}>
+          {title}
+        </h2>
+        {note && <p className="muted small">{note}</p>}
+      </div>
+      <div className="settings-body">{children}</div>
     </section>
   );
 }

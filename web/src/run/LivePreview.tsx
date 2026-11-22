@@ -1,5 +1,7 @@
 // The run's live preview: its dev server, started on request and stopped with the run.
-// Not the file preview tab (a code table); this is the running app.
+// Not the file preview tab (a code table); this is the running app. It always opens: the
+// daemon falls back to serving the project's files when there is no dev server, or when
+// the dev server dies, and says so here.
 
 import { useCallback, useEffect, useState } from "react";
 import { MonitorPlay, Play, Square, ExternalLink as Out } from "lucide-react";
@@ -13,8 +15,10 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
   const [busy, setBusy] = useState(false);
   const [frame, setFrame] = useState(false);
   const live = view?.state === "starting" || view?.state === "running";
-  const building = detail.phase === "planning" || detail.phase === "awaiting_approval";
-  const reason = building ? "Nothing to preview until the run has started building." : detail.active ? "The run is still building; preview it when it stops." : null;
+  const passed = detail.pages.some((p) => p.state === "passed");
+  const building = (detail.phase === "planning" || detail.phase === "awaiting_approval") && !passed;
+  const reason = building ? "Nothing to preview until the run has started building." : null;
+  const hint = !building && detail.active ? "The run is still building: the preview shows what has passed so far." : null;
 
   const load = useCallback(() => {
     api.preview(id).then(setView).catch(() => {});
@@ -31,13 +35,13 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
     return () => window.clearInterval(t);
   }, [live, load]);
 
-  if (!view || !view.available) return null;
+  if (!view) return null;
 
   const act = async (start: boolean) => {
     setBusy(true);
     try {
       setView(await (start ? api.startPreview(id) : api.stopPreview(id)));
-      if (!start) setFrame(false);
+      setFrame(start);
     } catch (err) {
       toast(start ? "The preview did not start" : "The preview did not stop", err instanceof Error ? err.message : String(err));
       load();
@@ -81,6 +85,8 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
         </div>
       </div>
       {!live && reason && <div className="muted small">{reason}</div>}
+      {hint && <div className="muted small">{hint}</div>}
+      {live && view.reason && <div className="small lp-note" data-testid="live-preview-note">{view.reason}</div>}
       {view.command && <div className="muted small clip mono lp-cmd">$ {view.command}</div>}
       {view.state === "failed" && (
         <div className="live-preview-fail small" data-testid="live-preview-failure">

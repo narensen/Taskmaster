@@ -1,9 +1,9 @@
-// Home: a chatbox to start a run, the most recently used run cards in a strip, and a
-// Show all popup for the rest. A card still shows the latest screenshot or a typed frame.
-// Nothing here scans the disk.
+// Home: a chatbox that starts a new project (or a clone), the open project's recent run
+// cards in a strip, and a Show all popup for the rest. A new run in the open project starts
+// from inside it (/runs/new), not here. Nothing here scans the disk.
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
 import { api, callAt, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
@@ -23,8 +23,23 @@ import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
 import { consumeCloneRequest } from "../commands";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
+import { ModePicker, useRunMode } from "../components/ModePicker";
 import { openProject } from "../openProject";
 import { Problem, useAction, useLoad } from "../ui";
+
+const FILLER = new Set(["a", "an", "the", "with", "and", "for", "of", "to", "in", "on", "my", "our", "that", "which", "where", "build", "make", "create", "me", "please", "simple", "small", "tiny", "new", "using", "it", "is", "has", "have"]);
+
+/** A folder name from a project's description: its first few telling words. */
+export function folderName(prompt: string): string {
+  const words = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !FILLER.has(w))
+    .slice(0, 3);
+  const name = words.join("-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+  return name || `project-${Date.now().toString(36).slice(-5)}`;
+}
 
 /** A name the View Transitions API accepts for a run, shared by its card and its page. */
 export function morphName(id: string): string {
@@ -286,8 +301,7 @@ export function Gallery() {
   const daemons = [...p.daemons].sort((a, b) => Number(b.pinned) - Number(a.pinned));
   const project = settings.data?.project;
   const name = project ? project.split(/[/\\]/).filter(Boolean).pop() ?? project : null;
-  const projectLabel = name ?? null;
-  const branch = settings.data?.branch ?? null;
+  const workspace = settings.data?.workspace?.replace(/[/\\]$/, "") ?? null;
   const access = approvalLabel(settings.data?.approvals?.mode);
   const { choice, setSeat, missing, fresh } = useChoice(settings.data);
   const [remember, setRemember] = useState(false);
@@ -309,7 +323,8 @@ export function Gallery() {
   const composer = useRef<ComposerHandle>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [allOpen, setAllOpen] = useState(false);
-  const [mode, setMode] = useState<"this" | "new" | "clone">("this");
+  const [mode, setMode] = useState<"new" | "clone">("new");
+  const [runMode, setRunMode] = useRunMode();
   const [newName, setNewName] = useState("");
   const [cloneUrl, setCloneUrl] = useState("");
   const [cloneName, setCloneName] = useState("");
@@ -329,10 +344,6 @@ export function Gallery() {
     window.addEventListener("taskmaster-clone", open);
     return () => window.removeEventListener("taskmaster-clone", open);
   }, []);
-
-  useEffect(() => {
-    if (settings.data && !settings.data.project) setMode("new");
-  }, [settings.data]);
 
   const onStripKey = (e: ReactKeyboardEvent) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -363,22 +374,26 @@ export function Gallery() {
       }
       const { roles, models: chosen } = toRequest(choice);
       const parallel = resolvePages(pages, max ?? 32);
-      if (mode === "new") {
-        const name = newName.trim();
-        if (!name) throw new Error("Name the folder first.");
-        const created = await api.createProject({ name, prompt, roles, models: chosen, parallel });
-        if (!created.id) throw new Error("The project was created, but the first run did not start.");
-        void afterStart(choice, settings.data, true);
-        runStarted(created.id);
-        composer.current?.clear();
-        navigate(`/runs/${encodeURIComponent(created.id)}`);
-        return;
+      // The folder is named for the description unless a name was given; a taken name gets a number.
+      const typed = newName.trim();
+      const base = typed || folderName(prompt);
+      let created: { project: string; id?: string } | null = null;
+      for (let n = 1; n <= 6 && !created; n++) {
+        const name = n === 1 ? base : `${base}-${n}`;
+        try {
+          created = await api.createProject({ name, prompt, roles, models: chosen, parallel, mode: runMode });
+        } catch (err) {
+          const taken = err instanceof Error && /already exists/.test(err.message);
+          if (!taken || typed) throw err;
+        }
       }
-      const { id } = await api.createRun({ prompt, roles, models: chosen, parallel });
-      void afterStart(choice, settings.data, remember);
-      runStarted(id);
+      if (!created) throw new Error(`Folders named ${base} already exist. Give the project a name.`);
+      if (!created.id) throw new Error("The project was created, but the first run did not start.");
+      void afterStart(choice, settings.data, true);
+      runStarted(created.id);
       composer.current?.clear();
-      navigate(`/runs/${encodeURIComponent(id)}`);
+      setNewName("");
+      navigate(`/runs/${encodeURIComponent(created.id)}`);
     });
   };
 
@@ -396,30 +411,8 @@ export function Gallery() {
   return (
     <div className="page wide gallery-page">
       <div className="home-above">
-        <h1 data-testid="home-heading">
-          {mode === "new" ? (
-            "Start something new"
-          ) : mode === "clone" ? (
-            "Clone a repository"
-          ) : (
-            <>Describe the next run{projectLabel ? <> for <span className="ask-project">{projectLabel}</span></> : null}</>
-          )}
-        </h1>
-        <div className="home-mode" role="tablist" aria-label="Choose a project">
-          <button
-            type="button"
-            role="tab"
-            data-testid="project-mode-this"
-            className={mode === "this" ? "on" : ""}
-            aria-selected={mode === "this"}
-            disabled={!project}
-            onClick={() => setMode("this")}
-          >
-            This project{name ? `: ${name}` : ""}
-          </button>
-          <span className="home-mode-sep" aria-hidden>
-            ·
-          </span>
+        <h1 data-testid="home-heading">{mode === "clone" ? "Clone a repository" : "Start a new project"}</h1>
+        <div className="home-mode" role="tablist" aria-label="New project or clone">
           <button
             type="button"
             role="tab"
@@ -443,6 +436,17 @@ export function Gallery() {
           >
             Clone
           </button>
+          {project && (
+            <>
+              <span className="home-mode-sep" aria-hidden>
+                ·
+              </span>
+              <Link to="/runs/new" className="home-mode-link" data-testid="project-mode-this" title={`Start a run inside ${name}`}>
+                New run in {name}
+                <ChevronRight size={13} aria-hidden />
+              </Link>
+            </>
+          )}
         </div>
         {mode === "clone" && (
           <form
@@ -477,30 +481,28 @@ export function Gallery() {
         )}
         {mode === "new" && (
           <label className="home-name">
-            <span>Name</span>
+            <span>Folder</span>
             <input
               data-testid="new-project-name"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              placeholder="a folder name"
+              placeholder="named from your description"
               spellCheck={false}
               autoComplete="off"
             />
           </label>
         )}
         <p className="ask-sub">
-          {mode === "new"
-            ? "Name the project, then tell the master what to build."
-            : mode === "clone"
-              ? "The clone sits next to this project. Paste the address without a token."
-              : "A master plans it, workers build the pages, and a different model checks the result."}
+          {mode === "clone"
+            ? "The clone sits next to this project. Paste the address without a token."
+            : "Describe what to build. Taskmaster makes a folder and a git repository for it, then builds it."}
         </p>
       </div>
-      <div className="home-composer">
+      <div className="home-composer" hidden={mode === "clone"}>
         <Composer
           ref={composer}
           bus
-          placeholder="Tell the master what to plan. @ files, # pull requests, $ skills, / commands"
+          placeholder="Describe a new project to build. @ files, $ skills, / commands"
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
@@ -520,13 +522,14 @@ export function Gallery() {
                 <button type="button" className="icon attach-btn" aria-label="Attach files" onClick={() => fileRef.current?.click()}>
                   <Paperclip size={16} />
                 </button>
+                <ModePicker value={runMode} onChange={setRunMode} />
               </div>
               <div className="composer-end">
                 <button type="button" className={`model-pill ${rolesOpen ? "on" : ""}`} aria-expanded={rolesOpen} title="Roles and pages" onClick={() => setRolesOpen((v) => !v)}>
                   <ProviderLogo id={masterPick?.harness} size={14} />
                   <span className="clip">{modelPill}</span>
                 </button>
-                <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
+                <button type="button" className="send-btn" aria-label="Create the project" disabled={action.busy !== null} onClick={() => submit()}>
                   {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
                 </button>
               </div>
@@ -535,14 +538,11 @@ export function Gallery() {
         />
         <div className="home-meta">
           <span className="home-meta-left">
-            <span>Project</span>
-            {project && <span className="mono clip" title={project}>{name}</span>}
-            {branch && (
-              <span className="home-meta-branch clip">
-                <GitBranch size={12} aria-hidden />
-                {branch}
-              </span>
-            )}
+            <span>New folder</span>
+            <span className="mono clip" title={workspace ?? undefined} data-testid="new-project-folder">
+              {workspace ? `${workspace}/` : ""}
+              {newName.trim() || <span className="muted">named from your description</span>}
+            </span>
           </span>
           <span className="home-meta-access">
             <Shield size={12} aria-hidden />
@@ -580,13 +580,13 @@ export function Gallery() {
       {settings.data && list.length === 0 && (
         <section className="home-empty" aria-label="No runs yet">
           <EmptyRuns />
-          <p>No runs yet. Describe one above and the master plans it with you.</p>
+          <p>{name ? <>No runs in {name} yet. <Link to="/runs/new">Start one inside it</Link>, or describe a new project above.</> : "No projects yet. Describe one above and Taskmaster builds it."}</p>
         </section>
       )}
       {list.length > 0 && (
         <section className="home-recent" aria-label="Recent runs">
           <div className="home-recent-head">
-            <h2>Recent</h2>
+            <h2>Recent runs{name ? <> in <span className="mono">{name}</span></> : null}</h2>
             <div className="home-recent-actions">
               <button type="button" className="icon" aria-label="Previous runs" onClick={() => scrollStrip(strip.current, -1)}>
                 <ArrowLeft size={16} />

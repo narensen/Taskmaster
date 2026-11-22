@@ -6666,3 +6666,130 @@ button.cancel-worker-btn:hover:not(:disabled) {
   font-weight: 500;
 }
 
+
+/* ---- Unit files as chips (a brace glob is several files, not one string) ---- */
+.glob-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+.glob-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  min-height: 0;
+  height: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--bg-sunken);
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 1.5;
+  box-shadow: none;
+}
+.glob-file svg { flex: none; color: var(--muted); }
+.glob-file.pattern { color: var(--muted); border-style: dashed; }
+.glob-file.edited { color: var(--ink); border-color: var(--line-strong); }
+.glob-file.edited svg { color: var(--good); }
+.glob-file.more { color: var(--muted); background: none; border-color: transparent; }
+button.glob-file { cursor: pointer; }
+button.glob-file:hover { color: var(--ink); border-color: var(--line-strong); background: var(--bg-sunken); }
+.dag-node-files { max-height: 44px; overflow: hidden; }
+.plan-worker-glob.glob-files { flex-wrap: nowrap; overflow: hidden; margin-left: auto; justify-content: flex-end; }
+.plan-worker-detail > .glob-files { margin-bottom: 8px; }
+.mission-drawer-files { margin: 2px 0 10px; }
+
+/* ---- Stopped: a call cut off by a cancel neither spins nor ticks ---- */
+.agent-ico.stopped,
+.dag-ico.stopped { color: var(--muted); }
+.dag-node.st-stopped { border-left: 3px solid var(--muted); }
+.agent-card[data-state="stopped"] .agent-headline-text { color: var(--muted); }
+
+/* ---- Mode picker: Auto / Code / Agent ---- */
+.mode-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-sunken);
+}
+.mode-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 0;
+  height: 24px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  transition: color 120ms ease, background 120ms ease;
+}
+.mode-opt:hover { color: var(--ink); background: none; }
+.mode-opt.on { color: var(--ink); background: var(--bg-elev-2); box-shadow: 0 0 0 1px var(--line); }
+.mode-opt:focus-visible { outline: 2px solid var(--line-strong); outline-offset: 1px; }
+.run-composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+/* ---- Home: new project first; a run starts inside the project ---- */
+.home-mode-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--muted);
+  text-decoration: none;
+}
+.home-mode-link:hover { color: var(--ink); }
+.home-composer[hidden] { display: none; }
+
+/* ---- Turns: each follow-up starts below the last ---- */
+.past-turn {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.past-turn + .past-turn,
+.past-turn + .flow { margin-top: 10px; }
+.past-turn-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 0;
+  height: auto;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--ink);
+  font-weight: 400;
+  text-align: left;
+}
+.past-turn-head:hover { background: var(--bg-elev-2); }
+.past-turn-n { flex: none; color: var(--muted); font-size: var(--fs-xs); }
+.past-turn-ask { flex: 1; min-width: 0; }
+.past-turn-meta { flex: none; color: var(--muted); font-size: var(--fs-xs); }
+.past-turn-body { padding: 4px 12px 12px; border-top: 1px solid var(--line); }
+.user-prompt.is-follow-up { border-color: var(--line-strong); }
+.user-prompt-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+.workers-stack.solo { display: flex; flex-direction: column; gap: 8px; }
+.flow-note.is-next-turn { border-style: dashed; }
+
+/* ---- Live preview notes ---- */
+.lp-note { color: var(--muted); overflow-wrap: anywhere; }

@@ -186,6 +186,8 @@ export interface RunDetail extends RunSummary {
   phase_at?: number;
   next_phase?: number | null;
   prompt: string | null;
+  /** How the run was asked for. Runs from before modes are `auto`. */
+  mode?: RunMode;
   roles: Roles;
   models: Models;
   /** Active cancellation mode while the run is stopping. */
@@ -218,6 +220,7 @@ export type RunEvent =
   | "resumed"
   | "follow_up"
   | { plan_ready: Plan }
+  | { agent_turn: { plan: Plan } }
   | { worker_finished: { page: string; outcome: WorkerOutcome } }
   | { flag_resolved: { page: string; key: string; resolution: "conform" | "amended" } }
   | { review_finished: { findings: Finding[] } }
@@ -444,7 +447,11 @@ export interface Health {
   terminal?: boolean;
 }
 
+/** Who does the work: the master and its workers, one agent, or the daemon's choice. */
+export type RunMode = "auto" | "code" | "agent";
+
 export interface NewRun {
+  mode?: RunMode;
   prompt?: string;
   id?: string;
   yes?: boolean;
@@ -457,6 +464,7 @@ export interface NewRun {
 }
 
 export interface NewProject {
+  mode?: RunMode;
   name: string;
   prompt?: string;
   yes?: boolean;
@@ -514,6 +522,7 @@ export interface AgentEntry {
     | "stalled"
     | "released"
     | "restarted"
+    | "turn"
     | "web_search"
     | "web_fetch"
     | "docs"
@@ -534,6 +543,13 @@ export interface AgentEntry {
   cost_usd?: number | null;
   seconds?: number;
   error?: string;
+  /** On an `end` the daemon wrote for a call that was cut off by a cancel or a stop. */
+  stopped?: boolean;
+  /** On a person's `turn`: which turn of the run it opens (the first is 1), and who takes it. */
+  turn?: number;
+  mode?: RunMode;
+  /** On a person's `turn`: the ids of the notes it took. */
+  notes?: string[];
   command?: string;
   cwd?: string;
   typed?: boolean;
@@ -571,6 +587,7 @@ export interface Note {
   text: string;
   at: string;
   delivered: boolean;
+  mode?: RunMode;
 }
 
 export interface DaemonSettings {
@@ -1203,7 +1220,8 @@ export const api = {
   agents: (id: string, after = 0) =>
     call<{ next: number; entries: AgentEntry[] }>("GET", `/api/runs/${enc(id)}/agents?after=${after}`),
   notes: (id: string) => call<{ notes: Note[] }>("GET", `/api/runs/${enc(id)}/notes`).then((r) => r.notes),
-  addNote: (id: string, to: string, text: string) => call<Note>("POST", `/api/runs/${enc(id)}/notes`, { to, text }),
+  addNote: (id: string, to: string, text: string, mode?: RunMode) =>
+    call<Note>("POST", `/api/runs/${enc(id)}/notes`, mode ? { to, text, mode } : { to, text }),
   editNote: (id: string, note: string, text?: string) =>
     call<{ notes: Note[] }>("POST", `/api/runs/${enc(id)}/notes/${enc(note)}`, text ? { text } : {}),
   terminal: (id: string, command: string) =>

@@ -142,11 +142,16 @@ export function WebAccessSection() {
   };
 
   return (
-    <section id="web-access" className="section">
-      <h2>Web access</h2>
-      <p className="muted small section-note">
-        Daemon-mediated web search, HTTPS-only SSRF-checked fetch, and local-first package docs. Off by default; every fetched page is converted to markdown, cached offline, and framed as untrusted data. API keys stay in the OS vault and are never written to config files.
-      </p>
+    <section id="web-access" className="settings-section" aria-labelledby="h-web-access">
+      <div className="settings-head">
+        <h2 className="section-title" id="h-web-access">
+          Web access
+        </h2>
+        <p className="muted small">
+          Daemon-mediated web search, HTTPS-only SSRF-checked fetch, and local-first package docs. Off by default; every fetched page is converted to markdown, cached offline, and framed as untrusted data. API keys stay in the OS vault and are never written to config files.
+        </p>
+      </div>
+      <div className="settings-body">
 
       <div className="ops-stack web-access-panel" data-testid="web-access-section">
         <label className="row between gap" data-testid="web-access-enabled">
@@ -403,6 +408,7 @@ export function WebAccessSection() {
       </div>
 
       <Problem error={loaded.error} onRetry={() => void loaded.reload()} />
+      </div>
     </section>
   );
 }

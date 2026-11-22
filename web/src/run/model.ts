@@ -9,10 +9,12 @@ import {
   type AgentTag,
   type LedgerEntry,
   type PagePlan,
+  type PageState,
   type Plan,
   type Note,
   type RunDetail,
   type RunEvent,
+  type RunMode,
   type Totals,
 } from "../api";
 import { keys, queryClient } from "../query";
@@ -76,7 +78,8 @@ export interface Surface {
   page: string | null;
   calls: Call[];
   tag: AgentTag | null;
-  state: "waiting" | "working" | "done" | "failed";
+  /** `stopped`: a call was still open when the run was cancelled or ended. */
+  state: "waiting" | "working" | "done" | "failed" | "stopped";
   summary: SurfaceSummary;
   tokens: number;
   /** The same tokens, split four ways, from each finished call's usage. */
@@ -100,6 +103,11 @@ function mergeChunk(prev: string | undefined, next: string): string {
   return prev + next;
 }
 
+/** The one unit of an Agent-mode run or follow-up turn: `agent`, or `agent-<turn>`. */
+export function isAgentUnit(page: string | null | undefined): boolean {
+  return !!page && /^agent(-\d+)?$/.test(page);
+}
+
 /** The page or unit an agent id names (`page:a`, `unit:a/part`), or null for any other agent. */
 export function workerPart(id: string): string | null {
   const hit = /^(?:page|unit):(.+)$/.exec(id);
@@ -118,6 +126,9 @@ export function surfaceOf(entry: LedgerEntry): string {
   if (entry.role === "security" || entry.role === "reviewer") return "reviewer";
   return entry.role;
 }
+
+/** Entry kinds that belong to an agent call. */
+const CALL_KINDS = new Set<string>(["start", "text", "thought", "tool_call", "command", "output", "preview", "permission", "end", "stalled", "released", "restarted"]);
 
 const EDIT_TOOL_RE = /edit|write|patch|strreplace|apply_patch|create_file|replace/i;
 const RUN_TOOL_RE = /bash|shell|command|exec|terminal|run_code/i;
@@ -182,7 +193,7 @@ function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
   for (const call of s.calls) {
     latestStart = call.at;
     latestEnd = call.end?.at ?? null;
-    if (call.end?.error) lastError = call.end.error;
+    if (call.end?.error && !call.end.stopped) lastError = call.end.error;
     for (const item of call.items) {
       if (item.t === "thought" && item.text.trim()) {
         latestThought = item.text;
@@ -212,7 +223,9 @@ function computeSummary(s: Surface, detail: RunDetail | null): SurfaceSummary {
   const open = s.calls.length > 0 && !s.calls[s.calls.length - 1]!.end;
 
   let headline = "Waiting";
-  if (s.state === "failed" || lastError) {
+  if (s.state === "stopped") {
+    headline = lastTool ? `Stopped while ${toolHeadline(lastTool).replace(/^\w/, (c) => c.toLowerCase())}` : "Stopped";
+  } else if (s.state === "failed" || lastError) {
     headline = lastError ? cleanLine(lastError, 96) || "Failed" : "Failed";
   } else if (open) {
     if (lastTool) {
@@ -286,7 +299,7 @@ function blankSurface(id: string): Surface {
   const role = page ? "worker" : id;
   return {
     id,
-    title: raw ? `Worker · ${raw.replaceAll("/", " / ")}` : id[0]!.toUpperCase() + id.slice(1),
+    title: raw && isAgentUnit(raw) ? "Agent" : raw ? `Worker · ${raw.replaceAll("/", " / ")}` : id[0]!.toUpperCase() + id.slice(1),
     role,
     page,
     calls: [],
@@ -316,6 +329,8 @@ function findLastTool(items: Item[], match: (t: ToolItem) => boolean): ToolItem 
  */
 export class SurfaceBuilder {
   private seen = 0;
+  /** The first entry this builder reads: a later turn starts part way through the transcript. */
+  private from = 0;
   private first: AgentEntry | undefined;
   private last: AgentEntry | undefined;
   private byId = new Map<string, Surface>();
@@ -323,14 +338,24 @@ export class SurfaceBuilder {
   private where = new Map<string, { id: string; index: number }>();
   private dirtySummary = new Set<string>();
 
-  /** Whether `entries` is the list this builder has read so far, with more on the end. */
-  continues(entries: AgentEntry[]): boolean {
-    if (this.seen === 0) return true;
-    return entries.length >= this.seen && entries[0] === this.first && entries[this.seen - 1] === this.last;
+  /** Read from entry `from` on, for a turn that starts there. */
+  start(from: number): this {
+    this.from = from;
+    this.seen = Math.max(this.seen, from);
+    return this;
   }
 
-  apply(entries: AgentEntry[]): this {
-    if (entries.length <= this.seen) return this;
+  /** Whether `entries` is the list this builder has read so far, with more on the end. */
+  continues(entries: AgentEntry[], from = 0): boolean {
+    if (from !== this.from) return false;
+    if (this.seen === this.from) return true;
+    return entries.length >= this.seen && entries[this.from] === this.first && entries[this.seen - 1] === this.last;
+  }
+
+  /** Read the entries up to `until` (all of them by default) that it has not read yet. */
+  apply(entries: AgentEntry[], until = entries.length): this {
+    const end = Math.min(until, entries.length);
+    if (end <= this.seen) return this;
     const touched = new Set<string>();
     const fresh = new Set<string>();
     // A surface and a call are copied once per batch, the first time the batch touches them.
@@ -374,10 +399,12 @@ export class SurfaceBuilder {
       if (i >= 0) call.items[i] = next;
       return next;
     };
-    for (let n = this.seen; n < entries.length; n++) {
+    for (let n = this.seen; n < end; n++) {
       const e = entries[n]!;
       const id = e.agent.id;
       if (id === "runtime" || id === "person") continue;
+      // Run-level lines (cancelling, budget, plan review) carry no call: they are not an agent at work.
+      if (e.agent.call == null && !CALL_KINDS.has(e.kind)) continue;
       const s = surface(id);
       const call = callOf(s, `${e.agent.id}#${e.agent.call ?? 0}`, e);
       s.tag = e.agent;
@@ -446,14 +473,23 @@ export class SurfaceBuilder {
           break;
       }
     }
-    this.seen = entries.length;
-    this.first = entries[0];
-    this.last = entries[entries.length - 1];
+    this.seen = end;
+    this.first = entries[this.from];
+    this.last = entries[end - 1];
     return this;
   }
 
   private lastPhase: string | undefined;
   private lastPlanLen = -1;
+  private lastHalt = "";
+  /** An earlier turn of the run: whatever it left open was stopped long ago. */
+  private over = false;
+
+  /** Mark this builder as an earlier turn, so a call it left open reads as stopped. */
+  closed(over: boolean): this {
+    this.over = over;
+    return this;
+  }
 
   /** Every agent in plan order, with its cost and state. An unchanged agent is the same object as last time. */
   snapshot(detail: RunDetail | null, ledger: LedgerEntry[]): Surface[] {
@@ -474,6 +510,11 @@ export class SurfaceBuilder {
         this.dirtySummary.add(id);
       }
     }
+    const halt = `${detail?.active}:${detail?.cancelled}:${detail?.cancelling ?? ""}`;
+    if (this.lastHalt !== halt) {
+      this.lastHalt = halt;
+      for (const id of this.byId.keys()) this.dirtySummary.add(id);
+    }
     if (this.lastPhase !== detail?.phase || this.lastPlanLen !== planPages.length) {
       this.lastPhase = detail?.phase;
       this.lastPlanLen = planPages.length;
@@ -487,12 +528,15 @@ export class SurfaceBuilder {
       c.n += 1;
       cost.set(key, c);
     }
+    const halted = this.over || runStopped(detail);
     for (const [id, s] of this.byId) {
       const c = cost.get(id) ?? { usd: 0, n: 0 };
       const open = s.calls.some((call) => !call.end);
-      const failed = s.calls.length > 0 && s.calls[s.calls.length - 1]!.end?.ok === false;
-      let state: Surface["state"] = s.calls.length === 0 ? "waiting" : open ? "working" : failed ? "failed" : "done";
-      if (s.page && detail?.pages.find((p) => p.id === s.page)?.state === "failed") state = "failed";
+      const lastEnd = s.calls.length > 0 ? s.calls[s.calls.length - 1]!.end : undefined;
+      const failed = lastEnd?.ok === false && !lastEnd.stopped;
+      let state: Surface["state"] =
+        s.calls.length === 0 ? "waiting" : open ? (halted ? "stopped" : "working") : lastEnd?.stopped ? "stopped" : failed ? "failed" : "done";
+      if (!this.over && s.page && detail?.pages.find((p) => p.id === s.page)?.state === "failed") state = "failed";
       const stateChanged = s.state !== state;
       const dirty = this.dirtySummary.has(id) || stateChanged;
       if (s.cost !== c.usd || s.calls_billed !== c.n || stateChanged || dirty) {
@@ -515,15 +559,108 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
   return new SurfaceBuilder().apply(entries).snapshot(detail, ledger);
 }
 
-/** [`surfaces`], kept up to date as entries stream in: only new entries are read. */
-export function useSurfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[], version = 0): Surface[] {
+/** [`surfaces`], kept up to date as entries stream in: only new entries are read, from `from` on. */
+export function useSurfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[], version = 0, from = 0): Surface[] {
   const builder = useRef<SurfaceBuilder | null>(null);
   return useMemo(() => {
     void version;
     let b = builder.current;
-    if (!b || !b.continues(entries)) b = builder.current = new SurfaceBuilder();
+    if (!b || !b.continues(entries, from)) b = builder.current = new SurfaceBuilder().start(from);
     return b.apply(entries).snapshot(detail, ledger);
-  }, [detail, entries, ledger, version]);
+  }, [detail, entries, ledger, version, from]);
+}
+
+/**
+ * One turn of a run: the first is the original request; each later one starts where the
+ * person's `turn` entry sits in the transcript, after a note on a finished run.
+ */
+export interface Turn {
+  /** 1 for the original request. */
+  n: number;
+  /** Transcript index the turn starts at, and the index it ends before (open-ended for the last). */
+  start: number;
+  end: number;
+  /** What the person asked, for a later turn. The first turn's is the run's prompt. */
+  text: string | null;
+  mode: RunMode | null;
+  at: string | null;
+  /** Ids of the notes this turn took. */
+  notes: string[];
+  /** The plan in force for the turn, from the run's log. */
+  plan: Plan | null;
+}
+
+/** Split the transcript into turns at each `turn` entry, with each turn's plan from the log. */
+export function useTurns(entries: AgentEntry[], version: number, events: RunEvent[], detail: RunDetail | null): Turn[] {
+  const scan = useRef<{ list: AgentEntry[] | null; seen: number; marks: number[] }>({ list: null, seen: 0, marks: [] });
+  const marks = useMemo(() => {
+    void version;
+    const s = scan.current;
+    if (s.list !== entries || entries.length < s.seen) {
+      s.list = entries;
+      s.seen = 0;
+      s.marks = [];
+    }
+    let grew = false;
+    for (let i = s.seen; i < entries.length; i++) {
+      const e = entries[i]!;
+      if (e.kind === "turn" && e.agent.id === "person") {
+        s.marks.push(i);
+        grew = true;
+      }
+    }
+    s.seen = entries.length;
+    if (grew) s.marks = s.marks.slice();
+    return s.marks;
+  }, [entries, version]);
+
+  const plans = useMemo(() => {
+    // The plan before each follow-up, and the one each agent turn brought.
+    const out: (Plan | null)[] = [];
+    let current: Plan | null = null;
+    for (const event of events) {
+      if (typeof event !== "object") {
+        if (event === "follow_up") out.push(current);
+        continue;
+      }
+      if ("plan_ready" in event) current = event.plan_ready;
+      else if ("agent_turn" in event) {
+        out.push(current);
+        current = event.agent_turn.plan;
+      }
+    }
+    return { before: out, last: current };
+  }, [events]);
+
+  return useMemo(() => {
+    const total = Number.MAX_SAFE_INTEGER;
+    const turns: Turn[] = [];
+    const firstEnd = marks.length ? marks[0]! : total;
+    turns.push({ n: 1, start: 0, end: firstEnd, text: null, mode: null, at: null, notes: [], plan: plans.before[0] ?? (marks.length ? null : (detail?.plan ?? plans.last)) });
+    marks.forEach((at, i) => {
+      const e = entries[at]!;
+      const end = i + 1 < marks.length ? marks[i + 1]! : total;
+      const next = plans.before[i + 1];
+      turns.push({
+        n: e.turn ?? i + 2,
+        start: at,
+        end,
+        text: e.text ?? null,
+        mode: e.mode ?? null,
+        at: e.at,
+        notes: e.notes ?? [],
+        plan: i + 1 < marks.length ? (next ?? null) : (detail?.plan ?? plans.last),
+      });
+    });
+    return turns;
+  }, [entries, marks, plans, detail?.plan]);
+}
+
+/** The surfaces of a finished turn, worked out once. A call it left open reads as stopped. */
+export function turnSurfaces(entries: AgentEntry[], turn: Turn, detail: RunDetail, ledger: LedgerEntry[], until: string | null): Surface[] {
+  const past: RunDetail = { ...detail, plan: turn.plan, pages: [], active: false, cancelled: false, cancelling: null, phase: "done" };
+  const spent = ledger.filter((e) => (!turn.at || e.at >= turn.at) && (!until || e.at < until));
+  return new SurfaceBuilder().start(turn.start).apply(entries, turn.end).closed(true).snapshot(past, spent);
 }
 
 export interface RunData {
@@ -745,11 +882,70 @@ export function useRun(id: string): RunData {
   return { detail, events, entries: entriesRef.current, entriesVersion, ledger, notes, error, planArrived, reload, refollow, reloadNotes, catchUp, patch };
 }
 
-/** A glob as the daemon's owners read it: `**` any depth, `*` within a segment. */
+/**
+ * True once nothing is driving the run any more, or a force stop was asked for: an agent
+ * call with no end then reads as stopped instead of spinning forever.
+ */
+export function runStopped(detail: RunDetail | null | undefined): boolean {
+  if (!detail) return false;
+  if (detail.cancelling === "force") return true;
+  if (detail.active) return false;
+  return detail.cancelled || detail.phase === "done" || detail.phase === "failed" || detail.phase === "awaiting_approval";
+}
+
+/** A page's state as shown: a page still marked building on a run that stopped is stopped. */
+export function shownPageState(state: PageState | undefined, detail: RunDetail | null | undefined): PageState | "stopped" | undefined {
+  if (state === "building" && runStopped(detail)) return "stopped";
+  return state;
+}
+
+/**
+ * The paths and patterns a glob names, one per entry: `{a.html,b.css,tests/**}` is three,
+ * `src/{a,b}.ts` is two. Nested braces expand too.
+ */
+export function expandGlob(glob: string): string[] {
+  const text = glob.trim();
+  if (!text) return [];
+  const open = text.indexOf("{");
+  if (open < 0) return text.split(/\s*,\s*/).filter(Boolean);
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}" && --depth === 0) {
+      close = i;
+      break;
+    }
+  }
+  if (close < 0) return [text];
+  const head = text.slice(0, open);
+  const tail = text.slice(close + 1);
+  const parts: string[] = [];
+  let start = open + 1;
+  depth = 0;
+  for (let i = open + 1; i < close; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}") depth--;
+    else if (text[i] === "," && depth === 0) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start, close));
+  const out: string[] = [];
+  for (const part of parts) {
+    for (const each of expandGlob(`${head}${part.trim()}${tail}`)) if (!out.includes(each)) out.push(each);
+  }
+  return out;
+}
+
+/** A glob as the daemon's owners read it: `**` any depth, `*` within a segment, `{a,b}` either. */
 export function globMatch(glob: string, path: string): boolean {
-  const re = glob
-    .split("**")
-    .map((part) => part.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*"))
-    .join(".*");
-  return new RegExp(`^${re}$`).test(path);
+  return expandGlob(glob).some((one) => {
+    const re = one
+      .split("**")
+      .map((part) => part.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*"))
+      .join(".*");
+    return new RegExp(`^${re.replace(/\.\*\//g, "(?:.*/)?")}$`).test(path);
+  });
 }

@@ -1142,6 +1142,7 @@ async fn show_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> 
     let request = app.request_for(&id)?;
     view["plan"] = json!(run.plan);
     view["prompt"] = json!(request.prompt);
+    view["mode"] = json!(request.mode);
     view["roles"] = json!(request.roles);
     view["models"] = json!(request.models);
     ok(view)

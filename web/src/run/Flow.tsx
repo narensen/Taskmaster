@@ -17,12 +17,14 @@ import {
   RotateCcw,
   Search,
   Sparkles,
+  Square,
   SquareTerminal,
 } from "lucide-react";
 import type { DiffStat, DiffStats, Phase, Plan, RunDetail, ToolApproval } from "../api";
 import { tokens, usd } from "../format";
 import { KnownPath, Rich, looksLikePath } from "../paths";
-import { unitPrefix, type Call, type Item, type Surface, type ToolItem } from "./model";
+import { GlobFiles } from "./GlobFiles";
+import { isAgentUnit, unitPrefix, type Call, type Item, type Surface, type ToolItem } from "./model";
 
 const VERB: [RegExp, string, "read" | "edit" | "run" | "search" | "look"][] = [
   [/edit|write|patch|strreplace|apply_patch|create_file|replace/, "Edit", "edit"],
@@ -88,6 +90,7 @@ function statusWord(surface: Surface, phase: Phase | undefined): string {
   if (surface.id === "master" && phase === "planning" && surface.state !== "failed") return "planning";
   if (surface.id === "master" && phase === "awaiting_approval" && surface.state !== "failed") return "asking";
   if (surface.state === "working") return "working";
+  if (surface.state === "stopped") return "stopped";
   if (surface.state === "failed") return "failed";
   if (surface.state === "done") return "done";
   return "waiting";
@@ -105,6 +108,9 @@ function StatusGlyph({ state }: { state: string }) {
   }
   if (state === "asking") {
     return <Sparkles size={14} strokeWidth={1.7} className="agent-ico asking" aria-hidden />;
+  }
+  if (state === "stopped") {
+    return <Square size={10} strokeWidth={2.2} className="agent-ico stopped" aria-hidden />;
   }
   return <Circle size={11} strokeWidth={1.8} className="agent-ico waiting" aria-hidden />;
 }
@@ -238,9 +244,7 @@ const DraftingPlan = memo(function DraftingPlan({ draft }: { draft: DraftPlan })
                       after {w.dependsOn.join(", ")}
                     </span>
                   )}
-                  <span className="plan-worker-glob mono muted clip" title={w.glob}>
-                    {w.glob}
-                  </span>
+                  <GlobFiles glob={w.glob} max={3} interactive={false} className="plan-worker-glob" />
                 </div>
               </div>
               {w.brief && <p className="plan-worker-brief clip">{w.brief.split("\n")[0]}</p>}
@@ -484,9 +488,7 @@ const OverallPlan = memo(function OverallPlan({
                       after {w.dependsOn.join(", ")}
                     </span>
                   )}
-                  <span className="plan-worker-glob mono muted clip" title={w.glob}>
-                    {w.glob}
-                  </span>
+                  <GlobFiles glob={w.glob} max={3} interactive={false} edited={surfaceById.get(w.agentId)?.summary.editedFiles} className="plan-worker-glob" />
                 </button>
                 {onJump && (
                   <button
@@ -502,6 +504,7 @@ const OverallPlan = memo(function OverallPlan({
               {briefLine && !open && <p className="plan-worker-brief clip">{briefLine}</p>}
               {open && (
                 <div className="plan-worker-detail">
+                  <GlobFiles glob={w.glob} edited={surfaceById.get(w.agentId)?.summary.editedFiles} />
                   {w.brief && (
                     <p className="plan-worker-full">
                       <Rich text={w.brief} />
@@ -799,9 +802,12 @@ const AgentBlock = memo(function AgentBlock({
   onRestartWorker,
   plan,
   ask,
+  idPrefix = "",
 }: {
   surface: Surface;
   detail: RunDetail;
+  /** Set for an earlier turn, so its blocks do not take the current turn's ids. */
+  idPrefix?: string;
   focused: boolean;
   expanded: boolean;
   onToggle: (id: string) => void;
@@ -814,7 +820,8 @@ const AgentBlock = memo(function AgentBlock({
   const master = surface.id === "master";
   const state = statusWord(surface, detail.phase);
   const openCall = surface.calls.length ? surface.calls[surface.calls.length - 1] : undefined;
-  const running = openCall && !openCall.end ? openCall : undefined;
+  // A call left open by a cancel is not running: no spinner, no ticking clock.
+  const running = openCall && !openCall.end && surface.state === "working" ? openCall : undefined;
   const planning = master && detail.phase === "planning" && surface.state !== "done" && surface.state !== "failed";
   const draft = useMemo(
     () => (planning && !detail.plan ? parseDraftPlan(running ?? openCall) : null),
@@ -844,8 +851,8 @@ const AgentBlock = memo(function AgentBlock({
   return (
     <section
       className={`agent-card ${master ? "is-master" : "is-worker"} ${expanded ? "is-open" : ""} ${focused ? "focused" : ""}`}
-      id={`agent-${surface.id}`}
-      data-agent={surface.id}
+      id={`agent-${idPrefix}${surface.id}`}
+      data-agent={idPrefix ? undefined : surface.id}
       data-state={state}
       tabIndex={-1}
     >
@@ -958,9 +965,12 @@ export function Flow({
   approvals,
   onTool,
   onFocusAgent,
+  turn,
 }: {
   detail: RunDetail;
   list: Surface[];
+  /** A turn after the first: its message, who took it, and whether it is over. */
+  turn?: { n: number; text: string | null; mode: string | null; past: boolean };
   focus: string | null;
   /** Agents whose activity drawers are open. */
   blown: ReadonlySet<string>;
@@ -974,17 +984,22 @@ export function Flow({
   onTool?: (id: string, allow: boolean) => void;
   onFocusAgent?: (agentId: string) => void;
 }) {
-  const prompt = detail.prompt?.trim();
+  const later = !!turn && turn.n > 1;
+  const prompt = (later ? turn.text : detail.prompt)?.trim();
+  const idPrefix = turn?.past ? `t${turn.n}-` : "";
   const pending = approvals ?? [];
   const shown = useMemo(
     () =>
       list.filter((s) => {
-        if (s.calls.length > 0 || s.id === "master" || s.role === "worker") return true;
+        if (s.calls.length > 0) return true;
+        // A later turn shows only who took part in it; the first shows the whole plan.
+        if (later || turn?.past) return false;
+        if (s.id === "master" || s.role === "worker") return true;
         if (s.id === "reviewer" && detail.phase === "reviewing") return true;
         if (s.id === "verifier" && detail.phase === "verifying") return true;
         return false;
       }),
-    [list, detail.phase],
+    [list, detail.phase, later, turn?.past],
   );
 
   const master = shown.find((s) => s.id === "master");
@@ -992,6 +1007,8 @@ export function Flow({
   const others = shown.filter((s) => s.id !== "master" && s.role !== "worker");
   const activeWorkers = workers.filter((w) => w.state === "working").length;
   const doneWorkers = workers.filter((w) => w.state === "done").length;
+  // One agent owns the turn: no worker pool to count.
+  const solo = workers.length === 1 && isAgentUnit(workers[0]!.page);
 
   const renderAgent = (surface: Surface) => {
     const mine = onTool ? pending.filter((a) => ownerOf(a, list) === surface.id) : [];
@@ -1003,19 +1020,20 @@ export function Flow({
         key={surface.id}
         surface={surface}
         detail={detail}
-        focused={focus === surface.id}
+        idPrefix={idPrefix}
+        focused={!idPrefix && focus === surface.id}
         expanded={blown.has(surface.id)}
         onToggle={onToggleAgent}
         diffStat={stat}
         onOpenDiff={onOpenDiff}
         onRestartWorker={onRestartWorker}
         plan={
-          isMaster && detail.plan ? (
+          isMaster && detail.plan && !later ? (
             <OverallPlan plan={detail.plan} detail={detail} surfaces={list} onJump={onFocusAgent} />
           ) : undefined
         }
         ask={
-          hasAsk ? (
+          hasAsk && !turn?.past ? (
             <>
               {isMaster && ask}
               {mine.map((a) => (
@@ -1032,11 +1050,17 @@ export function Flow({
     <div className="flow" data-testid="run-flow" data-phase={detail.phase} role="log" aria-label="Run">
       {prompt && (
         <section
-          className={`user-prompt ${focus === "you" ? "focused" : ""}`}
-          id="agent-you"
-          data-agent="you"
+          className={`user-prompt ${!idPrefix && focus === "you" ? "focused" : ""} ${later ? "is-follow-up" : ""}`}
+          id={idPrefix ? undefined : "agent-you"}
+          data-agent={idPrefix ? undefined : "you"}
+          data-testid={later ? "turn-prompt" : undefined}
           tabIndex={-1}
         >
+          {later && (
+            <span className="user-prompt-label">
+              Follow-up{turn.mode ? ` · ${turn.mode === "agent" ? "one agent" : turn.mode === "code" ? "master and workers" : turn.mode}` : ""}
+            </span>
+          )}
           <div className="user-prompt-body" data-agent-text="you">
             <Rich text={prompt} />
           </div>
@@ -1045,7 +1069,9 @@ export function Flow({
 
       {master && renderAgent(master)}
 
-      {workers.length > 0 && (
+      {solo && <div className="workers-stack solo">{workers.map(renderAgent)}</div>}
+
+      {workers.length > 0 && !solo && (
         <div className="workers-group" data-testid="workers-group">
           <div className="workers-group-head">
             <span>
@@ -1061,7 +1087,8 @@ export function Flow({
 
       {others.map(renderAgent)}
 
-      {!prompt && list.every((s) => s.calls.length === 0) && <p className="flow-empty">This run has not started.</p>}
+      {!later && !prompt && list.every((s) => s.calls.length === 0) && <p className="flow-empty">This run has not started.</p>}
+      {later && !turn.past && shown.length === 0 && <p className="flow-empty">Starting…</p>}
     </div>
   );
 }

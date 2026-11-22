@@ -27,7 +27,9 @@ import { LivePreview } from "../run/LivePreview";
 import { MissionLens } from "../run/MissionLens";
 import { ReviewLens } from "../run/ReviewLens";
 import { TelemetryLens } from "../run/TelemetryLens";
-import { useRun, useSurfaces } from "../run/model";
+import { useRun, useSurfaces, useTurns } from "../run/model";
+import { PastTurn } from "../run/Turns";
+import { ModePicker, useRunMode } from "../components/ModePicker";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
 import { WebSources } from "../run/WebSources";
@@ -307,7 +309,12 @@ export function RunView({ id }: { id: string }) {
 
   const shown = entries;
   const ledgerEntries = useMemo(() => ledger?.entries ?? [], [ledger]);
-  const list = useSurfaces(detail, shown, ledgerEntries, data.entriesVersion);
+  // Each note on a finished run is a turn of its own; only the latest one is live.
+  const turns = useTurns(shown, data.entriesVersion, data.events, detail);
+  const current = turns[turns.length - 1]!;
+  const turnLedger = useMemo(() => (current.at ? ledgerEntries.filter((e) => e.at >= current.at!) : ledgerEntries), [ledgerEntries, current.at]);
+  const list = useSurfaces(detail, shown, turnLedger, data.entriesVersion, current.start);
+  const [runMode, setRunMode] = useRunMode();
   const filteredList = useMemo(() => {
     if (streamFilter === "all") return list;
     if (streamFilter === "active") return list.filter((s) => s.state === "working" || s.id === "master");
@@ -599,10 +606,17 @@ export function RunView({ id }: { id: string }) {
     const text = messageText(message);
     if (!text) return;
     const to = noteTarget(message.chips);
+    // A note on a finished run starts a new turn below; the mode says who takes it.
+    const finished = !!detail && !detail.active && (detail.phase === "done" || detail.phase === "failed");
     try {
-      await api.addNote(id, to, text);
+      await api.addNote(id, to, text, finished ? runMode : undefined);
       composer.current?.clear();
       data.reloadNotes();
+      if (finished) {
+        setPinned(true);
+        await data.reload();
+        data.refollow();
+      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err));
     }
@@ -612,7 +626,9 @@ export function RunView({ id }: { id: string }) {
   if (!detail) return <FlowSkeleton />;
 
   const pending = notes.filter((n) => !n.delivered && !removed.has(n.id));
-  const delivered = notes.filter((n) => n.delivered);
+  // A note that opened a turn is shown as that turn's message, not again down here.
+  const opened = new Set(turns.flatMap((t) => t.notes));
+  const delivered = notes.filter((n) => n.delivered && !opened.has(n.id));
   const settled = !detail.active && (detail.phase === "done" || detail.phase === "failed");
   const sideVisible = narrow ? sheet : panelOpen;
   const totalDiff = diffStats?.total;
@@ -889,7 +905,11 @@ export function RunView({ id }: { id: string }) {
 
         {lens === "stream" && (
           <div className="run-thread">
+            {turns.slice(0, -1).map((t, i) => (
+              <PastTurn key={t.n} turn={t} next={turns[i + 1]} entries={shown} detail={detail} ledger={ledgerEntries} />
+            ))}
             <Flow
+              turn={turns.length > 1 ? { n: current.n, text: current.text, mode: current.mode, past: false } : undefined}
               detail={detail}
               list={filteredList}
               focus={focus}
@@ -934,10 +954,10 @@ export function RunView({ id }: { id: string }) {
             {(pending.length > 0 || delivered.length > 0) && (
               <section className="flow-notes">
                 {pending.map((n) => (
-                  <div key={n.id} className="flow-note" data-testid="draft">
+                  <div key={n.id} className={`flow-note ${settled ? "is-next-turn" : ""}`} data-testid="draft">
                     <header className="flow-role">
                       <h2>You</h2>
-                      <span className="flow-state">waiting for {noteTargetLabel(n.to)}</span>
+                      <span className="flow-state">{settled ? "starting a new turn…" : `waiting for ${noteTargetLabel(n.to)}`}</span>
                       <button
                         type="button"
                         className="link small"
@@ -1007,8 +1027,24 @@ export function RunView({ id }: { id: string }) {
           bus
           pages={pages}
           agents={["master", "workers", "reviewer", "verifier", ...pages.map((p) => `worker:${p}`)]}
-          placeholder="Steer master or @worker:<id>. @ files, # pull requests, $ skills, / commands"
+          placeholder={
+            settled
+              ? runMode === "code"
+                ? "Ask the master for a change. It starts a new turn below."
+                : "Ask for a fix or a change. It starts a new turn below."
+              : "Steer master or @worker:<id>. @ files, # pull requests, $ skills, / commands"
+          }
           onSend={(m) => void send(m)}
+          footer={
+            settled ? (
+              <div className="composer-foot run-composer-foot">
+                <div className="composer-actions">
+                  <ModePicker value={runMode} onChange={setRunMode} label="Who takes the next turn" />
+                </div>
+                <span className="muted small">Enter to send</span>
+              </div>
+            ) : undefined
+          }
         />
       </div>
     </div>

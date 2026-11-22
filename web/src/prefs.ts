@@ -58,6 +58,8 @@ export interface Prefs {
   fileDiff: boolean;
   /** Whether a run's side panel is open. */
   runPanel: boolean;
+  /** The composer's mode last chosen: master and workers, one agent, or auto. */
+  runMode: "auto" | "code" | "agent";
 }
 
 const KEY = "taskmaster.prefs";
@@ -85,6 +87,7 @@ const DEFAULTS: Prefs = {
   openFiles: {},
   fileDiff: false,
   runPanel: true,
+  runMode: "auto",
 };
 
 function load(): Prefs {

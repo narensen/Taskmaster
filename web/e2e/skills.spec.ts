@@ -39,7 +39,7 @@ test("search shows published skills and Install adds one", async ({ open, page }
 
 test("$ in the composer opens the skill picker and inserts a skill chip", async ({ open, page }) => {
   await open("/");
-  const box = page.getByRole("textbox", { name: /Tell the master/ });
+  const box = page.getByRole("textbox", { name: /Describe a new project/ });
   await box.click();
   await page.keyboard.type("Build a notes app with $");
   const picker = page.getByRole("listbox");

@@ -37,7 +37,7 @@ for (const theme of ["dark", "light"] as const) {
     await page.getByTestId("token-counter").hover();
     await page.getByTestId("token-ledger").screenshot({ path: `${out}/34-token-ledger-${theme}.png` });
     await page.goto(daemon.fixture!.url + "/");
-    await page.getByRole("textbox", { name: /Tell the master/ }).waitFor();
+    await page.getByRole("textbox", { name: /Describe a new project/ }).waitFor();
     await page.waitForTimeout(600);
     await page.screenshot({ path: `${out}/35-home-${theme}.png` });
   });
@@ -47,7 +47,7 @@ for (const theme of ["dark", "light"] as const) {
     await themed(page, theme);
     await page.route("**/api/skills/search?*", async (route) => route.fulfill({ response: await route.fetch() }));
     await open("/");
-    const box = page.getByRole("textbox", { name: /Tell the master/ });
+    const box = page.getByRole("textbox", { name: /Describe a new project/ });
     await box.click();
     await page.keyboard.type("A recipe box with tags and search. Follow $");
     await page.getByRole("listbox").waitFor();

@@ -22,6 +22,7 @@ import { Composer, messageText, type ComposerHandle, type Message } from "../com
 import { Field, Problem, useAction, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { RoleDeck } from "../components/RoleDeck";
+import { ModePicker, useRunMode } from "../components/ModePicker";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { ProviderLogo, providerName } from "../providers/logos";
 import { modelLabel } from "../components/ProviderPicker";
@@ -53,6 +54,7 @@ export function NewRun() {
     setPrefs({ parallel: v });
   };
   const [yes, setYes] = useState(false);
+  const [runMode, setRunMode] = useRunMode();
   const [remember, setRemember] = useState(false);
   const [budgetCap, setBudgetCap] = useState<string>("");
   const [issueOpen, setIssueOpen] = useState(false);
@@ -164,7 +166,7 @@ export function NewRun() {
       const parallel = resolvePages(pages, max ?? 32);
       const parsedCap = budgetCap.trim() ? Number(budgetCap.trim()) : undefined;
       const max_cost_usd = parsedCap && Number.isFinite(parsedCap) && parsedCap > 0 ? parsedCap : undefined;
-      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models, max_cost_usd });
+      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models, max_cost_usd, mode: runMode });
       for (const att of stagedFiles) {
         await api.addAttachment(id, { name: att.name, mime: att.mime, data_base64: att.data_base64 }).catch(() => {});
       }
@@ -185,7 +187,13 @@ export function NewRun() {
         <h1>
           Describe the next run{project ? <> for <span className="ask-project">{project}</span></> : null}
         </h1>
-        <p className="ask-sub muted">A master plans it, workers build the pages, and a different model checks the result.</p>
+        <p className="ask-sub muted">
+          {runMode === "agent"
+            ? "One agent owns the whole project and does the work across every file it needs. No planning step."
+            : runMode === "code"
+              ? "A master plans it, workers build the pages in parallel, and a different model checks the result."
+              : "A fix or a small change goes to one agent; anything bigger, the master plans and workers build."}
+        </p>
 
         {/* Live Preflight Doctor + Mode Telemetry Strip */}
         <div className="ask-preflight-row">
@@ -244,11 +252,17 @@ export function NewRun() {
         <Composer
           ref={composer}
           bus
-          placeholder="Tell the master what to plan. @ files, # pull requests, $ skills, / commands"
+          placeholder={
+            runMode === "agent"
+              ? "Tell the agent what to build or fix. @ files, # pull requests, $ skills, / commands"
+              : "Tell the master what to plan. @ files, # pull requests, $ skills, / commands"
+          }
           onSend={(m) => submit(m)}
           footer={
             <div className="composer-foot">
               <div className="composer-actions">
+                <ModePicker value={runMode} onChange={setRunMode} />
+                <span className="foot-sep" aria-hidden />
                 <button
                   type="button"
                   className={`model-pill ${advanced ? "on" : ""}`}
@@ -287,7 +301,7 @@ export function NewRun() {
                   </select>
                 </label>
               </div>
-              <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
+              <button type="button" className="send-btn" aria-label={runMode === "agent" ? "Start the agent" : "Start planning"} disabled={action.busy !== null} onClick={() => submit()}>
                 {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
               </button>
             </div>

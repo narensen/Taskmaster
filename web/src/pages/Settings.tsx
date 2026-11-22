@@ -338,32 +338,55 @@ function Keys({ text }: { text: string }) {
 export function Settings() {
   const p = usePrefs();
   const health = useLoad(api.health, []);
-  const daemon = useLoad(api.settings, []);
+  // One copy of the daemon's settings, shared with every other page: a toggle, an import or
+  // a reset here shows at once on the role pickers here and on New Run and the home page.
+  const roleSettings = useSettings();
+  const daemon = {
+    data: roleSettings.data,
+    setData: (next: Awaited<ReturnType<typeof api.settings>>) => queryClient.setQueryData(qk.settings, next),
+  };
   const { list: editorList, fallback } = useEditors();
   const [address, setAddress] = useState(server());
   const [other, setOther] = useState({ url: "", token: "" });
   const [endpoint, setEndpoint] = useState(p.searchEndpoint);
+  const savedPolicy = daemon.data?.approvals;
   const [policy, setPolicy] = useState<{ mode: ApprovalMode; timeout: string } | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  // Follow the saved policy (first load, an import, a reset) unless a timeout is being typed.
+  const editingTimeout = useRef(false);
   useEffect(() => {
-    const a = daemon.data?.approvals;
-    if (a && !policy) setPolicy({ mode: a.mode, timeout: String(a.timeout_secs) });
-  }, [daemon.data, policy]);
+    if (savedPolicy && !editingTimeout.current) setPolicy({ mode: savedPolicy.mode, timeout: String(savedPolicy.timeout_secs) });
+  }, [savedPolicy?.mode, savedPolicy?.timeout_secs]); // eslint-disable-line react-hooks/exhaustive-deps
   const savePolicy = (next: { mode: ApprovalMode; timeout: string }) => {
     setPolicy(next);
     const secs = Number(next.timeout);
-    if (!Number.isInteger(secs) || secs < 1 || secs > 86400) return;
+    if (!Number.isInteger(secs) || secs < 1 || secs > 86400) {
+      setPolicyError("Use a whole number of seconds from 1 to 86400.");
+      return;
+    }
+    setPolicyError(null);
+    if (savedPolicy && savedPolicy.mode === next.mode && savedPolicy.timeout_secs === secs) return;
     api.setApprovals({ approvals: next.mode, approval_timeout_secs: secs }).then(
-      () => toast("Tool approvals saved", `${approvalLabel(next.mode)}, denied after ${secs}s`),
+      () => {
+        void roleSettings.refetch();
+        toast("Tool approvals saved", `${approvalLabel(next.mode)}, denied after ${secs}s`);
+      },
       (err) => toast("Tool approvals were not saved", err instanceof Error ? err.message : String(err)),
     );
   };
 
+  // A link to one section (#telemetry) waits for the sections that need the daemon's settings.
+  const scrolled = useRef(false);
   useEffect(() => {
-    if (window.location.hash) document.querySelector(window.location.hash)?.scrollIntoView();
-  }, []);
+    if (scrolled.current || !window.location.hash || !daemon.data) return;
+    const target = document.getElementById(decodeURIComponent(window.location.hash.slice(1)));
+    if (target) {
+      scrolled.current = true;
+      target.scrollIntoView();
+    }
+  }, [daemon.data]);
 
   // Role choices live in the daemon's settings file. A change shows at once and is saved behind it.
-  const roleSettings = useSettings();
   const roleProviders = useProviders();
   const saved = savedChoice(roleSettings.data);
   const saveRole = (role: RoleName, pick: RoleDefault | null) => {
@@ -726,12 +749,18 @@ export function Settings() {
                 style={{ width: 90 }}
                 aria-label="Approval timeout in seconds"
                 value={policy.timeout}
+                onFocus={() => (editingTimeout.current = true)}
                 onChange={(e) => setPolicy({ ...policy, timeout: e.target.value })}
-                onBlur={() => savePolicy(policy)}
+                onKeyDown={(e) => e.key === "Enter" && (e.currentTarget as HTMLInputElement).blur()}
+                onBlur={() => {
+                  editingTimeout.current = false;
+                  savePolicy(policy);
+                }}
               />
               <span className="muted">seconds</span>
             </label>
           </div>
+          {policyError && <div className="error-line small">{policyError}</div>}
         </Section>
       )}
 

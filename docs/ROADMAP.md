@@ -1,406 +1,545 @@
-# Taskmaster roadmap: web access, production readiness, and a better pipeline
+# Taskmaster roadmap, round 3: speed, then what T3 Code, Orca and herdr do that we don't
 
-Written 2026-11-22. Each item says what it is, where it goes, and the test that proves it.
+Written 2026-11-22. Round 2 (web access, pipeline intelligence, hardening, the four-tab run
+view) is in [roadmap/round-2.md](roadmap/round-2.md); almost all of it shipped.
+
+Each item says what it is, where it goes, how, the test that proves it, and the number to
+measure before and after. Work top to bottom. One item, one local commit. Follow
+`AGENTS.md`, the `perf-check` skill (measure first, report both numbers) and the `tests` skill
+(a test that fails without the change).
 
 ## Where we stand
 
-Already solid, and not repeated below: locked contracts and globs, parallel worktrees, the
-shared cache-friendly prefix, zero-token checks, the tier ladder, Errorography with code-based
-signatures and project notes, early per-page checks, autofix, contract-test routing, stuck-repair
-escalation, flaky-test reruns, error digests, the scorecard, budget caps, graceful and force
-cancel, resumable runs, undo of a merged run, approvals, live preview, a browser for UI workers,
-Code Mode, skills, typed limits, and log rotation.
-
-The gaps that matter most:
-
-- **Agents cannot use the internet.** `/api/search` proxies SearXNG for the person only
-  (`api.rs`, `search.rs`). Agents may fetch only the package indexes
-  (`tm_harness::PACKAGE_INDEXES`, `gate.with_fetch_hosts`), the sandboxed shell runs with
-  `--unshare-net` (`code.rs`), and a refused `web_search` or `web_fetch` marks the unit
-  Blocked (`needs_capability`). The planner cannot read docs before it decides.
-- **Feedback arrives late.** Type errors show up after a merge, not while the agent is still
-  writing. Each early check starts its own `tsc`.
-- **Nothing measures the pipeline.** `bench/` has three prompts and a results file, with no
-  suite, no hidden tests, and no gate on prompt or engine changes.
-- **Two agents can edit one checkout.** It happened today. Worktrees isolate runs, but not
-  the threads that develop Taskmaster itself.
-
-## What makes a model do better: the principles behind the plan
-
-These come from what worked and what didn't while building the last two rounds.
-
-1. **Feedback inside the turn beats feedback after the merge.** An agent that sees a type
-   error seconds after writing fixes it in the same turn. One that sees it after the
-   barrier pays for a whole repair round. That is why LSP is in the loop (2.1).
-2. **Proof over claims.** A test that fails before the change and passes after it is worth
-   more than any review. That is why there is a red/green gate (2.3).
-3. **Look things up, don't search for them.** Grep and `ls` turns are most of an agent's
-   wasted calls. Code intelligence tools and per-unit context packs (2.2) remove them.
-4. **Research before deciding.** Wrong library versions and invented APIs come from planning
-   blind. That is the planner's research phase (1.4).
-5. **Disagree early.** A plan reviewed before approval is cheaper to fix than code reviewed
-   after it. Hence plan review (2.4), and best-of-N on hard units (2.5).
-6. **Measure every pipeline change.** Prompts and briefs are code. Without a suite, an
-   "improvement" is a guess. Hence the eval suite (Phase 5, started early).
-7. **One writer per checkout.** One thread or run per worktree, always (Phase 0).
-8. **Project live state, do not drown in append-only logs.** Context entropy after turn 10
-   destroys attention. Compiled Working Memory (2.9) keeps Tier-0 prefixes cache-identical
-   while projecting clean diffs, active diagnostics, and a structured Attempts Ledger.
-9. **Close the loop inside the turn.** Transactional `tryPatch`, reverse-dependency
-   `testAffected`, and deterministic runtime/AST `probe()` (2.10) cut multi-turn repair
-   loops into single-turn self-correction.
-10. **Negotiate contracts dynamically instead of stalling.** Additive, non-breaking contract
-    proposals auto-approve via AST reference checks (2.12); breaking changes pause only the
-    affected blast radius.
-11. **Show a parallel DAG like a parallel DAG.** Flattening 6 concurrent worktrees into one
-    chat feed hides critical paths, dependencies, and bottlenecks. A 4-Lens Spatial Run
-    Studio with purposeful visual coding (Phase 6) makes orchestration effortless to steer.
-
-## Phase 0: land what is here (1–2 days)
-
-- Review and commit the uncommitted work in slices: core (`tm-core`), engine, harnesses, web.
-  Run CI locally before each slice.
-- Rule for this repository's own development threads: each thread gets its own worktree
-  (`t3_thread_launch` with a worktree strategy). Add the rule to `AGENTS.md`.
-- CHANGELOG entries for the two improvement rounds.
-
-## Phase 1: internet access for agents (the T3 Code parity item)
-
-**Goal:** the planner researches, workers read docs, and reviewers look up advisories. Every
-request is answered by the daemon, cached, budgeted, audited, and framed as untrusted.
-
-1.1 **`web_search` and `web_fetch` MCP tools served by the daemon.** They go beside the
-   Dictionary server (`tm-dictionary/src/mcp.rs`) or in a new `crates/tm-web`.
-   - Providers sit behind one trait: SearXNG (the existing `settings.search.endpoint`), Brave
-     Search API, Tavily or Exa, and a "native" passthrough that lets a harness use its own
-     search when the person allows it.
-   - The sandbox keeps `--unshare-net`. Egress is the daemon's, so it can be audited.
-   - Test: a fixture provider answers. A worker calls `web_search` and gets hits. The call is
-     in the transcript and the ledger.
-
-1.2 **Fetch pipeline.**
-   - https only, with SSRF protection: no loopback, RFC 1918, link-local or metadata
-     addresses. This is checked after DNS resolution and after every redirect.
-   - A size cap, content-type checks, HTML converted to markdown with the main content
-     extracted, and text pulled from PDFs.
-   - A content-addressed cache under `$XDG_CACHE_HOME/taskmaster/web`, with a TTL.
-   - Tests: the SSRF table (127.0.0.1, `[::1]`, 169.254.169.254, a redirect to 10.0.0.1),
-     the size cap, a cache hit with no network, and markdown output on a fixture page.
-
-1.3 **Who gets what**, set in Settings → Web access, per role.
-   - Planner: search and fetch, with a budget of N searches and M fetches per plan.
-   - Workers: fetch only from an allowlist derived from the unit's dependencies (package
-     docs, the project's own docs domains), and search only when the person allows it.
-   - Reviewer: advisory lookups (OSV, GitHub Security Advisories).
-   - Verifier: none.
-   - An off-allowlist domain becomes an approval in `risky` mode (`approvals.rs`, `ToolKind::Fetch`).
-   - Test: a worker's fetch outside the allowlist is denied, or asks for approval in risky
-     mode. A planner over budget is told so plainly.
-
-1.4 **Planner research phase.**
-   - Before drafting, the planner may research. It writes a short "Research" section into
-     `PROJECT.md`: decisions, each with its source URL and the version it applies to.
-   - Workers inherit the decisions, not the raw pages, which keeps the shared prefix small
-     and stable.
-   - Test: a plan made with a fixture provider has a Research section with sources. The
-     shared prefix is byte-identical across that run's workers.
-
-1.5 **Local-first docs.**
-   - A `docs(package, symbol?)` tool reads the installed package first: the README and type
-     definitions in `node_modules/<pkg>`, `site-packages`, or `~/.cargo/registry/src`, at the
-     version in the lockfile. The web is only the fallback.
-   - Most "what's the API" questions are answered offline and at the right version.
-   - Test: a fixture `node_modules` package's `.d.ts` is returned for its version.
-
-1.6 **Untrusted-content framing (prompt-injection defence).**
-   - Results come back inside a provenance frame with the source and `untrusted`. Hidden text,
-     HTML comments and zero-width characters are stripped.
-   - Imperative text aimed at the agent ("ignore previous…", "run…") is flagged. Fetched text
-     can never grant a tool or widen a gate. Fetched content never enters the shared prefix.
-   - Test: a fixture page with an injected instruction comes back flagged and framed. The
-     gate's decisions are unchanged.
-
-1.7 **UI.**
-   - Settings → Web access: provider, API key (stored with secrets, see 3.1), per-role
-     switches, allowlist, budget, cache size.
-   - The Run view shows each agent's searches and sources. These are our own tool calls, so
-     showing them keeps the rule "show only what was sent".
-   - Playwright: the toggle is kept, and the sources show for a fixture run.
-
-## Phase 2: pipeline intelligence (the biggest lever on quality, speed and cost)
-
-2.1 **LSP in the loop.**
-   - Keep `tsserver`/`typescript-language-server`, `pyright` or `basedpyright`, and
-     `rust-analyzer` warm, one per run tree, shared by the worktrees through file overlays.
-   - Add a `diagnostics(files)` tool. `run_code` writes return diagnostics for the files they
-     touched automatically.
-   - Early checks and `mechanical_checks` ask the warm server instead of starting `tsc` per
-     page.
-   - Tests:
-     - A worker that writes a type error gets the diagnostic in the same turn.
-     - Early-check wall time drops on a fixture project.
-     - A server that crashes is restarted, and the checks fall back to `tsc`.
-
-2.2 **Code intelligence and context packs.**
-   - Tools: `definition`, `references`, `outline`, `symbols`, backed by LSP or tree-sitter.
-   - Each unit gets a context pack built from the import graph (`tm-verify`) and the repo map:
-     the exact contracts, symbols and neighbour signatures it needs, in a fixed order.
-   - Measure tokens and tool calls per unit before and after on the suite.
-
-2.3 **Red/green proof gate.**
-   - For bug-fix and follow-up runs, the worker adds a test. Taskmaster runs it on the base
-     (it must fail) and on the result (it must pass).
-   - Mutation sanity on contract tests: stub the implementation, and the test must fail.
-     This catches vacuous tests.
-   - Test: a test that passes on the base is rejected with a clear sentence.
-
-2.4 **Plan review before approval.**
-   - A different model reviews the plan for ownership gaps, missing contracts, units that
-     are too big, and wrong difficulty labels. The planner applies the findings once.
-   - The person sees the review beside the plan.
-   - Test: a fixture plan with overlapping globs comes back corrected.
-
-2.5 **Best-of-N on hard units.**
-   - For `difficulty: hard`, two models build in parallel worktrees. The checks, the tests,
-     then the reviewer pick the winner, and the loser's diff is discarded.
-   - The pair comes from the scorecard. It is off unless the budget allows it.
-   - Test: the winning diff is merged and the loser's worktree is removed. The ledger has
-     both calls.
-
-2.6 **Release gate.** If a worker could run tests, did not, and then released, it is asked
-   once more to run them (read from its tool calls). Test: the fake harness that skips tests
-   is sent back once.
-
-2.7 **Playbooks per error code.** Curated hints per code (TS2307, E0432, F821, …) are added
-   only when that code appears, separate from the per-model Errorography.
-
-2.8 **Brief versioning.** Hash every brief template and record the hash in the ledger, so
-   evals can A/B a prompt change.
-
-2.9 **Compiled Working Memory (`crates/tm-daemon/src/memory.rs`).**
-   - Split every prompt into 3 cache tiers: Tier 0 (frozen shared prefix across parallel
-     workers), Tier 1 (unit context pack of imported signatures and locked tests), and
-     Tier 2 (live state projection: current `git diff --stat`, deduplicated active
-     diagnostics, and a 5-bullet Attempts Ledger).
-   - Auto-compact warm sessions once context entropy or consecutive repairs cross a
-     threshold so repairs never drown in stale tool logs.
-   - Test: repeated repair attempts project a deduplicated Attempts Ledger and keep Tier 0
-     byte-identical across parallel workers.
-
-2.10 **Transactional `run_code` v2: `tryPatch`, `testAffected`, and `probe()`.**
-   - `tryPatch(diff)` validates ownership globs and runs fast checks on touched files in the
-     same turn, rolling back automatically on ownership violation.
-   - `testAffected(files?)` runs only the reverse-dependency test slice impacted by edited
-     files instead of the entire repository test suite.
-   - `probe(target)` provides deterministic runtime/AST introspection (`probe.ast(path)` for
-     structured exports/imports, `probe.http(...)` scoped to the worker's preview origin).
-   - Test: `tryPatch` rolls back an out-of-glob edit and returns structured diagnostics in
-     one call; `probe.ast` extracts exports from a fixture file.
-
-2.11 **Adversarial Dual-Spec Synthesis.**
-   - Optionally generate locked behavioral and property-based tests with a second model
-     family before builders start, mutation-checked red against base code.
-
-2.12 **Dynamic Mid-Flight Contract RFCs & Critical-Path Hedging.**
-   - Workers emit typed `ContractProposal` events; additive non-breaking additions
-     auto-merge into the contract branch via AST reference verification with zero Master
-     round-trip; breaking proposals pause only impacted dependents.
-   - Critical-path bottleneck units that stall past `p90` can speculatively race a second
-     model family within budget, taking the first green diff and cancelling the loser.
-
-2.13 **Living Codebase Atlas (`crates/tm-daemon/src/atlas.rs`) & Errorography v2.**
-   - Incrementally index module clusters, language breakdown, import centrality hubs, git
-     churn hotspots, and test-to-source mappings in `.taskmaster/atlas.json` (served at
-     `GET /api/atlas`).
-   - Distill semantic/architectural lessons from repairs, diff comments, and run undos into
-     glob-scoped project invariants with confidence decay.
-
-## Phase 3: production hardening
-
-3.1 **Secrets.**
-   - Store host tokens and web API keys in the OS keychain (Secret Service, macOS Keychain),
-     not plaintext, keeping `hosts.json` as the index only.
-   - A redaction filter over transcripts, logs, terminal output and exports, for known secret
-     values and common token patterns.
-   - Test: a secret printed by a worker shows as `•••` everywhere.
-
-3.2 **Egress audit and policy.** Every daemon-side network request is logged with run,
-   agent, host and bytes, and shown in Settings. A deny list can be set by policy.
-
-3.3 **Supply-chain gate.**
-   - When a unit adds a dependency, check before the merge:
-     - OSV advisories;
-     - the package's age and downloads;
-     - typosquat distance to popular names;
-     - whether its license is on the allowlist.
-   - Block the merge, or ask, with the reason.
-   - Test: a fixture lockfile adding a known-vulnerable version is held.
-
-3.4 **Merge queue and semantic conflicts.**
-   - Serialize merges across concurrent runs.
-   - When the base moved since the run started, merge into a temporary tree and run the
-     checks there before delivering.
-   - Test: two runs that each pass alone, but break together, do not both merge.
-
-3.5 **Preflight / doctor.**
-   - Before planning spends tokens, check:
-     - each harness's version and sign-in;
-     - quota hints;
-     - disk space;
-     - `node_modules` and the venv;
-     - whether Chrome is there for UI checks.
-   - The person gets one screen listing what is missing, each with a fix button.
-
-3.6 **Service and lifecycle.**
-   - A systemd user unit and a launchd plist, both installed by `install.sh`.
-   - Auto-resume of interrupted runs on start, and a graceful drain on SIGTERM.
-   - Retention settings for runs, worktrees and the web cache, with garbage collection.
-
-3.7 **Records schema versioning.** A version field on `events.jsonl` and `status.json`,
-   with migrations and a test per migration.
-
-3.8 **Observability.**
-   - OpenTelemetry traces (run → phase → agent call → tool call), a Prometheus `/metrics`
-     endpoint, and an option for JSON logs.
-   - Cost per project per month, with alerts at a threshold.
-
-3.9 **API idempotency.** An `Idempotency-Key` on `POST /api/runs` and the other POSTs that
-   start work.
-
-3.10 **Policy-as-Code (`taskmaster.policy.toml`, `crates/tm-daemon/src/policy.rs`).**
-   - Repo-versioned team guardrails: `protected_globs` (always require approval or review),
-     `denied_globs`, allowed/denied egress domains, `max_run_cost_usd`, `daily_budget_usd`,
-     `require_cross_family_review`, and custom secret `redact_patterns`.
-   - Served and editable via `GET /api/policy` and `POST /api/policy`.
-   - Test: a policy with `denied_globs` and `max_run_cost_usd` enforces both deterministically.
-
-3.11 **Flight Recorder (`.tmrun.json`) & Universal Secret Redaction.**
-   - `GET /api/runs/{id}/bundle` exports a portable, secret-redacted replay archive (plan,
-     events, ledger, changes, cache economics, waterfall timings).
-   - Shared redaction filter scrubs API keys (`sk-…`, `ghp_…`, `xai-…`, Bearer tokens,
-     custom policy patterns) across bundles, logs, and exports.
-
-3.12 **Checkpoint Time-Travel & A/B Run Forking.**
-   - `GET /api/runs/{id}/checkpoints` lists every phase/unit commit and checkpoint ref.
-   - `POST /api/runs/{id}/fork` forks any checkpoint into a new parallel run with optional
-     prompt, model, or budget override so teams can A/B compare approaches side-by-side.
-
-3.13 **Remote Runner Mesh.**
-   - Offload parallel worktrees to remote Linux daemons over mTLS / Tailscale while keeping
-     the local desktop/web Studio responsive and cool.
-
-## Phase 4: T3 Code-level workflow
-
-4.1 **PR loop.**
-   - Opening a PR already works (`POST /api/runs/{id}/pr`). Then:
-     - watch CI through `gh`;
-     - pull failing job logs;
-     - attribute them to pages with `runtime::attribute`;
-     - repair, and push.
-   - PR review comments become follow-up notes to the page that owns the file.
-
-4.2 **Start from an issue.** A GitHub or GitLab issue URL becomes the prompt, and the result
-   links back to the issue.
-
-4.3 **Attachments.** Images (mockups, screenshots) go to the planner and UI workers on the
-   harnesses that take images. Files are attached as context.
-
-4.4 **The person's own MCP servers.** Database, Sentry, Linear and others are offered per
-   role, under the approval policy, with tool calls in the transcript.
-
-4.5 **Notifications.** Desktop notifications, plus an optional webhook or push, when an
-   approval waits, a limit stops a run, or a run finishes.
-
-4.6 **Scheduled runs.** Nightly dependency bumps, a flaky-test sweep, a docs refresh.
-
-4.7 **Diff comments and checkpoints.**
-   - A comment on a line in the diff panel becomes a note to that page's worker.
-   - A checkpoint timeline per run, with restore and fork. Each page commit is a checkpoint,
-     and undo already exists for the whole run.
-
-4.8 **Environments.** Switch between this machine and a headless daemon on a server. The
-   headless tarball and pairing already exist.
-
-## Phase 5: measure and learn (start 5.1 right after Phase 0)
-
-5.1 **Eval suite.**
-   - Grow `bench/` into 20–30 tasks across web, library, CLI and Python, each with hidden
-     tests the agents never see.
-   - Runner: `tm-daemon eval --suite bench/`. It records pass rate, cost, wall time,
-     repairs and cache hits to `bench/results.jsonl`.
-
-5.2 **Gate.** A change to an engine prompt or the pipeline must not lower the pass rate or
-   raise the cost by more than 10% on the suite. A nightly CI job runs it.
-
-5.3 **Learned routing.** Record difficulty and language on ledger entries. The scorecard then
-   scores per (model, difficulty, language). An opt-in "Auto" role picks the cheapest model
-   at ≥85% first pass for each unit.
-
-## Phase 6: Spatial Mission Control & Rich Visual UI/UX Overhaul
-
-**Goal:** make Taskmaster's parallel, contract-first orchestration visually unmistakable,
-directly steerable, and radically faster to review than a linear chat thread, introducing
-rich semantic visual coding (contracts, workers, checks, critical path, cache economics)
-while preserving ≥4.5:1 contrast in both dark and light themes.
-
-6.1 **3-Pillar Spatial Workspace Shell (`web/src/App.tsx`).**
-   - Collapse 9 flat sidebar links into a focused Workspace Rail: Project Switcher +
-     `+ New run`, live Runs with visual progress rings/spend/approval dots, and a compact
-     bottom system bar (`Knowledge`, `Reviews`, `Doctor`, `Settings`). All legacy routes
-     remain directly navigable.
-
-6.2 **4-Lens Run Studio (`1`–`4` keyboard switching in `RunView.tsx`).**
-   - **Lens 1 — Mission & Interactive Plan Workbench (`MissionLens.tsx`)**: layered visual
-     DAG (Contracts → Parallel Units → Verification) with curved SVG dependency edges,
-     difficulty/tier badges, live diff stats, and a Node Focus Drawer with targeted
-     Soft-Steer. During `awaiting_approval`, units and contracts are editable inline and
-     persisted via `POST /api/runs/{id}/plan` with a live cost/time preview before launch.
-   - **Lens 2 — Filtered Activity Stream (`Flow.tsx`)**: upgraded narrative feed with smart
-     filter chips (`All`, `Edits`, `Checks & Errors`, `Approvals`, per-worker).
-   - **Lens 3 — Review & Verification Studio (`ReviewLens.tsx`)**: full-bleed unit-grouped
-     diff viewer with click-a-line inline commenting routed directly to the owning worker,
-     split Live Preview toggle, and ship controls (`Draft PR`, `Undo Merge`).
-   - **Lens 4 — Telemetry & Flight Recorder (`TelemetryLens.tsx`)**: parallel Gantt
-     execution waterfall, prompt cache-hit & cost economics breakdown, Checkpoint
-     Time-Travel scrubber with 1-click **Fork Run**, and `.tmrun.json` bundle export.
-
-6.3 **Ambient Floating Approval Dock (`ApprovalDock.tsx`).**
-   - Surfaces pending risky tool approvals across all 4 lenses with instant `A` (Approve) /
-     `D` (Deny) keyboard shortcuts so approvals never get buried in a scrolled log.
-
-6.4 **Smart New-Run Launcher (`NewRun.tsx`).**
-   - Centered home composer enriched with live Execution Mode preview (`Direct Fast-Path` vs
-     `Parallel Build` vs `Phased Sketch`), inline per-run USD Budget Cap selector, and a
-     live Preflight Doctor health badge (`GET /api/doctor`).
-
-6.5 **Unified Knowledge Hub (`Knowledge.tsx`).**
-   - One tabbed workspace uniting the visual **Codebase Atlas** (`GET /api/atlas`),
-     **Dictionary**, **Errorography**, **Skills**, and **Policy-as-Code** editor.
+Landed this round (commits `b8fb298`..`c502d84`):
+
+- Run modes: **Auto / Code / Agent** in every composer. Agent mode gives the whole project to
+  one agent with no planning call. A note on a finished run in Agent or Auto mode becomes
+  `Event::AgentTurn`: one agent, the note as its task, no page rebuilt.
+- **Turns**: each follow-up starts below the last; earlier turns fold to one line.
+- **Stop now** stops at once; calls cut off by a cancel end as `stopped`, with no spinner or clock.
+- **Preview always opens**: `dev` → `start` → `preview` script, install missing packages,
+  any HTML page, a file listing, and a static fallback when the dev server dies.
+- **Speed**: the provider model list is cached and warmed. Home went from 49 to 10 requests
+  and 4.1–4.6 s to 0.59 s; `POST /api/runs` from 0.5–1.3 s to 3–4 ms.
+- Settings uses one settings source; the ops and web access panels are styled.
+
+What the research below found missing, in one line each:
+
+- **Performance**: the run stream does work that scales with every other run's traffic, and a
+  transcript is 80% repeated metadata (Phase P).
+- **Written but not wired**: red/green proof, contract mutation sanity, best-of-N and the
+  release gate exist in `gates.rs` with no caller (Phase W).
+- **Agent experience** (T3 Code): queue vs steer, rewind a turn with file checkpoints,
+  per-run permission modes, goals, message search, server-owned settling, an MCP server for
+  outside agents (Phase A).
+- **Workspace** (Orca): a project file for worktree setup and shared folders, Design Mode,
+  batched diff review, usage meters, racing agents, an agent status line (Phase O).
+- **Runtime** (herdr): a blocked/working/idle/unseen state model with rollups, provider
+  session resume after a daemon restart, `wait` tools (Phase H).
+
+## What the three projects do, and where we are
+
+| Feature | T3 Code | Orca | herdr | Taskmaster now | Item |
+| --- | --- | --- | --- | --- | --- |
+| Bounded cold open, history paged, tool bodies on demand | yes | – | – | whole transcript on open | P5 |
+| Live command output only while a row is expanded, throttled | yes | – | – | every byte on the main stream | P5 |
+| Queue or steer a message while an agent works | yes | – | – | notes steer; no queue | A1 |
+| Edit an earlier prompt, revert files to that turn | yes (hidden git refs) | worktree checkpoints | – | undo of a whole merged run | A2 |
+| Permission mode per thread in the composer | yes | – | – | one global approvals mode | A3 |
+| Goals: keep going until a condition holds | `/goal` | – | – | no | A4 |
+| Message search in the palette | yes | jump anywhere | – | run ids only | A7 |
+| Server-owned settling (merged PR, inactivity) | yes | – | – | client-only flags | A8 |
+| Outside agents drive the app (MCP / CLI / socket) | MCP server | Orca CLI | socket API + skill | Dictionary MCP only | A10 |
+| Per-worktree setup script, shared dirs, copied ignored files | t3.json actions | `orca.yaml`, `.worktreeinclude` | – | `node_modules` symlink only | O1 |
+| Click an element in the preview, send it to the agent | – | Design Mode | – | no | O2 |
+| Batched line notes on a diff, sent once | – | yes | – | one note per line | O3 |
+| Usage and reset times before a limit hits | yes | yes | – | typed limit after it hits | O4 |
+| Same task raced across providers, pick the winner | – | yes | – | helper exists, unwired | O5 / W3 |
+| Agent sets its own status line | – | worktree comment | custom status | derived headline only | O6 |
+| Idle agent sessions released, resumed on return | – | hibernation | – | warm sessions kept | O7 |
+| Blocked / working / idle / done-unseen with rollups | partial | yes | yes (strict) | working/done/failed | H1 |
+| Resume provider sessions after a restart | – | yes | yes | fresh brief | H2 |
+| Agents wait on servers, logs or other agents | – | `terminal wait` | `wait output` | no | H4 |
+
+## Phase P: performance bugs
+
+Found by reading the hot paths and measuring on this machine. Each one names the cost, the fix,
+the test and the number to report.
+
+**Measured and fine (no action):** the transcript builder (`SurfaceBuilder`): 43,248 synthetic
+entries build in 18 ms cold, and a streaming frame costs 0.05–0.08 ms late in the run. Opening a
+finished run on the fixture shows the stream in 82–211 ms.
+
+### P1. The run stream re-reads files on every other run's traffic (daemon, M)
+
+- **Where:** `run_stream` in `crates/tm-daemon/src/api.rs`, and `Live::subscribe`.
+- **Bug:** each loop pass reads and parses the run's whole `events.jsonl` and reads the
+  transcript, even when only transcript entries are new. The wake channel is one broadcast for
+  all runs. A wake for another run does `continue`, which goes back to the top and reads both
+  files again. A 250 ms tick re-reads them on every open run page. Cost grows as
+  (open run pages) × (pushes per second across all runs): a 3-tab session with 8 streaming
+  workers is hundreds of full reads per second.
+- **Fix:**
+  - Per-run `tokio::sync::watch` sequence counters (one for events, one for agent entries)
+    in `Live`, replacing the global broadcast for feeds.
+  - Read `events.jsonl` only when its counter (or `Store::stat`) moved.
+  - On a wake for another run, never re-read.
+  - Drop the 250 ms tick, or keep it only for writers in another process, gated by `stat`.
+- **Test:** a counting `Store` wrapper: one open feed while another run pushes 1,000 entries
+  does zero reads of the first run's files.
+- **Measure:** reads per second with 3 feeds and the fixture streaming (`FIXTURE_DELAY_MS`).
+
+### P2. Transcripts are 80% repeated agent tags (daemon + web, M)
+
+- **Where:** `Live::push` in `live.rs` (writes the full `agent` tag on every entry); the
+  readers in `model.ts` (`SurfaceBuilder.apply`) and `Tabs.tsx`.
+- **Measured:** the largest transcript on this machine is 1.7 MB in 3,531 entries. 3,446 of
+  them are `thought` fragments with an average tag of 340 B and average text of 82 B. Real
+  transcripts: median 469 KB, max 1.7 MB.
+- **Fix:**
+  - Write the full tag once, on the call's `start`; later entries carry `{id, call}` only.
+  - The reader keeps a map from call to tag.
+  - Coalesce consecutive `text`/`thought` deltas of one call inside a ~50 ms window before
+    writing.
+  - The API expands old-format files the same way, so existing runs still open.
+- **Test:** a transcript written in the new form opens with the same surfaces as the old form
+  (fixture of each). Old files still read.
+- **Measure:** bytes and entries for the fixture bookshop run before and after; target ≥3×
+  smaller and ≥5× fewer SSE events.
+
+### P3. Every streamed fragment is a synchronous open–append–close under one global mutex (daemon, M)
+
+- **Where:** `Live::push` (`live.rs`), `FileStore::append` (`store.rs`), and
+  `secrets::redact_json` → `policy::redact_text`.
+- **Bug:**
+  - One `std::sync::Mutex` (`write`) serializes every run's pushes and every note change.
+    It holds file I/O on a tokio worker thread.
+  - `redact_text` copies each string about 10 times per entry (two marker passes plus one
+    per secret prefix), even when nothing matches.
+  - A secret split across two deltas is not redacted at all.
+- **Fix:**
+  - A writer task per run, fed by an `mpsc` channel. It keeps a `BufWriter` open and flushes
+    every 50 ms or 64 KB, or on `end`.
+  - Notes get their own lock.
+  - Redaction gets a fast pre-check (`memchr`/Aho–Corasick over the markers, prefixes and
+    registered secrets) and returns the input untouched on a miss.
+  - Redact after coalescing (P2), with a small carry window so split secrets are caught.
+- **Test:** a secret split across two `text` deltas shows as `•••`. 10,000 pushes from 8
+  tasks finish without blocking a concurrent `GET /api/runs`.
+- **Measure:** push throughput and p99 latency of `GET /api/runs` while 8 workers stream.
+
+### P4. The transcript cache never forgets (daemon, S)
+
+- **Where:** `Live.cache` in `live.rs`.
+- **Bug:** every entry of every run read since the daemon started stays in memory as
+  `serde_json::Value`, about 5–10× its JSON size, for the life of the daemon.
+- **Fix:** an LRU over runs (keep 8, drop runs idle more than 10 minutes), or keep line offsets
+  and read lines on demand.
+- **Test:** reading 20 runs keeps at most 8 cached.
+- **Measure:** RSS after opening 20 large fixture runs.
+
+### P5. Cold open sends the whole transcript; tool output rides the main stream (daemon + web, L)
+
+- **Where:** `GET /api/runs/{id}/agents` (`api/desk.rs`), `useRun` in `web/src/run/model.ts`,
+  `Step` in `Flow.tsx`.
+- **Fix** (T3 Code's rules, `docs/internals/performance-regressions.md` in their repo):
+  - **Bounded window.** `?window=recent` returns the newest entries up to about 1 MiB, never
+    splitting a call, plus a one-line summary per older call. Older calls load on scroll or
+    when a past turn is expanded.
+  - **Bodies on demand.** `output` bodies over 2 KB leave the wire as `{id, bytes}`.
+    `GET /api/runs/{id}/agents/{index}` returns one body when a step expands.
+  - **Live output per row.** A running command's output streams only to a client that
+    expanded that row: frames every 100 ms, a 16 KB append cap, then a tail replace
+    (T3's `CommandOutputHub`).
+- **Test:** a 900-call fixture run opens with at most 1.2 MiB over the wire. Expanding a step
+  fetches its body. A 50 KB command output does not grow the main stream.
+- **Measure:** bytes and time to first paint of the stream for the largest real transcript
+  (1.7 MB) and for a synthetic 10 MB one.
+
+### P6. The files panel's 483 KB chunk loads on every run open (web, S)
+
+- **Where:** `web/src/files/FilesPanel.tsx` imports `PatchDiff` from `@pierre/diffs/react` at
+  the top. The side panel opens by default on Files, so every run page pays for it (137 KB
+  gzip) before anyone asks for a diff.
+- **Fix:**
+  - Import `PatchDiff` lazily, only in diff mode.
+  - Mount the panel's body after the stream has painted (`requestIdleCallback`).
+- **Measure:** bytes and script time on run open, before and after (Playwright `page.on("response")`).
+
+### P7. The run page re-binds listeners and forces layout every frame (web, S)
+
+- **Where:** `RunView.tsx`.
+  - The global `keydown` effect depends on `list`, so it is removed and added on every
+    streamed frame.
+  - The auto-scroll effect sets `scrollTop = scrollHeight` on every `entriesVersion`, which
+    forces a layout each frame.
+- **Fix:**
+  - Keep `list` and `focus` in refs, and bind once.
+  - Pin to the bottom with a sentinel and `overflow-anchor`, or scroll only when
+    `scrollHeight` changed, in one `requestAnimationFrame`.
+- **Measure:** long tasks over 50 ms per second in a Performance trace while 8 fixture workers
+  stream.
+
+### P8. Expanded agent activity renders everything (web, S)
+
+- **Where:** `AgentActivity` in `Flow.tsx`.
+  - The "Raw model output" `<details>` renders and parses (`Rich`) every text block on every
+    update, even while it is closed.
+  - "Show earlier" renders every step with no limit.
+- **Fix:**
+  - Render the `<details>` body only when it is open.
+  - Virtualize steps with `@tanstack/react-virtual` (already used by `CodeView`).
+- **Measure:** commit time of one frame with a 3,000-step agent expanded.
+
+### P9. The run list re-renders every row every 3 seconds while anything runs (web + daemon, S)
+
+- **Where:** `useLoad(api.runs, …, 3000)` in `App.tsx` and `useLoad` in `ui.tsx`.
+- **Bug:** while any run is active, each poll returns a new array. Every row is a new object,
+  so every memoized row re-renders, and the whole list is `JSON.stringify`'d to compare.
+- **Fix:**
+  - Structural sharing by run id: keep the old object when its JSON is unchanged.
+  - Better: `GET /api/runs?since=<seq>` returns only changed rows, and later an SSE list
+    stream (T3's shell deltas).
+- **Measure:** row renders per poll with 30 runs and one active (React Profiler).
+
+### P10. Continuous animations (web, S)
+
+- **Where:** `styles.css` has 8 `infinite` animations: spinners on each working agent, the
+  sidebar and the header, plus shimmer, sheen, pulse and the caret. T3 Code treats a
+  continuously repainting animation as a bug, because it pegs the GPU on high-refresh
+  displays.
+- **Fix:**
+  - At most one animated indicator on screen.
+  - Elsewhere, a static working glyph that changes on state change.
+  - Pause animations of off-screen elements (`content-visibility: auto` on cards).
+  - Check that `prefers-reduced-motion` and the Motion setting stop all eight.
+- **Measure:** GPU and compositor time in a 10 s trace with 8 working agents.
+
+### P11. Every run event refetches the whole ledger (web + daemon, S)
+
+- **Where:** `useRun`. `reload()` fetches the run and the full ledger on every run event, and
+  the ledger is fetched again on every agent `end`.
+- **Fix:**
+  - `GET /api/runs/{id}/ledger?after=n` returns new entries only.
+  - Coalesce reloads within 100 ms.
+- **Measure:** requests per minute on a busy run.
+
+### P12. Guardrails so speed stays (S)
+
+- A Playwright `perf.spec.ts` with budgets, running in CI:
+  - home ≤ 12 API requests with 16 runs;
+  - `POST /api/runs` ≤ 50 ms with a cached provider list;
+  - run cold open ≤ 1.2 MiB;
+  - ≤ 20 SSE events per second per text-streaming agent;
+  - no request over 300 ms on home or run open.
+- A daemon test asserting a feed's reads do not grow with other runs' pushes (P1).
+- In `AGENTS.md`, a short "multiplicative paths" rule taken from herdr: before adding work to
+  a per-entry, per-frame or per-feed path, name its frequency × cardinality.
+
+## Phase W: wire up what is already written
+
+These exist in `crates/tm-daemon/src/gates.rs` with no caller outside that file. Cheap, and
+each one raises quality.
+
+- **W1. Release gate** (`transcript_ran_tests`, `release_gate_nudge`).
+  - When a worker that had a shell and tests available releases without running them, send
+    the nudge once as a follow-up turn on its open session.
+  - Call it where a worker's turn ends, before its checks (the `WorkerFinished` path in
+    `engine.rs`).
+  - Test: the fake harness that skips tests is sent back exactly once.
+- **W2. Red/green proof** (`verify_red_green`), for Agent-mode turns and bug-fix prompts.
+  - When the worker adds a test, run it on the base commit (it must fail) and on the result
+    (it must pass).
+  - A test that passes on the base is refused with a sentence.
+  - Test: the fixture where the new test already passes on the base is refused.
+- **W3. Best-of-N on hard units** (`pick_best_candidate`).
+  - For `difficulty: hard` and within budget, two providers from the scorecard build in
+    sibling worktrees. Checks, then tests, then the smaller diff pick the winner; the loser's
+    worktree is removed.
+  - Off by default.
+  - Test: the winner is merged, the loser is gone, and the ledger has both calls.
+- **W4. Contract mutation sanity** (`contract_mutation_sanity`).
+  - Stub the implementation; a contract test that still passes is vacuous and goes back to
+    its author.
+  - Test: the fixture with a vacuous contract test is flagged.
+
+## Phase A: agent experience (from T3 Code)
+
+### A1. Queue or steer while a run works (M)
+
+- **Today:** a note on an active run steers (the master reads it before the next worker). A
+  note on a finished run starts a turn.
+- **Add:** a `queued` flag on `Note` (`live.rs`). A queued note waits until the run settles,
+  then all queued notes open one turn together, in their order and with their own mode.
+- **Composer:** Enter uses the person's default (Settings → Chat: Queue or Steer), and
+  Ctrl/Cmd+Enter does the other.
+- **Thread:** queued notes show dashed at the end of the thread, with Edit, Remove and
+  Send now. Alt+Up edits the last one.
+- **Test:** two queued notes on a running fixture run start one turn after it finishes, and
+  a steer note reaches the master before the next worker.
+
+### A2. Edit from here: rewind a turn, with or without its files (L)
+
+- **Checkpoints.** Before each turn starts (the person's `turn` entry and the first turn),
+  capture the checkout into a hidden ref, `refs/taskmaster/checkpoints/<run>/turn/<n>`.
+  Write a tree from a temporary index (`GIT_INDEX_FILE`, `git add -A`, `write-tree`,
+  `commit-tree`), so untracked files are included and the person's branch gets no commit.
+  This is T3's `CheckpointStore`.
+- **Edit from here.** On a turn's message, this puts the message back in the composer and
+  drops that turn and later ones from the run's view, with two choices:
+  - **Keep changes** leaves the files as they are.
+  - **Revert files too** restores the checkpoint.
+- Refuse a file restore while another run builds in that checkout.
+- Builds on the turns from this round and on `undo.rs`.
+- **Test:** a run with two turns rewinds to turn 2: the files match the checkpoint, and turn
+  3's agents are gone from the view and from the next brief.
+
+### A3. Permission mode per run, in the composer (M)
+
+- **Today:** `approvals.rs` has one policy, set in Settings.
+- **Add:** a per-run mode stored on `RunRequest` (Supervised, Auto-accept edits, Auto, Full
+  access), mapped onto the gate (`tm-harness/src/gate.rs`) and each provider's own flags.
+  Where a provider cannot honour a mode, say so in the picker.
+- The composer shows the mode next to the Auto/Code/Agent picker; the Settings value is the
+  default.
+- **Test:** an Auto-accept-edits run approves an edit without asking and still asks for a
+  shell command.
+
+### A4. Goals: keep going until it is true (M)
+
+- `/goal <condition>` or a Goal field: "all tests pass", "the preview opens", "`cargo test`
+  is green".
+- After each turn, the daemon checks the condition: `test()`, the verify step, a command or a
+  preview probe. If it is not met, it starts another Agent turn with the failure as the task,
+  up to N turns or the budget.
+- The run header shows the goal and its progress.
+- **Test:** a fixture whose first agent turn leaves a failing test gets a second turn and ends
+  green, and the cap stops a goal that never holds.
+
+### A5. Suggested next prompt (S, Labs, off by default)
+
+After a turn ends, one cheap call that reuses the prompt cache suggests the next message.
+Tab fills it in.
+
+### A6. Prompt stash and recall (S)
+
+Ctrl/Cmd+S stashes the draft with its attachments; the same key on an empty composer restores
+it.
+
+### A7. Search inside runs from Ctrl+K (M)
+
+- An inverted index of transcript text and notes per project, built incrementally from
+  `agents.jsonl` (words of three letters or more).
+- Palette results under "In runs" open the run at the matching entry.
+- **Test:** a word from a worker's text finds that run and scrolls to the entry.
+
+### A8. Server-owned settling (M)
+
+- **Today:** Settle, Pin and Archive are browser-only (`prefs.runFlags`).
+- **Add:** move them to the daemon. Auto-settle after a merged run or PR, or after N days idle,
+  unless the run is set to Never.
+- Settling stops the run's preview and removes its leftover worktrees.
+- The sidebar reads the server's state, so every device agrees.
+- **Test:** a merged fixture run settles itself, and a run set to Never does not.
+
+### A9. Switch the model mid-run, with a handoff (M)
+
+- Change a role's provider on a finished or paused run.
+- The next agent gets a compact handoff (plan, decisions, diff stat, open failures) instead of
+  the old provider's session.
+- Uses the compiled working memory (`memory.rs`).
+
+### A10. Let outside agents drive Taskmaster (M)
+
+- An orchestrator MCP server beside the Dictionary MCP: `start_run`, `run_status`,
+  `wait_run` (until done, failed or needs-you), `add_note`, `read_transcript` (bounded),
+  `preview_url`. It uses a scoped token.
+- Ship `skills/taskmaster/SKILL.md` (as herdr ships its skill) so Claude Code or Codex knows
+  how to use it, and refuse when the token is missing.
+- **Test:** an MCP client starts a fixture run, waits, and reads the result.
+
+## Phase O: workspace (from Orca)
+
+### O1. A project file for worktrees: `taskmaster.yaml` (M) — do this first in this phase
+
+- Read from the project root, committed with the project:
+  ```yaml
+  setup: npm ci            # runs once in each new worktree, before its agent starts
+  preview: npm run dev -- --port $PORT
+  test: npm test
+  shared: [node_modules, .venv, .cache]   # linked, not copied (generalizes borrow_node_modules)
+  copy: [.env, .env.local]                # ignored files copied into new worktrees
+  archive: ""                             # runs before a worktree is removed
+  ```
+- `setup` runs with `wait-for-setup` semantics, and its output goes to the run's terminal
+  transcript.
+- `preview` feeds `Previews` ahead of package.json scripts. `test` feeds `runtime.rs`.
+- The person approves a shared file's commands once (trust by hash), like Orca.
+- Settings → Project shows the file's state, with "Create from this project" to generate it.
+- **Test:**
+  - a fixture with `setup: touch .ready` has `.ready` in every worker's tree before its brief;
+  - `copy: [.env]` puts the ignored `.env` in each worktree;
+  - an unapproved changed `setup` asks first.
+
+### O2. Design Mode in the preview (M)
+
+- A toolbar toggle in the Preview tab. Hover highlights an element, and a click captures its
+  CSS selector, trimmed outer HTML, key computed styles and a cropped screenshot. Use the
+  existing browser (`browser.rs`) for the screenshot, or the iframe when same-origin.
+- The capture lands in the composer as a chip and is routed to the worker that owns the
+  source file (owned globs plus a source-map lookup when the dev server has one).
+- **Test:** clicking the fixture's `<h1>` inserts a chip with its selector, and sending routes
+  a note to the page's worker.
+
+### O3. Batched diff review (S)
+
+- Line comments in the Diff and Review lenses collect as drafts with a count.
+- "Send N notes" sends one note per owning worker with every line anchor, as one turn.
+- Comments stay pinned after the revision and can be resolved.
+- **Test:** three comments on two pages become two notes and one turn.
+
+### O4. Usage and limits before they bite (M)
+
+- A status-bar meter per provider: the 5-hour and weekly windows and their reset times.
+  Sources are each CLI's own reports (Claude's rate-limit status data, Codex rate-limit
+  events, ACP usage); OAuth polling is opt-in and off by default.
+- A warning at 80%.
+- `Roles::resolve_auto` routes away from a provider near its limit.
+- Typed limits stay as the backstop.
+- **Test:** a fixture provider reporting 85% shows the warning and is skipped by Auto.
+
+### O5. Race a request across providers (L)
+
+- A "Race" choice in the composer: the same prompt runs as 2–3 runs on sibling branches
+  (one per provider).
+- A compare view shows checks, tests, diff size, cost and the preview side by side. Merge the
+  winner; the others are removed.
+- Builds on `POST /api/runs/{id}/fork` and W3.
+- **Test:** a race of two fixture providers shows both results and merges only the chosen one.
+
+### O6. Agents set their own status line (S)
+
+- `status(text)` in `run_code` (and an MCP tool for harnesses without Code Mode) sets a
+  one-line "what I am doing" shown on the agent card and the mission node, ahead of the
+  derived headline.
+- Kept in the transcript as a `status` entry.
+
+### O7. Release idle warm sessions and resume them (S)
+
+- Warm sessions (`Driver.warm`) idle for more than N minutes are closed.
+- A repair that needs one resumes the provider session by id (`claude --resume` is already
+  supported in `tm-harness/src/claude.rs`; Codex and ACP have session ids) instead of
+  starting cold.
+
+### O8. Let the master answer low-risk worker approvals (S, opt-in)
+
+The master may approve a worker's approval request with a reason. The person still sees Allow
+and Deny, and the first answer wins.
+
+## Phase H: runtime (from herdr)
+
+### H1. One state model, rolled up, with unread (S–M)
+
+- Agent states: `working`, `blocked` (waiting on an approval, a question or a limit), `idle`,
+  `done` (unseen until viewed), `failed`, `stopped`.
+- A blocked agent makes its run show "Needs you" in the sidebar and on gallery cards. A run
+  that finished while you were elsewhere stays bold until opened.
+- An "explain" tooltip says why a state was chosen (for example "waiting on approval
+  `bash: npm i`").
+- Use strict rules: blocked only on a real pending approval, question or limit, never a
+  guess.
+- **Test:** a fixture approval turns the run "Needs you", and approving clears it. A finished
+  run is unread until opened.
+
+### H2. Resume provider sessions after a daemon restart (M)
+
+- Record each call's provider session id (Claude session, Codex thread, ACP session) on its
+  `start`/`end` entries.
+- When `resume.rs` respawns an in-flight unit, it resumes that session with a short "the
+  daemon restarted; continue" turn instead of sending the whole brief again. It falls back to
+  a fresh brief.
+- **Test:** a fixture worker interrupted by a restart is resumed with its session id, and the
+  brief is not resent.
+
+### H3. Keep agents alive across a daemon update (L, later)
+
+- A small process holder owns agent processes and PTYs. A new `tm-daemon` reattaches to them
+  after an update instead of killing them (herdr's `--handoff`, Orca's daemon).
+- Only after H2.
+
+### H4. Agents can wait (S)
+
+- `wait({url|port|log|agent, timeout})` in `run_code`: wait for the dev server to answer, a
+  log line to appear, or a sibling unit to pass.
+- It replaces sleep loops and makes the preview check reliable.
+
+### H5. Several machines, one run list (M)
+
+- The sidebar merges runs from paired daemons (today they are only gallery cards), each with
+  its own reconnect and its own "Needs you".
+
+**Not needed:** herdr's screen-detection rules. Our agents speak structured protocols
+(`stream-json`, the Codex app server, ACP). The PTY screen reader (`tm-harness/src/screen.rs`)
+is only for installers and sign-in screens.
 
 ## Order
 
-| Step | What | Size | Needs |
+| Step | Items | Size | Why now |
 | --- | --- | --- | --- |
-| 1 | Phase 0: commit in slices, one worktree per thread | S | — |
-| 2 | 5.1 a first eval suite of 10 tasks | M | 0 |
-| 3 | 2.9–2.10, 2.13, 3.5, 3.10–3.12: Compiled Memory, `run_code` v2, Atlas, Policy, Doctor, Checkpoints/Fork, Flight Recorder | L | 0 |
-| 4 | Phase 6: Spatial Mission Control, 4-Lens Run Studio, Interactive Plan Workbench, Rich Visuals, Knowledge Hub | L | 3 |
-| 5 | 1.1–1.3, 1.6: web tools, fetch pipeline, roles, injection framing | L | 0 |
-| 6 | 2.1 LSP in the loop | L | 0 |
-| 7 | 1.4–1.5, 1.7: research phase, local docs, UI | M | 5 |
-| 8 | 2.3 red/green gate, 2.6 release gate, 2.11–2.12 dual-spec & contract RFCs | M | 6 |
-| 9 | 3.1 secrets, 3.3 supply-chain gate, 3.4 merge queue | L | 5 |
-| 10 | 2.4 plan review, 2.5 best-of-N, 2.2 context packs | L | 2, 6 |
-| 11 | 3.6–3.9, 3.13 service, schema, observability, idempotency, remote mesh | M | — |
-| 12 | Phase 4 workflow items, PR loop first | L | 9 |
-| 13 | 5.2 gate, 5.3 learned routing | M | 2 |
+| 1 | P1, P3, P4 | M | Daemon cost that grows with every run and tab |
+| 2 | P2 | M | Transcripts 3–4× smaller, fewer SSE events; P5 builds on it |
+| 3 | P6–P11, P12 | M | The run page and sidebar stay smooth; budgets stop regressions |
+| 4 | P5 | L | Big runs open fast |
+| 5 | W1–W4 | M | Quality from code already written |
+| 6 | O1 | M | Worktree setup, shared deps and `.env`: preview and tests work in every worktree |
+| 7 | H1, A1 | M | Never hunt for the stuck run; queue or steer |
+| 8 | A2 | L | Rewind a turn, with files |
+| 9 | O4, H2, O7 | M | Limits before they bite; resume instead of re-briefing |
+| 10 | O2, O3, O6, H4 | M | Design Mode, batched review, status line, wait |
+| 11 | A3, A4 | M | Per-run permissions, goals |
+| 12 | A10, A7, A8 | M | Outside agents, search, server settling |
+| 13 | O5, A9, A5, A6, O8, H5 | M–L | Race, model switch, conveniences, multi-machine list |
+| 14 | H3 | L | Live handoff across daemon updates |
+
+## How to run each item
+
+1. Measure the "before" number named in the item. Write it in the commit message.
+2. Write the test that fails without the change.
+3. Make the change.
+4. Run the checks:
+   `cargo clippy -p tm-daemon -p tm-core --offline --all-targets -- -D warnings`,
+   `cargo test -p tm-core -p tm-daemon --offline --lib`, `npm run typecheck --prefix web`,
+   and `cd web && npm run e2e`. Two tm-daemon tests fail without `python3-venv`; that is the
+   baseline.
+5. Check the screen in the browser against the fixture daemon (the `web-ui` skill).
+6. Measure "after" and commit. Do not push.
 
 ## Risks
 
-- **Prompt injection through the web** is the largest new risk. 1.6 ships with 1.1, never
-  after it.
-- **Warm language servers** cost memory per run tree. Cap them, share where possible, and fall
-  back to the CLI checkers.
-- **Best-of-N doubles spend on hard units.** It stays behind the budget and is off by default.
-- **More gates mean more ways to stall.** Every gate refuses with a sentence and a way out
-  (Retry, Switch, or an override), the same as typed limits.
+- **Changing the transcript format (P2, P5)** touches every reader: the web stream, the
+  terminal tab, `close_open_calls`, tests and exports. Keep reading the old form, and add a
+  format version on `start` entries.
+- **Checkpoints (A2)** write hidden refs in the person's repository. Prune them when a run is
+  removed, and never restore files while another run uses the checkout.
+- **`taskmaster.yaml` (O1)** runs commands from a file in the repository. Ask once per file
+  hash, as Orca does, and never run it for a cloned repository before the person approves.
+- **Racing and best-of-N (O5, W3)** multiply spend. They stay behind the budget cap and are off
+  by default.
+- **Usage polling (O4)** must not send tokens anywhere new. Read what the CLIs report; OAuth
+  polling is opt-in.
+
+## Sources
+
+- T3 Code: [pingdotgg/t3code](https://github.com/pingdotgg/t3code). Read:
+  `docs/internals/overview.md`, `docs/internals/performance-regressions.md`,
+  `docs/internals/web-ui.md`, `docs/user/composer.md`, `docs/user/permission-modes.md`,
+  `docs/user/thread-sidebar.md`, `apps/server/src/checkpointing/CheckpointStore.ts`,
+  `apps/server/src/orchestration-v2/CommandOutputHub.ts`.
+- Orca: [stablyai/orca](https://github.com/stablyai/orca). Read: `README.md` and
+  `docs/site/content/docs/` (`cli/orchestration`, `model/orca-yaml`,
+  `cli/worktree-checkpoints`, `browser/design-mode`, `review/annotate-ai-diff`,
+  `recipes/parallel-agents`, `agents/hibernation`, `agents/usage-tracking`,
+  `model/session-restore`, `agents/hooks-memory`).
+- herdr: [ogulcancelik/herdr](https://github.com/ogulcancelik/herdr). Read: `README.md`,
+  `AGENTS.md` (multiplicative performance paths), and docs 0.7.3 (`agents`, `agent-skill`,
+  `session-state`, `integrations`, `socket-api`).

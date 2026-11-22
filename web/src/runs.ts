@@ -6,20 +6,20 @@ import type { RunSummary } from "./api";
 import { undoable } from "./overlay";
 import { prefs, setRunFlag, type RunFlags } from "./prefs";
 
-export type Group = "Needs approval" | "Working" | "Pinned" | "Runs" | "Settled" | "Archived";
+export type Group = "Needs you" | "Working" | "Pinned" | "Runs" | "Settled" | "Archived";
 
 export const WORKING = new Set(["planning", "building", "reviewing", "verifying"]);
 
 export function groupOf(run: RunSummary, flags: RunFlags | undefined): Group {
   if (flags?.archived) return "Archived";
-  if (run.phase === "awaiting_approval") return "Needs approval";
+  if (run.needs_you || (run.pending_approvals ?? 0) > 0 || run.phase === "awaiting_approval") return "Needs you";
   if (WORKING.has(run.phase) && run.active) return "Working";
   if (flags?.pinned) return "Pinned";
   if (flags?.settled) return "Settled";
   return "Runs";
 }
 
-const ORDER: Group[] = ["Needs approval", "Working", "Pinned", "Runs", "Settled", "Archived"];
+const ORDER: Group[] = ["Needs you", "Working", "Pinned", "Runs", "Settled", "Archived"];
 
 /** Runs in the order they are shown, with their group. Archived ones only when asked. */
 export function ordered(runs: RunSummary[], showArchived: boolean): { run: RunSummary; group: Group }[] {

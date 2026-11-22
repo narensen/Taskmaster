@@ -18,7 +18,7 @@ import { Loading } from "../ui";
 import { Link, navigate } from "../router";
 import { ExternalLink } from "../paths";
 import { approvalLabel, isUnpriced, phaseLabel, tokens, usd } from "../format";
-import { motionOn, prefs, setPrefs, usePrefs } from "../prefs";
+import { isRunUnread, markRunSeen, motionOn, prefs, setPrefs, usePrefs } from "../prefs";
 import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
 import { consumeCloneRequest } from "../commands";
@@ -109,10 +109,15 @@ function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: num
   const { shot, prompt } = useShot(run, useSeen(card));
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
+  const unread = isRunUnread(run, p.seenRuns);
+  const needsYou = !!run.needs_you || (run.pending_approvals ?? 0) > 0 || run.phase === "awaiting_approval";
   return (
     <article
       ref={card}
-      className="card gallery-card"
+      className={`card gallery-card ${unread ? "unread" : ""} ${needsYou ? "needs-you" : ""}`}
+      data-unread={unread ? "true" : undefined}
+      data-run-state={run.state}
+      title={run.state_reason}
       onMouseEnter={() => prefetchRun(run.id)}
       onFocus={() => prefetchRun(run.id)}
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
@@ -123,24 +128,31 @@ function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: num
         }
       }}
     >
-      <Link morph to={`/runs/${encodeURIComponent(run.id)}`} className="frame-link" aria-label={`Open ${run.id}`} style={{ viewTransitionName: morphName(run.id) } as React.CSSProperties}>
+      <Link morph to={`/runs/${encodeURIComponent(run.id)}`} onClick={() => markRunSeen(run)} className="frame-link" aria-label={`Open ${run.id}`} style={{ viewTransitionName: morphName(run.id) } as React.CSSProperties}>
         {shot ? (
           <img className="frame shot" src={shot} alt={`Latest page of ${run.id}`} />
         ) : (
           <div className="frame typed" data-testid="typed-frame">
             <div className="typed-line">{folder || run.id}</div>
             {prompt && <div className="typed-sub clip">{prompt}</div>}
-            <div className="typed-phase">{phaseLabel(run)}</div>
+            <div className="typed-phase" title={run.state_reason}>
+              {needsYou ? "Needs you" : phaseLabel(run)}
+            </div>
           </div>
         )}
       </Link>
       <div className="card-foot">
         <div className="grow">
-          <Link morph to={`/runs/${encodeURIComponent(run.id)}`} className="card-title clip">
+          <Link morph to={`/runs/${encodeURIComponent(run.id)}`} onClick={() => markRunSeen(run)} className="card-title clip">
             {run.id}
+            {needsYou && (
+              <span className="needs-pill" title={run.state_reason ?? "Needs your attention"} style={{ marginLeft: 6 }}>
+                Needs you
+              </span>
+            )}
           </Link>
-          <div className="card-meta clip">
-            {phaseLabel(run)} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {isUnpriced(run.spent) ? `${tokens(run.spent.tokens)} tokens` : usd(run.spent.cost_usd)}
+          <div className="card-meta clip" title={run.state_reason}>
+            {needsYou ? "Needs you" : phaseLabel(run)} · {run.pages.length} page{run.pages.length === 1 ? "" : "s"} · {isUnpriced(run.spent) ? `${tokens(run.spent.tokens)} tokens` : usd(run.spent.cost_usd)}
           </div>
         </div>
         <div className="card-actions">

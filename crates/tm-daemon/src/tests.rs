@@ -4887,6 +4887,237 @@ async fn o1_project_config_http_generate_and_trust_roundtrip() {
     drop(server);
 }
 
+#[tokio::test]
+async fn a1_queued_notes_batch_into_one_turn_and_steer_note_reaches_master_before_next_worker() {
+    struct A1Harness {
+        live: Arc<crate::live::Live>,
+        run_id: String,
+        master_briefs: Mutex<Vec<String>>,
+        worker_briefs: Mutex<Vec<String>>,
+        injected: Mutex<bool>,
+    }
+    #[async_trait]
+    impl Harness for A1Harness {
+        fn id(&self) -> &'static str {
+            "a1-harness"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Distinguish master consults from workers by prompt prefix.
+            if task.brief.starts_with("Read these notes") {
+                self.master_briefs.lock().unwrap().push(task.brief.clone());
+                let _ = events.send(HarnessEvent::Text { text: "Master says: follow the steer note.".into() }).await;
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+            }
+            self.worker_briefs.lock().unwrap().push(task.brief.clone());
+            // When page `a` runs, drop 1 steer note (reaches master before page `b`) and 2 queued notes (batched into 1 turn after finish).
+            if task.brief.contains("app/a/") {
+                let mut inj = self.injected.lock().unwrap();
+                if !*inj {
+                    *inj = true;
+                    self.live.add_note_full(&self.run_id, "master", "STEER_NOTE_FOR_B", None, false).unwrap();
+                    self.live.add_note_full(&self.run_id, "master", "QUEUED_ONE", Some("agent"), true).unwrap();
+                    self.live.add_note_full(&self.run_id, "master", "QUEUED_TWO", Some("agent"), true).unwrap();
+                }
+                let file = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(file.parent().unwrap())?;
+                std::fs::write(&file, "export const a = 1;\n")?;
+            } else if task.brief.contains("app/b/") {
+                let file = task.cwd.join("app/b/page.ts");
+                std::fs::create_dir_all(file.parent().unwrap())?;
+                std::fs::write(&file, "export const b = 2;\n")?;
+            } else {
+                // Batched Agent turn after initial run settles.
+                let file = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(file.parent().unwrap())?;
+                std::fs::write(&file, "export const a = 2;\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("a1-queue-steer");
+    let store: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp.0));
+    let live = Arc::new(crate::live::Live::new(store.clone()));
+    let run_id = "a1-run".to_string();
+    let h = Arc::new(A1Harness {
+        live: live.clone(),
+        run_id: run_id.clone(),
+        master_briefs: Mutex::new(Vec::new()),
+        worker_briefs: Mutex::new(Vec::new()),
+        injected: Mutex::new(false),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &["a"])]), true, 1);
+    cfg.run_id = run_id.clone();
+    cfg.store = Some(store);
+    cfg.live = Some(live.clone());
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    // 1. Steer note reached master before page `b`, and queued notes did NOT leak into master consult.
+    let masters = h.master_briefs.lock().unwrap();
+    assert!(
+        masters.iter().any(|b| b.contains("STEER_NOTE_FOR_B")),
+        "expected steer note to reach master before page b, got: {masters:#?}"
+    );
+    assert!(
+        masters.iter().all(|b| !b.contains("QUEUED_ONE") && !b.contains("QUEUED_TWO")),
+        "queued notes must not steer the active run: {masters:#?}"
+    );
+
+    // 2. Both queued notes opened ONE follow-up AgentTurn together, in order, after the initial run settled.
+    let workers = h.worker_briefs.lock().unwrap();
+    let queued_turns: Vec<&String> = workers
+        .iter()
+        .filter(|b| b.contains("QUEUED_ONE") || b.contains("QUEUED_TWO"))
+        .collect();
+    assert_eq!(
+        queued_turns.len(),
+        1,
+        "two queued notes must batch into exactly one follow-up turn, got: {queued_turns:#?}"
+    );
+    let combined = queued_turns[0];
+    let p1 = combined.find("QUEUED_ONE").expect("QUEUED_ONE in turn");
+    let p2 = combined.find("QUEUED_TWO").expect("QUEUED_TWO in turn");
+    assert!(p1 < p2, "queued notes must preserve order");
+}
+
+#[tokio::test]
+async fn h1_pending_approval_marks_run_blocked_needs_you_and_approving_clears_it() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let parsed = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    struct AskOnceHarness;
+    #[async_trait]
+    impl Harness for AskOnceHarness {
+        fn id(&self) -> &'static str {
+            "h1-ask"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let decision = gate
+                .decide_async(&tm_harness::PermissionRequest {
+                    tool: "bash".into(),
+                    kind: tm_harness::ToolKind::Execute,
+                    command: Some("npm i".into()),
+                    paths: vec![],
+                    url: None,
+                })
+                .await;
+            assert_eq!(decision, tm_harness::Decision::Allow);
+            let file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "export const ok = true;\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("h1-needs-you");
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let mut options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    options.harness = Arc::new(|_| Ok(Arc::new(AskOnceHarness) as Arc<dyn Harness>));
+    options.approvals = crate::approvals::Policy {
+        mode: crate::approvals::Mode::Risky,
+        timeout: std::time::Duration::from_secs(30),
+    };
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+    let (st, _) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/runs",
+        Some(serde_json::json!({
+            "id": "r-h1",
+            "plan": planned,
+            "yes": true,
+            "roles": {
+                "worker": "h1-ask",
+                "mid": "h1-ask",
+                "master": "h1-ask",
+                "reviewer": "h1-ask",
+                "verifier": "h1-ask"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, 202);
+
+    // Wait briefly until the pending approval is registered.
+    let mut approval_id = None;
+    for _ in 0..80 {
+        let (_, pending) = call(&addr, Some(&token), "GET", "/api/approvals?run=r-h1", None).await;
+        if let Some(first) = pending["approvals"].as_array().and_then(|a| a.first()) {
+            approval_id = first["id"].as_str().map(str::to_string);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let approval_id = approval_id.expect("pending approval registered");
+
+    // H1: Run reports `state: "blocked"`, `needs_you: true`, and explain reason mentioning `bash: npm i`.
+    let (st, list) = call(&addr, Some(&token), "GET", "/api/runs", None).await;
+    assert_eq!(st, 200);
+    let row = list["runs"].as_array().unwrap().iter().find(|r| r["id"] == "r-h1").unwrap();
+    assert_eq!(row["state"], "blocked");
+    assert_eq!(row["needs_you"], true);
+    let reason = row["state_reason"].as_str().unwrap();
+    assert!(reason.contains("bash: npm i"), "expected explain reason to name tool+cmd, got: {reason}");
+
+    // Approve it -> `needs_you` clears immediately.
+    let (st, _) = call(&addr, Some(&token), "POST", &format!("/api/approvals/{approval_id}/approve"), Some(serde_json::json!({}))).await;
+    assert_eq!(st, 200);
+
+    let (st, after) = call(&addr, Some(&token), "GET", "/api/runs", None).await;
+    assert_eq!(st, 200);
+    let row_after = after["runs"].as_array().unwrap().iter().find(|r| r["id"] == "r-h1").unwrap();
+    assert_eq!(row_after["needs_you"], false);
+    assert_ne!(row_after["state"], "blocked");
+
+    drop(server);
+}
+
+
 
 
 

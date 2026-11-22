@@ -279,6 +279,10 @@ pub struct Note {
     /// `auto`. `None` follows the run's own mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// True when the note should wait until the active run settles and open the next turn
+    /// together with other queued notes instead of steering the running master (A1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
 }
 
 impl Live {
@@ -546,6 +550,18 @@ impl Live {
 
     /// [`Live::add_note`] with the mode a new turn should run in (see [`Note::mode`]).
     pub fn add_note_as(&self, run: &str, to: &str, text: &str, mode: Option<&str>) -> anyhow::Result<Note> {
+        self.add_note_full(run, to, text, mode, false)
+    }
+
+    /// [`Live::add_note`] with an optional turn mode and `queued` flag (A1).
+    pub fn add_note_full(
+        &self,
+        run: &str,
+        to: &str,
+        text: &str,
+        mode: Option<&str>,
+        queued: bool,
+    ) -> anyhow::Result<Note> {
         let _guard = self.notes_lock.lock().unwrap();
         let mut notes = self.notes(run);
         let note = Note {
@@ -555,6 +571,7 @@ impl Live {
             at: rfc3339_now(),
             delivered: false,
             mode: mode.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string),
+            queued,
         };
         notes.push(note.clone());
         self.save_notes(run, &notes)?;
@@ -563,19 +580,55 @@ impl Live {
 
     /// Change or remove a note that has not been delivered. `None` removes it.
     pub fn edit_note(&self, run: &str, id: &str, text: Option<&str>) -> anyhow::Result<bool> {
+        self.edit_note_full(run, id, text, None)
+    }
+
+    /// Change text and/or `queued` flag on an undelivered note; if both are `None`, removes it.
+    pub fn edit_note_full(
+        &self,
+        run: &str,
+        id: &str,
+        text: Option<&str>,
+        queued: Option<bool>,
+    ) -> anyhow::Result<bool> {
         let _guard = self.notes_lock.lock().unwrap();
         let mut notes = self.notes(run);
         let Some(index) = notes.iter().position(|note| note.id == id && !note.delivered) else {
             return Ok(false);
         };
-        match text {
-            Some(text) => notes[index].text = text.to_string(),
-            None => {
-                notes.remove(index);
+        if text.is_none() && queued.is_none() {
+            notes.remove(index);
+        } else {
+            if let Some(text) = text {
+                notes[index].text = text.to_string();
+            }
+            if let Some(q) = queued {
+                notes[index].queued = q;
             }
         }
         self.save_notes(run, &notes)?;
         Ok(true)
+    }
+
+    /// Promote all undelivered queued notes into active notes so a newly opened FollowUp turn reads them together.
+    pub fn unqueue_all(&self, run: &str) {
+        let guard = self.notes_lock.lock().unwrap();
+        self.unqueue_all_held(&guard, run);
+    }
+
+    /// [`Live::unqueue_all`] when the caller already holds [`Live::write_lock`].
+    pub fn unqueue_all_held(&self, _held: &std::sync::MutexGuard<'_, ()>, run: &str) {
+        let mut notes = self.notes(run);
+        let mut changed = false;
+        for note in notes.iter_mut() {
+            if !note.delivered && note.queued {
+                note.queued = false;
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.save_notes(run, &notes);
+        }
     }
 
     /// Undelivered notes matching `pred`, marked delivered. A note is read once.
@@ -623,12 +676,13 @@ impl Live {
 
     /// The undelivered notes for `to`, marked delivered. `workers` notes are kept for
     /// every later worker as well, so they are returned whether delivered or not.
+    /// Queued notes are held back until the current turn finishes (A1).
     pub fn take_notes(&self, run: &str, to: &[&str]) -> Vec<String> {
         let _guard = self.notes_lock.lock().unwrap();
         let mut notes = self.notes(run);
         let mut out = Vec::new();
         for note in notes.iter_mut() {
-            if !to.contains(&note.to.as_str()) {
+            if note.queued || !to.contains(&note.to.as_str()) {
                 continue;
             }
             if note.delivered && note.to != "workers" {

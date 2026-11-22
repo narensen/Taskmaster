@@ -14,7 +14,7 @@ import { phaseLabel, usd } from "../format";
 import { FilesPanel } from "../lazy";
 import { emit, Sheet, toast, undoable, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, looksLikePath, resolvedPath } from "../paths";
-import { prefs, rememberRun, setPrefs } from "../prefs";
+import { markRunSeen, prefs, rememberRun, setPrefs, usePrefs } from "../prefs";
 import { useSettings } from "../query";
 import { navigate } from "../router";
 import { setRunChrome } from "../shell/runChrome";
@@ -268,8 +268,12 @@ function EndLine({ detail, onDiff, onRetry }: { detail: RunDetail; onDiff: () =>
 }
 
 export function RunView({ id }: { id: string }) {
+  const p = usePrefs();
   const data = useRun(id);
   const { detail, entries, ledger, notes } = data;
+  useEffect(() => {
+    if (detail) markRunSeen(detail);
+  }, [detail]);
   const narrow = useNarrow();
   const composer = useRef<ComposerHandle>(null);
   const runRef = useRef<HTMLDivElement>(null);
@@ -659,14 +663,18 @@ export function RunView({ id }: { id: string }) {
     return () => document.removeEventListener("mouseup", onUp);
   }, []);
 
-  const send = async (message: { text: string; chips: Chip[]; attachments: Chip[] }) => {
+  const send = async (message: { text: string; chips: Chip[]; attachments: Chip[] }, opts?: { alt?: boolean }) => {
     const text = messageText(message);
     if (!text) return;
     const to = noteTarget(message.chips);
-    // A note on a finished run starts a new turn below; the mode says who takes it.
+    // A note on a finished run starts a new turn below; on an active run Enter uses the
+    // person's Queue/Steer default and Ctrl/Cmd+Enter does the other (A1).
     const finished = !!detail && !detail.active && (detail.phase === "done" || detail.phase === "failed");
+    const active = !!detail?.active;
+    const defaultQueue = p.chatSendMode !== "steer";
+    const queued = active ? (opts?.alt ? !defaultQueue : defaultQueue) : false;
     try {
-      await api.addNote(id, to, text, finished ? runMode : undefined);
+      await api.addNote(id, to, text, finished || queued ? runMode : undefined, queued);
       composer.current?.clear();
       data.reloadNotes();
       if (finished) {
@@ -1036,10 +1044,34 @@ export function RunView({ id }: { id: string }) {
             {(pending.length > 0 || delivered.length > 0) && (
               <section className="flow-notes">
                 {pending.map((n) => (
-                  <div key={n.id} className={`flow-note ${settled ? "is-next-turn" : ""}`} data-testid="draft">
+                  <div
+                    key={n.id}
+                    className={`flow-note ${settled ? "is-next-turn" : ""} ${n.queued ? "is-queued" : ""}`}
+                    data-testid={n.queued ? "queued-note" : "draft"}
+                  >
                     <header className="flow-role">
                       <h2>You</h2>
-                      <span className="flow-state">{settled ? "starting a new turn…" : `waiting for ${noteTargetLabel(n.to)}`}</span>
+                      <span className="flow-state">
+                        {settled
+                          ? "starting a new turn…"
+                          : n.queued
+                            ? `queued for next turn${n.mode ? ` · ${n.mode}` : ""}`
+                            : `steering ${noteTargetLabel(n.to)}`}
+                      </span>
+                      {n.queued && !settled && (
+                        <button
+                          type="button"
+                          className="link small"
+                          onClick={() => {
+                            void api.editNote(id, n.id, undefined, false).then(() => {
+                              data.reloadNotes();
+                              toast("Promoted to steer now");
+                            });
+                          }}
+                        >
+                          Send now
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="link small"
@@ -1048,7 +1080,7 @@ export function RunView({ id }: { id: string }) {
                           if (text !== null) void api.editNote(id, n.id, text || undefined).then(data.reloadNotes);
                         }}
                       >
-                        edit
+                        Edit
                       </button>
                       <button
                         type="button"
@@ -1063,10 +1095,10 @@ export function RunView({ id }: { id: string }) {
                             });
                             toast("The note was not removed");
                           });
-                          undoable("Removed the note", () => void api.addNote(id, n.to, n.text).then(data.reloadNotes));
+                          undoable("Removed the note", () => void api.addNote(id, n.to, n.text, n.mode, n.queued).then(data.reloadNotes));
                         }}
                       >
-                        remove
+                        Remove
                       </button>
                     </header>
                     <div className="flow-said">
@@ -1114,18 +1146,30 @@ export function RunView({ id }: { id: string }) {
               ? runMode === "code"
                 ? "Ask the master for a change. It starts a new turn below."
                 : "Ask for a fix or a change. It starts a new turn below."
-              : "Steer master or @worker:<id>. @ files, # pull requests, $ skills, / commands"
+              : p.chatSendMode === "steer"
+                ? "Steer now (Enter) or queue for next turn (⌘↵). @ files, # PRs, $ skills"
+                : "Queue for next turn (Enter) or steer now (⌘↵). @ files, # PRs, $ skills"
           }
-          onSend={(m) => void send(m)}
+          onSend={(m, opts) => void send(m, opts)}
+          onAltUp={() => {
+            const lastQueued = [...pending].reverse().find((n) => n.queued) ?? pending[pending.length - 1];
+            if (!lastQueued) return;
+            const next = window.prompt("Edit queued note", lastQueued.text);
+            if (next !== null) void api.editNote(id, lastQueued.id, next || undefined).then(data.reloadNotes);
+          }}
           footer={
-            settled ? (
-              <div className="composer-foot run-composer-foot">
-                <div className="composer-actions">
-                  <ModePicker value={runMode} onChange={setRunMode} label="Who takes the next turn" />
-                </div>
-                <span className="muted small">Enter to send</span>
+            <div className="composer-foot run-composer-foot">
+              <div className="composer-actions">
+                <ModePicker value={runMode} onChange={setRunMode} label="Who takes the next turn" />
               </div>
-            ) : undefined
+              <span className="muted small">
+                {settled
+                  ? "Enter to send"
+                  : p.chatSendMode === "steer"
+                    ? "Enter: Steer · ⌘↵: Queue · Alt+↑: edit last"
+                    : "Enter: Queue · ⌘↵: Steer · Alt+↑: edit last"}
+              </span>
+            </div>
           }
         />
       </div>

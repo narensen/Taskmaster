@@ -1736,7 +1736,7 @@ impl Driver {
             return Ok(());
         }
         let repair = errors.is_some();
-        let steer = self.live.has_pending_where(&self.id, |note| note.to == "master" || note.to == "workers");
+        let steer = self.live.has_pending_where(&self.id, |note| !note.queued && (note.to == "master" || note.to == "workers"));
         if !repair && self.citations_fresh(&page)? && !steer && !self.opened_by_note(&page) {
             eprintln!("taskmaster: {page} citations are unchanged");
             self.push_event(Event::PageFresh { page })?;
@@ -4617,7 +4617,7 @@ impl Driver {
 
     /// One master turn over the notes `pred` selects. Nothing is asked when there are none.
     async fn consult(&mut self, pred: impl Fn(&crate::live::Note) -> bool) -> anyhow::Result<Option<String>> {
-        let notes = self.live.take_fresh_where(&self.id, pred);
+        let notes = self.live.take_fresh_where(&self.id, |note| !note.queued && pred(note));
         if notes.is_empty() {
             return Ok(None);
         }
@@ -5128,6 +5128,7 @@ impl Driver {
         let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
         let mode = crate::turns::turn_mode(&pending, self.config.mode);
         if mode != crate::RunMode::Agent {
+            self.live.unqueue_all(&self.id);
             let (agent, fields) = crate::turns::turn_entry(turn, mode, &pending);
             self.live.push(&self.id, &agent, "turn", fields);
             return self.push_event(Event::FollowUp);

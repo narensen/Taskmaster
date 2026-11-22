@@ -213,7 +213,7 @@ mod tests {
     use super::*;
 
     fn note(text: &str, mode: Option<&str>) -> Note {
-        Note { id: "n".into(), to: "master".into(), text: text.into(), at: String::new(), delivered: false, mode: mode.map(str::to_string) }
+        Note { id: "n".into(), to: "master".into(), text: text.into(), at: String::new(), delivered: false, mode: mode.map(str::to_string), queued: false }
     }
 
     #[test]

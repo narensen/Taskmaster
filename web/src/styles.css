@@ -6951,3 +6951,39 @@ button.glob-file:hover { color: var(--ink); border-color: var(--line-strong); ba
     scroll-behavior: auto !important;
   }
 }
+
+/* H1: unread finished runs stay bold until opened; Needs you pill uses status ink. */
+.runrow.unread .run-title,
+.gallery-card.unread .card-title {
+  font-weight: 700;
+  color: var(--ink);
+}
+.runrow.unread .run-title::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--ink);
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.needs-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--warn, var(--line-2));
+  color: var(--warn, var(--ink));
+}
+
+/* A1: queued notes show dashed at the end of the thread until the run settles. */
+.flow-note.is-queued {
+  border: 1px dashed var(--line-2);
+  border-radius: var(--radius-sm, 8px);
+  padding: 8px 12px;
+  opacity: 0.92;
+}
+

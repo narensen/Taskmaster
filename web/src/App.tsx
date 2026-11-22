@@ -33,7 +33,7 @@ import { SignIn } from "./pages/SignIn";
 import { ContextMenu, Toasts, emit, openMenu, toast, undoLatest, useOn, type Chip } from "./overlay";
 import type { PaletteState } from "./palette";
 import { openProject } from "./openProject";
-import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
+import { isRunUnread, markRunSeen, prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan, usd } from "./format";
 import { readFile } from "./composer";
@@ -259,7 +259,7 @@ function useClocks(ids: string[], runs: RunSummary[] = []) {
 
 function RunMark({ group }: { group: Group }) {
   if (group === "Working") return <CircleDot size={13} />;
-  if (group === "Needs approval") return <CircleAlert size={13} />;
+  if (group === "Needs you") return <CircleAlert size={13} />;
   if (group === "Pinned") return <Pin size={13} />;
   if (group === "Archived") return <Archive size={13} />;
   return <Circle size={13} />;
@@ -277,6 +277,13 @@ function Stamp({ run, group, clock }: { run: RunSummary; group: Group; clock?: {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [working]);
+  if (group === "Needs you") {
+    return (
+      <span className="needs-pill" title={run.state_reason ?? "Needs your attention"}>
+        Needs you
+      </span>
+    );
+  }
   const when = working && clock ? shortSpan(now - clock.start) : !working && clock ? shortSpan(now - clock.end) : null;
   return <span>{working ? (when ? `Working ${when}` : phaseLabel(run).toLowerCase()) : (when ?? phaseLabel(run).toLowerCase())}</span>;
 }
@@ -298,6 +305,7 @@ const RunRow = memo(function RunRow({
 }) {
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
+  const unread = !on && isRunUnread(run, p.seenRuns);
   const menu = (x: number, y: number) =>
     openMenu(x, y, [
       { label: flags.pinned ? "Unpin" : "Pin", run: () => toggleFlag(run.id, "pinned") },
@@ -306,7 +314,10 @@ const RunRow = memo(function RunRow({
     ]);
   return (
     <div
-      className={`runrow ${on ? "on" : ""} ${group === "Needs approval" ? "ask" : ""} ${group === "Settled" ? "settled" : ""}`}
+      className={`runrow ${on ? "on" : ""} ${group === "Needs you" ? "ask" : ""} ${group === "Settled" ? "settled" : ""} ${unread ? "unread" : ""}`}
+      data-unread={unread ? "true" : undefined}
+      data-run-state={run.state}
+      title={run.state_reason}
       onDragOver={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
       onDrop={(e) => {
         if (e.dataTransfer.files.length) {
@@ -321,11 +332,12 @@ const RunRow = memo(function RunRow({
       onMouseEnter={() => prefetchRun(run.id)}
       onFocus={() => prefetchRun(run.id)}
     >
-      <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick} aria-current={on ? "page" : undefined}>
+      <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={() => { markRunSeen(run); onPick(); }} aria-current={on ? "page" : undefined}>
         <span
-          className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs approval" ? "ask" : ""} ${
+          className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs you" ? "ask" : ""} ${
             run.phase === "done" ? "done" : run.phase === "failed" ? "failed" : ""
           }`}
+          title={run.state_reason}
           aria-hidden
         >
           <RunMark group={group} />

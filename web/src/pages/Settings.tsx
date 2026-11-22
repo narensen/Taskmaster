@@ -872,6 +872,26 @@ export function Settings() {
       <RemoteMeshSection />
       <OperationsSection />
 
+      <Section title="Chat" note="What Enter does in a running run's composer. Ctrl/Cmd+Enter always does the other.">
+        <div className="seg" role="radiogroup" aria-label="While a run works">
+          {([
+            ["queue", "Queue for next turn"],
+            ["steer", "Steer active run"],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="radio"
+              aria-checked={(p.chatSendMode ?? "queue") === value}
+              className={(p.chatSendMode ?? "queue") === value ? "on" : ""}
+              onClick={() => setPrefs({ chatSendMode: value })}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </Section>
+
       <Section title="Motion" note="The system's reduced-motion setting always wins.">
         <label className="check">
           <input type="checkbox" checked={p.motion} onChange={(e) => setPrefs({ motion: e.target.checked })} />

@@ -464,6 +464,9 @@ pub struct NoteBody {
     /// On a finished run: `agent`, `code` or `auto` for the turn this note starts.
     #[serde(default)]
     mode: Option<String>,
+    /// Queue until the active run settles instead of steering the running master (A1).
+    #[serde(default)]
+    queued: bool,
 }
 
 pub fn valid_recipient(to: &str) -> bool {
@@ -484,7 +487,8 @@ pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
     {
         return Err(fail(StatusCode::BAD_REQUEST, format!("unknown mode `{mode}`: use `auto`, `code` or `agent`")));
     }
-    let note = app.live.add_note_as(&id, &body.to, body.text.trim(), mode)?;
+    let note = app.live.add_note_full(&id, &body.to, body.text.trim(), mode, body.queued)?;
+    app.live.notify_events(&id);
     app.wake_for_note(&id)?;
     ok(json!(note))
 }
@@ -493,6 +497,7 @@ pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
 #[serde(default)]
 pub struct EditNote {
     text: Option<String>,
+    queued: Option<bool>,
 }
 
 pub async fn edit_note(
@@ -501,8 +506,15 @@ pub async fn edit_note(
     body: Option<Json<EditNote>>,
 ) -> Reply {
     app.known(&id)?;
-    let text = body.and_then(|Json(body)| body.text).filter(|text| !text.trim().is_empty());
-    if app.live.edit_note(&id, &note, text.as_deref())? {
+    let (text, queued) = match body {
+        Some(Json(b)) => (b.text.filter(|t| !t.trim().is_empty()), b.queued),
+        None => (None, None),
+    };
+    if app.live.edit_note_full(&id, &note, text.as_deref(), queued)? {
+        app.live.notify_events(&id);
+        if queued == Some(false) {
+            app.wake_for_note(&id)?;
+        }
         ok(json!({ "notes": app.live.notes(&id) }))
     } else {
         Err(fail(StatusCode::CONFLICT, "that note was delivered or does not exist"))
@@ -1255,7 +1267,12 @@ pub async fn decide(State(app): State<Arc<App>>, UrlPath((id, decision)): UrlPat
         _ => return Err(fail(StatusCode::NOT_FOUND, "answer with approve or deny")),
     };
     match app.live.approvals.answer(&id, allow, "person") {
-        Some(view) => ok(json!({ "id": id, "allowed": allow, "approval": view })),
+        Some(view) => {
+            if let Some(run) = view["run"].as_str() {
+                app.live.notify_events(run);
+            }
+            ok(json!({ "id": id, "allowed": allow, "approval": view }))
+        }
         None => Err(fail(StatusCode::CONFLICT, "that question was already answered, timed out, or its run ended")),
     }
 }

@@ -93,7 +93,8 @@ export interface ComposerHandle {
 
 export interface ComposerProps {
   placeholder?: string;
-  onSend: (message: Message) => void;
+  onSend: (message: Message, opts?: { alt?: boolean }) => void;
+  onAltUp?: () => void;
   pages?: string[];
   agents?: string[];
   autoFocus?: boolean;
@@ -369,11 +370,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     setPopup(null);
   };
 
-  const send = () => {
+  const send = (alt = false) => {
     const message = read();
     if (!message.text && !message.attachments.length) return;
     rememberPrompt(messageText(message));
-    props.onSend(message);
+    props.onSend(message, { alt });
   };
 
   const setText = (text: string) => {
@@ -407,9 +408,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       e.preventDefault();
       return setPopup(null);
     }
+    if (e.key === "ArrowUp" && e.altKey && props.onAltUp) {
+      e.preventDefault();
+      return props.onAltUp();
+    }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      return send();
+      return send(e.metaKey || e.ctrlKey);
     }
     if (e.key === "Enter" && e.shiftKey) {
       e.preventDefault();

@@ -60,6 +60,10 @@ export interface Prefs {
   runPanel: boolean;
   /** The composer's mode last chosen: master and workers, one agent, or auto. */
   runMode: "auto" | "code" | "agent";
+  /** Default action on Enter while a run works: Queue for next turn or Steer active run (A1). */
+  chatSendMode: "queue" | "steer";
+  /** Last seen terminal state fingerprint per run id, so runs finishing elsewhere stay bold until opened (H1). */
+  seenRuns: Record<string, string>;
 }
 
 const KEY = "taskmaster.prefs";
@@ -88,7 +92,33 @@ const DEFAULTS: Prefs = {
   fileDiff: false,
   runPanel: true,
   runMode: "auto",
+  chatSendMode: "queue",
+  seenRuns: {},
 };
+
+/** Stable key representing a run's latest finished state, or null while still running/idle (H1). */
+export function runFinishKey(run: { phase: string; active: boolean; last_at?: string | null; phase_at?: string | number | null }): string | null {
+  if (run.active) return null;
+  if (run.phase !== "done" && run.phase !== "failed") return null;
+  return `${run.phase}:${run.last_at ?? run.phase_at ?? ""}`;
+}
+
+export function isRunUnread(
+  run: { id: string; phase: string; active: boolean; last_at?: string | null; phase_at?: string | number | null },
+  seen: Record<string, string> | undefined,
+): boolean {
+  const key = runFinishKey(run);
+  if (!key) return false;
+  return seen?.[run.id] !== key;
+}
+
+export function markRunSeen(run: { id: string; phase: string; active: boolean; last_at?: string | null; phase_at?: string | number | null }) {
+  const key = runFinishKey(run);
+  if (!key) return;
+  const cur = prefs().seenRuns ?? {};
+  if (cur[run.id] === key) return;
+  setPrefs({ seenRuns: { ...cur, [run.id]: key } });
+}
 
 function load(): Prefs {
   try {

@@ -143,9 +143,27 @@ export interface Plan {
 export type Roles = Record<RoleName, string>;
 export type Models = Partial<Record<RoleName, string | null>>;
 
+export type RunState = "working" | "blocked" | "idle" | "done" | "failed" | "stopped";
+
+export interface BlockedAgent {
+  id?: string;
+  call?: number;
+  role?: string;
+  page?: string;
+  reason: string;
+}
+
 export interface RunSummary {
   id: string;
   phase: Phase;
+  /** Unified H1 state rolled up from real approvals, limits, phase and activity. */
+  state?: RunState;
+  /** True strictly when waiting on a real pending approval, question or limit (H1). */
+  needs_you?: boolean;
+  /** Explain-tooltip reason for the current state (H1). */
+  state_reason?: string;
+  /** Pending tool approvals mapped to their blocked agents (H1). */
+  blocked_agents?: BlockedAgent[];
   /** Number of parallel worker slots configured for this run. */
   parallel?: number;
   active: boolean;
@@ -617,6 +635,7 @@ export interface Note {
   at: string;
   delivered: boolean;
   mode?: RunMode;
+  queued?: boolean;
 }
 
 export interface DaemonSettings {
@@ -1398,10 +1417,18 @@ export const api = {
       `/api/runs/${enc(id)}/agents/${index}`,
     ),
   notes: (id: string) => call<{ notes: Note[] }>("GET", `/api/runs/${enc(id)}/notes`).then((r) => r.notes),
-  addNote: (id: string, to: string, text: string, mode?: RunMode) =>
-    call<Note>("POST", `/api/runs/${enc(id)}/notes`, mode ? { to, text, mode } : { to, text }),
-  editNote: (id: string, note: string, text?: string) =>
-    call<{ notes: Note[] }>("POST", `/api/runs/${enc(id)}/notes/${enc(note)}`, text ? { text } : {}),
+  addNote: (id: string, to: string, text: string, mode?: RunMode, queued?: boolean) => {
+    const body: Record<string, unknown> = { to, text };
+    if (mode) body.mode = mode;
+    if (queued) body.queued = true;
+    return call<Note>("POST", `/api/runs/${enc(id)}/notes`, body);
+  },
+  editNote: (id: string, note: string, text?: string, queued?: boolean) => {
+    const body: Record<string, unknown> = {};
+    if (text !== undefined) body.text = text;
+    if (queued !== undefined) body.queued = queued;
+    return call<{ notes: Note[] }>("POST", `/api/runs/${enc(id)}/notes/${enc(note)}`, body);
+  },
   terminal: (id: string, command: string) =>
     call<{ ok: boolean; code: number | null; output: string }>("POST", `/api/runs/${enc(id)}/terminal`, { command }),
   diff: (id: string, scope: "run" | "page", page?: string) =>

@@ -844,9 +844,77 @@ impl App {
         let prompt_head = request.as_ref().and_then(|r| r.prompt.as_deref()).and_then(|prompt| {
             prompt.lines().map(str::trim).find(|line| !line.is_empty()).map(|line| line.chars().take(160).collect::<String>())
         });
+        let approvals = self.live.approvals.list(Some(id));
+        let pending_approvals = approvals.len();
+        let blocked_agents: Vec<Value> = approvals
+            .iter()
+            .map(|a| {
+                let tool = a["tool"].as_str().unwrap_or("tool");
+                let detail = a["command"]
+                    .as_str()
+                    .or_else(|| a["paths"].as_array().and_then(|arr| arr.first()).and_then(|v| v.as_str()))
+                    .map(|s| s.chars().take(80).collect::<String>());
+                let reason = match detail {
+                    Some(d) if !d.is_empty() => format!("waiting on approval `{tool}: {d}`"),
+                    _ => format!("waiting on approval `{tool}`"),
+                };
+                json!({
+                    "id": a["id"],
+                    "call": a["agent"]["call"],
+                    "role": a["agent"]["role"],
+                    "page": a["agent"]["page"],
+                    "reason": reason,
+                })
+            })
+            .collect();
+        let has_limit = status.get("limit").is_some_and(|v| !v.is_null());
+        let (state, needs_you, state_reason) = if let Some(first) = blocked_agents.first() {
+            (
+                "blocked",
+                true,
+                first["reason"].as_str().unwrap_or("waiting on approval").to_string(),
+            )
+        } else if run.phase == RunPhase::AwaitingApproval && !is_active {
+            ("blocked", true, "waiting on plan approval".to_string())
+        } else if has_limit && !is_active {
+            (
+                "blocked",
+                true,
+                status
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("paused on provider limit")
+                    .to_string(),
+            )
+        } else if cancelled {
+            ("stopped", false, "stopped by you".to_string())
+        } else if is_active {
+            let phase_name = format!("{:?}", run.phase).to_lowercase();
+            let reason = if pages.is_empty() {
+                phase_name
+            } else {
+                format!("{phase_name} ({} page{})", pages.len(), if pages.len() == 1 { "" } else { "s" })
+            };
+            ("working", false, reason)
+        } else if run.phase == RunPhase::Done {
+            ("done", false, "finished".to_string())
+        } else if run.phase == RunPhase::Failed {
+            let err = status
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|e| format!("failed: {}", e.chars().take(120).collect::<String>()))
+                .unwrap_or_else(|| "failed".to_string());
+            ("failed", false, err)
+        } else {
+            ("idle", false, "idle".to_string())
+        };
         Ok(json!({
             "id": id,
             "phase": run.phase,
+            "state": state,
+            "needs_you": needs_you,
+            "state_reason": state_reason,
+            "blocked_agents": blocked_agents,
             "parallel": self.parallel(id),
             "prompt_head": prompt_head,
             "mode": request.as_ref().map(|r| r.mode),
@@ -856,7 +924,7 @@ impl App {
             "cancelling": cancelling,
             "budget_usd": budget_usd,
             "active": is_active,
-            "pending_approvals": self.live.approvals.count(id),
+            "pending_approvals": pending_approvals,
             "error": status.get("error"),
             "limit": status.get("limit"),
             "branch": status.get("branch"),
@@ -1017,6 +1085,7 @@ impl App {
                 true
             }
             _ => {
+                self.live.unqueue_all_held(&notes, id);
                 let (agent, fields) = crate::turns::turn_entry(turn, mode, &pending);
                 self.live.push_held(&notes, id, &agent, "turn", fields);
                 events.push(Event::FollowUp);

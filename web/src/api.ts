@@ -118,6 +118,13 @@ export interface PhaseSketch {
   needs?: string;
 }
 
+/** One compact research decision recorded by the planner in PROJECT.md. */
+export interface ResearchNote {
+  decision: string;
+  source: string;
+  version: string;
+}
+
 export interface Plan {
   kind?: "web" | "library" | "cli" | "server" | "migration";
   /** Concise overview of the overall plan and worker division. */
@@ -129,6 +136,8 @@ export interface Plan {
   design?: string;
   /** The sketch, when the run is built a phase at a time. */
   phases?: PhaseSketch[];
+  /** Compact decisions from the planner's research phase. */
+  research?: ResearchNote[];
 }
 
 export type Roles = Record<RoleName, string>;
@@ -490,7 +499,24 @@ export interface AgentTag {
 export interface AgentEntry {
   at: string;
   agent: AgentTag;
-  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved" | "stalled" | "released" | "restarted";
+  kind:
+    | "start"
+    | "text"
+    | "thought"
+    | "tool_call"
+    | "permission"
+    | "end"
+    | "command"
+    | "output"
+    | "preview"
+    | "approval_requested"
+    | "approval_resolved"
+    | "stalled"
+    | "released"
+    | "restarted"
+    | "web_search"
+    | "web_fetch"
+    | "docs";
   /** Tool call id, on a `tool_call` and on the `output` that belongs to it. */
   id?: string;
   text?: string;
@@ -519,6 +545,23 @@ export interface AgentEntry {
   lingering?: number;
   /** `stalled`: which fresh agent this is. */
   restart?: number;
+  /** Phase 1 web access transcript fields (`web_search`, `web_fetch`, `docs`). */
+  provider?: string;
+  query?: string;
+  hits?: number;
+  sources?: { title: string; url: string; engine?: string }[];
+  url?: string;
+  final_url?: string;
+  host?: string;
+  bytes?: number;
+  cached?: boolean;
+  package?: string;
+  version?: string;
+  ecosystem?: string;
+  symbol?: string | null;
+  source?: string;
+  path?: string;
+  injection_flagged?: boolean;
 }
 
 export interface Note {
@@ -1005,6 +1048,84 @@ export interface EvalSuiteTask {
   hidden_test_file: string;
 }
 
+export interface WebRolePolicy {
+  search: boolean;
+  fetch: boolean;
+}
+
+export interface WebRoleMatrix {
+  planner: WebRolePolicy;
+  worker: WebRolePolicy;
+  reviewer: WebRolePolicy;
+  verifier: WebRolePolicy;
+}
+
+export interface WebAccessSettings {
+  enabled: boolean;
+  provider: string;
+  endpoint: string;
+  roles: WebRoleMatrix;
+  allowlist: string[];
+  planner_max_searches: number;
+  planner_max_fetches: number;
+  max_fetch_bytes: number;
+  cache_ttl_secs: number;
+  cache_max_mb: number;
+}
+
+export interface WebCacheStats {
+  dir: string;
+  entries: number;
+  bytes: number;
+}
+
+export interface WebAccessPayload {
+  web_access: WebAccessSettings;
+  has_api_key: boolean;
+  vault_backend: string;
+  derived_allowlist: string[];
+  advisory_hosts: string[];
+  providers: string[];
+  cache: WebCacheStats;
+}
+
+export interface WebAccessUpdate {
+  enabled?: boolean;
+  provider?: string;
+  endpoint?: string;
+  api_key?: string;
+  clear_api_key?: boolean;
+  roles?: WebRoleMatrix;
+  allowlist?: string[];
+  planner_max_searches?: number;
+  planner_max_fetches?: number;
+  max_fetch_bytes?: number;
+  cache_ttl_secs?: number;
+  cache_max_mb?: number;
+}
+
+export interface WebActivityItem {
+  at: string;
+  agent: AgentTag;
+  kind: "web_search" | "web_fetch" | "docs";
+  provider?: string;
+  query?: string;
+  hits?: number;
+  sources?: { title: string; url: string; engine?: string }[];
+  url?: string;
+  final_url?: string;
+  host?: string;
+  bytes?: number;
+  cached?: boolean;
+  package?: string;
+  version?: string;
+  ecosystem?: string;
+  symbol?: string | null;
+  source?: string;
+  path?: string;
+  injection_flagged?: boolean;
+}
+
 export function searchWeb(q: string, endpoint: string) {
   const params = new URLSearchParams({ q });
   if (endpoint) params.set("endpoint", endpoint);
@@ -1200,6 +1321,13 @@ export const api = {
     return call<{ slices: StratifiedSlice[]; auto_route?: ModelScore | null }>("GET", `/api/scorecard/stratified${qs ? `?${qs}` : ""}`);
   },
   evalSuite: () => call<{ tasks: EvalSuiteTask[] }>("GET", "/api/eval/suite").then((r) => r.tasks),
+
+  // Phase 1 web access settings, cache management, and per-run web activity
+  webAccess: () => call<WebAccessPayload>("GET", "/api/web-access"),
+  updateWebAccess: (body: WebAccessUpdate) => call<WebAccessPayload>("POST", "/api/web-access", body),
+  clearWebCache: () => call<{ removed: number; cache: WebCacheStats }>("POST", "/api/web-access/cache/clear", {}),
+  runWebActivity: (id: string) =>
+    call<{ items: WebActivityItem[] }>("GET", `/api/runs/${enc(id)}/web`).then((r) => r.items),
 };
 
 /**

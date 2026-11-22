@@ -6528,3 +6528,141 @@ button.cancel-worker-btn:hover:not(:disabled) {
   color: var(--ink);
   font-size: 12px;
 }
+
+/* Phase 1: Settings -> Web access & RunView -> Web sources (monochrome dark/light) */
+.web-access-panel {
+  gap: 14px;
+}
+.web-access-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.web-access-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.web-access-key-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+.web-access-key-meta {
+  padding-bottom: 2px;
+}
+.web-access-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.web-access-roles td,
+.web-access-roles th {
+  vertical-align: middle;
+}
+.web-access-derived {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg-sunken);
+  word-break: break-word;
+}
+.web-access-budgets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+.web-access-num {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.web-access-num input {
+  width: 100%;
+}
+.web-access-foot {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.web-sources {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg-elev);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.web-sources-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.web-sources-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.web-sources-research {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.web-sources-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.web-sources-row {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.web-sources-body {
+  font-size: 13px;
+  color: var(--ink);
+}
+.web-sources-detail {
+  color: var(--ink-2);
+  word-break: break-word;
+}
+.web-sources-query {
+  font-size: 13px;
+  color: var(--ink);
+}
+.web-sources-links {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.web-sources-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 500;
+}
+

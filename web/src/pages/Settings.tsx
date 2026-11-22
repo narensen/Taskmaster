@@ -19,6 +19,7 @@ import {
   UserMcpSection,
   WebhookNotificationsSection,
 } from "../settings/OpsPanels";
+import { WebAccessSection } from "../settings/WebAccessSection";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { appVersion, checkForUpdate, installUpdate, isDesktop, type AvailableUpdate } from "../desktop";
@@ -308,6 +309,7 @@ const TOC: { group: string; items: [string, string][] }[] = [
       ["code-mode", "Code Mode"],
       ["scorecard", "Model scorecard"],
       ["sandbox", "Worker sandbox"],
+      ["web-access", "Web access"],
       ["telemetry", "Telemetry"],
       ["tool-approvals", "Tool approvals"],
     ],
@@ -671,6 +673,8 @@ export function Settings() {
           </label>
         </Section>
       )}
+
+      <WebAccessSection />
 
       {daemon.data && (
         <Section

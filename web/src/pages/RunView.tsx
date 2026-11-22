@@ -30,6 +30,7 @@ import { TelemetryLens } from "../run/TelemetryLens";
 import { useRun, useSurfaces } from "../run/model";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
+import { WebSources } from "../run/WebSources";
 import { morphName } from "./Gallery";
 
 type Lens = "mission" | "stream" | "review" | "telemetry";
@@ -915,6 +916,8 @@ export function RunView({ id }: { id: string }) {
                 ) : null
               }
             />
+
+            <WebSources runId={id} entries={entries} research={detail.plan?.research} />
 
             {detail.limit && detail.error && phase !== "done" && phase !== "failed" ? (
               <LimitNotice id={id} limit={detail.limit} message={detail.error} onDone={() => { void data.reload(); data.refollow(); }} />

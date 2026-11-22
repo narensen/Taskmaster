@@ -20,12 +20,14 @@
 //! POST /api/runs/{id}/reject      {prompt?} drop the plan, and plan again when a prompt is given
 //! POST /api/runs/{id}/resume      carry on a run that stopped part way
 //! POST /api/runs/{id}/cancel
+//! POST /api/runs/{id}/undo        take a merged run back out: one commit that puts its files back
 //!
 //! GET  /api/providers             ?harness=<h> installed harnesses and their models
 //! GET  /api/templates             the built-in templates; a directory path works as well
 //! GET  /api/dictionary            ?q=<text> Commons first, then the project
 //! GET  /api/dictionary/{key}
 //! GET  /api/errorography          recurring mistakes, per model
+//! GET  /api/scorecard             per-model first-pass rate, cache hit rate, cost and speed
 //! GET  /api/reviews               reviews started here
 //! POST /api/reviews               {target?, base?, head?, pr?, dirty?, reviewer?, verifier?, ...}
 //! GET  /api/reviews/{id}
@@ -181,6 +183,7 @@ impl Drop for Server {
     fn drop(&mut self) {
         crate::log::note("shutting down");
         for active in self.app.active.lock().unwrap().values() {
+            let _ = active.cancel_mode.send(crate::CancelMode::Force);
             let _ = active.cancel.send(true);
         }
         self.app.live.approvals.refuse_all();
@@ -197,9 +200,14 @@ impl Drop for Server {
 
 struct Active {
     cancel: watch::Sender<bool>,
+    cancel_mode: watch::Sender<crate::CancelMode>,
+    budget_usd: Option<f64>,
+    worker_restarts: crate::WorkerRestarts,
     /// The run commits into the project's own working tree, so it must run alone.
     in_place: bool,
 }
+
+type RunFingerprint = [(u64, u128); 4];
 
 struct App {
     /// Parent of the first project this daemon opened; new projects are created here.
@@ -214,6 +222,8 @@ struct App {
     harness: HarnessFactory,
     web: Option<PathBuf>,
     active: Mutex<HashMap<String, Active>>,
+    /// Cached `view()` JSON for settled (inactive) runs, validated via O(1) file metadata stats.
+    summary_cache: Mutex<HashMap<(PathBuf, String), (RunFingerprint, Value)>>,
     live: Arc<Live>,
     /// The editor override; the settings file's value until `POST /api/settings` changes it.
     editor: Mutex<String>,
@@ -261,6 +271,7 @@ impl Server {
             harness: options.harness,
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
+            summary_cache: Mutex::new(HashMap::new()),
             live,
             editor: Mutex::new(options.editor),
             previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
@@ -300,6 +311,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/reject", post(reject_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/undo", post(undo_run))
+        .route("/api/runs/{id}/workers/{page}/restart", post(restart_worker))
         .route("/api/search", get(web_search))
         .route("/api/providers", get(providers))
         .route("/api/templates", get(templates))
@@ -308,6 +321,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/dictionary", get(search_dictionary))
         .route("/api/dictionary/{key}", get(show_entry))
         .route("/api/errorography", get(errorography))
+        .route("/api/scorecard", get(scorecard))
         .route("/api/reviews", get(list_reviews).post(create_review))
         .route("/api/reviews/{id}", get(show_review))
         .route("/api/reviews/{id}/cancel", post(cancel_review))
@@ -318,6 +332,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/notes/{note}", post(desk::edit_note))
         .route("/api/runs/{id}/terminal", post(desk::terminal))
         .route("/api/runs/{id}/diff", get(desk::diff))
+        .route("/api/runs/{id}/diff-stats", get(desk::diff_stats))
         .route("/api/runs/{id}/pr", post(desk::open_pr))
         .route("/api/runs/{id}/preview", get(desk::preview).post(desk::start_preview))
         .route("/api/runs/{id}/preview/stop", post(desk::stop_preview))
@@ -519,6 +534,8 @@ async fn pair(State(app): State<Arc<App>>, Json(body): Json<PairBody>) -> Reply 
 enum Decision {
     /// Carry on from wherever the run is.
     Continue,
+    /// Resume a cancelled run, keeping already-passed pages and rebuilding the rest.
+    ResumeCancelled,
     Approve,
     Reject,
     Cancel,
@@ -624,12 +641,21 @@ impl App {
             .collect();
         // A cancelled run ends in the failed phase; the log says which it was.
         let cancelled = run.phase == RunPhase::Failed && self.records().events(id)?.last() == Some(&tm_core::Event::Cancelled);
+        let (is_active, cancelling, budget_usd) = {
+            let guard = self.active.lock().unwrap();
+            match guard.get(id) {
+                Some(active) => (true, active.cancel_mode.borrow().as_str(), active.budget_usd),
+                None => (false, None, None),
+            }
+        };
         Ok(json!({
             "id": id,
             "phase": run.phase,
             "parallel": self.parallel(id),
             "cancelled": cancelled,
-            "active": self.is_active(id),
+            "cancelling": cancelling,
+            "budget_usd": budget_usd,
+            "active": is_active,
             "pending_approvals": self.live.approvals.count(id),
             "error": status.get("error"),
             "limit": status.get("limit"),
@@ -637,6 +663,7 @@ impl App {
             "merged": status.get("merged"),
             "base": status.get("base"),
             "merge_commit": status.get("merge_commit"),
+            "undone": status.get("undone"),
             "pages": pages,
             "estimate": run.plan.as_ref().map(|plan| &plan.estimate),
             "spent": totals(&self.records().ledger(id)?),
@@ -666,7 +693,9 @@ impl App {
         }
         let harnesses = Harnesses::from_roles(&request.roles, &*self.harness)
             .map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
-        let (cancel, cancelled) = watch::channel(matches!(decision, Decision::Cancel));
+        let initial_cancel = if matches!(decision, Decision::Cancel) { crate::CancelMode::Force } else { crate::CancelMode::None };
+        let (cancel, cancelled) = watch::channel(initial_cancel.is_cancelled());
+        let (cancel_mode, cancel_mode_rx) = watch::channel(initial_cancel);
         let mut config = Config::new(self.project());
         config.skills = Some(self.skills_root.clone());
         let saved = crate::settings::Settings::load(&self.project()).unwrap_or_default();
@@ -678,11 +707,17 @@ impl App {
         config.package_indexes = saved.sandbox.package_indexes;
         config.prices = crate::settings::price_table(&saved);
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
+        let budget_usd = request
+            .max_cost_usd
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or_else(|| (saved.agents.budget_usd.is_finite() && saved.agents.budget_usd > 0.0).then_some(saved.agents.budget_usd));
+        config.max_cost_usd = budget_usd;
         config.run_id = id.to_string();
         config.plan = request.plan;
         config.prompt = request.prompt;
         config.yes = matches!(decision, Decision::Approve);
         config.reject = matches!(decision, Decision::Reject);
+        config.resume_cancelled = matches!(decision, Decision::ResumeCancelled);
         config.parallel = request.parallel.unwrap_or(config.parallel).max(1);
         if let Some(secs) = request.timeout_secs {
             config.timeout = crate::settings::agent_limit(secs);
@@ -694,11 +729,15 @@ impl App {
         config.store = self.store.clone();
         config.remote = self.remote.clone();
         config.cancel = cancelled;
+        config.cancel_mode = Some(cancel_mode_rx);
+        let worker_restarts: crate::WorkerRestarts = Arc::new(Mutex::new(HashMap::new()));
+        config.worker_restarts = Some(worker_restarts.clone());
         config.live = Some(self.live.clone());
         self.live.approvals.reopen(id);
         // The run is about to change what it built, so a preview of the old build goes.
         self.previews.stop(id);
-        active.insert(id.to_string(), Active { cancel, in_place });
+        self.summary_cache.lock().unwrap().remove(&(self.project(), id.to_string()));
+        active.insert(id.to_string(), Active { cancel, cancel_mode, budget_usd, worker_restarts, in_place });
         drop(active);
 
         let app = self.clone();
@@ -713,6 +752,7 @@ impl App {
             crate::telemetry::record(&app.project(), if result.is_ok() { "run_finished" } else { "run_failed" });
             app.record_outcome(&id, result);
             app.active.lock().unwrap().remove(&id);
+            app.summary_cache.lock().unwrap().remove(&(app.project(), id.clone()));
             // A note can land in the moment the driver stops. Pick it up once the run is idle.
             if let Err(err) = app.wake_for_note(&id) {
                 eprintln!("taskmaster: run {id}: a note was not picked up: {}", err.1);
@@ -792,13 +832,61 @@ impl App {
 }
 
 async fn list_runs(State(app): State<Arc<App>>) -> Reply {
+    let project = app.project();
+    let records = app.records();
     let mut runs = Vec::new();
-    for id in app.records().run_ids()? {
+    for id in records.run_ids()? {
+        let is_active = app.is_active(&id);
+        let pending_approvals = app.live.approvals.list(Some(&id)).len();
+        let fp = (!is_active && pending_approvals == 0).then(|| records.run_fingerprint(&id)).flatten();
+        if let Some(fp) = fp {
+            let hit = app
+                .summary_cache
+                .lock()
+                .unwrap()
+                .get(&(project.clone(), id.clone()))
+                .filter(|(cached_fp, _)| *cached_fp == fp)
+                .map(|(_, v)| v.clone());
+            if let Some(view) = hit {
+                runs.push(view);
+                continue;
+            }
+        }
         if let Some(run) = app.replay(&id)? {
-            runs.push(app.view(&id, &run)?);
+            let view = app.view(&id, &run)?;
+            if let Some(fp) = fp {
+                app.summary_cache.lock().unwrap().insert((project.clone(), id.clone()), (fp, view.clone()));
+            }
+            runs.push(view);
         }
     }
     ok(json!({ "runs": runs }))
+}
+
+/// Restart one worker without cancelling sibling parallel workers. If the worker is currently
+/// executing, signals its per-page restart channel so the driver aborts and re-queues it;
+/// otherwise queues a retry note for `page:<page>` and wakes the run.
+async fn restart_worker(
+    State(app): State<Arc<App>>,
+    UrlPath((id, page)): UrlPath<(String, String)>,
+) -> Reply {
+    app.known(&id)?;
+    if !valid_key(&page) {
+        return Err(fail(StatusCode::BAD_REQUEST, "invalid worker page id"));
+    }
+    let live_tx = {
+        let active = app.active.lock().unwrap();
+        active
+            .get(&id)
+            .and_then(|run| run.worker_restarts.lock().unwrap().get(&page).cloned())
+    };
+    if let Some(tx) = live_tx {
+        tx.send_modify(|v| *v += 1);
+        return ok(json!({ "ok": true, "mode": "restarted", "page": page }));
+    }
+    app.live.add_note(&id, &format!("page:{page}"), "Retry this worker and fix the failure.")?;
+    app.wake_for_note(&id)?;
+    ok(json!({ "ok": true, "mode": "queued", "page": page }))
 }
 
 #[derive(Deserialize, Default)]
@@ -815,6 +903,7 @@ struct NewRun {
     parallel: Option<usize>,
     timeout_secs: Option<u64>,
     template: Option<String>,
+    max_cost_usd: Option<f64>,
 }
 
 /// The saved defaults with the request's own choices laid over them.
@@ -858,6 +947,7 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
         parallel: body.parallel,
         timeout_secs: body.timeout_secs,
         template: body.template,
+        max_cost_usd: body.max_cost_usd,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.start(&id, request.clone(), decision)?;
@@ -1046,25 +1136,84 @@ async fn reject_run(
     accepted(json!({ "id": id }))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CancelBody {
+    mode: Option<String>,
+}
+
 async fn resume_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
     let run = app.known(&id)?;
-    if matches!(run.phase, RunPhase::Done | RunPhase::Failed) {
+    let cancelled = run.phase == RunPhase::Failed && app.records().events(&id)?.last() == Some(&tm_core::Event::Cancelled);
+    if matches!(run.phase, RunPhase::Done | RunPhase::Failed) && !cancelled {
         return Err(fail(StatusCode::CONFLICT, "this run is over"));
     }
-    app.start(&id, app.request_for(&id)?, Decision::Continue)?;
+    let decision = if cancelled { Decision::ResumeCancelled } else { Decision::Continue };
+    app.start(&id, app.request_for(&id)?, decision)?;
     accepted(json!({ "id": id }))
 }
 
-async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+/// One commit on the branch the run was merged into that puts back every file it changed.
+/// Refused, with the reason, while the run is going, or when those files were edited since.
+async fn undo_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    app.known(&id)?;
+    if app.is_active(&id) {
+        return Err(fail(StatusCode::CONFLICT, format!("run `{id}` is in progress; undo it once it finishes")));
+    }
+    let (project, records, run) = (app.project(), app.records(), id.clone());
+    let undone = tokio::task::spawn_blocking(move || crate::undo::undo_run(&project, &records, &run))
+        .await
+        .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("the undo stopped: {err}")))??;
+    match undone {
+        crate::undo::Undo::Done { commit, files } => {
+            crate::log::note(&format!("run {id}: undone in {commit} ({files} file(s))"));
+            ok(json!({ "id": id, "commit": commit, "files": files }))
+        }
+        crate::undo::Undo::Refused(why) => Err(fail(StatusCode::CONFLICT, why)),
+    }
+}
+
+async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>, body: axum::body::Bytes) -> Reply {
     let run = app.known(&id)?;
+    let parsed: CancelBody = if body.is_empty() {
+        CancelBody::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let explicit = match parsed.mode.as_deref().map(str::trim) {
+        Some("force") | Some("immediate") => Some(crate::CancelMode::Force),
+        Some("graceful") | Some("drain") => Some(crate::CancelMode::Graceful),
+        Some(other) if !other.is_empty() => {
+            return Err(fail(StatusCode::BAD_REQUEST, format!("unknown cancel mode `{other}`: use `graceful` or `force`")));
+        }
+        _ => None,
+    };
     app.stop_run_reviews(&id);
     {
         let active = app.active.lock().unwrap();
         if let Some(active) = active.get(&id) {
+            let current = *active.cancel_mode.borrow();
+            // A second cancel while already draining gracefully escalates immediately to Force.
+            let next = match explicit {
+                Some(crate::CancelMode::Force) => crate::CancelMode::Force,
+                Some(crate::CancelMode::Graceful) => {
+                    if current.is_force() { crate::CancelMode::Force } else { crate::CancelMode::Graceful }
+                }
+                Some(crate::CancelMode::None) | None => {
+                    if current.is_cancelled() { crate::CancelMode::Force } else { crate::CancelMode::Graceful }
+                }
+            };
+            let _ = active.cancel_mode.send(next);
             let _ = active.cancel.send(true);
+            app.live.push(
+                &id,
+                &json!({ "id": "master", "role": "master" }),
+                "cancelling",
+                json!({ "mode": next.as_str().unwrap_or("graceful") }),
+            );
             app.live.approvals.refuse_run(&id);
             app.previews.stop(&id);
-            return accepted(json!({ "id": id }));
+            return accepted(json!({ "id": id, "mode": next.as_str().unwrap_or("graceful") }));
         }
     }
     if matches!(run.phase, RunPhase::Done | RunPhase::Failed) {
@@ -1074,7 +1223,7 @@ async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
     let mut request = app.request_for(&id)?;
     (request.plan, request.prompt) = (None, None);
     app.start(&id, request, Decision::Cancel)?;
-    accepted(json!({ "id": id }))
+    accepted(json!({ "id": id, "mode": "force" }))
 }
 
 // What the project knows.
@@ -1101,6 +1250,7 @@ struct NewProject {
     parallel: Option<usize>,
     timeout_secs: Option<u64>,
     template: Option<String>,
+    max_cost_usd: Option<f64>,
     /// Open the new project in this daemon. Defaults to true when a prompt or plan is sent.
     switch: Option<bool>,
 }
@@ -1212,6 +1362,7 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
         parallel: body.parallel,
         timeout_secs: body.timeout_secs,
         template: body.template,
+        max_cost_usd: body.max_cost_usd,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.start(&id, request.clone(), decision)?;
@@ -1271,6 +1422,10 @@ async fn show_entry(State(app): State<Arc<App>>, UrlPath(key): UrlPath<String>) 
 
 async fn errorography(State(app): State<Arc<App>>) -> Reply {
     ok(json!(app.records().book()?))
+}
+
+async fn scorecard(State(app): State<Arc<App>>) -> Reply {
+    ok(json!(app.records().scorecard(crate::store::SCORECARD_RUNS)?))
 }
 
 // The Commons, for other daemons.

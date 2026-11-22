@@ -276,6 +276,12 @@ impl World {
             let real = matches!(self.mode, Mode::ConfirmFinding);
             return Ok(Script::text(if real { "{\"real\": true}" } else { "{\"real\": false}" }));
         }
+        if brief.contains("Decide independently for EACH numbered claim") {
+            let real = matches!(self.mode, Mode::ConfirmFinding);
+            let count = brief.lines().filter(|l| l.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit()) && l.contains(" at line ")).count();
+            let items: Vec<String> = (0..count).map(|i| format!("{{\"index\":{i},\"real\":{real}}}")).collect();
+            return Ok(Script::text(&format!("[{}]", items.join(","))));
+        }
         if brief.contains("the output names no file any unit owns") {
             // The master's fix: a file the project's build looks for.
             return Ok(Script { text: "fixed".into(), files: vec![("fixed.txt".into(), Some("ok\n".into()))] });
@@ -302,7 +308,7 @@ impl World {
                 "[]"
             }));
         }
-        if brief.contains("reviewing one connection") || brief.contains("security problems") {
+        if brief.contains("reviewing one connection") || brief.contains("reviewing all connections") || brief.contains("security problems") {
             return Ok(self.review(&brief));
         }
         bail!("unexpected brief: {}", brief.chars().take(240).collect::<String>());
@@ -548,6 +554,167 @@ async fn happy_path_locks_contracts_and_merges_each_page() {
     let status: serde_json::Value =
         serde_json::from_str(&read(&run_directory(&tmp.0, "current").join("status.json"))).unwrap();
     assert_eq!(status["ok"], true);
+}
+
+/// Page `a` is written with a type error the first time and fixed when its errors come
+/// back. Page `b` holds its build open until `a`'s repair has started, so `a` can only be
+/// repaired in time if its own files are checked as soon as it merges.
+struct EarlyChecked {
+    inner: Fake,
+    order: Arc<Mutex<Vec<String>>>,
+    repaired: Arc<Notify>,
+}
+
+#[async_trait]
+impl Harness for EarlyChecked {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+
+    async fn run(&self, task: WorkerTask, gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> anyhow::Result<RunSummary> {
+        let page = task.brief.split("Build page `").nth(1).and_then(|r| r.split('`').next()).map(str::to_string);
+        let Some(page) = page else { return self.inner.run(task, gate, events).await };
+        let body = match page.as_str() {
+            "a" if task.brief.contains("TS2304") => {
+                self.order.lock().unwrap().push("a repaired".into());
+                self.repaired.notify_one();
+                "export const a: string = \"a\";\n"
+            }
+            "a" => {
+                self.order.lock().unwrap().push("a built".into());
+                "export const a: string = oops;\n"
+            }
+            _ => {
+                let waited = tokio::time::timeout(Duration::from_secs(8), self.repaired.notified()).await;
+                self.order.lock().unwrap().push(if waited.is_ok() { "b built".into() } else { "b gave up waiting".into() });
+                "export const b: string = \"b\";\n"
+            }
+        };
+        let file = task.cwd.join(format!("app/{page}/page.ts"));
+        std::fs::create_dir_all(file.parent().unwrap())?;
+        std::fs::write(file, body)?;
+        let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_merged_page_is_checked_and_sent_back_while_other_pages_build() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = seeded("early-check");
+    std::fs::write(tmp.0.join("tsconfig.json"), "{}\n").unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "typescript"]);
+    // A stand-in for `tsc`: every `oops` under app/ is an unknown name.
+    let bin = tmp.0.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tsc = bin.join("tsc");
+    std::fs::write(
+        &tsc,
+        "#!/bin/sh\ngrep -rn oops app 2>/dev/null | while IFS=: read -r file line rest; do echo \"$file($line,1): error TS2304: Cannot find name 'oops'.\"; done\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let world = World::new(Mode::Write);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let harness: Arc<dyn Harness> = Arc::new(EarlyChecked { inner: Fake(world.clone()), order: order.clone(), repaired: Arc::new(Notify::new()) });
+    let harnesses = Harnesses { worker: harness.clone(), mid: harness.clone(), master: harness.clone(), reviewer: harness.clone(), verifier: harness };
+    let config = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    let outcome = tokio::time::timeout(Duration::from_secs(30), drive(config, harnesses)).await.expect("the run finished").unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(*order.lock().unwrap(), vec!["a built", "a repaired", "b built"], "a was repaired while b was still building");
+    assert!(read(&tmp.0.join("app/a/page.ts")).contains("\"a\""));
+}
+
+/// Builds page `a` without the `total` its locked contract test imports, then with it once
+/// the test's failure comes back. Every brief is kept.
+struct ContractTested {
+    inner: Fake,
+    briefs: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Harness for ContractTested {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+
+    async fn run(&self, task: WorkerTask, gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> anyhow::Result<RunSummary> {
+        self.briefs.lock().unwrap().push(task.brief.clone());
+        if !task.brief.contains("Build page `a`") {
+            return self.inner.run(task, gate, events).await;
+        }
+        let body = if task.brief.contains("TS2305") { "export const total = (n: number[]) => n.length;\n" } else { "export const count = 0;\n" };
+        let file = task.cwd.join("app/a/page.ts");
+        std::fs::create_dir_all(file.parent().unwrap())?;
+        std::fs::write(file, body)?;
+        let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failing_contract_test_goes_to_the_unit_it_imports_not_to_the_master() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = seeded("contract-test");
+    std::fs::write(tmp.0.join("tsconfig.json"), "{}\n").unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "typescript"]);
+    // A stand-in for `tsc`: the contract test cannot import `total` until page a exports it.
+    let bin = tmp.0.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tsc = bin.join("tsc");
+    std::fs::write(
+        &tsc,
+        "#!/bin/sh\ngrep -q 'export const total' app/a/page.ts 2>/dev/null || echo \"tests/contract/a.test.ts(1,10): error TS2305: Module '../../app/a/page' has no exported member 'total'.\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let test_source = "import { total } from \"../../app/a/page\";\nexport const checks = total([1, 2]) === 2;\n";
+    let mut plan = plan(&[("a", &[])]);
+    plan.contracts.push(ContractFile { path: "tests/contract/a.test.ts".into(), content: test_source.into() });
+    let world = World::new(Mode::Write);
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let harness: Arc<dyn Harness> = Arc::new(ContractTested { inner: Fake(world.clone()), briefs: briefs.clone() });
+    let harnesses = Harnesses { worker: harness.clone(), mid: harness.clone(), master: harness.clone(), reviewer: harness.clone(), verifier: harness };
+    let outcome = tokio::time::timeout(Duration::from_secs(30), drive(config(&tmp.0, plan, true, 1), harnesses)).await.expect("the run finished").unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let briefs = briefs.lock().unwrap().clone();
+    let builds: Vec<&String> = briefs.iter().filter(|b| b.contains("Build page `a`")).collect();
+    assert_eq!(builds.len(), 2, "page a was built, then repaired");
+    assert!(builds[0].contains("`tests/contract/a.test.ts` are the acceptance check"), "the test is named as the oracle up front");
+    assert!(builds[1].contains("TS2305") && builds[1].contains("Never edit the test"), "{}", builds[1]);
+    assert!(!briefs.iter().any(|b| b.contains("Shared files this run wrote fail")), "the master was not asked to rewrite the test");
+    assert_eq!(read(&tmp.0.join("tests/contract/a.test.ts")), test_source);
+}
+
+/// The project's test script fails the first time it runs and passes after that.
+#[tokio::test]
+async fn a_test_that_fails_once_and_then_passes_is_flaky_and_gets_no_repair() {
+    let npm = std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("npm").is_file()));
+    if !npm {
+        eprintln!("npm is missing; skipping");
+        return;
+    }
+    let tmp = seeded("flaky");
+    std::fs::write(tmp.0.join("package.json"), r#"{"name":"flaky","private":true,"scripts":{"test":"sh flaky.sh"}}"#).unwrap();
+    std::fs::write(tmp.0.join("flaky.sh"), "if [ -f .ran-once ]; then exit 0; fi\ntouch .ran-once\necho 'timeout waiting for port 3000' >&2\nexit 1\n").unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n.ran-once\n").unwrap();
+    std::fs::create_dir_all(tmp.0.join("node_modules")).unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "tests"]);
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = world.calls.lock().unwrap().clone();
+    assert_eq!(calls.iter().filter(|c| c.contains("Build page `a`")).count(), 1, "the page was not repaired");
+    assert!(!calls.iter().any(|c| c.contains("The project's own build or tests fail")), "the master was not asked to repair a flaky test");
 }
 
 #[tokio::test]
@@ -1566,6 +1733,53 @@ async fn a_run_builds_on_its_own_branch_and_is_merged_when_it_finishes() {
     let commit = status["merge_commit"].as_str().unwrap();
     assert!(commit.len() >= 7 && head.trim().starts_with(commit));
     assert_eq!(status["base"].as_str(), Some(git_out(&tmp.0, &["rev-parse", "--abbrev-ref", "HEAD"]).trim()));
+}
+
+#[tokio::test]
+async fn a_merged_run_is_undone_in_one_commit_that_keeps_later_work() {
+    let tmp = seeded("undo");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(tmp.0.join("app/a/page.ts").is_file());
+    std::fs::write(tmp.0.join("notes.md"), "mine\n").unwrap();
+    git(&tmp.0, &["add", "notes.md"]);
+    git(&tmp.0, &["commit", "-q", "-m", "my own work after the run"]);
+    let records = Records::files(&tmp.0);
+    assert!(records.citations().unwrap().pages.contains_key("a"));
+
+    let undone = crate::undo::undo_run(&tmp.0, &records, "current").unwrap();
+    let crate::undo::Undo::Done { commit, files } = undone else { panic!("refused: {undone:?}") };
+    assert!(files >= 3, "the pages and the contract came back out: {files}");
+    assert!(!tmp.0.join("app/a/page.ts").exists() && !tmp.0.join("contracts/types.ts").exists());
+    assert_eq!(read(&tmp.0.join("notes.md")), "mine\n", "work after the merge is kept");
+    assert_eq!(read(&tmp.0.join("README.md")), "# project\n");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(log(&tmp.0).starts_with("taskmaster: undo run current\nmy own work after the run\n"));
+    assert!(git_out(&tmp.0, &["rev-parse", "HEAD"]).starts_with(&commit));
+    assert!(!records.citations().unwrap().pages.contains_key("a"), "the pages are built again next time");
+    assert_eq!(records.status("current").unwrap().unwrap()["undone"]["commit"].as_str(), Some(commit.as_str()));
+    let again = crate::undo::undo_run(&tmp.0, &records, "current").unwrap();
+    assert!(matches!(&again, crate::undo::Undo::Refused(why) if why.contains("already undone")), "{again:?}");
+}
+
+#[tokio::test]
+async fn a_run_whose_files_were_edited_after_the_merge_is_not_undone() {
+    let tmp = seeded("undo-edited");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    std::fs::write(tmp.0.join("app/a/page.ts"), "export const a = \"changed by hand\";\n").unwrap();
+    let records = Records::files(&tmp.0);
+    let dirty = crate::undo::undo_run(&tmp.0, &records, "current").unwrap();
+    assert!(matches!(&dirty, crate::undo::Undo::Refused(why) if why.contains("uncommitted edits")), "{dirty:?}");
+    git(&tmp.0, &["commit", "-q", "-am", "hand edit"]);
+    let head = git_out(&tmp.0, &["rev-parse", "HEAD"]);
+    let edited = crate::undo::undo_run(&tmp.0, &records, "current").unwrap();
+    assert!(matches!(&edited, crate::undo::Undo::Refused(why) if why.contains("edited after it was merged") && why.contains("git revert")), "{edited:?}");
+    assert_eq!(git_out(&tmp.0, &["rev-parse", "HEAD"]), head, "the project is left alone");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(records.status("current").unwrap().unwrap().get("undone").is_none());
 }
 
 #[tokio::test]
@@ -3197,6 +3411,59 @@ mod http {
         assert_eq!(started.lines().filter(|line| *line == "started").count(), 1, "{started}");
     }
 
+    #[tokio::test]
+    async fn two_mode_cancel_escalates_and_resumes_a_cancelled_run_keeping_passed_pages() {
+        let tmp = seeded("api-two-mode-cancel");
+        // Worker blocks on a barrier nobody else reaches, proving Force interrupts it immediately.
+        let barrier = Arc::new(Barrier::new(2));
+        let blocked_world = World::new(Mode::Parallel(Some(barrier)));
+        let (_server, mut client, code) = server(&tmp, &blocked_world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let planned = serde_json::to_value(plan(&[("a", &[]), ("b", &[])])).unwrap();
+        let (status, made) = client.post("/api/runs", json!({ "id": "stop", "plan": planned, "yes": true, "parallel": 1 })).await;
+        assert_eq!(status, 202, "{made}");
+
+        // Wait until worker `a` is actively inside the blocked call.
+        for _ in 0..200 {
+            if blocked_world.inflight.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(blocked_world.inflight.load(Ordering::SeqCst) >= 1, "worker never started");
+
+        // 1. First cancel with explicit graceful mode sets `cancelling: "graceful"` without killing `a`.
+        let (status, first) = client.post("/api/runs/stop/cancel", json!({ "mode": "graceful" })).await;
+        assert_eq!(status, 202, "{first}");
+        assert_eq!(first["mode"], "graceful");
+        let (_, draining) = client.get("/api/runs/stop").await;
+        assert_eq!(draining["active"], true, "{draining}");
+        assert_eq!(draining["cancelling"], "graceful", "{draining}");
+
+        // 2. A repeat cancel (with empty body) auto-escalates to `force` and interrupts `a` immediately.
+        let (status, second) = client.call("POST", "/api/runs/stop/cancel", None).await;
+        assert_eq!(status, 202, "{second}");
+        assert_eq!(second["mode"], "force");
+        let cancelled = client.settled("stop", "failed").await;
+        assert_eq!(cancelled["cancelled"], true, "{cancelled}");
+        assert!(cancelled["cancelling"].is_null(), "{cancelled}");
+
+        // 3. Now start a fresh server with Mode::Write on the same repo and resume the cancelled run!
+        drop(_server);
+        let write_world = World::new(Mode::Write);
+        let (_server2, mut client2, code2) = server(&tmp, &write_world).await;
+        let (_, paired2) = client2.post("/api/pair", json!({ "code": code2 })).await;
+        client2.token = Some(paired2["token"].as_str().unwrap().to_string());
+
+        let (status, resumed) = client2.post("/api/runs/stop/resume", json!({})).await;
+        assert_eq!(status, 202, "{resumed}");
+        let done = client2.settled("stop", "done").await;
+        assert_eq!(done["cancelled"], false, "{done}");
+        assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
+    }
+
 }
 
 mod commons_service {
@@ -3358,7 +3625,8 @@ mod role_defaults {
                     "id": "billing",
                     "owned_glob": "src/billing/**",
                     "brief": "Implement Stripe webhook handler.",
-                    "context": "Reuse UserId from contracts/types.ts."
+                    "context": "Reuse UserId from contracts/types.ts.",
+                    "depends_on": ["auth"]
                 }
             ]
         }"#;
@@ -3367,5 +3635,80 @@ mod role_defaults {
         assert_eq!(plan.pages.len(), 2);
         assert_eq!(plan.pages[0].context, "Use argon2 for hashing and export requireAuth from src/auth/index.ts.");
         assert_eq!(plan.pages[1].context, "Reuse UserId from contracts/types.ts.");
+        assert_eq!(plan.pages[1].depends_on, vec!["auth".to_string()]);
     }
+}
+
+#[tokio::test]
+async fn direct_fast_path_skips_master_planning_for_scoped_edits_and_keeps_approval_gate() {
+    let tmp = repo("fast-path");
+    std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+    std::fs::write(tmp.0.join("src/greet.ts"), "export function hello(name: string) { return `Helo ${name}`; }\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "seed existing repo"]);
+
+    // With `yes: false`, the Direct Fast-Path synthesizes the plan with 0 planner calls
+    // and still pauses at the approval gate.
+    let world = World::new(Mode::Write);
+    let paused = run(prompt_config(&tmp.0, "Fix the typo in src/greet.ts", false), &world).await.unwrap();
+    assert!(matches!(paused, Outcome::NeedsApproval { .. }), "{paused:?}");
+    assert!(planner_calls(&world).is_empty(), "direct fast-path must make 0 planner calls");
+
+    // Resuming with `yes: true` runs 1 Code-Mode worker with the pre-computed repo map in
+    // its shared prefix, runs deterministic checks, and merges cleanly.
+    let again = World::new(Mode::Write);
+    let outcome = run(prompt_config(&tmp.0, "Fix the typo in src/greet.ts", true), &again).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(planner_calls(&again).is_empty());
+    let calls = again.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "expected exactly 1 worker call, got: {calls:?}");
+    assert!(calls[0].contains("Repository map"), "shared prefix should include repo map: {}", calls[0]);
+    assert!(calls[0].contains("src/greet.ts"), "repo map should list src/greet.ts: {}", calls[0]);
+    assert!(calls[0].contains("Build unit `edit`"), "worker should run the direct edit unit: {}", calls[0]);
+}
+
+#[tokio::test]
+async fn force_cancel_aborts_a_blocked_worker_immediately_and_cleans_up() {
+    let tmp = seeded("force-cancel");
+    let barrier = Arc::new(Barrier::new(2));
+    let world = World::new(Mode::Parallel(Some(barrier)));
+    let (tx, rx) = watch::channel(crate::CancelMode::None);
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1);
+    cfg.cancel_mode = Some(rx);
+
+    let watcher_world = world.clone();
+    tokio::spawn(async move {
+        for _ in 0..200 {
+            if watcher_world.inflight.load(Ordering::SeqCst) >= 1 {
+                let _ = tx.send(crate::CancelMode::Force);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), drive(cfg, world.harnesses()))
+        .await
+        .expect("force cancel must abort blocked worker promptly")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    assert!(read(&run_directory(&tmp.0, "current").join("events.jsonl")).contains("cancelled"));
+    assert!(!tmp.0.join("app/a/page.ts").exists());
+    assert!(!tmp.0.join("app/b/page.ts").exists());
+}
+
+#[tokio::test]
+async fn max_cost_usd_stops_the_run_cleanly_once_budget_is_reached() {
+    let tmp = seeded("budget-cap");
+    let world = World::new(Mode::Write);
+    // Each Fake call costs $0.01; capping at $0.01 stops before starting page `b`.
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 1);
+    cfg.max_cost_usd = Some(0.01);
+    let outcome = run(cfg, &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    assert!(read(&run_directory(&tmp.0, "current").join("events.jsonl")).contains("cancelled"));
+    let calls = world.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|c| c.contains("Build page `a`")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.contains("Build page `b`")), "budget cap must prevent building page b: {calls:?}");
+    assert!(git_out(&tmp.0, &["show", "taskmaster/current:app/a/page.ts"]).contains("\"a\""));
 }

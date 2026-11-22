@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use tm_core::docs::{
-    ARCHITECTURE_FILE, CHANGES_FILE, render_architecture, render_changes, review_brief, security_brief, verify_brief,
+    ARCHITECTURE_FILE, CHANGES_FILE, render_architecture, render_changes, review_batch_brief, review_brief, security_brief, verify_batch_brief, verify_brief,
 };
 use tm_core::{
     ChangeEntry, ChangeKind, Citation, Command, DictTier, DraftEntry, EntryKind, Event, Finding, Flag,
@@ -76,10 +76,49 @@ struct CheckInput {
 /// and the scratch directory to remove.
 type CheckDone = (PageId, anyhow::Result<Answer>, Bill, PathBuf);
 
+/// Early checks run on at most this many merged pages at once, so a wide phase does not
+/// start a type checker per page together.
+const EARLY_CHECKS_AT_ONCE: usize = 2;
+
+/// A merged page's own static checks, run while other builders still work.
+struct EarlyDone {
+    page: PageId,
+    /// The checks that ran, for the terminal: `tsc+eslint`.
+    picked: String,
+    files: usize,
+    fixed: checks::Fixed,
+    /// `(file, line)` for every error the checks reported, on any file.
+    lines: Vec<(String, String)>,
+    took: Duration,
+    timed_out: bool,
+}
+
+/// What a passed page's finish needs once its early check is back.
+struct Settling {
+    tier: Tier,
+    errors: Option<String>,
+    text: String,
+    refused: Vec<String>,
+    review: Option<(String, Vec<String>)>,
+    shot: Option<Vec<u8>>,
+    wanted: usize,
+}
+
+/// What [`Driver::join_one`] woke up for.
+enum Joined {
+    Job(Result<(PageId, usize, anyhow::Result<WorkerJob>), tokio::task::JoinError>),
+    Early(Result<EarlyDone, tokio::task::JoinError>),
+}
+
 struct Product {
     answer: Answer,
     bill: Bill,
     worktree: PathBuf,
+}
+
+enum WorkerJob {
+    Finished(Box<Product>),
+    Restarted(PathBuf),
 }
 
 struct AgentRequest {
@@ -245,7 +284,7 @@ enum Step {
 
 /// Runs in one process share the project's Errorography, its citation record and its
 /// checked-out branch. Each is read, changed and written back under this lock.
-static PROJECT: Mutex<()> = Mutex::new(());
+pub(crate) static PROJECT: Mutex<()> = Mutex::new(());
 
 struct Driver {
     config: Config,
@@ -260,6 +299,8 @@ struct Driver {
     delivery: Option<(String, bool)>,
     /// The base branch and short commit the run was merged as, once it was.
     merge_commit: Option<(String, String)>,
+    /// The project's commit before the merge and after it, in full: what an undo puts back.
+    merge_range: Option<(String, String)>,
     /// Citations of pages built on the run's branch. They are written to the project's
     /// record only once the branch is merged: until then the project does not have the
     /// pages, and a later run must not skip them.
@@ -274,7 +315,7 @@ struct Driver {
     changes: Vec<ChangeEntry>,
     pending: VecDeque<Command>,
     running: Vec<Command>,
-    jobs: JoinSet<(PageId, usize, anyhow::Result<Product>)>,
+    jobs: JoinSet<(PageId, usize, anyhow::Result<WorkerJob>)>,
     /// Finished units of pages that still have units running.
     batches: HashMap<PageId, Vec<(usize, Product)>>,
     /// Caps concurrent worker calls at `parallel`, counting every unit of every page.
@@ -307,6 +348,11 @@ struct Driver {
     checks: JoinSet<CheckDone>,
     /// Pages already given to the checker: each is checked once.
     checked: BTreeSet<PageId>,
+    /// Merged pages whose own static checks run while other builders still work. The page
+    /// stays in `running` until its check is back.
+    early: JoinSet<EarlyDone>,
+    early_slots: Arc<Semaphore>,
+    settling: HashMap<PageId, Settling>,
     /// UI findings already sent to their page for one repair: (page, check).
     ui_sent: BTreeSet<(PageId, String)>,
     /// Harnesses already reported as having no shell in this run.
@@ -314,6 +360,12 @@ struct Driver {
     /// PROJECT.md as it stands: the sketch and what each finished phase landed. Every
     /// builder's shared prefix carries it.
     project_md: String,
+    /// Deterministic compact file+symbol map of the existing repository, cached once per run
+    /// and placed inside the shared prefix so every agent skips redundant `ls`/`grep` turns.
+    repo_map: String,
+    /// Project memory as it stood when the run started. Lessons learned during the run are
+    /// kept for the next one, so the shared prefix stays the same for every agent of this one.
+    project_memory: String,
     /// The next phase's planning call, started while the current phase builds.
     next_plan: Option<NextPlan>,
     /// Builders whose sessions are still open, by agent (`page` or `page/unit`), oldest
@@ -441,6 +493,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         branch: meta.branch.clone(),
         delivery: None,
         merge_commit: None,
+        merge_range: None,
         staged: BTreeMap::new(),
         template,
         id,
@@ -473,54 +526,257 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         code,
         checks: JoinSet::new(),
         checked: BTreeSet::new(),
+        early: JoinSet::new(),
+        early_slots: Arc::new(Semaphore::new(EARLY_CHECKS_AT_ONCE)),
+        settling: HashMap::new(),
         ui_sent: BTreeSet::new(),
         no_shell: BTreeSet::new(),
         project_md: String::new(),
+        repo_map: String::new(),
+        project_memory: String::new(),
         next_plan: None,
         warm: VecDeque::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
+    driver.repo_map = crate::repomap::render(&driver.tree);
+    driver.project_memory = driver.render_project_memory();
+    driver.warn_struggling_worker();
+    if driver.config.resume_cancelled && driver.run.phase == RunPhase::Failed {
+        driver.push_event(Event::Resumed)?;
+    }
     driver.grant_pages()?;
     driver.pull_commons();
     driver.r#loop().await
 }
 
+/// Wait until a `Force` cancellation signal arrives (or pend forever if no mode watcher exists).
+async fn wait_for_force(rx: &mut Option<tokio::sync::watch::Receiver<crate::CancelMode>>) {
+    match rx {
+        Some(rx) => {
+            if rx.borrow().is_force() {
+                return;
+            }
+            let _ = rx.wait_for(|m| m.is_force()).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 impl Driver {
+    fn cancel_mode(&self) -> crate::CancelMode {
+        if let Some(rx) = &self.config.cancel_mode {
+            let mode = *rx.borrow();
+            if mode.is_cancelled() {
+                return mode;
+            }
+        }
+        if *self.config.cancel.borrow() {
+            crate::CancelMode::Graceful
+        } else {
+            crate::CancelMode::None
+        }
+    }
+
+    fn force_watcher(&self) -> Option<tokio::sync::watch::Receiver<crate::CancelMode>> {
+        self.config.cancel_mode.clone()
+    }
+
+    fn should_cancel(&self) -> bool {
+        self.cancel_mode().is_cancelled() && !matches!(self.run.phase, RunPhase::Done | RunPhase::Failed)
+    }
+
+    fn is_force_cancel(&self) -> bool {
+        self.cancel_mode().is_force() && !matches!(self.run.phase, RunPhase::Done | RunPhase::Failed)
+    }
+
+    /// Abort every in-flight worker, check, warm session, and warm Node sandbox immediately.
+    async fn abort_active(&mut self) {
+        self.jobs.abort_all();
+        self.checks.abort_all();
+        self.early.abort_all();
+        self.next_plan = None;
+        self.running.clear();
+        self.pending.clear();
+        self.settling.clear();
+        for (_, products) in std::mem::take(&mut self.batches) {
+            for (_, product) in products {
+                self.drop_worktree(&product.worktree);
+            }
+        }
+        for (_, warm) in std::mem::take(&mut self.warm) {
+            let _ = warm.session.close().await;
+            self.drop_worktree(&warm.worktree);
+        }
+        if let Some(code) = &self.code {
+            code.detach_all();
+        }
+        if let Some(map) = &self.config.worker_restarts {
+            map.lock().unwrap().clear();
+        }
+    }
+
+    async fn force_cancel(&mut self) -> anyhow::Result<()> {
+        eprintln!("taskmaster: force-stopping run {}", self.id);
+        self.abort_active().await;
+        self.live.push(
+            &self.id,
+            &serde_json::json!({ "id": "master", "role": "master" }),
+            "cancelled",
+            serde_json::json!({ "mode": "force" }),
+        );
+        self.push_event(Event::Cancelled)?;
+        Ok(())
+    }
+
+    /// Returns `Some((spent_usd, cap_usd))` when this run has reached its configured USD budget.
+    fn budget_exceeded(&self) -> Option<(f64, f64)> {
+        let cap = self.config.max_cost_usd.filter(|c| c.is_finite() && *c > 0.0)?;
+        let ledger = self.records.ledger(&self.id).ok()?;
+        let spent = totals(&ledger).cost_usd;
+        (spent >= cap).then_some((spent, cap))
+    }
+
     async fn r#loop(&mut self) -> anyhow::Result<Outcome> {
+        let mut budget_stopped = false;
         loop {
+            if self.is_force_cancel() {
+                self.force_cancel().await?;
+                continue;
+            }
             if self.should_cancel() {
+                // Graceful stop: abort speculative background work and drop queued units,
+                // letting only currently active workers finish — unless escalated to Force.
+                self.next_plan = None;
+                self.checks.abort_all();
+                self.early.abort_all();
+                self.pending.clear();
                 if !self.running.is_empty() {
-                    self.join_one().await?;
+                    let mut force_rx = self.force_watcher();
+                    let interrupted = tokio::select! {
+                        joined = self.join_one() => {
+                            joined?;
+                            false
+                        }
+                        _ = wait_for_force(&mut force_rx) => true,
+                    };
+                    if interrupted {
+                        self.force_cancel().await?;
+                    }
                     continue;
                 }
-                self.pending.clear();
+                self.live.push(
+                    &self.id,
+                    &serde_json::json!({ "id": "master", "role": "master" }),
+                    "cancelled",
+                    serde_json::json!({ "mode": "graceful" }),
+                );
                 self.push_event(Event::Cancelled)?;
                 continue;
             }
-            let room = self.running.len() < self.parallel;
-            let next_spawn = matches!(self.pending.front(), Some(Command::SpawnWorker { .. }));
-            if !self.running.is_empty() && (!room || !next_spawn) {
-                self.join_one().await?;
-                continue;
-            }
-            if next_spawn {
-                self.start_spawn().await?;
-                continue;
-            }
-            if let Some(cmd) = self.pending.pop_front() {
-                if let Step::Stop(outcome) = self.dispatch(cmd).await? {
-                    return Ok(outcome);
+            if !budget_stopped
+                && !matches!(self.run.phase, RunPhase::Done | RunPhase::Failed)
+                && let Some((spent, cap)) = self.budget_exceeded()
+            {
+                budget_stopped = true;
+                eprintln!("taskmaster: budget cap reached (${spent:.4} >= ${cap:.2}); stopping new work");
+                self.live.push(
+                    &self.id,
+                    &serde_json::json!({ "id": "master", "role": "master" }),
+                    "budget_exceeded",
+                    serde_json::json!({ "spent_usd": spent, "budget_usd": cap }),
+                );
+                self.next_plan = None;
+                self.checks.abort_all();
+                self.early.abort_all();
+                self.pending.clear();
+                if self.running.is_empty() {
+                    self.push_event(Event::Cancelled)?;
                 }
                 continue;
             }
-            if let Step::Stop(outcome) = self.idle().await? {
-                return Ok(outcome);
+            let room = self.running.len() < self.parallel;
+            let has_spawn = matches!(self.pending.front(), Some(Command::SpawnWorker { .. }));
+            let ready_spawn = if has_spawn { self.next_ready_spawn() } else { None };
+            if !self.running.is_empty() && (!room || ready_spawn.is_none() || budget_stopped) {
+                let mut force_rx = self.force_watcher();
+                let interrupted = tokio::select! {
+                    joined = self.join_one() => {
+                        joined?;
+                        false
+                    }
+                    _ = wait_for_force(&mut force_rx) => true,
+                };
+                if interrupted {
+                    self.force_cancel().await?;
+                } else if budget_stopped && self.running.is_empty() {
+                    self.push_event(Event::Cancelled)?;
+                }
+                continue;
+            }
+            if has_spawn && !budget_stopped {
+                let idx = ready_spawn.unwrap_or(0);
+                self.start_spawn(idx).await?;
+                continue;
+            }
+            if let Some(cmd) = self.pending.pop_front() {
+                let can_abort = !matches!(cmd, Command::Finish { .. } | Command::RequestApproval);
+                let mut force_rx = if can_abort { self.force_watcher() } else { None };
+                let stepped = tokio::select! {
+                    res = self.dispatch(cmd) => Some(res?),
+                    _ = wait_for_force(&mut force_rx) => None,
+                };
+                match stepped {
+                    Some(Step::Stop(outcome)) => return Ok(outcome),
+                    Some(Step::Continue) => continue,
+                    None => {
+                        self.force_cancel().await?;
+                        continue;
+                    }
+                }
+            }
+            let can_abort_idle = matches!(self.run.phase, RunPhase::Planning);
+            let mut force_rx = if can_abort_idle { self.force_watcher() } else { None };
+            let stepped = tokio::select! {
+                res = self.idle() => Some(res?),
+                _ = wait_for_force(&mut force_rx) => None,
+            };
+            match stepped {
+                Some(Step::Stop(outcome)) => return Ok(outcome),
+                Some(Step::Continue) => {}
+                None => {
+                    self.force_cancel().await?;
+                }
             }
         }
     }
 
-    fn should_cancel(&self) -> bool {
-        *self.config.cancel.borrow() && !matches!(self.run.phase, RunPhase::Done | RunPhase::Failed)
+    /// Index of the first leading `SpawnWorker` command whose `depends_on` upstream units have
+    /// already passed (ignoring unknown IDs). Only scans the leading contiguous `SpawnWorker`
+    /// prefix so ordering barriers (checks/merge) are never bypassed.
+    fn next_ready_spawn(&self) -> Option<usize> {
+        let plan = self.run.plan.as_ref();
+        for (idx, cmd) in self.pending.iter().enumerate() {
+            let Command::SpawnWorker { page, .. } = cmd else {
+                break;
+            };
+            let deps = plan
+                .and_then(|p| p.pages.iter().find(|u| u.id == *page))
+                .map(|u| u.depends_on.as_slice())
+                .unwrap_or(&[]);
+            let ready = deps.iter().all(|dep| {
+                if dep == page {
+                    return true;
+                }
+                match self.run.pages.get(dep) {
+                    Some(st) => st.state == tm_core::PageState::Passed,
+                    None => true,
+                }
+            });
+            if ready {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     async fn idle(&mut self) -> anyhow::Result<Step> {
@@ -579,6 +835,13 @@ impl Driver {
         let mut errors: Vec<String> = Vec::new();
         let mut rejected: Option<String> = None;
         let master_notes = self.live.take_notes(&self.id, &["master"]);
+        if self.lite_edit_pass(prompt) && master_notes.is_empty() {
+            let mut plan = crate::small::lite_edit_plan(prompt);
+            self.settle_skills(&mut plan, prompt);
+            self.records.save_plan(&self.id, &plan)?;
+            eprintln!("taskmaster: direct fast-path edit (skipped master planning; 1 worker + free checks)");
+            return Ok(plan);
+        }
         let mut full_calls = 0;
         for attempt in 1..=PLAN_ATTEMPTS {
             let answer = match rejected.take() {
@@ -639,31 +902,37 @@ impl Driver {
         let token = self.master_token.clone();
         let mut request = self.read_request(&cwd, brief.clone(), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
         self.small = self.small_pass(prompt);
+        let quick = !self.small && self.quick_edit_pass(prompt);
         let fresh = self.fresh_project(prompt)?;
         if self.small || fresh {
             // Every stored entry is in the brief, so the master needs no tools.
             request.dictionary = None;
+        } else {
+            self.offer_code_readonly("master", &cwd, &mut request);
         }
-        request.effort = if self.small {
+        request.effort = if self.small || quick {
             Some(crate::small::SMALL_EFFORT.to_string())
         } else if fresh {
             Some(FRESH_EFFORT.to_string())
         } else {
             None
         };
-        request.commit = Some(self.commit_budget(self.small || fresh));
+        request.commit = Some(self.commit_budget(self.small || fresh || quick));
         self.tag(&mut request, "master", "planner", None, None);
         let bill = request.bill(Role::Planner, None);
         let mut asked = ask(request).await;
+        if let Some(code) = &self.code {
+            code.detach("master");
+        }
         // Looked or thought too long: one more turn, with no tools, to write it down.
         let stopped = asked.as_ref().err().and_then(|err| err.downcast_ref::<Overrun>()).map(|over| (over.why.clone(), over.notes.clone()));
         if let Some((why, notes)) = stopped {
             eprintln!("taskmaster: the planner was stopped ({why}); asking it to write the plan now");
-            let mut quick = self.read_request(&cwd, commit_brief(&brief, &why, &notes), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
-            quick.dictionary = None;
-            quick.effort = Some(crate::small::SMALL_EFFORT.to_string());
-            self.tag(&mut quick, "master", "planner", None, None);
-            asked = ask(quick).await;
+            let mut quick_req = self.read_request(&cwd, commit_brief(&brief, &why, &notes), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+            quick_req.dictionary = None;
+            quick_req.effort = Some(crate::small::SMALL_EFFORT.to_string());
+            self.tag(&mut quick_req, "master", "planner", None, None);
+            asked = ask(quick_req).await;
         }
         if scratch {
             self.drop_worktree(&cwd);
@@ -1001,6 +1270,17 @@ impl Driver {
         crate::small::is_small_prompt(prompt, self.existing_files())
     }
 
+    /// Direct / Lite Fast-Path: scoped bug fixes and small edits in existing repos skip
+    /// Master Planning altogether (0 planner tokens -> 1 Code-Mode worker -> free checks).
+    fn lite_edit_pass(&self, prompt: &str) -> bool {
+        self.config.fast_path && self.template.is_none() && crate::small::is_lite_edit(prompt, self.existing_files())
+    }
+
+    /// Short, focused edits in an existing repo take the repo-map fast planning pass.
+    fn quick_edit_pass(&self, prompt: &str) -> bool {
+        self.template.is_none() && crate::small::is_quick_edit(prompt, self.existing_files())
+    }
+
     /// Stored Dictionary entries that bear on this request, one formatted item each, for a
     /// planning brief. This project's own entries are always listed. A Commons entry is
     /// listed only when it shares at least two words with the request, best match first,
@@ -1090,6 +1370,17 @@ impl Driver {
             }
             return Ok(brief);
         }
+        if self.quick_edit_pass(prompt) {
+            let mut brief = crate::small::quick_edit_brief(prompt, &self.repo_map, &self.entry_listing(prompt)?, self.parallel, Some(&worker));
+            if !errors.is_empty() {
+                brief.push_str("\nThe last plan was rejected:\n");
+                for error in errors {
+                    brief.push_str(&format!("- {error}\n"));
+                }
+                brief.push_str("Reply with a corrected JSON object.\n");
+            }
+            return Ok(brief);
+        }
         let look = if self.fresh_project(prompt)? {
             "The project is empty and every Dictionary entry already stored is listed below, so you need no tools: \
              do not call any, and plan from this brief alone."
@@ -1100,11 +1391,17 @@ impl Driver {
         let mut brief = format!(
             "Plan this product and lock its contracts.\n\n\
              {pool}\n\
-             Request:\n{prompt}\n\n\
-             {look} Cite an existing entry instead of rewriting it. \
+             Request:\n{prompt}\n\n"
+        );
+        if !self.repo_map.is_empty() {
+            brief.push_str(&self.repo_map);
+            brief.push('\n');
+        }
+        brief.push_str(&format!(
+            "{look} Cite an existing entry instead of rewriting it. \
              If you include an existing key, its content must match exactly.\n\n\
              Dictionary entries already stored:\n"
-        );
+        ));
         let found = self.entry_listing(prompt)?;
         if found.is_empty() {
             brief.push_str("- none\n");
@@ -1123,8 +1420,10 @@ impl Driver {
              Leave `estimate` at zero: Taskmaster works it out from what past runs cost. \
              `summary` is one concise paragraph describing the overall plan and how work is divided across workers. \
              `kind` says what is being built: web, library, cli, server or migration. \
-             `contracts` are shared interface files that more than one unit imports, locked before any unit starts. \
-             `units` are the parallel worker assignments; each owns one disjoint glob. \
+             `contracts` are shared interface files that more than one unit relies on, locked before any unit starts. \
+             Where units must agree on behaviour, not only types, add a small executable contract test among them, named so the project's test runner finds it \
+             (`tests/contract/cart.test.ts`, `tests/test_cart_contract.py`): it imports the units it checks and is every worker's acceptance check from its first turn. \
+             `units` are the parallel worker assignments; each owns one disjoint glob and may set `difficulty` (`\"easy\"`, `\"normal\"`, or `\"hard\"`) to route easy boilerplate at low effort and hard core modules straight to the stronger mid tier. \
              `dictionary` holds new entries those units cite; an entry's `kind` is schema, routes, component_api, pattern, or hint. \
              Every unit, and every part of one, is one worker agent: its `brief` is its task, `context` is the self-contained architectural/integration context it needs (shared interfaces, DOM ids, symbols, conventions, sibling boundaries), and `done` is one line \
              saying how it knows it is finished.\n",
@@ -1277,8 +1576,8 @@ impl Driver {
         Ok(Step::Continue)
     }
 
-    async fn start_spawn(&mut self) -> anyhow::Result<()> {
-        let Some(Command::SpawnWorker { page, tier, errors }) = self.pending.pop_front() else {
+    async fn start_spawn(&mut self, idx: usize) -> anyhow::Result<()> {
+        let Some(Command::SpawnWorker { page, tier, errors }) = self.pending.remove(idx) else {
             bail!("expected a worker spawn");
         };
         if self.is_stale(&page) {
@@ -1365,6 +1664,11 @@ impl Driver {
         }
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
         self.batches.remove(&page);
+        let restart_rx = self.config.worker_restarts.as_ref().map(|map| {
+            let mut guard = map.lock().unwrap();
+            let tx = guard.entry(page.clone()).or_insert_with(|| tokio::sync::watch::channel(0u64).0);
+            tx.subscribe()
+        });
         for (index, (mut request, worktree, warm)) in prepared.into_iter().enumerate() {
             // Each unit is its own agent: `page:<page>/<unit>` when the page is split.
             let unit = (units.len() > 1).then(|| units[index].id.as_str());
@@ -1383,16 +1687,30 @@ impl Driver {
             }
             let bill = request.bill(Role::builder(tier), Some(&page));
             let (page, slots) = (page.clone(), self.slots.clone());
+            let mut rx = restart_rx.clone();
             if warm.is_some() {
                 eprintln!("taskmaster: sending the repair of {agent} to its open session");
             }
             self.jobs.spawn(async move {
                 let permit = slots.acquire_owned().await.ok();
-                let asked = match warm {
-                    Some(warm) => follow(request, warm.session).await,
-                    None => ask(request).await,
+                let restart_wait = async {
+                    match rx.as_mut() {
+                        Some(rx) => {
+                            let generation = *rx.borrow();
+                            let _ = rx.wait_for(|&v| v != generation).await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
                 };
-                let result = asked.map(|answer| Product { answer, bill, worktree });
+                let result = tokio::select! {
+                    asked = async {
+                        match warm {
+                            Some(warm) => follow(request, warm.session).await,
+                            None => ask(request).await,
+                        }
+                    } => asked.map(|answer| WorkerJob::Finished(Box::new(Product { answer, bill, worktree }))),
+                    _ = restart_wait => Ok(WorkerJob::Restarted(worktree)),
+                };
                 // The agent is released; its slot goes to the next waiting unit at once.
                 drop(permit);
                 (page, index, result)
@@ -1403,12 +1721,15 @@ impl Driver {
     }
 
     async fn join_one(&mut self) -> anyhow::Result<()> {
-        let (page, index, result) = self
-            .jobs
-            .join_next()
-            .await
-            .context("a worker disappeared")?
-            .context("a worker task panicked")?;
+        let joined = tokio::select! {
+            Some(done) = self.early.join_next(), if !self.early.is_empty() => Joined::Early(done),
+            Some(job) = self.jobs.join_next(), if !self.jobs.is_empty() => Joined::Job(job),
+            else => anyhow::bail!("a worker disappeared"),
+        };
+        let (page, index, result) = match joined {
+            Joined::Early(done) => return self.finish_early(done.context("an early check panicked")?),
+            Joined::Job(job) => job.context("a worker task panicked")?,
+        };
         let shot = match (&self.browsers, self.config.checker && !self.checked.contains(&page)) {
             (Some(browsers), true) => browsers.snapshot(&page).await,
             _ => None,
@@ -1420,8 +1741,35 @@ impl Driver {
             code.detach_page(&page);
         }
         let product = match result {
-            Ok(product) => product,
+            Ok(WorkerJob::Finished(product)) => *product,
+            Ok(WorkerJob::Restarted(worktree)) => {
+                self.drop_worktree(&worktree);
+                if let Some(partial) = self.batches.remove(&page) {
+                    for (_, p) in partial {
+                        self.drop_worktree(&p.worktree);
+                    }
+                }
+                if let Some(map) = &self.config.worker_restarts {
+                    map.lock().unwrap().remove(&page);
+                }
+                if let Some(cmd) = self.take_running(&page) {
+                    eprintln!("taskmaster: {page} restarted by user; re-queueing");
+                    let agent_id = self.agent_id(&page, None);
+                    self.live.push(
+                        &self.id,
+                        &serde_json::json!({ "id": agent_id, "role": "worker", "page": page }),
+                        "restarted",
+                        serde_json::json!({ "reason": "restarted by user" }),
+                    );
+                    self.pending.push_front(cmd);
+                    let _ = self.persist();
+                }
+                return Ok(());
+            }
             Err(err) => {
+                if let Some(map) = &self.config.worker_restarts {
+                    map.lock().unwrap().remove(&page);
+                }
                 self.persist()?;
                 return Err(err);
             }
@@ -1436,6 +1784,9 @@ impl Driver {
         let mut products = self.batches.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
         let cmd = self.take_running(&page);
+        if let Some(map) = &self.config.worker_restarts {
+            map.lock().unwrap().remove(&page);
+        }
         if self.is_stale(&page) {
             for (_, product) in &products {
                 self.drop_worktree(&product.worktree);
@@ -1470,6 +1821,20 @@ impl Driver {
                 return Err(err);
             }
         };
+        let settling = Settling { tier, errors, text, refused, review, shot, wanted };
+        if matches!(outcome, WorkerOutcome::Passed)
+            && let Some(cmd) = cmd
+            && let Some(files) = self.early_files(&page)
+        {
+            self.start_early(&page, files, cmd, settling);
+            return Ok(());
+        }
+        self.settle(&page, outcome, settling)
+    }
+
+    /// Log a page's outcome, learn from it, and hand it to the run.
+    fn settle(&mut self, page: &str, outcome: WorkerOutcome, settling: Settling) -> anyhow::Result<()> {
+        let Settling { tier, errors, text, refused, review, shot, wanted } = settling;
         // The log says what the ledger says: a call that had tools refused is not a clean pass.
         let refused_note = if refused.is_empty() { String::new() } else { format!(" (refused: {})", refused.join(", ")) };
         match &outcome {
@@ -1485,16 +1850,111 @@ impl Driver {
                 if let Some(failure) = &errors {
                     self.learn_fix(tier, failure, &text)?;
                 }
-                self.record_citations(&page)?;
+                self.record_citations(page)?;
             }
             WorkerOutcome::Flagged(_) => {}
         }
         if let (WorkerOutcome::Passed, Some((diff, files))) = (&outcome, review) {
-            self.start_check(&page, tier, wanted, CheckInput { diff, files, shot, said: text });
+            self.start_check(page, tier, wanted, CheckInput { diff, files, shot, said: text });
         }
-        self.push_event(Event::WorkerFinished { page: page.clone(), outcome })?;
-        self.records.clear_merged(&self.id, &page);
+        self.push_event(Event::WorkerFinished { page: page.to_string(), outcome })?;
+        self.records.clear_merged(&self.id, page);
         Ok(())
+    }
+
+    /// The files a page just merged, when they are worth checking now: other builders are
+    /// still working, so the barrier check is not next, and a static check applies to them.
+    fn early_files(&self, page: &str) -> Option<Vec<String>> {
+        if !self.config.checks {
+            return None;
+        }
+        let others = !self.jobs.is_empty() || self.pending.iter().any(|cmd| matches!(cmd, Command::SpawnWorker { .. }));
+        if !others {
+            return None;
+        }
+        let entry = self
+            .changes
+            .last()
+            .filter(|c| c.page.as_deref() == Some(page) && matches!(c.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired))?;
+        let files: Vec<String> = entry.files.iter().filter(|f| self.tree.join(f).is_file()).cloned().collect();
+        let applies = checks::select(&self.tree, &files).iter().any(|c| c.is_static() && *c != checks::Check::Html);
+        (applies && !files.is_empty()).then_some(files)
+    }
+
+    /// Check a merged page's own files beside the build. The page stays running until the
+    /// check is back, so nothing that depends on it starts on broken files.
+    fn start_early(&mut self, page: &str, files: Vec<String>, cmd: Command, settling: Settling) {
+        self.running.push(cmd);
+        self.settling.insert(page.to_string(), settling);
+        let picked: Vec<&str> = checks::select(&self.tree, &files).into_iter().filter(|c| c.is_static()).map(|c| c.name()).collect();
+        let picked = picked.join("+");
+        let (tree, slots, page) = (self.tree.clone(), self.early_slots.clone(), page.to_string());
+        eprintln!("taskmaster: checking {page}'s {} file(s) with {picked} while the other units build", files.len());
+        self.early.spawn(async move {
+            let _permit = slots.acquire_owned().await.ok();
+            let began = Instant::now();
+            let fixed = checks::autofix(&tree, &files).await;
+            let mut lines = checks::html_sanity(&tree, &files);
+            let count = files.len();
+            let linted = tokio::time::timeout(
+                checks::STATIC_TIMEOUT,
+                tokio::task::spawn_blocking(move || tm_review::lint::run_errors(&tree, &files)),
+            )
+            .await;
+            let timed_out = linted.is_err();
+            if let Ok(Ok(report)) = linted {
+                lines.extend(report.findings.iter().map(|f| (f.file.clone(), format!("{}:{} {}", f.file, f.line, f.failure))));
+            }
+            EarlyDone { page, picked, files: count, fixed, lines, took: began.elapsed(), timed_out }
+        });
+    }
+
+    /// A page's early check is back: send it straight back to its builder when its own files
+    /// fail, or let it pass. Errors in other files wait for the barrier check.
+    fn finish_early(&mut self, done: EarlyDone) -> anyhow::Result<()> {
+        let EarlyDone { page, picked, files, fixed, lines, took, timed_out } = done;
+        let Some(settling) = self.settling.remove(&page) else { return Ok(()) };
+        self.take_running(&page);
+        self.commit_autofix(&fixed);
+        let owners = Owners::from_plan(self.plan()?)?;
+        let tests: BTreeSet<&str> = lines.iter().map(|(file, _)| file.as_str()).filter(|file| self.is_contract_test(file)).collect();
+        let reaches = !tests.is_empty() && self.units_reached(&owners, tests.iter().copied()).contains(&page);
+        let mine: Vec<&str> = lines
+            .iter()
+            .filter(|(file, _)| owners.owner(file).is_some_and(|owner| *owner == page) || (reaches && tests.contains(file.as_str())))
+            .map(|(_, line)| line.as_str())
+            .collect();
+        let status = if timed_out { "timeout" } else if mine.is_empty() { "ok" } else { "failed" };
+        eprintln!("taskmaster: early check of {page}: {picked} {:.1}s {status}", took.as_secs_f64());
+        if timed_out {
+            eprintln!("taskmaster: the early check of {page} did not finish; the barrier check covers it");
+        }
+        if mine.is_empty() {
+            return self.settle(&page, WorkerOutcome::Passed, settling);
+        }
+        let mut text = mine.join("\n");
+        self.terminal("command", serde_json::json!({ "command": format!("{picked} on {files} file(s) of {page}"), "cwd": self.tree.display().to_string() }));
+        self.terminal("output", serde_json::json!({ "ok": false, "text": text }));
+        if reaches {
+            text.push('\n');
+            text.push_str(&contract_test_note(&tests.iter().copied().collect::<Vec<_>>()));
+        }
+        eprintln!("taskmaster: {page} failed its own checks while other units build; sending it back now");
+        self.settle(&page, failed(text), settling)
+    }
+
+    /// Commit what the deterministic fixers rewrote, so the run's branch has the fixed files
+    /// and the tree stays clean for the next merge.
+    fn commit_autofix(&mut self, fixed: &checks::Fixed) {
+        if fixed.changed.is_empty() {
+            return;
+        }
+        let ran = fixed.ran.join(", ");
+        eprintln!("taskmaster: auto-fixed {} file(s) with {ran}", fixed.changed.len());
+        let paths: Vec<String> = fixed.changed.iter().filter(|p| git::safe_rel(p)).cloned().collect();
+        if let Err(err) = git::commit_paths(&self.tree, &format!("taskmaster: auto-fix ({ran})"), &paths) {
+            eprintln!("taskmaster: the auto-fixed files were not committed: {err:#}");
+        }
     }
 
     /// Give a page that just passed to the mid model for a second look, beside the build.
@@ -1933,15 +2393,56 @@ impl Driver {
         Ok(Event::FlagResolved { page: flag.page, key: flag.key, resolution })
     }
 
+    /// Shared cache-friendly prefix for reviewers, security checks, and verifiers:
+    /// the run's `shared_prefix()` plus a deterministic summary/diff of the run's changes
+    /// against its base commit so provider prompt caches hit across review and verification.
+    fn review_prefix(&self, worktree: &Path) -> String {
+        let mut out = self.shared_prefix().unwrap_or_default();
+        let base = self.records.meta(&self.id).ok().flatten().and_then(|m| m.base);
+        if let Some(base) = base {
+            if let Ok(output) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["diff", "--no-color", "--stat", &base, "--", ".", ":!.taskmaster"])
+                .output()
+                && output.status.success()
+            {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                if !stat.trim().is_empty() {
+                    out.push_str("\nRun diff summary:\n");
+                    out.push_str(stat.trim_end());
+                    out.push('\n');
+                }
+            }
+            if let Ok(output) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["diff", "--no-color", "-U2", &base, "--", ".", ":!.taskmaster"])
+                .output()
+                && output.status.success()
+            {
+                let diff = String::from_utf8_lossy(&output.stdout);
+                if !diff.trim().is_empty() {
+                    out.push_str("\nRun diff (truncated if large):\n```diff\n");
+                    out.push_str(&clip(diff.trim_end(), 12_000));
+                    out.push_str("\n```\n");
+                }
+            }
+        }
+        out
+    }
+
     async fn review(&mut self, scopes: Vec<ReviewScope>, security: Vec<PageId>) -> anyhow::Result<Vec<Finding>> {
         eprintln!("taskmaster: reviewing {} connections", scopes.len());
         let worktree = self.fresh_worktree("review")?;
         let sem = Arc::new(Semaphore::new(self.parallel.max(1)));
         let mut set = JoinSet::new();
         let reviewer_notes = self.decision_for(|note| note.to == "reviewer").await?;
-        for scope in scopes {
-            let key = scope.key.clone();
-            let brief = self.with_notes(review_brief(&scope), &reviewer_notes);
+        let prefix = self.review_prefix(&worktree);
+        if scopes.len() > 1 {
+            // Batch all connection scopes into one reviewer call sharing the repo+diff prefix
+            // instead of spawning N cold processes.
+            let brief = self.with_notes(format!("{prefix}{}", review_batch_brief(&scopes)), &reviewer_notes);
             let mut request = self.read_request(
                 &worktree,
                 brief,
@@ -1949,6 +2450,25 @@ impl Driver {
                 self.config.models.reviewer.clone(),
                 &self.reviewer_token.clone(),
             )?;
+            self.offer_code_readonly("reviewer", &worktree, &mut request);
+            self.tag(&mut request, "reviewer", "reviewer", None, None);
+            let permit = sem.clone();
+            let bill = request.bill(Role::Reviewer, None);
+            set.spawn(async move {
+                let _permit = permit.acquire_owned().await.context("review stopped")?;
+                Ok::<_, anyhow::Error>((bill, None, ask(request).await?))
+            });
+        } else if let Some(scope) = scopes.into_iter().next() {
+            let key = scope.key.clone();
+            let brief = self.with_notes(format!("{prefix}{}", review_brief(&scope)), &reviewer_notes);
+            let mut request = self.read_request(
+                &worktree,
+                brief,
+                self.harnesses.reviewer.clone(),
+                self.config.models.reviewer.clone(),
+                &self.reviewer_token.clone(),
+            )?;
+            self.offer_code_readonly("reviewer", &worktree, &mut request);
             self.tag(&mut request, "reviewer", "reviewer", None, None);
             let permit = sem.clone();
             let bill = request.bill(Role::Reviewer, None);
@@ -1958,7 +2478,7 @@ impl Driver {
             });
         }
         if !security.is_empty() {
-            let brief = self.with_notes(security_brief(&security), &reviewer_notes);
+            let brief = self.with_notes(format!("{prefix}{}", security_brief(&security)), &reviewer_notes);
             let mut request = self.read_request(
                 &worktree,
                 brief,
@@ -1966,6 +2486,7 @@ impl Driver {
                 self.config.models.reviewer.clone(),
                 &self.reviewer_token.clone(),
             )?;
+            self.offer_code_readonly("reviewer", &worktree, &mut request);
             self.tag(&mut request, "reviewer", "security", None, None);
             let permit = sem.clone();
             let bill = request.bill(Role::Security, None);
@@ -1986,6 +2507,9 @@ impl Driver {
                 Err(err) => failure = Some(err),
             }
         }
+        if let Some(code) = &self.code {
+            code.detach("reviewer");
+        }
         self.drop_worktree(&worktree);
         if let Some(err) = failure {
             return Err(err);
@@ -1994,13 +2518,16 @@ impl Driver {
     }
 
     async fn verify_findings(&mut self, findings: Vec<Finding>) -> anyhow::Result<Vec<Finding>> {
+        if findings.is_empty() {
+            return Ok(Vec::new());
+        }
         eprintln!("taskmaster: verifying {} findings", findings.len());
         let worktree = self.fresh_worktree("verify")?;
-        let sem = Arc::new(Semaphore::new(self.parallel.max(1)));
-        let mut set = JoinSet::new();
         let verifier_notes = self.decision_for(|note| note.to == "verifier").await?;
-        for finding in findings {
-            let brief = self.with_notes(verify_brief(&finding), &verifier_notes);
+        let prefix = self.review_prefix(&worktree);
+        if findings.len() > 1 {
+            // One batched verifier call instead of N separate round-trips.
+            let brief = self.with_notes(format!("{prefix}{}", verify_batch_brief(&findings)), &verifier_notes);
             let mut request = self.read_request(
                 &worktree,
                 brief,
@@ -2008,32 +2535,39 @@ impl Driver {
                 self.config.models.verifier.clone(),
                 &self.verifier_token.clone(),
             )?;
-            self.tag(&mut request, "verifier", "verifier", Some(&finding.page), None);
-            let permit = sem.clone();
-            let bill = request.bill(Role::Verifier, Some(&finding.page));
-            set.spawn(async move {
-                let _permit = permit.acquire_owned().await.context("verifier stopped")?;
-                Ok::<_, anyhow::Error>((finding, bill, ask(request).await?))
-            });
-        }
-        let mut confirmed = Vec::new();
-        let mut failure = None;
-        while let Some(joined) = set.join_next().await {
-            match joined.context("verifier task panicked").and_then(|done| done) {
-                Ok((finding, bill, answer)) => {
-                    self.charge(&bill, &answer)?;
-                    if reply::parse_verdict(&answer.text) {
-                        confirmed.push(finding);
-                    }
-                }
-                Err(err) => failure = Some(err),
+            self.offer_code_readonly("verifier", &worktree, &mut request);
+            self.tag(&mut request, "verifier", "verifier", None, None);
+            let bill = request.bill(Role::Verifier, None);
+            let asked = ask(request).await;
+            if let Some(code) = &self.code {
+                code.detach("verifier");
             }
+            self.drop_worktree(&worktree);
+            let answer = asked?;
+            self.charge(&bill, &answer)?;
+            let verdicts = reply::parse_verdicts_batch(&answer.text, findings.len());
+            return Ok(findings.into_iter().zip(verdicts).filter_map(|(f, real)| real.then_some(f)).collect());
+        }
+        let finding = findings.into_iter().next().unwrap();
+        let brief = self.with_notes(format!("{prefix}{}", verify_brief(&finding)), &verifier_notes);
+        let mut request = self.read_request(
+            &worktree,
+            brief,
+            self.harnesses.verifier.clone(),
+            self.config.models.verifier.clone(),
+            &self.verifier_token.clone(),
+        )?;
+        self.offer_code_readonly("verifier", &worktree, &mut request);
+        self.tag(&mut request, "verifier", "verifier", Some(&finding.page), None);
+        let bill = request.bill(Role::Verifier, Some(&finding.page));
+        let asked = ask(request).await;
+        if let Some(code) = &self.code {
+            code.detach("verifier");
         }
         self.drop_worktree(&worktree);
-        if let Some(err) = failure {
-            return Err(err);
-        }
-        Ok(confirmed)
+        let answer = asked?;
+        self.charge(&bill, &answer)?;
+        if reply::parse_verdict(&answer.text) { Ok(vec![finding]) } else { Ok(Vec::new()) }
     }
 
     fn note_findings(&mut self, confirmed: &[Finding]) -> anyhow::Result<()> {
@@ -2078,6 +2612,23 @@ impl Driver {
     async fn verify_checks(&mut self, timings: &mut Vec<Timing>) -> anyhow::Result<(bool, BTreeMap<PageId, String>)> {
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
+        // Run zero-cost deterministic auto-fixers (eslint --fix, ruff --fix) on what the
+        // builders wrote before running linters, so trivial lint issues never burn a repair
+        // turn. Locked contracts are left as they were locked.
+        if self.config.checks {
+            let changed: Vec<String> = self
+                .changes
+                .iter()
+                .filter(|c| matches!(c.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired))
+                .flat_map(|c| c.files.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if !changed.is_empty() {
+                let fixed = checks::autofix(&self.tree, &changed).await;
+                self.commit_autofix(&fixed);
+            }
+        }
         let sources = load_sources(&self.tree)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
         // The static checks and the project's own build and tests do not wait for each other.
@@ -2279,7 +2830,29 @@ impl Driver {
                 (timed, failed, None)
             }
         };
+        let timed_out = steps_timed.iter().any(|t| t.name == "test" && t.status == "timeout");
         ran.timings.extend(steps_timed);
+        // A test step that fails once and passes when run again is flaky, not broken: say so,
+        // and spend no repair on it. A step that ran out of time is not run twice.
+        let failed = match (failed, steps.iter().find(|step| step.name == "test")) {
+            (Some(failure), Some(step)) if failure.step == "test" && !timed_out => {
+                eprintln!("taskmaster: `{}` failed; running it once more to rule out a flaky test", step.line());
+                let (again_timed, again) = runtime::run_steps(&self.tree, std::slice::from_ref(step), checks::STEP_TIMEOUT).await;
+                ran.timings.extend(again_timed.into_iter().map(|t| Timing::new(format!("{} again", t.name), t.took, t.status)));
+                match again {
+                    Some(_) => Some(failure),
+                    None => {
+                        eprintln!("taskmaster: `{}` passed when run again, so the first failure was flaky:\n{}", step.line(), failure.output);
+                        self.terminal(
+                            "output",
+                            serde_json::json!({ "ok": true, "step": "test", "text": format!("flaky: `{}` failed once and passed when run again", step.line()) }),
+                        );
+                        None
+                    }
+                }
+            }
+            (failed, _) => failed,
+        };
         if !steps.is_empty() {
             match &failed {
                 Some(failure) => self.terminal("output", serde_json::json!({ "ok": false, "step": failure.step, "text": failure.output })),
@@ -2295,8 +2868,25 @@ impl Driver {
                 let locked = self.locked_files();
                 let named: BTreeSet<String> =
                     rest.lines().flat_map(runtime::paths_in).filter(|path| locked.contains(path)).collect();
-                if !named.is_empty() {
-                    let text = format!("`{}` failed:\n{rest}", failure.step);
+                let text = format!("`{}` failed:\n{rest}", failure.step);
+                // Failing contract tests go to the units they reach, not to the master.
+                let reached = if !named.is_empty() && named.iter().all(|file| tm_core::is_test_path(file)) {
+                    self.units_reached(owners, named.iter().map(String::as_str))
+                } else {
+                    BTreeSet::new()
+                };
+                if !reached.is_empty() {
+                    let tests: Vec<&str> = named.iter().map(String::as_str).collect();
+                    for page in reached {
+                        let entry = ran.pages.entry(page).or_default();
+                        if !entry.is_empty() {
+                            entry.push('\n');
+                        }
+                        entry.push_str(&text);
+                        entry.push('\n');
+                        entry.push_str(&contract_test_note(&tests));
+                    }
+                } else if !named.is_empty() {
                     ran.shared = named.into_iter().map(|file| (file, String::new())).collect();
                     ran.shared.push((String::new(), text));
                 } else if ran.pages.is_empty() {
@@ -2403,6 +2993,67 @@ impl Driver {
     }
 
     /// Shared files this run wrote: the contracts and the template.
+    /// A locked contract of this run's plan that is an executable test.
+    fn is_contract_test(&self, file: &str) -> bool {
+        self.run.plan.as_ref().is_some_and(|plan| plan.contracts.iter().any(|c| c.path == file && c.is_test()))
+    }
+
+    /// The units `tests` reach through their imports, directly or through other shared files.
+    fn units_reached<'a>(&self, owners: &Owners, tests: impl IntoIterator<Item = &'a str>) -> BTreeSet<PageId> {
+        let Ok(sources) = load_sources(&self.tree) else { return BTreeSet::new() };
+        let graph = ImportGraph::build(&sources, "");
+        let mut reached = BTreeSet::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<String> = tests.into_iter().map(str::to_string).collect();
+        while let Some(file) = stack.pop() {
+            if !seen.insert(file.clone()) || seen.len() > 256 {
+                continue;
+            }
+            for to in graph.edges.get(&file).into_iter().flatten() {
+                match owners.owner(to) {
+                    Some(page) => {
+                        reached.insert(page.clone());
+                    }
+                    None => stack.push(to.clone()),
+                }
+            }
+        }
+        reached
+    }
+
+    /// Errors in locked contract tests, as `(file, line)`, moved to the units each test
+    /// reaches. The rest, and tests that reach no unit, stay with the shared files.
+    fn route_contract_tests(&self, owners: &Owners, shared: Vec<(String, String)>) -> (BTreeMap<PageId, String>, Vec<(String, String)>) {
+        let mut routed: BTreeMap<PageId, Vec<(String, String)>> = BTreeMap::new();
+        let mut kept = Vec::new();
+        let mut reaches: BTreeMap<String, BTreeSet<PageId>> = BTreeMap::new();
+        for (file, line) in shared {
+            if !reaches.contains_key(&file) {
+                let reached = if self.is_contract_test(&file) { self.units_reached(owners, [file.as_str()]) } else { BTreeSet::new() };
+                reaches.insert(file.clone(), reached);
+            }
+            let reached = reaches[&file].clone();
+            if reached.is_empty() {
+                kept.push((file, line));
+                continue;
+            }
+            for page in reached {
+                routed.entry(page).or_default().push((file.clone(), line.clone()));
+            }
+        }
+        let routed = routed
+            .into_iter()
+            .map(|(page, errors)| {
+                let mut tests: Vec<&str> = errors.iter().map(|(file, _)| file.as_str()).collect();
+                tests.dedup();
+                let mut text: String = errors.iter().map(|(_, line)| format!("{line}\n")).collect();
+                text.push_str(&contract_test_note(&tests));
+                (page, text)
+            })
+            .collect();
+        (routed, kept)
+    }
+
     fn locked_files(&self) -> BTreeSet<String> {
         self.changes
             .iter()
@@ -2452,7 +3103,8 @@ impl Driver {
     /// passed over in silence.
     async fn repair_unowned(&mut self, output: &str) -> anyhow::Result<()> {
         eprintln!("taskmaster: asking the master to repair a failure no unit owns");
-        let mut brief = String::from(
+        let mut brief = self.shared_prefix().unwrap_or_default();
+        brief.push_str(
             "The project's own build or tests fail, and the output names no file any unit owns. Find the cause and fix it. \
              It may be the project's configuration, a test, a shared file, a missing dependency or a dependency file \
              (a lockfile, pyproject.toml, package.json). Change as little as you can, and do not rewrite a unit's work \
@@ -2477,15 +3129,19 @@ impl Driver {
             read_only: false,
             feed: None,
             browser: None,
-            code_mode: false,
+            code_mode: self.code.is_some(),
             commit: None,
             shell,
             fetch: self.config.package_indexes,
             keep: false,
         };
+        self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
         let asked = ask(request).await;
+        if let Some(code) = &self.code {
+            code.detach("master");
+        }
         let merged = match asked {
             Ok(answer) => {
                 self.charge(&bill, &answer)?;
@@ -2548,14 +3204,19 @@ impl Driver {
     async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<()> {
         let allowed: BTreeSet<String> = errors.iter().map(|(file, _)| file.clone()).filter(|file| !file.is_empty()).collect();
         eprintln!("taskmaster: asking the master to repair {} shared file(s)", allowed.len());
-        let mut brief = String::from(
+        let mut brief = self.shared_prefix().unwrap_or_default();
+        brief.push_str(
             "Shared files this run wrote fail the project's checks. Fix the errors below.\n\
              You may edit only these files; any other edit is discarded:\n",
         );
         for file in &allowed {
             brief.push_str(&format!("- `{file}`\n"));
         }
-        brief.push_str("\nPages already import these files, so keep every exported name and type that still makes sense.\n\nErrors:\n");
+        brief.push_str("\nPages already import these files, so keep every exported name and type that still makes sense.\n");
+        if allowed.iter().any(|file| self.is_contract_test(file)) {
+            brief.push_str("A contract test among them is the acceptance check: fix it only where the test itself is wrong (a bad import or path), never by weakening what it checks.\n");
+        }
+        brief.push_str("\nErrors:\n");
         for (_, line) in errors.iter().filter(|(_, line)| !line.is_empty()) {
             brief.push_str(&format!("{line}\n"));
         }
@@ -2576,15 +3237,19 @@ impl Driver {
             read_only: false,
             feed: None,
             browser: None,
-            code_mode: false,
+            code_mode: self.code.is_some(),
             commit: None,
             shell,
             fetch: self.config.package_indexes,
             keep: false,
         };
+        self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
         let bill = request.bill(Role::Master, None);
         let asked = ask(request).await;
+        if let Some(code) = &self.code {
+            code.detach("master");
+        }
         let merged = match asked {
             Ok(answer) => {
                 self.charge(&bill, &answer)?;
@@ -2727,6 +3392,11 @@ impl Driver {
         if older > 0 {
             eprintln!("taskmaster: {older} error(s) are in files this run did not write, so they were left alone");
         }
+        let (routed, shared) = self.route_contract_tests(owners, std::mem::take(&mut checked.shared));
+        checked.shared = shared;
+        for (page, text) in routed {
+            checked.pages.entry(page).or_default().push_str(&text);
+        }
         Ok(checked)
     }
 
@@ -2780,13 +3450,18 @@ impl Driver {
         let harness = self.harness_for(tier);
         let label = if units > 1 { format!("{page}-{unit}") } else { page.to_string() };
         let shell = self.shell_for(&harness, &label);
+        let effort = match self.page(page).ok().and_then(|p| p.effort_hint()) {
+            // An easy unit that failed once is repaired at the harness's usual effort.
+            Some("low") if errors.is_some() => None,
+            Some(hint) => Some(hint.to_string()),
+            None => (self.small && errors.is_none()).then(|| crate::small::SMALL_EFFORT.to_string()),
+        };
         Ok(AgentRequest {
             harness,
             brief,
             cwd,
             model: self.model_for(tier),
-            // A small product's first build needs little deliberation; repairs think at the default.
-            effort: (self.small && errors.is_none()).then(|| crate::small::SMALL_EFFORT.to_string()),
+            effort,
             dictionary: Some(self.access(&token)),
             timeout: self.config.timeout,
             stall: None,
@@ -2872,6 +3547,14 @@ impl Driver {
         code.attach(page, cwd, gate_for(request), request.shell.clone());
     }
 
+    /// Give a read-only agent (planner, reviewer, verifier) read-only `run_code` (`read`,
+    /// `readMany`, `grep`, `ls`, `diff`, `symbols`) so it can explore in one script call.
+    fn offer_code_readonly(&self, agent: &str, cwd: &Path, request: &mut AgentRequest) {
+        let Some(code) = &self.code else { return };
+        code.attach_readonly(agent, cwd, gate_for(request));
+        request.code_mode = true;
+    }
+
     /// A project a browser can show: one with a package.json, an HTML start page, or plan
     /// files of the web's kinds.
     fn looks_like_web(&self, cwd: &Path) -> bool {
@@ -2937,16 +3620,26 @@ impl Driver {
         files.into_iter().filter(|f| matcher.is_match(f) && !locked.contains(f)).take(40).collect()
     }
 
-    /// The opening every builder of this run shares, word for word: the project, the locked
-    /// contracts in full and in a fixed order, the design, Code Mode, and the master's
-    /// decisions. Providers cache a prompt's leading text, so keeping this identical across
-    /// workers and repairs is what makes their cache hit. Nothing unit-specific goes here.
+    /// The opening every builder, reviewer, and verifier of this run shares, word for word:
+    /// the project, plan summary, repository map, locked contracts in full and in a fixed
+    /// order, design, shared project memory, Code Mode, and the master's decisions. Providers
+    /// cache a prompt's leading text, so keeping this identical across workers, repairs,
+    /// reviewers, and verifiers is what makes their cache hit. Nothing unit-specific goes here.
     fn shared_prefix(&self) -> anyhow::Result<String> {
         let plan = self.plan()?;
         let mut out = format!("Shared context for every agent of this run (a {} project); your own task follows it.\n", plan.kind.id());
         if !self.project_md.is_empty() {
             out.push_str("\nPROJECT.md, the plan of the whole project:\n");
             out.push_str(self.project_md.trim_end());
+            out.push('\n');
+        }
+        let plan_summary = plan.summary.trim();
+        if !plan_summary.is_empty() {
+            out.push_str(&format!("\nOverall plan:\n{plan_summary}\n"));
+        }
+        if !self.repo_map.is_empty() {
+            out.push_str("\nRepository map (files and top-level symbols — skip exploratory ls/grep when the answer is here):\n");
+            out.push_str(self.repo_map.trim_end());
             out.push('\n');
         }
         let mut contracts: Vec<&tm_core::ContractFile> = plan.contracts.iter().collect();
@@ -2964,6 +3657,14 @@ impl Driver {
                 out.push_str(&format!("- `{}`\n", c.path));
             }
         }
+        let tests: Vec<String> = contracts.iter().filter(|c| c.is_test()).map(|c| format!("`{}`", c.path)).collect();
+        if !tests.is_empty() {
+            out.push_str(&format!(
+                "\nThe locked contract tests {} are the acceptance check for every unit: they say what the code must do. \
+                 Make the ones that reach your files pass. Never edit them, and never weaken what they check.\n",
+                tests.join(", ")
+            ));
+        }
         let design = if plan.has_ui() { plan.design.trim() } else { "" };
         if !design.is_empty() {
             out.push_str(&format!(
@@ -2971,6 +3672,7 @@ impl Driver {
             ));
             out.push_str(crate::small::QUALITY_BARS);
         }
+        out.push_str(&self.project_memory);
         out.push_str(
             "\nFor every unit: write only the files your task gives you; a write anywhere else is discarded and fails the unit. \
              Paths are from the project root. If a Dictionary entry is wrong, stop and reply with \
@@ -3004,10 +3706,6 @@ impl Driver {
             format!("Build unit `{}` of this {} project.", page.id, self.plan()?.kind.id())
         };
         let mut brief = self.shared_prefix()?;
-        let plan_summary = self.plan()?.summary.trim().to_string();
-        if !plan_summary.is_empty() {
-            brief.push_str(&format!("Overall plan:\n{plan_summary}\n\n"));
-        }
         brief.push_str(&format!(
             "{opening}\nYou may create or edit only files matching `{glob}`.\nCite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
             glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
@@ -3053,7 +3751,7 @@ impl Driver {
         }
         if let Some(errors) = errors {
             brief.push_str("\nChecks failed last time. This is their output; fix what it shows and leave every other unit alone:\n");
-            brief.push_str(errors);
+            brief.push_str(&tm_core::digest(errors));
             brief.push('\n');
             brief.push_str(&self.handoff(page_id, tier)?);
         }
@@ -3152,7 +3850,7 @@ impl Driver {
             "The checks failed after your last turn. Your worktree now also has what the other units built since. \
              This is the output; fix what it shows in your own files and leave every other unit alone:\n",
         );
-        brief.push_str(errors.trim_end());
+        brief.push_str(tm_core::digest(errors).trim_end());
         brief.push('\n');
         if let Ok(unit_plan) = self.page(page) {
             brief.push_str(&self.todo(unit_plan, true));
@@ -3578,11 +4276,15 @@ impl Driver {
                     body["base"] = serde_json::json!(base);
                     body["merge_commit"] = serde_json::json!(commit);
                 }
+                if let Some((from, head)) = &self.merge_range {
+                    body["merged_from"] = serde_json::json!(from);
+                    body["merged_head"] = serde_json::json!(head);
+                }
             }
             // A finished run that is driven again has nothing new to deliver.
             None => {
                 let before = self.records.status(&self.id)?.unwrap_or_default();
-                for key in ["branch", "merged", "base", "merge_commit"] {
+                for key in ["branch", "merged", "base", "merge_commit", "merged_from", "merged_head", "undone"] {
                     if let Some(value) = before.get(key) {
                         body[key] = value.clone();
                     }
@@ -3695,6 +4397,45 @@ impl Driver {
         Catalog::open(&self.dict, &self.commons)
     }
 
+    /// Say so when this run's worker keeps needing repairs in this project's recent runs,
+    /// and which builder the scorecard would pick instead. The choice stays the person's.
+    fn warn_struggling_worker(&self) {
+        let Ok(card) = self.records.scorecard(crate::store::SCORECARD_RUNS) else { return };
+        let key = self.model_byline(Tier::Worker).trim().to_string();
+        if !card.struggling.contains(&key) {
+            return;
+        }
+        let Some(score) = card.score(&key) else { return };
+        let mut line = format!(
+            "taskmaster: the worker {key} built {} of its last {} units here without a repair ({:.0}%)",
+            score.first_pass_units,
+            score.units_built,
+            score.first_pass_rate * 100.0
+        );
+        if let Some(better) = card.recommended_worker.as_deref().and_then(|k| card.score(k)) {
+            line.push_str(&format!(
+                "; {} passes {:.0}% first time. Change the worker under Settings, Providers for each role",
+                better.key,
+                better.first_pass_rate * 100.0
+            ));
+        }
+        eprintln!("{line}");
+    }
+
+    /// The project notes every model of this repository is told, for the shared prefix.
+    fn render_project_memory(&self) -> String {
+        let Ok(book) = self.records.book() else { return String::new() };
+        let memories = book.project_memories();
+        if memories.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("\nProject memory (lessons from earlier runs of this repository; follow them):\n");
+        for note in memories {
+            out.push_str(&format!("- {}\n", note.note));
+        }
+        out
+    }
+
     fn note_mistake(&self, tier: Tier, failure: &str) -> anyhow::Result<()> {
         let model = self.model_byline(tier);
         self.note_mistake_model(&model, failure)
@@ -3707,11 +4448,31 @@ impl Driver {
         self.records.save_book(&book)
     }
 
+    /// Keep what got a page past `failure`. The fix goes on the mistake of every model of
+    /// this run up to `tier` that has it on record: when the master fixes what the worker
+    /// kept getting wrong, the worker is told how next time. Each model still sees only its
+    /// own mistakes.
     fn learn_fix(&self, tier: Tier, failure: &str, text: &str) -> anyhow::Result<()> {
-        let model = self.model_byline(tier);
+        let mut models: Vec<String> = Vec::new();
+        for t in [Tier::Worker, Tier::Mid, Tier::Master] {
+            let model = self.model_byline(t);
+            if !models.contains(&model) {
+                models.push(model);
+            }
+            if t == tier {
+                break;
+            }
+        }
         let _project = PROJECT.lock().unwrap();
         let mut book = self.records.book()?;
-        book.learn_fix(&model, failure, text);
+        for model in &models {
+            book.learn_fix(model, failure, text);
+        }
+        // A build or test step that failed and is fixed now is about the repository, not the
+        // model: every model in this project is told from the next run on.
+        if let Some((key, note)) = tm_core::project_lesson(failure, text) {
+            book.note_project(&key, &note);
+        }
         self.records.save_book(&book)
     }
 
@@ -3849,9 +4610,10 @@ impl Driver {
             self.delivery = Some((branch, false));
             return;
         }
-        let merged = {
+        let (merged, before) = {
             let _project = PROJECT.lock().unwrap();
-            git::merge_branch(&self.project, &branch, &[ARCHITECTURE_FILE, CHANGES_FILE])
+            let before = git::git(&self.project, &["rev-parse", "--verify", "HEAD"]).ok().map(|sha| sha.trim().to_string());
+            (git::merge_branch(&self.project, &branch, &[ARCHITECTURE_FILE, CHANGES_FILE]), before)
         };
         if merged {
             let tree = self.tree.clone();
@@ -3866,6 +4628,9 @@ impl Driver {
             let commit = git::git(&self.project, &["rev-parse", "--short=8", "HEAD"]).unwrap_or_default();
             if !commit.trim().is_empty() {
                 self.merge_commit = Some((base.trim().to_string(), commit.trim().to_string()));
+            }
+            if let (Some(before), Ok(after)) = (before, git::git(&self.project, &["rev-parse", "--verify", "HEAD"])) {
+                self.merge_range = Some((before, after.trim().to_string()));
             }
             let _ = git::git(&self.project, &["branch", "-D", &branch]);
             self.branch = None;
@@ -3974,6 +4739,15 @@ fn reported_limit(request: &AgentRequest, hit: reply::ProviderLimit) -> reply::R
     reply::ReportedLimit::new(request.harness.id(), role, hit)
 }
 
+/// What a unit is told when a locked contract test that reaches its files fails.
+fn contract_test_note(tests: &[&str]) -> String {
+    let list: Vec<String> = tests.iter().map(|t| format!("`{t}`")).collect();
+    format!(
+        "The locked contract test {} is the acceptance check and reaches your files: change your files so it passes. Never edit the test.\n",
+        list.join(", ")
+    )
+}
+
 fn failed(errors: impl Into<String>) -> WorkerOutcome {
     WorkerOutcome::CheckFailed { errors: errors.into() }
 }
@@ -3993,13 +4767,13 @@ const PROJECT_MARK: &str = "<!-- Written by Taskmaster from the run's sketch and
 /// reply had no plan in it at all, one more full plan).
 const PLAN_ATTEMPTS: usize = 3;
 
-/// How a worker with Code Mode is told to work, in the shared prefix.
-const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, grep, ls, \
-sh, test, check and browser. Batch your work into a few scripts rather than many single tool calls: one script loads what \
-you need with readMany and writes your files, and every script that changes code ends with `return await test()`, which \
-runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or \
-shell tools are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies \
-short: the files are the work.\n";
+/// How an agent with Code Mode is told to work, in the shared prefix.
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, patch, applyPatch, grep, ls, \
+diff, symbols, sh, test, check and browser (read-only roles get read, readMany, grep, ls, diff, symbols). Batch your work into \
+a few scripts rather than many single tool calls: one script loads what you need with readMany/symbols and writes or patches \
+your files (prefer edit/patch/applyPatch over rewriting whole files), and every script that changes code ends with `return await test()`, \
+which runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or shell tools \
+are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
 
 /// Generous silence window so thinking models are never killed mid-reasoning,
 /// while genuinely hung sockets still recover automatically.
@@ -4458,6 +5232,9 @@ fn plan_json(plan: &Plan, drafts: &[DraftEntry]) -> String {
 /// Whether a refused call (`tool target`) needed a shell or the network, which no later
 /// attempt in this run will be given.
 fn needs_capability(refused: &str) -> bool {
+    if refused.contains("(use run_code)") {
+        return false;
+    }
     let tool = refused.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
     ["bash", "shell", "exec", "command", "terminal", "run_command", "fetch", "web_fetch", "webfetch", "http", "curl", "web_search", "websearch", "download"]
         .iter()

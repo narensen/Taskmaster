@@ -24,6 +24,7 @@ use crate::{Harness, HarnessEvent, PermissionGate, RunSummary, Usage, WorkerTask
 /// The Dictionary token reaches Codex through this variable, never the command line.
 const TOKEN_ENV: &str = "TASKMASTER_DICTIONARY_TOKEN";
 
+#[derive(Clone)]
 pub struct Codex {
     pub binary: String,
 }
@@ -31,6 +32,195 @@ pub struct Codex {
 impl Default for Codex {
     fn default() -> Self {
         Codex { binary: "codex".into() }
+    }
+}
+
+impl Codex {
+    /// Arguments for one turn: stateless (`persist = false`) or persistent/resumed (`resume = Some(thread_id)`).
+    ///
+    /// Matches `codex exec [OPTIONS] [PROMPT]` and `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]`.
+    pub fn args_with(&self, task: &WorkerTask, prompt: &str, persist: bool, resume: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = if resume.is_some() {
+            vec!["exec".into(), "resume".into()]
+        } else {
+            vec!["exec".into()]
+        };
+        args.extend(["--json".into(), "--skip-git-repo-check".into()]);
+        if !persist {
+            args.push("--ephemeral".into());
+        }
+        // In Code Mode with Taskmaster's MCP server attached, disable Codex's native shell tool
+        // and keep Codex's own sandbox read-only so edits and commands batch through `run_code`.
+        let enforce_code_mode = task.code_mode && !task.read_only && task.dictionary.is_some();
+        if enforce_code_mode {
+            args.extend(["--disable".into(), "shell_tool".into()]);
+        }
+        if resume.is_none() {
+            args.extend(["-C".into(), task.cwd.display().to_string()]);
+            let sandbox = if task.read_only || enforce_code_mode { "read-only" } else { "workspace-write" };
+            args.extend(["--sandbox".into(), sandbox.into()]);
+        }
+        if let Some(model) = &task.model {
+            args.extend(["--model".into(), model.clone()]);
+        }
+        if let Some(effort) = &task.effort {
+            args.extend(["-c".into(), format!("model_reasoning_effort={effort:?}")]);
+        }
+        if let Some(dict) = &task.dictionary {
+            // TOML string values; `{:?}` quotes and escapes them.
+            args.extend(["-c".into(), format!("mcp_servers.{}.url={:?}", dict.name, dict.url)]);
+            args.extend(["-c".into(), format!("mcp_servers.{}.bearer_token_env_var={TOKEN_ENV:?}", dict.name)]);
+        }
+        if let Some(thread_id) = resume {
+            args.push(thread_id.to_string());
+        }
+        args.push(prompt.to_string());
+        args
+    }
+
+    async fn execute(
+        &self,
+        task: &WorkerTask,
+        prompt: &str,
+        persist: bool,
+        resume: Option<&str>,
+        events: mpsc::Sender<HarnessEvent>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(self.args_with(task, prompt, persist, resume)).current_dir(&task.cwd);
+        if let Some(dict) = &task.dictionary {
+            cmd.env(TOKEN_ENV, &dict.bearer_token);
+        }
+        let (mut child, group) = crate::spawn_grouped(
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
+        )
+        .with_context(|| format!("failed to start `{}`", self.binary))?;
+        let stdout = child.stdout.take().context("codex stdout was not captured")?;
+
+        let read = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut thread_id: Option<String> = resume.map(str::to_string);
+            while let Some(line) = lines.next_line().await? {
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                if msg["type"].as_str() == Some("thread.started")
+                    && let Some(id) = msg["thread_id"].as_str().filter(|s| !s.is_empty())
+                {
+                    thread_id = Some(id.to_string());
+                }
+                match msg["type"].as_str() {
+                    Some("item.completed") => {
+                        for event in item_events(&msg["item"]) {
+                            let _ = events.send(event).await;
+                        }
+                    }
+                    Some("turn.completed") => {
+                        let usage = read_usage(&msg["usage"]);
+                        return Ok((RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None }, thread_id));
+                    }
+                    Some("turn.failed") => bail!("codex: {}", error_message(&msg["error"])),
+                    Some("error") => bail!("codex: {}", error_message(&msg)),
+                    _ => {}
+                }
+            }
+            bail!("codex exited without completing its turn")
+        };
+        let result = match tokio::time::timeout(timeout, read).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", timeout)),
+        };
+        let freed = group.release(&mut child).await;
+        match result {
+            Ok((mut summary, thread_id)) => {
+                summary.freed = Some(freed);
+                Ok((summary, thread_id))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// A persisted Codex thread resumed with `codex exec resume [OPTIONS] <thread_id>` for cached repair turns.
+struct CodexSession {
+    harness: Codex,
+    task: WorkerTask,
+    thread_id: String,
+    cleaned: bool,
+}
+
+impl CodexSession {
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        if let Some(root) = codex_home() {
+            cleanup_codex_session(&root, &self.thread_id);
+        }
+    }
+}
+
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn codex_home() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex"))
+}
+
+/// Remove persisted rollout JSONL files matching `thread_id` under `<codex_home>/sessions/**`.
+fn cleanup_codex_session(codex_home: &std::path::Path, thread_id: &str) -> usize {
+    if thread_id.len() < 8 || !thread_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return 0;
+    }
+    let sessions = codex_home.join("sessions");
+    if !sessions.is_dir() {
+        return 0;
+    }
+    let mut stack = vec![sessions];
+    let mut removed = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".jsonl")
+                && name.contains(thread_id)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+#[async_trait]
+impl crate::Session for CodexSession {
+    async fn follow_up(
+        &mut self,
+        text: String,
+        events: mpsc::Sender<HarnessEvent>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<RunSummary> {
+        let (summary, next_id) = self.harness.execute(&self.task, &text, true, Some(&self.thread_id), events, timeout).await?;
+        if let Some(id) = next_id {
+            self.thread_id = id;
+        }
+        Ok(summary)
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Freed {
+        self.cleanup();
+        crate::Freed::default()
     }
 }
 
@@ -46,62 +236,37 @@ impl Harness for Codex {
         true
     }
 
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        let prompt = task.framed_brief();
+        match self.execute(&task, &prompt, true, None, events, task.timeout).await {
+            Ok((summary, Some(thread_id))) if summary.ok => {
+                let kept: Box<dyn crate::Session> = Box::new(CodexSession { harness: self.clone(), task, thread_id, cleaned: false });
+                (Ok(summary), Some(kept))
+            }
+            Ok((summary, Some(thread_id))) => {
+                if let Some(root) = codex_home() {
+                    cleanup_codex_session(&root, &thread_id);
+                }
+                (Ok(summary), None)
+            }
+            Ok((summary, None)) => (Ok(summary), None),
+            Err(err) => (Err(err), None),
+        }
+    }
+
     async fn run(
         &self,
         task: WorkerTask,
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(["exec", "--json", "--ephemeral", "--skip-git-repo-check"])
-            .arg("-C")
-            .arg(&task.cwd)
-            .args(["--sandbox", if task.read_only { "read-only" } else { "workspace-write" }]);
-        if let Some(model) = &task.model {
-            cmd.args(["--model", model]);
-        }
-        if let Some(effort) = &task.effort {
-            cmd.args(["-c", &format!("model_reasoning_effort={effort:?}")]);
-        }
-        if let Some(dict) = &task.dictionary {
-            // TOML string values; `{:?}` quotes and escapes them.
-            cmd.arg("-c").arg(format!("mcp_servers.{}.url={:?}", dict.name, dict.url));
-            cmd.arg("-c")
-                .arg(format!("mcp_servers.{}.bearer_token_env_var={TOKEN_ENV:?}", dict.name));
-            cmd.env(TOKEN_ENV, &dict.bearer_token);
-        }
-        let (mut child, group) = crate::spawn_grouped(
-            cmd.arg(task.framed_brief()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
-        )
-        .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let stdout = child.stdout.take().context("codex stdout was not captured")?;
-
-        let read = async {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next_line().await? {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                match msg["type"].as_str() {
-                    Some("item.completed") => {
-                        for event in item_events(&msg["item"]) {
-                            let _ = events.send(event).await;
-                        }
-                    }
-                    Some("turn.completed") => {
-                        let usage = read_usage(&msg["usage"]);
-                        return Ok(RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None });
-                    }
-                    Some("turn.failed") => bail!("codex: {}", error_message(&msg["error"])),
-                    Some("error") => bail!("codex: {}", error_message(&msg)),
-                    _ => {}
-                }
-            }
-            bail!("codex exited without completing its turn")
-        };
-        let result = match tokio::time::timeout(task.timeout, read).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", task.timeout)),
-        };
-        crate::released(result, group.release(&mut child).await)
+        let prompt = task.framed_brief();
+        self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _)| summary)
     }
 }
 
@@ -229,5 +394,76 @@ mod tests {
         // Recorded from Codex 0.169 when the account was over its usage limit.
         let failed = json!({ "type": "turn.failed", "error": { "message": "You've hit your usage limit." } });
         assert_eq!(error_message(&failed["error"]), "You've hit your usage limit.");
+    }
+
+    #[test]
+    fn warm_session_omits_ephemeral_and_resumes_by_thread_id() {
+        let harness = Codex::default();
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: "/w".into(),
+            model: Some("gpt-5".into()),
+            effort: Some("medium".into()),
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+        };
+        let stateless = harness.args_with(&task, "initial", false, None);
+        assert!(stateless.contains(&"--ephemeral".to_string()));
+        assert_eq!(&stateless[..1], ["exec"]);
+
+        let kept = harness.args_with(&task, "initial", true, None);
+        assert!(!kept.contains(&"--ephemeral".to_string()));
+
+        let resumed = harness.args_with(&task, "fix it", true, Some("thr_123"));
+        assert!(!resumed.contains(&"--ephemeral".to_string()));
+        assert_eq!(&resumed[..2], ["exec", "resume"]);
+        // Codex CLI expects `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]`.
+        let tail = &resumed[resumed.len() - 2..];
+        assert_eq!(tail, ["thr_123", "fix it"]);
+    }
+
+    #[test]
+    fn code_mode_enforces_run_code_when_dictionary_is_attached() {
+        let harness = Codex::default();
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: "/w".into(),
+            model: Some("gpt-5".into()),
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "taskmaster".into(),
+                url: "http://127.0.0.1:9/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+        };
+        let args = harness.args_with(&task, "build", false, None);
+        assert!(args.windows(2).any(|w| w == ["--disable", "shell_tool"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]), "{args:?}");
+    }
+
+    #[test]
+    fn cleanup_codex_session_removes_matching_jsonl_only() {
+        let root = std::env::temp_dir().join(format!("tm-codex-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("sessions/2026/11/22");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("rollout-2026-11-22-thr_cleanup_99.jsonl");
+        let other = dir.join("rollout-2026-11-22-thr_other_11.jsonl");
+        std::fs::write(&target, "{}\n").unwrap();
+        std::fs::write(&other, "{}\n").unwrap();
+
+        assert_eq!(cleanup_codex_session(&root, "thr_cleanup_99"), 1);
+        assert!(!target.exists());
+        assert!(other.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

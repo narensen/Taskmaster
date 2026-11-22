@@ -45,19 +45,15 @@ const MAX_READ: usize = 256 * 1024;
 const MAX_REPLY: usize = 24 * 1024;
 const MAX_CALLS: usize = 200;
 
-const PRELUDE: &str = r#""use strict";
+/// Persistent warm Node sandbox worker script: executes multiple `run_code` bodies over
+/// NDJSON stdin/stdout without paying `bwrap` + `node` cold-start cost on every tool call.
+/// Each script body runs in a fresh `AsyncFunction` scope with its own `logs` and `console`.
+const WORKER_SCRIPT: &str = r#""use strict";
 const readline = require("readline");
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const lines = readline.createInterface({ input: process.stdin });
 const waiting = new Map();
 let next = 1;
-lines.on("line", (line) => {
-  const m = JSON.parse(line);
-  const w = waiting.get(m.id);
-  if (!w) return;
-  waiting.delete(m.id);
-  if (m.error !== undefined) w.reject(new Error(m.error));
-  else w.resolve(m.result);
-});
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 const call = (op, args) => new Promise((resolve, reject) => {
   const id = next++;
@@ -67,29 +63,126 @@ const call = (op, args) => new Promise((resolve, reject) => {
 const read = (path) => call("read", { path });
 const write = (path, text) => call("write", { path, text: String(text) });
 const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
+const patch = (path, edits) => call("patch", { path, edits });
+const applyPatch = (diff) => call("applyPatch", { diff: String(diff) });
 const grep = (text, glob) => call("grep", { text, glob });
 const ls = (glob) => call("ls", { glob });
+const diff = (glob) => call("diff", { glob });
+const symbols = (glob) => call("symbols", { glob });
 const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
 const test = () => call("test", {});
 const sh = (command) => call("sh", { command });
 const check = () => call("check", {});
 const browser = (action, args = {}) => call("browser", { action, args });
-const logs = [];
-console.log = console.info = console.warn = console.error = (...parts) =>
-  logs.push(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
-(async () => {
+
+async function runBody(code) {
+  const logs = [];
+  const logFn = (...parts) =>
+    logs.push(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
+  const scopedConsole = { log: logFn, info: logFn, warn: logFn, error: logFn };
+  let fn;
   try {
-    const result = await (async () => {
-/*CODE*/
-    })();
+    fn = new AsyncFunction(
+      "read", "write", "edit", "patch", "applyPatch", "grep", "ls", "diff", "symbols",
+      "readMany", "test", "sh", "check", "browser", "console", "require",
+      `return (async () => {\n${code}\n})();`
+    );
+  } catch (err) {
+    send({ done: true, syntaxError: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") });
+    return;
+  }
+  try {
+    const result = await fn(
+      read, write, edit, patch, applyPatch, grep, ls, diff, symbols,
+      readMany, test, sh, check, browser, scopedConsole, require
+    );
     send({ done: true, result: result === undefined ? null : result, logs });
   } catch (err) {
     send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"), logs });
   }
-  lines.close();
-  process.exit(0);
-})();
+}
+
+lines.on("line", (line) => {
+  let m;
+  try {
+    m = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (m.exec) {
+    void runBody(m.code || "");
+    return;
+  }
+  const w = waiting.get(m.id);
+  if (!w) return;
+  waiting.delete(m.id);
+  if (m.error !== undefined) w.reject(new Error(m.error));
+  else w.resolve(m.result);
+});
+lines.on("close", () => process.exit(0));
 "#;
+
+/// A warm sandboxed Node worker bound to one agent scope, reused across `run_code` calls.
+struct WarmNode {
+    child: tokio::process::Child,
+    _guard: tm_harness::GroupGuard,
+    stdin: tokio::process::ChildStdin,
+    out: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    scratch: PathBuf,
+}
+
+impl WarmNode {
+    fn spawn(node: &Path, bwrap: Option<&Path>) -> anyhow::Result<Self> {
+        let scratch = std::env::temp_dir().join(format!("tm-code-{}-{}", std::process::id(), crate::secret::random_hex(6)?));
+        std::fs::create_dir_all(&scratch)?;
+        let script = scratch.join("worker.js");
+        std::fs::write(&script, WORKER_SCRIPT)?;
+        let node_args = [
+            "--permission".to_string(),
+            format!("--allow-fs-read={}", script.display()),
+            "--disable-proto=throw".to_string(),
+            script.display().to_string(),
+        ];
+        let mut cmd = match bwrap {
+            Some(bwrap) => {
+                let mut cmd = tokio::process::Command::new(bwrap);
+                cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--unshare-net", "--die-with-parent"])
+                    .arg("--ro-bind")
+                    .arg(&scratch)
+                    .arg(&scratch)
+                    .arg(node)
+                    .args(&node_args);
+                cmd
+            }
+            None => {
+                let mut cmd = tokio::process::Command::new(node);
+                cmd.args(&node_args);
+                cmd
+            }
+        };
+        cmd.current_dir(&scratch)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, guard) = tm_harness::spawn_grouped(&mut cmd).context("could not start node")?;
+        let stdin = child.stdin.take().context("no stdin")?;
+        let out = BufReader::new(child.stdout.take().context("no stdout")?).lines();
+        Ok(WarmNode { child, _guard: guard, stdin, out, scratch })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for WarmNode {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
 
 /// What a page's scripts may touch, and through which gate.
 struct Scope {
@@ -97,6 +190,10 @@ struct Scope {
     gate: Arc<dyn PermissionGate>,
     /// The agent's sandboxed shell: what `sh` may write besides the worktree.
     shell: Option<tm_harness::ShellScope>,
+    /// Read-only agents (planners, reviewers, verifiers) may only call read/search/diff/symbols/check.
+    read_only: bool,
+    /// Persistent warm Node sandbox process, lazily started on first `run_code` call.
+    warm: tokio::sync::Mutex<Option<WarmNode>>,
 }
 
 pub struct CodeTools {
@@ -133,7 +230,35 @@ impl CodeTools {
     }
 
     pub fn attach(&self, page: &str, cwd: &Path, gate: Arc<dyn PermissionGate>, shell: Option<tm_harness::ShellScope>) {
-        self.scopes.lock().unwrap().insert(page.to_string(), Arc::new(Scope { cwd: cwd.to_path_buf(), gate, shell }));
+        self.scopes.lock().unwrap().insert(
+            page.to_string(),
+            Arc::new(Scope {
+                cwd: cwd.to_path_buf(),
+                gate,
+                shell,
+                read_only: false,
+                warm: tokio::sync::Mutex::new(None),
+            }),
+        );
+    }
+
+    /// Attach a read-only scope (planners, reviewers, verifiers) so they can batch `readMany`, `grep`, `ls`, `symbols`, and `diff`.
+    pub fn attach_readonly(&self, agent: &str, cwd: &Path, gate: Arc<dyn PermissionGate>) {
+        self.scopes.lock().unwrap().insert(
+            agent.to_string(),
+            Arc::new(Scope {
+                cwd: cwd.to_path_buf(),
+                gate,
+                shell: None,
+                read_only: true,
+                warm: tokio::sync::Mutex::new(None),
+            }),
+        );
+    }
+
+    /// Drop a single agent's scope (and tear down its warm Node sandbox process).
+    pub fn detach(&self, agent: &str) {
+        self.scopes.lock().unwrap().remove(agent);
     }
 
     /// Drop the scope of a page and of every part of it (`page/unit`).
@@ -142,54 +267,53 @@ impl CodeTools {
         self.scopes.lock().unwrap().retain(|key, _| key != page && !key.starts_with(&prefix));
     }
 
-    /// Run `code` for `grant`'s page. The text is what the agent reads back.
+    /// Drop every attached scope and kill every warm Node sandbox process at once.
+    pub fn detach_all(&self) {
+        self.scopes.lock().unwrap().clear();
+    }
+
+    /// Run `code` for `grant`'s page in its warm sandboxed Node worker. The text is what the agent reads back.
     pub async fn run(&self, grant: &Grant, code: &str) -> anyhow::Result<String> {
         let scope = self.scopes.lock().unwrap().get(&grant.agent()).cloned().context("this agent has no worktree to run code in")?;
-        let scratch = std::env::temp_dir().join(format!("tm-code-{}-{}", std::process::id(), crate::secret::random_hex(6)?));
-        std::fs::create_dir_all(&scratch)?;
-        let script = scratch.join("run.js");
-        std::fs::write(&script, PRELUDE.replace("/*CODE*/", code))?;
-        let result = tokio::time::timeout(self.script_limit, self.drive(grant, &scope, &scratch, &script)).await;
-        let _ = std::fs::remove_dir_all(&scratch);
+        let mut slot = scope.warm.lock().await;
+        if slot.as_mut().is_none_or(|w| !w.is_alive()) {
+            *slot = Some(WarmNode::spawn(&self.node, self.bwrap.as_deref())?);
+        }
+        let worker = slot.as_mut().expect("warm worker spawned");
+        let result = tokio::time::timeout(self.script_limit, self.drive_warm(grant, &scope, worker, code)).await;
         match result {
-            Ok(result) => result,
-            Err(_) => bail!("the script ran longer than {}s and was stopped", self.script_limit.as_secs()),
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(DriveError::Syntax(msg))) => {
+                // Worker is still healthy and idle; keep it warm for the next call.
+                bail!("the script had a syntax error: {msg}")
+            }
+            Ok(Err(DriveError::Broken(err))) => {
+                *slot = None;
+                Err(err)
+            }
+            Err(_) => {
+                // Timeout: kill the stuck worker so the next call gets a clean one.
+                *slot = None;
+                bail!("the script ran longer than {}s and was stopped", self.script_limit.as_secs())
+            }
         }
     }
 
-    async fn drive(&self, grant: &Grant, scope: &Scope, scratch: &Path, script: &Path) -> anyhow::Result<String> {
-        let node_args = [
-            "--permission".to_string(),
-            format!("--allow-fs-read={}", script.display()),
-            "--disable-proto=throw".to_string(),
-            script.display().to_string(),
-        ];
-        let mut cmd = match &self.bwrap {
-            Some(bwrap) => {
-                let mut cmd = tokio::process::Command::new(bwrap);
-                cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--unshare-net", "--die-with-parent"])
-                    .arg("--ro-bind")
-                    .arg(scratch)
-                    .arg(scratch)
-                    .arg(&self.node)
-                    .args(&node_args);
-                cmd
-            }
-            None => {
-                let mut cmd = tokio::process::Command::new(&self.node);
-                cmd.args(&node_args);
-                cmd
-            }
-        };
-        cmd.current_dir(scratch).env_clear().env("PATH", "/usr/bin:/bin").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let (mut child, _guard) = tm_harness::spawn_grouped(&mut cmd).context("could not start node")?;
-        let mut stdin = child.stdin.take().context("no stdin")?;
-        let mut out = BufReader::new(child.stdout.take().context("no stdout")?).lines();
-        let mut stderr = child.stderr.take().context("no stderr")?;
+    async fn drive_warm(&self, grant: &Grant, scope: &Scope, worker: &mut WarmNode, code: &str) -> Result<String, DriveError> {
+        let req = json!({ "exec": true, "code": code });
+        worker
+            .stdin
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .context("could not send script to warm node worker")
+            .map_err(DriveError::Broken)?;
         let mut calls = 0usize;
-        while let Some(line) = out.next_line().await? {
+        while let Some(line) = worker.out.next_line().await.map_err(|e| DriveError::Broken(e.into()))? {
             let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
             if message["done"] == true {
+                if let Some(syntax) = message["syntaxError"].as_str() {
+                    return Err(DriveError::Syntax(syntax.to_string()));
+                }
                 return Ok(summary(&message));
             }
             calls += 1;
@@ -202,11 +326,14 @@ impl CodeTools {
                     Err(err) => json!({ "id": id, "error": format!("{err:#}") }),
                 }
             };
-            stdin.write_all(format!("{reply}\n").as_bytes()).await?;
+            worker
+                .stdin
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .context("warm node worker stopped accepting replies")
+                .map_err(DriveError::Broken)?;
         }
-        let mut said = String::new();
-        let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut said).await;
-        bail!("the script stopped before it finished: {}", said.lines().take(6).collect::<Vec<_>>().join("\n"))
+        Err(DriveError::Broken(anyhow::anyhow!("the script stopped before it finished")))
     }
 
     /// Run `command` with `sh -c` in the agent's sandbox: the worktree and its scratch are
@@ -244,6 +371,9 @@ impl CodeTools {
     }
 
     async fn op(&self, grant: &Grant, scope: &Scope, op: &str, args: &Value) -> anyhow::Result<Value> {
+        if scope.read_only && matches!(op, "write" | "edit" | "patch" | "applyPatch" | "sh" | "test" | "browser") {
+            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, check)");
+        }
         let path = |key: &str| -> anyhow::Result<PathBuf> {
             let raw = args[key].as_str().context("a path is required")?;
             Ok(if Path::new(raw).is_absolute() { PathBuf::from(raw) } else { scope.cwd.join(raw) })
@@ -284,6 +414,96 @@ impl CodeTools {
                 let next = if all { text.replace(find, replace) } else { text.replacen(find, replace, 1) };
                 std::fs::write(&file, next)?;
                 Ok(json!(count))
+            }
+            "patch" => {
+                let file = path("path")?;
+                self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
+                let edits = args["edits"].as_array().context("`edits` must be an array of {find, replace, all?}")?;
+                if edits.is_empty() {
+                    return Ok(json!(0));
+                }
+                let mut text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", args["path"].as_str().unwrap_or("")))?;
+                let mut applied = 0usize;
+                for (i, item) in edits.iter().enumerate() {
+                    let find = item["find"].as_str().filter(|f| !f.is_empty()).with_context(|| format!("edits[{i}].find is required"))?;
+                    let replace = item["replace"].as_str().unwrap_or("");
+                    let all = item["all"].as_bool() == Some(true);
+                    let count = text.matches(find).count();
+                    if count == 0 {
+                        bail!("edits[{i}].find does not occur in {}", args["path"].as_str().unwrap_or(""));
+                    }
+                    if count > 1 && !all {
+                        bail!("edits[{i}].find occurs {count} times; make it unique or set all: true");
+                    }
+                    text = if all { text.replace(find, replace) } else { text.replacen(find, replace, 1) };
+                    applied += count;
+                }
+                std::fs::write(&file, text)?;
+                Ok(json!(applied))
+            }
+            "applyPatch" => {
+                let raw = args["diff"].as_str().filter(|d| !d.trim().is_empty()).context("`diff` is required")?;
+                let patches = parse_unified_diff(raw)?;
+                if patches.is_empty() {
+                    bail!("no unified diff hunks found in `diff`");
+                }
+                // Validate permission and apply every file in memory first so a refused path or
+                // mismatched hunk never partially writes earlier files.
+                let mut staged: Vec<(PathBuf, Option<String>, String)> = Vec::new();
+                let mut total_hunks = 0usize;
+                for file_patch in &patches {
+                    let rel = file_patch.target_path();
+                    let full = if Path::new(rel).is_absolute() { PathBuf::from(rel) } else { scope.cwd.join(rel) };
+                    self.allowed(scope, op, ToolKind::Edit, Some(&full), None).await?;
+                    if file_patch.is_delete() {
+                        let existing = std::fs::read_to_string(&full).with_context(|| format!("cannot read {rel} to delete"))?;
+                        let _ = apply_file_hunks(rel, &existing, &file_patch.hunks)?;
+                        staged.push((full, None, rel.to_string()));
+                    } else {
+                        let existing = if file_patch.is_create() && !full.exists() {
+                            String::new()
+                        } else {
+                            std::fs::read_to_string(&full).with_context(|| format!("cannot read {rel}"))?
+                        };
+                        let updated = apply_file_hunks(rel, &existing, &file_patch.hunks)?;
+                        staged.push((full, Some(updated), rel.to_string()));
+                    }
+                    total_hunks += file_patch.hunks.len();
+                }
+                let mut touched = Vec::with_capacity(staged.len());
+                for (full, content, rel) in staged {
+                    match content {
+                        Some(text) => {
+                            if let Some(dir) = full.parent() {
+                                std::fs::create_dir_all(dir)?;
+                            }
+                            std::fs::write(&full, text)?;
+                        }
+                        None => {
+                            if full.exists() {
+                                std::fs::remove_file(&full)?;
+                            }
+                        }
+                    }
+                    touched.push(rel);
+                }
+                Ok(json!({ "files": touched, "hunks": total_hunks }))
+            }
+            "diff" => {
+                self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
+                let mut cmd = std::process::Command::new("git");
+                cmd.arg("-C").arg(&scope.cwd).args(["diff", "--no-color"]);
+                if let Some(glob) = args["glob"].as_str().filter(|g| !g.is_empty()) {
+                    cmd.arg("--").arg(glob);
+                }
+                let out = cmd.output().context("failed to run git diff")?;
+                let text = String::from_utf8_lossy(&out.stdout);
+                Ok(json!(tail(&text, 16_000)))
+            }
+            "symbols" => {
+                self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
+                let syms = crate::repomap::extract_symbols(&scope.cwd, args["glob"].as_str())?;
+                Ok(json!(syms))
             }
             "ls" | "grep" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -481,6 +701,184 @@ fn summary(done: &Value) -> String {
     tail(&out, MAX_REPLY)
 }
 
+/// Internal drive failure distinction: syntax errors leave the warm Node worker healthy;
+/// I/O or protocol errors tear down and respawn it on the next call.
+enum DriveError {
+    Syntax(String),
+    Broken(anyhow::Error),
+}
+
+struct FilePatch {
+    old_path: String,
+    new_path: String,
+    hunks: Vec<Hunk>,
+}
+
+impl FilePatch {
+    fn is_create(&self) -> bool {
+        self.old_path == "/dev/null"
+    }
+
+    fn is_delete(&self) -> bool {
+        self.new_path == "/dev/null"
+    }
+
+    fn target_path(&self) -> &str {
+        if self.is_delete() { &self.old_path } else { &self.new_path }
+    }
+}
+
+struct Hunk {
+    old_start: usize,
+    lines: Vec<(char, String)>,
+}
+
+fn strip_diff_path(raw: &str) -> String {
+    let trimmed = raw.split('\t').next().unwrap_or(raw).trim();
+    if trimmed == "/dev/null" {
+        return "/dev/null".to_string();
+    }
+    trimmed
+        .strip_prefix("a/")
+        .or_else(|| trimmed.strip_prefix("b/"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn parse_hunk_header(line: &str) -> anyhow::Result<usize> {
+    let rest = line.strip_prefix("@@ ").context("expected hunk header")?;
+    let range = rest.split(" @@").next().context("malformed hunk header")?;
+    let old_part = range.split_whitespace().next().context("missing old range in hunk header")?;
+    let old_nums = old_part.strip_prefix('-').context("missing '-' in hunk header")?;
+    let start_str = old_nums.split(',').next().unwrap_or(old_nums);
+    let start: usize = start_str.parse().with_context(|| format!("invalid hunk start line `{start_str}`"))?;
+    Ok(start)
+}
+
+fn parse_unified_diff(diff: &str) -> anyhow::Result<Vec<FilePatch>> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut i = 0;
+    let mut patches = Vec::new();
+    while i < lines.len() {
+        if lines[i].starts_with("--- ") {
+            let old_path = strip_diff_path(&lines[i][4..]);
+            i += 1;
+            if i >= lines.len() || !lines[i].starts_with("+++ ") {
+                bail!("malformed unified diff: expected `+++ ` after `--- `");
+            }
+            let new_path = strip_diff_path(&lines[i][4..]);
+            i += 1;
+            let mut hunks = Vec::new();
+            while i < lines.len() {
+                if lines[i].starts_with("--- ") || lines[i].starts_with("diff --git ") {
+                    break;
+                }
+                if lines[i].starts_with("@@ ") {
+                    let old_start = parse_hunk_header(lines[i])?;
+                    i += 1;
+                    let mut hunk_lines = Vec::new();
+                    while i < lines.len() {
+                        let line = lines[i];
+                        if line.starts_with("@@ ") || line.starts_with("--- ") || line.starts_with("diff --git ") {
+                            break;
+                        }
+                        if line.starts_with("\\ No newline") {
+                            i += 1;
+                            continue;
+                        }
+                        let mut chars = line.chars();
+                        match chars.next() {
+                            Some(tag @ (' ' | '-' | '+')) => hunk_lines.push((tag, chars.as_str().to_string())),
+                            None => hunk_lines.push((' ', String::new())),
+                            Some(_) => break,
+                        }
+                        i += 1;
+                    }
+                    hunks.push(Hunk { old_start, lines: hunk_lines });
+                } else {
+                    i += 1;
+                }
+            }
+            if !hunks.is_empty() {
+                patches.push(FilePatch { old_path, new_path, hunks });
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(patches)
+}
+
+fn apply_file_hunks(rel: &str, existing: &str, hunks: &[Hunk]) -> anyhow::Result<String> {
+    let trailing_newline = existing.ends_with('\n') || existing.is_empty();
+    let mut lines: Vec<String> = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(str::to_string).collect()
+    };
+    let mut offset: isize = 0;
+
+    for (hunk_idx, hunk) in hunks.iter().enumerate() {
+        let expected: Vec<&str> = hunk
+            .lines
+            .iter()
+            .filter(|(tag, _)| *tag == ' ' || *tag == '-')
+            .map(|(_, s)| s.as_str())
+            .collect();
+        let replacement: Vec<String> = hunk
+            .lines
+            .iter()
+            .filter(|(tag, _)| *tag == ' ' || *tag == '+')
+            .map(|(_, s)| s.clone())
+            .collect();
+
+        let base = if hunk.old_start == 0 {
+            0isize
+        } else {
+            (hunk.old_start as isize - 1) + offset
+        };
+        let target_idx = find_hunk_pos(&lines, &expected, base).with_context(|| {
+            format!("hunk #{} did not match `{rel}` near line {}", hunk_idx + 1, hunk.old_start)
+        })?;
+        lines.splice(target_idx..target_idx + expected.len(), replacement.iter().cloned());
+        offset += replacement.len() as isize - expected.len() as isize;
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() && trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn find_hunk_pos(lines: &[String], expected: &[&str], hint: isize) -> Option<usize> {
+    if expected.is_empty() {
+        return Some(hint.clamp(0, lines.len() as isize) as usize);
+    }
+    if expected.len() > lines.len() {
+        return None;
+    }
+    let max_start = lines.len() - expected.len();
+    let center = hint.clamp(0, max_start as isize) as usize;
+    let matches_at = |pos: usize| expected.iter().enumerate().all(|(k, want)| lines[pos + k] == *want);
+    if matches_at(center) {
+        return Some(center);
+    }
+    // Search outward up to ±50 lines in case earlier edits shifted line numbers.
+    for delta in 1..=50usize {
+        if let Some(pos) = center.checked_sub(delta)
+            && matches_at(pos)
+        {
+            return Some(pos);
+        }
+        let pos = center + delta;
+        if pos <= max_start && matches_at(pos) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
 /// Whether bubblewrap can make a sandbox here; some containers forbid user namespaces.
 fn bwrap_works() -> bool {
     std::process::Command::new("bwrap")
@@ -494,17 +892,24 @@ fn bwrap_works() -> bool {
 #[async_trait::async_trait]
 impl Extension for CodeTools {
     fn tools(&self, grant: &Grant) -> Vec<Value> {
-        if !self.scopes.lock().unwrap().contains_key(&grant.agent()) {
+        let Some(scope) = self.scopes.lock().unwrap().get(&grant.agent()).cloned() else {
             return Vec::new();
-        }
+        };
+        let description = if scope.read_only {
+            "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
+             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), check(), and console.log. \
+             Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
+        } else {
+            "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
+             Functions: read(path), readMany(globs), write(path, text), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
+             applyPatch(diff) for unified diffs, grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), sh(command), \
+             test() which runs the project's tests and returns {ok, failed, output}, check(), browser(action, args) with action open|click|type|console, \
+             and console.log. Paths are relative to your worktree. The same permissions as your own tools apply. \
+             Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
+        };
         vec![json!({
             "name": "run_code",
-            "description": "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
-                Functions: read(path), readMany(globs), write(path, text), edit(path, find, replace, all?), grep(text, glob?), ls(glob?), \
-                sh(command), test() which runs the project's tests and returns {ok, failed, output}, check(), \
-                browser(action, args) with action open|click|type|console, and console.log. Paths are relative to your worktree. \
-                The same permissions as your own tools apply. Batch steps into one script and end with `return await test()`. \
-                Returns the log lines and the returned value.",
+            "description": description,
             "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The body of an async function" } }, "required": ["code"] },
         })]
     }
@@ -702,6 +1107,115 @@ mod tests {
         assert!(text.contains("Error: Error: nope"), "{text}");
         let syntax = tools.run(&grant(), "return (").await;
         assert!(syntax.is_err(), "{syntax:?}");
+        // Warm worker stays alive and usable after a syntax error.
+        let after = tools.run(&grant(), "return 2 + 2;").await.unwrap();
+        assert_eq!(after.trim(), "4");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warm_node_worker_is_reused_across_calls_with_isolated_scope() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("warm-node");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+        let pid1 = tools.run(&grant(), "const x = 1; return process.pid;").await.unwrap();
+        let pid2 = tools.run(&grant(), "const x = 2; return process.pid;").await.unwrap();
+        assert_eq!(pid1.trim(), pid2.trim(), "second run_code call should reuse the same warm Node process");
+        tools.detach_page("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_patch_edits_creates_deletes_and_obeys_the_gate() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("apply-patch");
+        std::fs::write(dir.join("app/old.txt"), "remove me\n").unwrap();
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+        let script = r#"
+            const diff = [
+                "--- a/app/index.html",
+                "+++ b/app/index.html",
+                "@@ -1,2 +1,2 @@",
+                "-<h1>Old title</h1>",
+                "+<h1>Patched title</h1>",
+                " <p>Old body</p>",
+                "--- /dev/null",
+                "+++ b/app/created.txt",
+                "@@ -0,0 +1,2 @@",
+                "+alpha",
+                "+beta",
+                "--- a/app/old.txt",
+                "+++ /dev/null",
+                "@@ -1,1 +0,0 @@",
+                "-remove me",
+            ].join("\n");
+            return await applyPatch(diff);
+        "#;
+        let text = tools.run(&grant(), script).await.unwrap();
+        assert!(text.contains("app/index.html") && text.contains("app/created.txt") && text.contains("app/old.txt"), "{text}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/index.html")).unwrap(), "<h1>Patched title</h1>\n<p>Old body</p>\n");
+        assert_eq!(std::fs::read_to_string(dir.join("app/created.txt")).unwrap(), "alpha\nbeta\n");
+        assert!(!dir.join("app/old.txt").exists());
+
+        // Refusing an outside path leaves earlier files in the same patch untouched (atomic check).
+        let refused = tools
+            .run(
+                &grant(),
+                r#"
+                const diff = [
+                    "--- a/app/index.html",
+                    "+++ b/app/index.html",
+                    "@@ -1,2 +1,2 @@",
+                    "-<h1>Patched title</h1>",
+                    "+<h1>Should not apply</h1>",
+                    " <p>Old body</p>",
+                    "--- a//etc/hosts",
+                    "+++ b//etc/hosts",
+                    "@@ -1,1 +1,1 @@",
+                    "-127.0.0.1 localhost",
+                    "+127.0.0.1 hacked",
+                ].join("\n");
+                return await applyPatch(diff);
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(refused.contains("refused: applyPatch"), "{refused}");
+        assert!(std::fs::read_to_string(dir.join("app/index.html")).unwrap().contains("Patched title"));
+        tools.detach_page("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn readonly_scope_batches_discovery_and_refuses_mutations() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("readonly");
+        std::fs::write(dir.join("app/lib.ts"), "export function greet() { return 'hi'; }\n").unwrap();
+        tools.attach_readonly("planner", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).read_only()));
+        let g = Grant { run: "r".into(), page: "planner".into(), unit: String::new() };
+        let ok = tools
+            .run(
+                &g,
+                r#"
+                const files = await readMany(["app/*.html", "app/*.ts"]);
+                const syms = await symbols("app/*.ts");
+                return { keys: Object.keys(files).sort(), syms };
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(ok.contains("app/index.html") && ok.contains("greet"), "{ok}");
+
+        for op in [
+            r#"await write("app/x.txt", "no")"#,
+            r#"await edit("app/index.html", "Old", "New")"#,
+            r#"await applyPatch("--- a/app/index.html\n+++ b/app/index.html\n@@ -1,1 +1,1 @@\n-<h1>Old title</h1>\n+<h1>X</h1>")"#,
+            r#"await sh("echo hi")"#,
+        ] {
+            let res = tools.run(&g, op).await.unwrap();
+            assert!(res.contains("disabled in a read-only scope"), "{op} => {res}");
+        }
+        tools.detach("planner");
         std::fs::remove_dir_all(dir).ok();
     }
 }

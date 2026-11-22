@@ -308,20 +308,40 @@ pub fn safe_rel(path: &str) -> bool {
         && !path.as_os_str().is_empty()
 }
 
-/// Let a checkout use the project's installed packages: they are not in git. A link is
-/// made only when the project has `node_modules` and the checkout does not. Windows allows
-/// a directory link only with Developer Mode on or as an administrator; without it the
-/// checkout goes without, as it would with no packages installed.
-pub fn borrow_node_modules(project: &Path, tree: &Path) {
-    let installed = project.join("node_modules");
-    let link = tree.join("node_modules");
-    if !installed.is_dir() || link.exists() {
+fn link_dir(src: &Path, dst: &Path) {
+    if !src.is_dir() || dst.exists() || dst.symlink_metadata().is_ok() {
         return;
     }
     #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(&installed, &link);
+    let _ = std::os::unix::fs::symlink(src, dst);
     #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(&installed, &link);
+    let _ = std::os::windows::fs::symlink_dir(src, dst);
+}
+
+/// Let a checkout use the project's installed packages: they are not in git. Links are
+/// made only when the project has the dependency cache and the checkout does not. Windows
+/// allows directory links only with Developer Mode on or as an administrator; without it
+/// the checkout goes without, as it would with no packages installed.
+pub fn borrow_node_modules(project: &Path, tree: &Path) {
+    for name in ["node_modules", ".venv", "venv"] {
+        link_dir(&project.join(name), &tree.join(name));
+    }
+    // Monorepos often keep frontend/backend packages one level down (e.g. `web/node_modules`).
+    let Ok(entries) = std::fs::read_dir(project) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if s.starts_with('.') || matches!(s, "node_modules" | "target" | "venv" | "dist" | "build") {
+            continue;
+        }
+        let sub_src = entry.path().join("node_modules");
+        let sub_tree = tree.join(s);
+        if sub_src.is_dir() && sub_tree.is_dir() {
+            link_dir(&sub_src, &sub_tree.join("node_modules"));
+        }
+    }
 }
 
 pub fn worktree_dir(project: &Path, run_id: &str, label: &str) -> PathBuf {

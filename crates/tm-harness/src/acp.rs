@@ -93,7 +93,13 @@ impl AcpHarness {
         };
         let binary = resolve_binary(&self.binary)?;
         let mut cmd = Command::new("bwrap");
-        cmd.args(sandbox.bwrap_args_with(&binary, &args, &task.cwd, task.read_only, task.shell.as_ref()));
+        // When Code Mode is active with the daemon's MCP server attached, writes and shell
+        // commands go through `run_code` (which has its own sandboxed worktree access), so the
+        // agent's own sandbox stays read-only even for harnesses that edit without asking.
+        let enforce_code_mode = task.code_mode && !task.read_only && task.dictionary.is_some();
+        let read_only = task.read_only || enforce_code_mode;
+        let shell = (!enforce_code_mode).then_some(task.shell.as_ref()).flatten();
+        cmd.args(sandbox.bwrap_args_with(&binary, &args, &task.cwd, read_only, shell));
         Ok(cmd)
     }
 }
@@ -157,6 +163,7 @@ impl AcpHarness {
             lines: BufReader::new(stdout).lines(),
             next_id: 0,
             dictionary_prefix: task.dictionary.as_ref().map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
+            code_mode: task.code_mode && !task.read_only && task.dictionary.is_some(),
             gate,
             events,
             denied: 0,
@@ -233,6 +240,8 @@ struct Session {
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     dictionary_prefix: Option<String>,
+    /// When Code Mode (`run_code`) is active on a builder, steer native shell/edit prompts to `run_code`.
+    code_mode: bool,
     gate: Arc<dyn PermissionGate>,
     events: mpsc::Sender<HarnessEvent>,
     denied: u32,
@@ -363,13 +372,19 @@ impl Session {
                 } else if is_browser_tool(&request.tool) {
                     request.kind = ToolKind::Browser;
                 }
-                let allowed = self.gate.decide_async(&request).await == Decision::Allow;
-                if !allowed {
+                let blocked_by_code_mode = self.code_mode && matches!(request.kind, ToolKind::Execute | ToolKind::Edit);
+                let allowed = !blocked_by_code_mode && self.gate.decide_async(&request).await == Decision::Allow;
+                if !allowed && !blocked_by_code_mode {
                     self.denied += 1;
                 }
+                let reported_tool = if blocked_by_code_mode {
+                    format!("{} (use run_code)", request.tool)
+                } else {
+                    request.tool
+                };
                 let _ = self
                     .events
-                    .send(HarnessEvent::PermissionDecided { tool: request.tool, allowed })
+                    .send(HarnessEvent::PermissionDecided { tool: reported_tool, allowed })
                     .await;
                 let outcome = match choose_option(&params["options"], allowed) {
                     Some(option) => json!({ "outcome": "selected", "optionId": option }),
@@ -914,5 +929,61 @@ mod tests {
         assert!(matches!(&events[0], HarnessEvent::ToolCall { name, .. } if name == "write"));
         assert!(matches!(&events[1], HarnessEvent::ToolResult { text, diff: None, .. } if text == "wrote a.ts"));
         assert!(!events.iter().any(|event| matches!(event, HarnessEvent::Thought { .. })));
+    }
+
+    #[tokio::test]
+    async fn code_mode_blocks_native_edit_and_execute_and_allows_run_code() {
+        let script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}'
+read l
+echo '{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{"toolCall":{"name":"write_file","kind":"edit","locations":[{"path":"/tmp/a.ts"}]},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}'
+read r1
+echo '{"jsonrpc":"2.0","id":11,"method":"session/request_permission","params":{"toolCall":{"name":"taskmaster__run_code","kind":"other","rawInput":{"code":"return 1"}},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}'
+read r2
+echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        let harness = AcpHarness {
+            id: "fake",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "{server}__",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "taskmaster".into(),
+                url: "http://127.0.0.1:9/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, mut rx) = mpsc::channel(16);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        assert_eq!(summary.denied, 0, "Code Mode redirection should not count as a capability denial");
+        let mut decisions = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            if let HarnessEvent::PermissionDecided { tool, allowed } = ev {
+                decisions.push((tool, allowed));
+            }
+        }
+        assert_eq!(
+            decisions,
+            vec![
+                ("write_file (use run_code)".to_string(), false),
+                ("taskmaster__run_code".to_string(), true),
+            ]
+        );
     }
 }

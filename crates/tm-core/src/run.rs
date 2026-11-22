@@ -70,6 +70,19 @@ pub struct PageRun {
     pub stale: bool,
     /// Check output handed to the next attempt.
     pub pending_errors: Option<String>,
+    /// What the last failure was counted as (see [`failure_key`]). A repair that comes back
+    /// with the same failure is stuck, and goes up a tier at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+}
+
+/// The error codes, or the words, a failure is counted under, in a fixed order: two
+/// failures with the same key are the same failure in different files or lines.
+pub fn failure_key(errors: &str) -> String {
+    let mut keys: Vec<String> = crate::errorography::classify(errors).into_iter().map(|(key, _)| key).collect();
+    keys.sort();
+    keys.dedup();
+    keys.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +120,9 @@ pub enum Event {
     /// A note arrived after the run had finished. The master reads it, then the pages
     /// are built again.
     FollowUp,
+    /// A cancelled run was resumed: pages that already passed stay passed, and only
+    /// unfinished pages are queued again.
+    Resumed,
     Cancelled,
 }
 
@@ -192,16 +208,19 @@ impl Run {
         let mut out = Vec::new();
         match (self.phase, event) {
             (RunPhase::Planning, Event::PlanReady(plan)) => {
+                let focused = self.focused;
                 self.pages = plan
                     .pages
                     .iter()
                     .map(|p| {
+                        let tier = if !focused && p.is_hard() { Tier::Mid } else { Tier::Worker };
                         let page = PageRun {
                             state: PageState::Queued,
-                            tier: Tier::Worker,
+                            tier,
                             repairs: 0,
                             stale: false,
                             pending_errors: None,
+                            last_failure: None,
                         };
                         (p.id.clone(), page)
                     })
@@ -329,14 +348,16 @@ impl Run {
                 let next = self.next_phase.take().unwrap_or(self.phase_at + 1);
                 self.phase_at = next;
                 let Some(plan) = self.plan.as_mut() else { return out };
+                let focused = self.focused;
                 for mut page in added.pages {
                     if self.pages.contains_key(&page.id) {
                         continue;
                     }
                     page.phase = next;
+                    let tier = if !focused && page.is_hard() { Tier::Mid } else { Tier::Worker };
                     self.pages.insert(
                         page.id.clone(),
-                        PageRun { state: PageState::Queued, tier: Tier::Worker, repairs: 0, stale: false, pending_errors: None },
+                        PageRun { state: PageState::Queued, tier, repairs: 0, stale: false, pending_errors: None, last_failure: None },
                     );
                     plan.pages.push(page);
                 }
@@ -357,6 +378,7 @@ impl Run {
                         PageState::Passed | PageState::Failed | PageState::Queued => {
                             page.state = PageState::Building;
                             page.pending_errors = None;
+                            page.last_failure = None;
                             page.repairs = 0;
                             page.tier = Tier::Worker;
                             page.stale = false;
@@ -388,6 +410,23 @@ impl Run {
                     self.settle(&mut out);
                 }
             }
+            (RunPhase::Failed, Event::Resumed) => {
+                if self.plan.is_none() {
+                    self.phase = RunPhase::Planning;
+                } else if self.pages.is_empty() {
+                    self.phase = RunPhase::AwaitingApproval;
+                } else {
+                    self.phase = RunPhase::Building;
+                    for page in self.pages.values_mut() {
+                        if page.state != PageState::Passed {
+                            page.state = PageState::Queued;
+                            page.repairs = 0;
+                            page.stale = false;
+                        }
+                    }
+                    self.settle(&mut out);
+                }
+            }
             (RunPhase::Done | RunPhase::Failed, _) => {}
             (_, Event::Cancelled) => {
                 self.phase = RunPhase::Failed;
@@ -398,9 +437,24 @@ impl Run {
         out
     }
 
-    /// Repair on the same tier, then escalate, then give up. With `focused` (one model on
-    /// every tier) there is nothing to escalate to: a few repairs, then give up.
+    /// Repair on the same tier, then escalate, then give up. A repair that fails exactly as
+    /// the attempt before it is stuck: it escalates at once rather than spending the rest of
+    /// its tier's repairs on the same mistake. With `focused` (one model on every tier) there
+    /// is nothing to escalate to: a few repairs, then give up.
     fn fail_page(p: &mut PageRun, errors: String, focused: bool) {
+        let key = failure_key(&errors);
+        let stuck = !key.is_empty() && p.last_failure.as_deref() == Some(key.as_str());
+        p.last_failure = Some(key);
+        if stuck
+            && !focused
+            && let Some(next) = p.tier.next()
+        {
+            p.tier = next;
+            p.repairs = 0;
+            p.state = PageState::Queued;
+            p.pending_errors = Some(errors);
+            return;
+        }
         if focused {
             if p.repairs < MAX_FOCUSED_REPAIRS {
                 p.repairs += 1;
@@ -552,6 +606,27 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_unit_starts_on_the_mid_tier_unless_every_tier_is_one_model() {
+        let mut planned = plan(&[("easy", &[]), ("core", &[])]);
+        planned.pages[0].difficulty = Some("easy".into());
+        planned.pages[1].difficulty = Some("Hard".into());
+        let mut run = Run::new(4);
+        run.step(Event::PlanReady(planned.clone()));
+        let cmds = run.step(Event::PlanApproved);
+        assert_eq!(cmds, vec![Command::LockContracts, spawn("easy", Tier::Worker, None), spawn("core", Tier::Mid, None)]);
+        assert_eq!(planned.pages[0].effort_hint(), Some("low"));
+        assert_eq!(planned.pages[1].effort_hint(), Some("high"));
+        planned.pages[0].difficulty = Some("normal".into());
+        assert_eq!(planned.pages[0].effort_hint(), None, "a normal unit keeps the harness's default");
+
+        let mut focused = Run::new(4);
+        focused.focused = true;
+        focused.step(Event::PlanReady(planned));
+        let cmds = focused.step(Event::PlanApproved);
+        assert_eq!(cmds[2], spawn("core", Tier::Worker, None), "one model has no stronger tier to start on");
+    }
+
+    #[test]
     fn parallel_limit_is_respected() {
         let (mut run, cmds) = started(&[("a", &[]), ("b", &[]), ("c", &[])], 2);
         assert_eq!(cmds.len(), 3, "lock plus two spawns: {cmds:?}");
@@ -564,11 +639,13 @@ mod tests {
     fn page_repairs_then_escalates_then_fails() {
         let (mut run, _) = started(&[("a", &[])], 1);
         let mut seen = Vec::new();
-        loop {
-            let cmds = run.step(finished("a", check_failed("TS2322")));
+        for n in 0.. {
+            // A different failure each time: every repair made progress, so none is stuck.
+            let failure = format!("app/a/page.ts:1 tsc: TS{}: wrong", 2300 + n);
+            let cmds = run.step(finished("a", check_failed(&failure)));
             match cmds.as_slice() {
                 [Command::SpawnWorker { tier, errors, .. }] => {
-                    assert_eq!(errors.as_deref(), Some("TS2322"));
+                    assert_eq!(errors.as_deref(), Some(failure.as_str()));
                     seen.push(*tier);
                 }
                 [Command::Finish { ok: false }] => break,
@@ -579,6 +656,26 @@ mod tests {
         use Tier::*;
         assert_eq!(seen, vec![Worker, Worker, Mid, Mid, Mid, Master, Master, Master]);
         assert_eq!(run.phase, RunPhase::Failed);
+    }
+
+    #[test]
+    fn a_repair_that_fails_the_same_way_goes_up_a_tier_at_once() {
+        let (mut run, _) = started(&[("a", &[])], 1);
+        let mut seen = Vec::new();
+        loop {
+            // The same mistake each time, in another file and line.
+            let line = seen.len() + 1;
+            let failure = format!("app/a/x{line}.ts:{line} tsc: TS2322: Type 'string' is not assignable to type 'number'.");
+            match run.step(finished("a", check_failed(&failure))).as_slice() {
+                [Command::SpawnWorker { tier, .. }] => seen.push(*tier),
+                [Command::Finish { ok: false }] => break,
+                other => panic!("unexpected commands: {other:?}"),
+            }
+        }
+        use Tier::*;
+        // One repair on the worker, then each stuck repair goes straight up; the master,
+        // with nothing above it, keeps its repairs.
+        assert_eq!(seen, vec![Worker, Mid, Master, Master, Master]);
     }
 
     #[test]
@@ -718,5 +815,22 @@ mod tests {
         assert!(run.step(Event::PlanApproved).is_empty());
         assert!(run.step(finished("ghost", WorkerOutcome::Passed)).is_empty());
         assert_eq!(run.phase, RunPhase::Planning);
+    }
+
+    #[test]
+    fn resuming_a_cancelled_run_keeps_passed_pages_and_rebuilds_the_rest() {
+        let (mut run, _) = started(&[("a", &[]), ("b", &[]), ("c", &[])], 2);
+        run.step(finished("a", WorkerOutcome::Passed));
+        // Cancel while `b` is still building and `c` is queued.
+        let stop = run.step(Event::Cancelled);
+        assert_eq!(stop, vec![Command::Finish { ok: false }]);
+        assert_eq!(run.phase, RunPhase::Failed);
+        assert_eq!(run.pages["a"].state, PageState::Passed);
+
+        // Resuming keeps `a` passed and only spawns `b` and `c`.
+        let cmds = run.step(Event::Resumed);
+        assert_eq!(run.phase, RunPhase::Building);
+        assert_eq!(run.pages["a"].state, PageState::Passed);
+        assert_eq!(cmds, vec![spawn("b", Tier::Worker, None), spawn("c", Tier::Worker, None)]);
     }
 }

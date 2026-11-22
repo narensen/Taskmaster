@@ -75,9 +75,7 @@ pub fn select(tree: &Path, changed: &[String]) -> Vec<Check> {
     if tree.join("tsconfig.json").is_file() && has(changed, &["ts", "tsx", "mts", "cts"]) && bin("tsc") {
         out.push(Check::Tsc);
     }
-    let eslint_config = ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.cjs"]
-        .iter()
-        .any(|file| tree.join(file).is_file());
+    let eslint_config = ESLINT_CONFIGS.iter().any(|file| tree.join(file).is_file());
     if eslint_config && has(changed, &["js", "jsx", "ts", "tsx", "mjs", "cjs"]) && bin("eslint") {
         out.push(Check::Eslint);
     }
@@ -99,6 +97,59 @@ pub fn select(tree: &Path, changed: &[String]) -> Vec<Check> {
     }
     out
 }
+
+/// What the deterministic fixers did: which of them ran, and which files they rewrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fixed {
+    pub ran: Vec<&'static str>,
+    pub changed: Vec<String>,
+}
+
+/// Zero-token deterministic auto-fixers run before static checks so LLMs never burn a repair
+/// round on auto-fixable lint or formatting issues. Only the project's own configured tools
+/// run, and only on `changed`; nothing is installed. The caller commits [`Fixed::changed`].
+pub async fn autofix(tree: &Path, changed: &[String]) -> Fixed {
+    let mut fixed = Fixed::default();
+    let eslint_bin = tree.join("node_modules/.bin/eslint");
+    let eslint_config = ESLINT_CONFIGS.iter().any(|file| tree.join(file).is_file());
+    let js_files: Vec<&String> = changed
+        .iter()
+        .filter(|f| ["js", "jsx", "ts", "tsx", "mjs", "cjs"].iter().any(|ext| f.ends_with(&format!(".{ext}"))) && tree.join(f).is_file())
+        .collect();
+    let py_files: Vec<&String> = changed.iter().filter(|f| f.ends_with(".py") && tree.join(f).is_file()).collect();
+    let run_eslint = eslint_config && eslint_bin.exists() && !js_files.is_empty();
+    let run_ruff = !py_files.is_empty() && on_path("ruff");
+    if !run_eslint && !run_ruff {
+        return fixed;
+    }
+    let mut before: Vec<(&String, Vec<u8>)> = Vec::new();
+    for file in js_files.iter().filter(|_| run_eslint).chain(py_files.iter().filter(|_| run_ruff)) {
+        if let Ok(bytes) = std::fs::read(tree.join(file)) {
+            before.push((file, bytes));
+        }
+    }
+    if run_eslint {
+        let mut cmd = tokio::process::Command::new(&eslint_bin);
+        cmd.arg("--fix").args(&js_files).current_dir(tree).kill_on_drop(true);
+        let _ = tokio::time::timeout(Duration::from_secs(25), cmd.output()).await;
+        fixed.ran.push("eslint --fix");
+    }
+    if run_ruff {
+        let mut cmd = tokio::process::Command::new("ruff");
+        cmd.args(["check", "--fix", "--quiet"]).args(&py_files).current_dir(tree).kill_on_drop(true);
+        let _ = tokio::time::timeout(Duration::from_secs(20), cmd.output()).await;
+        fixed.ran.push("ruff --fix");
+    }
+    fixed.changed = before
+        .into_iter()
+        .filter(|(file, old)| std::fs::read(tree.join(file)).is_ok_and(|now| now != *old))
+        .map(|(file, _)| file.clone())
+        .collect();
+    fixed
+}
+
+const ESLINT_CONFIGS: [&str; 7] =
+    ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.cjs"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Timing {

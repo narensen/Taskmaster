@@ -338,6 +338,73 @@ pub async fn diff(
     ok(json!({ "scope": scope, "base": base, "branch": branch, "diff": text }))
 }
 
+/// Fast per-page `+added / -removed` line counts for a run branch using `git diff --numstat`.
+pub async fn diff_stats(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+    app.known(&id)?;
+    let Some(meta) = app.records().meta(&id)? else {
+        return ok(json!({ "pages": {}, "total": { "added": 0, "removed": 0, "files": 0 } }));
+    };
+    let (Some(base), Some(branch)) = (meta.base.clone(), meta.branch.clone()) else {
+        return ok(json!({ "pages": {}, "total": { "added": 0, "removed": 0, "files": 0 } }));
+    };
+    let Some(head) = run_head(&app, &id, &branch) else {
+        return ok(json!({ "pages": {}, "total": { "added": 0, "removed": 0, "files": 0 } }));
+    };
+    let Ok(raw) = git(&app.project(), &["diff", "--numstat", &base, &head]) else {
+        return ok(json!({ "pages": {}, "total": { "added": 0, "removed": 0, "files": 0 } }));
+    };
+    // Map each file path to the page that changed it (from change records, falling back to plan globs).
+    let mut file_owner: HashMap<String, String> = HashMap::new();
+    if let Ok(changes) = app.records().changes(&id) {
+        for change in changes {
+            if let Some(page) = change.page {
+                for file in change.files {
+                    file_owner.insert(file, page.clone());
+                }
+            }
+        }
+    }
+    let owners = app
+        .records()
+        .events(&id)
+        .ok()
+        .and_then(|evs| tm_core::Run::replay(1, evs).plan)
+        .and_then(|plan| tm_verify::ownership::Owners::from_plan(&plan).ok());
+    let mut pages: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    let mut total_add = 0u64;
+    let mut total_del = 0u64;
+    let mut total_files = 0u64;
+    for line in raw.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a), Some(d), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let add = a.parse::<u64>().unwrap_or(0);
+        let del = d.parse::<u64>().unwrap_or(0);
+        total_add += add;
+        total_del += del;
+        total_files += 1;
+        let owner = file_owner
+            .get(path)
+            .cloned()
+            .or_else(|| owners.as_ref().and_then(|o| o.owner(path).cloned()));
+        if let Some(page) = owner {
+            let entry = pages.entry(page).or_default();
+            entry.0 += add;
+            entry.1 += del;
+            entry.2 += 1;
+        }
+    }
+    let pages_json: serde_json::Map<String, serde_json::Value> = pages
+        .into_iter()
+        .map(|(k, (added, removed, files))| (k, json!({ "added": added, "removed": removed, "files": files })))
+        .collect();
+    ok(json!({
+        "pages": pages_json,
+        "total": { "added": total_add, "removed": total_del, "files": total_files },
+    }))
+}
+
 /// What to compare against: the run branch while it exists, else the commit it ended on.
 pub fn run_head(app: &App, id: &str, branch: &str) -> Option<String> {
     if git(&app.project(), &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_ok() {
@@ -1179,7 +1246,7 @@ pub async fn reset_settings(State(app): State<Arc<App>>) -> Reply {
         ("editor", json!("")),
         ("approvals", json!({ "mode": "never", "timeout_secs": 600 })),
         ("checker", json!({ "enabled": false })),
-        ("code_mode", json!({ "enabled": false })),
+        ("code_mode", json!({ "enabled": true })),
         ("telemetry", json!({ "enabled": false })),
         ("agents", json!({ "timeout_secs": crate::settings::DEFAULT_AGENT_SECS })),
         ("sandbox", json!({ "shell": true, "package_indexes": true })),

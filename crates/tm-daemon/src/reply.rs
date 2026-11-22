@@ -155,6 +155,24 @@ pub fn parse_verdict(text: &str) -> bool {
     last_json(text, '{', '}').and_then(|v| v["real"].as_bool()).unwrap_or(false)
 }
 
+/// Parse a batched verifier JSON array `[{"index": 0, "real": true}, ...]`.
+/// Missing or malformed entries default to `false` (unconfirmed).
+pub fn parse_verdicts_batch(text: &str, count: usize) -> Vec<bool> {
+    let mut confirmed = vec![false; count];
+    let Some(array) = last_json(text, '[', ']') else { return confirmed };
+    let Some(items) = array.as_array() else { return confirmed };
+    for (pos, item) in items.iter().enumerate() {
+        let idx = item["index"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(pos);
+        if idx < count {
+            confirmed[idx] = item["real"].as_bool().unwrap_or(false);
+        }
+    }
+    confirmed
+}
+
 /// What the Taskmaster decided about a worker's objection.
 pub enum Resolution {
     Conform,
@@ -563,5 +581,26 @@ mod tests {
             Ok(_) => panic!("a usage limit is not an arbitration"),
         }
         assert!(matches!(parse_resolution("{\"resolution\":\"conform\"}").unwrap(), Resolution::Conform));
+    }
+
+    #[test]
+    fn parses_batched_verdicts_and_batched_review_keys() {
+        let verdicts = parse_verdicts_batch(
+            "Checked all three:\n[{\"index\":0,\"real\":true},{\"index\":1,\"real\":false,\"why\":\"handled\"},{\"index\":2,\"real\":true}]",
+            3,
+        );
+        assert_eq!(verdicts, vec![true, false, true]);
+        // Missing or unreadable reply defaults every finding to unconfirmed.
+        assert_eq!(parse_verdicts_batch("not json", 2), vec![false, false]);
+
+        let findings = parse_review(
+            r#"[{"key":"auth","page":"dashboard","file":"app/dashboard/page.ts","line":12,"failure":"missing role check"},
+                {"key":"nav","page":"settings","file":"app/settings/page.ts","line":4,"failure":"dead link"}]"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].key.as_deref(), Some("auth"));
+        assert_eq!(findings[1].key.as_deref(), Some("nav"));
     }
 }

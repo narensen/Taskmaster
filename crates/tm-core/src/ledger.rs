@@ -287,6 +287,175 @@ pub fn forecast(history: &[LedgerEntry], shape: &Shape, prices: Option<Prices>) 
     (Estimate { tokens: fresh as u64, usd, cache_read: cached as u64, priced }, builds.len())
 }
 
+/// Aggregated performance and cost metrics for one `(harness, model)` across runs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelScore {
+    pub key: String,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub calls: u64,
+    pub ok_calls: u64,
+    /// Builder units (run+agent pairs) where this model was the first attempt.
+    pub units_built: u64,
+    /// Builder units that succeeded without a subsequent repair call on the same agent.
+    pub first_pass_units: u64,
+    pub first_pass_rate: f64,
+    pub total_tokens: u64,
+    pub cache_read: u64,
+    pub cache_hit_rate: f64,
+    pub total_usd: f64,
+    pub avg_usd_per_call: f64,
+    pub priced_calls: u64,
+    pub avg_seconds: f64,
+}
+
+/// A builder is recommended when it passes this share of its units without a repair.
+pub const RECOMMEND_FIRST_PASS: f64 = 0.85;
+/// A builder below this share of first passes keeps needing repairs.
+pub const STRUGGLING_FIRST_PASS: f64 = 0.5;
+/// Units a builder must have built before it is recommended or called struggling.
+pub const SCORE_MIN_UNITS: u64 = 3;
+
+/// Cross-run scorecard used to compare harnesses/models and suggest the best-value worker.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelScorecard {
+    pub runs_sampled: usize,
+    pub models: Vec<ModelScore>,
+    /// Key of the cheapest builder that passes at least [`RECOMMEND_FIRST_PASS`] of its units
+    /// first time, over at least [`SCORE_MIN_UNITS`] units. Ties go to the faster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_worker: Option<String>,
+    /// Keys of builders that pass fewer than [`STRUGGLING_FIRST_PASS`] of their units first
+    /// time, over at least [`SCORE_MIN_UNITS`] units: each costs a repair more often than not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub struggling: Vec<String>,
+}
+
+impl ModelScorecard {
+    /// The score for `key` (`harness` or `harness model`), when it has been used.
+    pub fn score(&self, key: &str) -> Option<&ModelScore> {
+        self.models.iter().find(|m| m.key == key)
+    }
+}
+
+/// Compute a [`ModelScorecard`] from per-run ledger slices.
+pub fn scorecard(runs: &[Vec<LedgerEntry>]) -> ModelScorecard {
+    struct Acc {
+        harness: String,
+        model: Option<String>,
+        calls: u64,
+        ok_calls: u64,
+        units_built: u64,
+        first_pass_units: u64,
+        total_tokens: u64,
+        cache_read: u64,
+        total_usd: f64,
+        priced_calls: u64,
+        total_seconds: f64,
+    }
+    let mut map: BTreeMap<String, Acc> = BTreeMap::new();
+    for entries in runs {
+        // Track how many builder calls each agent needed in this run so we can measure first-pass rate.
+        let mut agent_builds: BTreeMap<String, Vec<&LedgerEntry>> = BTreeMap::new();
+        for e in entries {
+            let key = match &e.model {
+                Some(m) if !m.is_empty() => format!("{} {m}", e.harness),
+                _ => e.harness.clone(),
+            };
+            let acc = map.entry(key).or_insert_with(|| Acc {
+                harness: e.harness.clone(),
+                model: e.model.clone().filter(|m| !m.is_empty()),
+                calls: 0,
+                ok_calls: 0,
+                units_built: 0,
+                first_pass_units: 0,
+                total_tokens: 0,
+                cache_read: 0,
+                total_usd: 0.0,
+                priced_calls: 0,
+                total_seconds: 0.0,
+            });
+            acc.calls += 1;
+            if e.ok {
+                acc.ok_calls += 1;
+            }
+            acc.total_tokens += e.tokens();
+            acc.cache_read += e.cache_read;
+            acc.total_seconds += e.seconds;
+            if let Some(usd) = e.cost_usd {
+                acc.total_usd += usd;
+                acc.priced_calls += 1;
+            }
+            if matches!(e.role, Role::Worker | Role::Mid | Role::Master) && e.page.is_some() {
+                agent_builds.entry(e.agent()).or_default().push(e);
+            }
+        }
+        for calls in agent_builds.values() {
+            let Some(first) = calls.first() else { continue };
+            let key = match &first.model {
+                Some(m) if !m.is_empty() => format!("{} {m}", first.harness),
+                _ => first.harness.clone(),
+            };
+            if let Some(acc) = map.get_mut(&key) {
+                acc.units_built += 1;
+                if calls.len() == 1 && first.ok {
+                    acc.first_pass_units += 1;
+                }
+            }
+        }
+    }
+    let mut models: Vec<ModelScore> = map
+        .into_iter()
+        .map(|(key, a)| {
+            let first_pass_rate = if a.units_built > 0 { a.first_pass_units as f64 / a.units_built as f64 } else if a.calls > 0 { a.ok_calls as f64 / a.calls as f64 } else { 0.0 };
+            let cache_denom = (a.total_tokens).max(1) as f64;
+            let cache_hit_rate = a.cache_read as f64 / cache_denom;
+            let avg_usd_per_call = if a.priced_calls > 0 { a.total_usd / a.priced_calls as f64 } else { 0.0 };
+            let avg_seconds = if a.calls > 0 { a.total_seconds / a.calls as f64 } else { 0.0 };
+            ModelScore {
+                key,
+                harness: a.harness,
+                model: a.model,
+                calls: a.calls,
+                ok_calls: a.ok_calls,
+                units_built: a.units_built,
+                first_pass_units: a.first_pass_units,
+                first_pass_rate,
+                total_tokens: a.total_tokens,
+                cache_read: a.cache_read,
+                cache_hit_rate,
+                total_usd: a.total_usd,
+                avg_usd_per_call,
+                priced_calls: a.priced_calls,
+                avg_seconds,
+            }
+        })
+        .collect();
+    models.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.key.cmp(&b.key)));
+
+    let recommended_worker = models
+        .iter()
+        .filter(|m| m.units_built >= SCORE_MIN_UNITS && m.first_pass_rate >= RECOMMEND_FIRST_PASS)
+        .min_by(|a, b| {
+            let cost_a = if a.priced_calls > 0 { a.avg_usd_per_call } else { f64::MAX };
+            let cost_b = if b.priced_calls > 0 { b.avg_usd_per_call } else { f64::MAX };
+            cost_a
+                .partial_cmp(&cost_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.first_pass_rate.partial_cmp(&a.first_pass_rate).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.avg_seconds.partial_cmp(&b.avg_seconds).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .map(|m| m.key.clone());
+    let struggling = models
+        .iter()
+        .filter(|m| m.units_built >= SCORE_MIN_UNITS && m.first_pass_rate < STRUGGLING_FIRST_PASS)
+        .map(|m| m.key.clone())
+        .collect();
+
+    ModelScorecard { runs_sampled: runs.len(), models, recommended_worker, struggling }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +479,33 @@ mod tests {
             unit: None,
             priced_by: None,
         }
+    }
+
+    /// One unit built by `harness`: a passing first call, then `repairs` more on the same agent.
+    fn unit(harness: &str, page: &str, cost: f64, repairs: usize) -> Vec<LedgerEntry> {
+        (0..=repairs)
+            .map(|_| LedgerEntry { page: Some(page.into()), ..entry(Role::Worker, harness, 100, 50, Some(cost)) })
+            .collect()
+    }
+
+    #[test]
+    fn the_scorecard_recommends_the_cheapest_reliable_builder_and_names_strugglers() {
+        // Each run is built by one harness, so a page's agent is that harness's alone.
+        let run = |harness: &str, cost: f64, repairs: &[usize]| -> Vec<LedgerEntry> {
+            ["a", "b", "c", "d"].iter().zip(repairs).flat_map(|(page, n)| unit(harness, page, cost, *n)).collect()
+        };
+        let runs = vec![
+            run("cheap", 0.01, &[0, 0, 0, 0]),
+            run("dear", 0.20, &[0, 0, 0, 0]),
+            run("loopy", 0.001, &[1, 2, 0, 1]),
+            // Two units are too few to be judged either way.
+            run("new", 0.0001, &[0, 0]),
+        ];
+        let card = scorecard(&runs);
+        assert_eq!(card.score("cheap").unwrap().first_pass_rate, 1.0);
+        assert_eq!(card.score("loopy").unwrap().first_pass_rate, 0.25);
+        assert_eq!(card.recommended_worker.as_deref(), Some("cheap"));
+        assert_eq!(card.struggling, vec!["loopy".to_string()]);
     }
 
     #[test]

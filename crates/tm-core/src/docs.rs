@@ -111,6 +111,31 @@ pub fn review_brief(scope: &ReviewScope) -> String {
     )
 }
 
+/// Batched reviewer brief: checks all connections in a single reviewer call instead of
+/// spawning one cold agent process per scope.
+pub fn review_batch_brief(scopes: &[ReviewScope]) -> String {
+    let mut out = format!(
+        "You are reviewing all connections in this project in one pass. You cannot edit anything.\n\n\
+         Read `{ARCHITECTURE_FILE}` and `{CHANGES_FILE}` first (batch file reads with `run_code` / `readMany` when available). \
+         The first says how the app is meant to fit together; the second says what changed recently.\n\n\
+         Connections under review:\n"
+    );
+    for scope in scopes {
+        let _ = writeln!(out, "- Dictionary entry `{}` — used by pages: {}", scope.key, scope.consumers.join(", "));
+    }
+    out.push_str(
+        "\nCite each listed entry from the Dictionary, then check how each consumer page uses it.\n\n\
+         Look for, in this order: a recent change that contradicts the architecture; an entry \
+         being used differently from how it is defined; logic duplicated across pages; \
+         obvious performance problems. Ignore style. The compiler has already passed, so do not \
+         report type errors.\n\n\
+         Reply with ONLY a JSON array. Each item: {\"key\", \"page\", \"file\", \"line\", \"failure\"}, where \
+         `key` is the Dictionary entry key from the list above and `failure` states the input or state that \
+         goes wrong and what happens. Report nothing you cannot point to a line for. An empty array means all connections are sound.",
+    );
+    out
+}
+
 /// The brief for the one reviewer per run that looks only for security problems.
 pub fn security_brief(pages: &[String]) -> String {
     format!(
@@ -142,6 +167,24 @@ pub fn verify_brief(finding: &crate::types::Finding) -> String {
         page = finding.page,
         failure = finding.failure,
     )
+}
+
+/// Batched verifier brief: checks all review findings in a single agent call to avoid spawning
+/// one cold verifier process per finding.
+pub fn verify_batch_brief(findings: &[crate::types::Finding]) -> String {
+    let mut out = String::from(
+        "Another reviewer reported the problems below. Decide independently for EACH numbered claim whether it is real. You cannot edit anything.\n\nClaims:\n",
+    );
+    for (idx, f) in findings.iter().enumerate() {
+        let _ = writeln!(out, "{idx}. in `{}` at line {} (page {}): {}", f.file, f.line, f.page, f.failure);
+    }
+    out.push_str(
+        "\nRead the referenced files (batch reads with `run_code` / `readMany` when available) and try to disprove each claim: \
+         check whether the code already handles the case, whether the line matches the claim, and whether the failure can actually happen.\n\n\
+         Reply with ONLY a JSON array of objects, one per claim: `[{\"index\": 0, \"real\": true}, {\"index\": 1, \"real\": false, \"why\": \"...\"}]`. \
+         If you are unsure about a claim, mark `\"real\": false`.",
+    );
+    out
 }
 
 #[cfg(test)]
@@ -203,5 +246,17 @@ mod tests {
         assert!(brief.contains(ARCHITECTURE_FILE) && brief.contains(CHANGES_FILE));
         assert!(brief.contains("`auth`") && brief.contains("dashboard, settings"));
         assert!(brief.contains("cannot edit"));
+    }
+
+    #[test]
+    fn review_batch_brief_lists_all_connections_and_requests_key_field() {
+        let scopes = vec![
+            ReviewScope { key: "auth".into(), consumers: vec!["dashboard".into(), "settings".into()] },
+            ReviewScope { key: "nav".into(), consumers: vec!["dashboard".into()] },
+        ];
+        let brief = review_batch_brief(&scopes);
+        assert!(brief.contains(ARCHITECTURE_FILE) && brief.contains(CHANGES_FILE));
+        assert!(brief.contains("`auth`") && brief.contains("dashboard, settings"));
+        assert!(brief.contains("`nav`") && brief.contains("\"key\""));
     }
 }

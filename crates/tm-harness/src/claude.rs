@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use crate::sandbox::Sandbox;
 use crate::{Harness, HarnessEvent, PermissionGate, RunSummary, Usage, WorkerTask};
 
+#[derive(Clone)]
 pub struct ClaudeCode {
     pub binary: String,
     /// The sandbox it runs in, when bubblewrap can run here. `None` runs it unconfined, with
@@ -44,10 +45,22 @@ impl Default for ClaudeCode {
 const WRITING_TOOLS: [&str; 5] = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
 
 impl ClaudeCode {
-    /// The arguments for one task: permissions, tools, model, effort and the Dictionary.
+    /// The arguments for one stateless task: permissions, tools, model, effort and the Dictionary.
     pub fn args(&self, task: &WorkerTask) -> Vec<String> {
-        let mut args: Vec<String> = vec!["-p".into(), task.framed_brief()];
-        args.extend(["--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--no-session-persistence"].map(String::from));
+        self.args_with(task, &task.framed_brief(), false, None)
+    }
+
+    /// Arguments for one turn, optionally keeping the session on disk (`persist`) or resuming an
+    /// earlier Claude Code session (`resume`) so repair turns reuse the provider prompt cache.
+    pub fn args_with(&self, task: &WorkerTask, prompt: &str, persist: bool, resume: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = vec!["-p".into(), prompt.to_string()];
+        if let Some(session_id) = resume {
+            args.extend(["--resume".into(), session_id.to_string()]);
+        }
+        args.extend(["--output-format", "stream-json", "--verbose", "--strict-mcp-config"].map(String::from));
+        if !persist {
+            args.push("--no-session-persistence".into());
+        }
         let shell = self.sandbox.is_some() && task.shell.is_some() && !task.read_only;
         let mut denied: Vec<&str> = if task.read_only {
             // With no edit tools and nobody to approve a prompt, the session can only read.
@@ -91,9 +104,9 @@ impl ClaudeCode {
         args
     }
 
-    fn command(&self, task: &WorkerTask) -> anyhow::Result<Command> {
+    fn command_with(&self, task: &WorkerTask, prompt: &str, persist: bool, resume: Option<&str>) -> anyhow::Result<Command> {
         let program = crate::sandbox::resolve_binary(&self.binary).with_context(|| format!("`{}` is not installed", self.binary))?;
-        let args = self.args(task);
+        let args = self.args_with(task, prompt, persist, resume);
         Ok(match &self.sandbox {
             Some(sandbox) => {
                 let mut cmd = Command::new("bwrap");
@@ -107,25 +120,17 @@ impl ClaudeCode {
             }
         })
     }
-}
 
-#[async_trait]
-impl Harness for ClaudeCode {
-    fn id(&self) -> &'static str {
-        "claude-code"
-    }
-
-    fn sandboxed_shell(&self) -> bool {
-        self.sandbox.is_some()
-    }
-
-    async fn run(
+    async fn execute(
         &self,
-        task: WorkerTask,
-        _gate: Arc<dyn PermissionGate>,
+        task: &WorkerTask,
+        prompt: &str,
+        persist: bool,
+        resume: Option<&str>,
         events: mpsc::Sender<HarnessEvent>,
-    ) -> anyhow::Result<RunSummary> {
-        let mut cmd = self.command(&task)?;
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        let mut cmd = self.command_with(task, prompt, persist, resume)?;
         let (mut child, group) = crate::spawn_grouped(
             cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
         )
@@ -134,8 +139,12 @@ impl Harness for ClaudeCode {
 
         let read = async {
             let mut lines = BufReader::new(stdout).lines();
+            let mut session_id: Option<String> = resume.map(str::to_string);
             while let Some(line) = lines.next_line().await? {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                if let Some(id) = msg["session_id"].as_str().filter(|s| !s.is_empty()) {
+                    session_id = Some(id.to_string());
+                }
                 match msg["type"].as_str() {
                     Some("assistant") => {
                         for event in content_events(&msg["message"]["content"]) {
@@ -152,18 +161,143 @@ impl Harness for ClaudeCode {
                         for event in denials(&msg) {
                             let _ = events.send(event).await;
                         }
-                        return Ok(summary(&msg));
+                        return Ok((summary(&msg), session_id));
                     }
                     _ => {}
                 }
             }
             bail!("claude exited without a result event")
         };
-        let result = match tokio::time::timeout(task.timeout, read).await {
+        let result = match tokio::time::timeout(timeout, read).await {
             Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", task.timeout)),
+            Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", timeout)),
         };
-        crate::released(result, group.release(&mut child).await)
+        let freed = group.release(&mut child).await;
+        match result {
+            Ok((mut summary, session_id)) => {
+                summary.freed = Some(freed);
+                Ok((summary, session_id))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// A persisted Claude Code session resumed with `--resume <session_id>` for cached repair turns.
+struct ClaudeSession {
+    harness: ClaudeCode,
+    task: WorkerTask,
+    session_id: String,
+    cleaned: bool,
+}
+
+impl ClaudeSession {
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        if let Some(home) = std::env::var_os("HOME") {
+            cleanup_claude_session(&std::path::PathBuf::from(home), &self.session_id);
+        }
+    }
+}
+
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Remove a persisted Claude Code session JSONL file (and optional session dir) under
+/// `<home>/.claude/projects/*/<session_id>.jsonl`.
+fn cleanup_claude_session(home: &std::path::Path, session_id: &str) -> usize {
+    if session_id.len() < 4 || !session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return 0;
+    }
+    let projects = home.join(".claude/projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else { return 0 };
+    let target_file = format!("{session_id}.jsonl");
+    let mut removed = 0usize;
+    for dir in entries.flatten() {
+        let path = dir.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let file = path.join(&target_file);
+        if file.is_file() && std::fs::remove_file(&file).is_ok() {
+            removed += 1;
+        }
+        let sub = path.join(session_id);
+        if sub.is_dir() && std::fs::remove_dir_all(&sub).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[async_trait]
+impl crate::Session for ClaudeSession {
+    async fn follow_up(
+        &mut self,
+        text: String,
+        events: mpsc::Sender<HarnessEvent>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<RunSummary> {
+        let (summary, next_id) = self.harness.execute(&self.task, &text, true, Some(&self.session_id), events, timeout).await?;
+        if let Some(id) = next_id {
+            self.session_id = id;
+        }
+        Ok(summary)
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Freed {
+        self.cleanup();
+        crate::Freed::default()
+    }
+}
+
+#[async_trait]
+impl Harness for ClaudeCode {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn sandboxed_shell(&self) -> bool {
+        self.sandbox.is_some()
+    }
+
+    async fn run_kept(
+        &self,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        let prompt = task.framed_brief();
+        match self.execute(&task, &prompt, true, None, events, task.timeout).await {
+            Ok((summary, Some(session_id))) if summary.ok => {
+                let kept: Box<dyn crate::Session> = Box::new(ClaudeSession { harness: self.clone(), task, session_id, cleaned: false });
+                (Ok(summary), Some(kept))
+            }
+            Ok((summary, Some(session_id))) => {
+                if let Some(home) = std::env::var_os("HOME") {
+                    cleanup_claude_session(&std::path::PathBuf::from(home), &session_id);
+                }
+                (Ok(summary), None)
+            }
+            Ok((summary, None)) => (Ok(summary), None),
+            Err(err) => (Err(err), None),
+        }
+    }
+
+    async fn run(
+        &self,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+    ) -> anyhow::Result<RunSummary> {
+        let prompt = task.framed_brief();
+        self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _)| summary)
     }
 }
 
@@ -348,5 +482,40 @@ mod tests {
         assert_eq!(s.usage.total(), 8 + 463 + 69148 + 11406);
         assert_eq!(s.cost_usd, Some(0.0033));
         assert_eq!(s.denied, 1);
+    }
+
+    #[test]
+    fn warm_session_omits_no_persistence_and_resumes_by_session_id() {
+        let harness = sandboxed();
+        let t = task(false, true, true);
+        let stateless = harness.args(&t);
+        assert!(stateless.contains(&"--no-session-persistence".to_string()));
+        assert!(!stateless.contains(&"--resume".to_string()));
+
+        let kept = harness.args_with(&t, "initial", true, None);
+        assert!(!kept.contains(&"--no-session-persistence".to_string()));
+        assert!(!kept.contains(&"--resume".to_string()));
+
+        let resumed = harness.args_with(&t, "fix it", true, Some("sess-42"));
+        assert!(!resumed.contains(&"--no-session-persistence".to_string()));
+        assert_eq!(after(&resumed, "--resume"), ["sess-42"]);
+    }
+
+    #[test]
+    fn cleanup_claude_session_removes_session_jsonl_and_dir_only() {
+        let home = std::env::temp_dir().join(format!("tm-claude-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let proj = home.join(".claude/projects/-tmp-demo");
+        std::fs::create_dir_all(proj.join("sess-clean-1")).unwrap();
+        let target = proj.join("sess-clean-1.jsonl");
+        let other = proj.join("sess-keep-2.jsonl");
+        std::fs::write(&target, "{}\n").unwrap();
+        std::fs::write(&other, "{}\n").unwrap();
+
+        assert_eq!(cleanup_claude_session(&home, "sess-clean-1"), 2);
+        assert!(!target.exists());
+        assert!(!proj.join("sess-clean-1").exists());
+        assert!(other.exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

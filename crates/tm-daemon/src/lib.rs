@@ -31,6 +31,7 @@ mod log;
 pub mod jobs;
 pub mod live;
 pub mod preview;
+pub mod repomap;
 pub mod reply;
 pub mod report;
 mod resume;
@@ -46,6 +47,7 @@ pub mod store;
 pub mod template;
 mod telemetry;
 mod time;
+mod undo;
 
 #[cfg(test)]
 mod tests;
@@ -194,6 +196,8 @@ pub struct RunRequest {
     pub models: Models,
     pub parallel: Option<usize>,
     pub timeout_secs: Option<u64>,
+    /// Optional per-run USD budget cap; overrides `settings.agents.budget_usd`.
+    pub max_cost_usd: Option<f64>,
     /// `next`, or a directory. See [`template`].
     pub template: Option<String>,
 }
@@ -251,6 +255,8 @@ pub struct Config {
     pub models: Models,
     /// Set to `true` to stop the run at the next command boundary.
     pub cancel: watch::Receiver<bool>,
+    /// Optional per-page restart signals shared with the HTTP API.
+    pub worker_restarts: Option<WorkerRestarts>,
     /// Where agents' text, thoughts and tool calls are written as they happen. `None`
     /// writes them next to the run's records.
     pub live: Option<Arc<live::Live>>,
@@ -260,8 +266,18 @@ pub struct Config {
     pub browser: bool,
     /// Have the mid model check each finished page that is worth it (see `checker.rs`).
     pub checker: bool,
-    /// Code Mode: workers get `run_code`, and Claude Code runs its own code mode.
+    /// Code Mode: workers get `run_code`, and harnesses run in Code Mode.
     pub code_mode: bool,
+    /// Direct / Lite Fast-Path: scoped bug fixes and small edits in existing repos skip heavy
+    /// Master Planning and go straight to 1 Code-Mode worker + deterministic free checks.
+    pub fast_path: bool,
+    /// Optional 2-mode cancel signal (`Graceful` drains active workers; `Force` kills active
+    /// agent process groups and aborts immediately). Works alongside legacy `cancel`.
+    pub cancel_mode: Option<watch::Receiver<CancelMode>>,
+    /// Optional USD budget guardrail for this run; once reached, no new repairs/units spawn.
+    pub max_cost_usd: Option<f64>,
+    /// True when resuming a previously cancelled run (`Event::Resumed`).
+    pub resume_cancelled: bool,
     /// Seconds a `run_code` script, and one `sh`/`test` call in it, may run (0 = default).
     pub code_script_secs: u64,
     pub code_sh_secs: u64,
@@ -272,6 +288,39 @@ pub struct Config {
     /// Dollars per million tokens by model id or harness id, for calls with no reported price.
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
 }
+
+/// How an active run should stop when cancelled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelMode {
+    #[default]
+    None,
+    /// Stop scheduling queued work and let currently active workers finish & save cleanly.
+    Graceful,
+    /// Immediately abort in-flight planner/workers/reviewers, kill child process groups, and clean up.
+    Force,
+}
+
+impl CancelMode {
+    pub fn is_cancelled(self) -> bool {
+        !matches!(self, CancelMode::None)
+    }
+
+    pub fn is_force(self) -> bool {
+        matches!(self, CancelMode::Force)
+    }
+
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            CancelMode::None => None,
+            CancelMode::Graceful => Some("graceful"),
+            CancelMode::Force => Some("force"),
+        }
+    }
+}
+
+/// Per-page restart signals shared between the API and a running driver.
+pub type WorkerRestarts = Arc<std::sync::Mutex<std::collections::HashMap<String, watch::Sender<u64>>>>;
 
 impl Config {
     pub fn new(project: impl Into<PathBuf>) -> Self {
@@ -297,11 +346,16 @@ impl Config {
             run_id: "current".into(),
             models: Models::default(),
             cancel,
+            worker_restarts: None,
             live: None,
             skills: None,
             browser: true,
             checker: false,
-            code_mode: false,
+            code_mode: true,
+            fast_path: true,
+            cancel_mode: None,
+            max_cost_usd: None,
+            resume_cancelled: false,
             code_script_secs: 0,
             code_sh_secs: 0,
             worker_shell: true,

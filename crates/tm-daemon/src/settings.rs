@@ -84,11 +84,13 @@ impl Default for SandboxSettings {
 pub struct AgentSettings {
     /// Seconds one agent call may run before it is stopped. 0 means no limit.
     pub timeout_secs: u64,
+    /// Optional per-run USD spend cap. 0 means no limit.
+    pub budget_usd: f64,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
-        AgentSettings { timeout_secs: DEFAULT_AGENT_SECS }
+        AgentSettings { timeout_secs: DEFAULT_AGENT_SECS, budget_usd: 0.0 }
     }
 }
 
@@ -109,16 +111,22 @@ pub struct TelemetrySettings {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CodeModeSettings {
-    /// Workers get `run_code`, and Claude Code runs its native code mode (see `code.rs`).
+    /// Workers (and read-only planners/reviewers) get `run_code`, and harnesses run in Code Mode (see `code.rs`).
     pub enabled: bool,
     /// Seconds one `run_code` script may run; 0 keeps the default (600). A script that runs
     /// the tests needs room.
     pub script_secs: u64,
     /// Seconds one `sh()` or `test()` call inside a script may run; 0 keeps the default (300).
     pub sh_secs: u64,
+}
+
+impl Default for CodeModeSettings {
+    fn default() -> Self {
+        CodeModeSettings { enabled: true, script_secs: 0, sh_secs: 0 }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

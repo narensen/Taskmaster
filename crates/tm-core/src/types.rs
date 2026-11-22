@@ -60,6 +60,30 @@ pub struct ContractFile {
     pub content: String,
 }
 
+impl ContractFile {
+    /// A contract that is an executable acceptance test rather than an interface.
+    pub fn is_test(&self) -> bool {
+        is_test_path(&self.path)
+    }
+}
+
+/// A test file by its runner's naming (`cart.test.ts`, `cart.spec.js`, `test_cart.py`,
+/// `cart_test.py`, `cart_test.go`) or a source file under a `tests`, `__tests__`, `test`,
+/// or `spec` directory. Fixture files (`conftest.py`, `__init__.py`) are not tests.
+pub fn is_test_path(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if matches!(name, "conftest.py" | "__init__.py" | "mod.rs") || !name.contains('.') {
+        return false;
+    }
+    name.contains(".test.")
+        || name.contains(".spec.")
+        || (name.starts_with("test_") && name.ends_with(".py"))
+        || name.ends_with("_test.py")
+        || name.ends_with("_test.go")
+        || path.split('/').rev().skip(1).any(|dir| matches!(dir, "tests" | "__tests__" | "test" | "spec"))
+}
+
 /// What a plan builds. Only a web project has routes, a design system and browser checks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -166,6 +190,14 @@ pub struct PagePlan {
     /// The phase of the sketch this unit belongs to, from 0.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub phase: usize,
+    /// Optional IDs of other units/pages that must finish before this unit starts,
+    /// enabling fine-grained parallel DAG execution without waiting on a whole phase.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Optional complexity hint (`easy`, `normal`, `hard`) set by the planner to skip
+    /// unnecessary escalation on hard units and reduce reasoning effort on easy ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -185,12 +217,31 @@ pub struct WorkUnit {
     /// How this unit's agent knows it is finished: what must exist and work.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub done: String,
+    /// Optional upstream unit IDs this worker depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// The most units a page is split into.
 pub const MAX_UNITS: usize = 16;
 
 impl PagePlan {
+    /// True when the planner marked this unit `hard` (complex state, concurrency, or deep integration).
+    pub fn is_hard(&self) -> bool {
+        self.difficulty
+            .as_deref()
+            .is_some_and(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "hard" | "high" | "complex"))
+    }
+
+    /// Reasoning effort hint derived from `difficulty`: `low` for easy, `high` for hard. A
+    /// normal unit keeps the harness's own default.
+    pub fn effort_hint(&self) -> Option<&'static str> {
+        match self.difficulty.as_deref()?.trim().to_ascii_lowercase().as_str() {
+            "easy" | "low" | "simple" => Some("low"),
+            "hard" | "high" | "complex" => Some("high"),
+            _ => None,
+        }
+    }
     /// The units to run. The declared split when it is safe (2 to [`MAX_UNITS`] units, unique
     /// ids, no overlapping files); otherwise a single unit owning the whole page.
     pub fn work_units(&self) -> Vec<WorkUnit> {
@@ -203,6 +254,7 @@ impl PagePlan {
             brief: self.brief.clone(),
             context: self.context.clone(),
             done: self.done.clone(),
+            depends_on: self.depends_on.clone(),
         }]
     }
 }
@@ -454,6 +506,17 @@ mod unit_tests {
             units,
             skills: vec![],
             phase: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn contract_tests_are_told_apart_from_interfaces() {
+        for test in ["tests/contract/cart.ts", "app/cart.test.ts", "web/cart.spec.tsx", "test_cart.py", "pkg/cart_test.py", "cart_test.go", "crate/tests/api.rs", "src/__tests__/cart.js"] {
+            assert!(is_test_path(test), "{test}");
+        }
+        for interface in ["contracts/types.ts", "conftest.py", "tests/conftest.py", "tests/__init__.py", "src/testing.ts", "latest.py", "tests/README"] {
+            assert!(!is_test_path(interface), "{interface}");
         }
     }
 

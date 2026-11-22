@@ -23,7 +23,7 @@
 //! ```
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,6 +38,22 @@ use crate::RunRequest;
 pub trait Store: Send + Sync {
     /// `None` when nothing is stored under `key`.
     fn read(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Read only bytes added after `offset`, returning `(total_len, tail_bytes)`.
+    /// When the record shrank (`total_len < offset`), reads the whole record from 0.
+    fn read_from(&self, key: &str, offset: u64) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+        let Some(bytes) = self.read(key)? else {
+            return Ok(None);
+        };
+        let len = bytes.len() as u64;
+        if len < offset {
+            return Ok(Some((len, bytes)));
+        }
+        let start = offset as usize;
+        if start >= bytes.len() {
+            return Ok(Some((len, Vec::new())));
+        }
+        Ok(Some((len, bytes[start..].to_vec())))
+    }
     /// Replace the record. A reader sees the old bytes or the new ones, never a mix.
     fn write(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()>;
     /// Add one line to a record that is a list of lines.
@@ -46,6 +62,11 @@ pub trait Store: Send + Sync {
     fn remove(&self, key: &str) -> anyhow::Result<()>;
     /// The names directly under `prefix`, sorted.
     fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
+    /// Lightweight `(byte_len, mtime_nanos)` fingerprint for cache validation without reading bytes.
+    /// Returns `None` when the store does not support metadata stats.
+    fn stat(&self, _key: &str) -> Option<(u64, u128)> {
+        None
+    }
 }
 
 /// Records as files under one directory.
@@ -81,6 +102,29 @@ impl Store for FileStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err).with_context(|| format!("cannot read {}", path.display())),
         }
+    }
+
+    fn read_from(&self, key: &str, offset: u64) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+        let path = self.path(key)?;
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("cannot open {}", path.display())),
+        };
+        let len = file.metadata().with_context(|| format!("cannot stat {}", path.display()))?.len();
+        if len == offset {
+            return Ok(Some((len, Vec::new())));
+        }
+        let start = if len < offset { 0 } else { offset };
+        if start > 0 {
+            file.seek(SeekFrom::Start(start))
+                .with_context(|| format!("cannot seek {}", path.display()))?;
+        }
+        let mut buf = Vec::with_capacity((len.saturating_sub(start)) as usize);
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let end_len = start + buf.len() as u64;
+        Ok(Some((end_len, buf)))
     }
 
     fn write(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -125,6 +169,23 @@ impl Store for FileStore {
             read.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         Ok(names)
+    }
+
+    fn stat(&self, key: &str) -> Option<(u64, u128)> {
+        let path = self.path(key).ok()?;
+        match fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                Some((meta.len(), mtime))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -179,6 +240,9 @@ pub struct Attempt {
     pub diff: Option<String>,
 }
 
+/// Runs the model scorecard is worked out from: the most recent ones.
+pub const SCORECARD_RUNS: usize = 50;
+
 /// The daemon's records, by name and type.
 #[derive(Clone)]
 pub struct Records {
@@ -198,6 +262,17 @@ impl Records {
 
     pub fn run_ids(&self) -> anyhow::Result<Vec<String>> {
         self.store.list("runs")
+    }
+
+    /// Cheap metadata fingerprint of the files that determine a run's summary view.
+    /// Returns `None` if the underlying store does not provide stats.
+    pub fn run_fingerprint(&self, run: &str) -> Option<[(u64, u128); 4]> {
+        Some([
+            self.store.stat(&format!("runs/{run}/events.jsonl"))?,
+            self.store.stat(&format!("runs/{run}/ledger.jsonl"))?,
+            self.store.stat(&format!("runs/{run}/status.json"))?,
+            self.store.stat(&format!("runs/{run}/meta.json"))?,
+        ])
     }
 
     /// The agents' transcript of a run, one JSON value per line.
@@ -272,6 +347,20 @@ impl Records {
         let Some(bytes) = self.store.read(&format!("runs/{run}/ledger.jsonl"))? else { return Ok(Vec::new()) };
         let text = String::from_utf8_lossy(&bytes);
         Ok(text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect())
+    }
+
+    /// The model scorecard over the ledgers of the last `recent` runs that spent anything.
+    pub fn scorecard(&self, recent: usize) -> anyhow::Result<tm_core::ModelScorecard> {
+        let ids = self.run_ids()?;
+        let mut ledgers = Vec::new();
+        for id in &ids[ids.len().saturating_sub(recent)..] {
+            if let Ok(entries) = self.ledger(id)
+                && !entries.is_empty()
+            {
+                ledgers.push(entries);
+            }
+        }
+        Ok(tm_core::scorecard(&ledgers))
     }
 
     pub fn charge(&self, run: &str, entry: &LedgerEntry) -> anyhow::Result<()> {

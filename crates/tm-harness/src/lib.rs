@@ -211,6 +211,12 @@ pub struct WorkerTask {
     pub shell: Option<ShellScope>,
 }
 
+/// Standing instruction added when Code Mode (`run_code`) is active for a read-only agent.
+pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol lookups, and diffs in a single `run_code` script (`readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
+
+/// Standing instruction added when Code Mode (`run_code`) is active for a builder.
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch reads (`readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls.\n\n";
+
 impl WorkerTask {
     /// The brief with the standing rules for this kind of task in front of it.
     pub fn framed_brief(&self) -> String {
@@ -221,7 +227,12 @@ impl WorkerTask {
         } else {
             WORKER_RULES
         };
-        format!("{rules}{}", self.brief)
+        if self.code_mode {
+            let code = if self.read_only { CODE_MODE_READ_RULES } else { CODE_MODE_WRITE_RULES };
+            format!("{code}{rules}{}", self.brief)
+        } else {
+            format!("{rules}{}", self.brief)
+        }
     }
 }
 

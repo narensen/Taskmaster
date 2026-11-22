@@ -71,6 +71,7 @@ pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
          ALWAYS delegate across multiple parallel workers whenever the work spans independent files, layers, or modules \
          (for example: separate pages/routes, markup+styles vs. application logic/state, backend vs. frontend, core module vs. tests, or distinct subsystems) \
          by defining multiple `units` or splitting a unit into `parts` with disjoint `owned_glob` patterns so up to {cap} workers build at once. \
+         If one unit genuinely depends on another finishing first, add an optional `depends_on: [\"other-unit-id\"]` array so unrelated workers still start immediately in parallel. \
          Include a concise top-level `summary` describing the overall architecture and how the workers divide the job. \
          Every worker runs in isolation and only sees its own `brief`, `context`, `done`, locked `contracts`, `design`, and cited Dictionary entries: \
          give each worker rich, self-contained `brief` + `context` (exact file names, exports, types, DOM ids/selectors, shared interfaces, and how its output connects to sibling workers).\n"
@@ -219,6 +220,161 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
              and pin every id, file name and interface they share in a contract, a cited entry or each part's brief and context.\n",
         );
     }
+    brief.push_str("Optional unit `difficulty`: easy|normal|hard (hard starts on the mid tier).\n");
+    brief
+}
+
+const HEAVY_HINTS: [&str; 17] = [
+    "rewrite",
+    "from scratch",
+    "entire app",
+    "multi-phase",
+    "architecture",
+    "migrate",
+    "full platform",
+    "redesign",
+    "new feature",
+    "new page",
+    "build page",
+    "build a ",
+    "create a new ",
+    "add a new page",
+    "across all",
+    "every page",
+    "multiple ",
+];
+
+const LITE_EDIT_CUES: [&str; 18] = [
+    "fix ",
+    "fixes ",
+    "bug",
+    "typo",
+    "rename ",
+    "tweak ",
+    "adjust ",
+    "patch ",
+    "hotfix",
+    "revert ",
+    "change the ",
+    "update the ",
+    "remove the ",
+    "replace the ",
+    "correct ",
+    "resolve ",
+    "prevent ",
+    "avoid ",
+];
+
+const SOURCE_EXTS: [&str; 20] = [
+    ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".css",
+    ".scss", ".html", ".json", ".toml", ".yaml", ".yml", ".md", ".sql", ".sh", ".vue",
+];
+
+/// True when `prompt` mentions a concrete source or config file path (e.g. `src/app.rs`).
+fn names_a_file(prompt: &str) -> bool {
+    prompt.split_whitespace().any(|raw| {
+        let token = raw.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']'));
+        let lower = token.to_ascii_lowercase();
+        SOURCE_EXTS.iter().any(|ext| lower.len() > ext.len() && lower.ends_with(ext))
+    })
+}
+
+/// True when the prompt is a scoped bug fix / small edit in an existing repository that can
+/// bypass heavy Master Planning altogether (Direct / Lite Fast-Path: 0 planner tokens ->
+/// 1 Code-Mode worker -> deterministic free checks -> done).
+pub fn is_lite_edit(prompt: &str, existing_files: usize) -> bool {
+    if existing_files == 0 {
+        return false;
+    }
+    let text = prompt.trim().to_lowercase();
+    let len = text.chars().count();
+    if len == 0 || len > 280 {
+        return false;
+    }
+    if HEAVY_HINTS.iter().any(|h| text.contains(h)) {
+        return false;
+    }
+    LITE_EDIT_CUES.iter().any(|cue| text.contains(cue)) || names_a_file(prompt)
+}
+
+/// Synthesize a minimal, valid 1-unit plan deterministically in Rust (0 planning tokens)
+/// for scoped edits in existing repos.
+pub fn lite_edit_plan(prompt: &str) -> tm_core::Plan {
+    let trimmed = prompt.trim();
+    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+    let headline: String = first_line.chars().take(120).collect();
+    tm_core::Plan {
+        kind: tm_core::ProjectKind::Migration,
+        summary: format!("Direct edit: {headline}"),
+        contracts: Vec::new(),
+        pages: vec![tm_core::PagePlan {
+            id: "edit".into(),
+            route: String::new(),
+            owned_glob: "**".into(),
+            cites: Vec::new(),
+            brief: format!(
+                "{trimmed}\n\nKeep the change tightly scoped to the files needed for this edit. \
+                 Run the relevant project checks and tests before finishing."
+            ),
+            context: "Direct fast-path edit in an existing repository: use `run_code` (`readMany`/`symbols`/`grep`) \
+                      to inspect only the target files, apply minimal edits (`edit`/`patch`/`applyPatch`), \
+                      and verify with `test()` / `check()`."
+                .into(),
+            done: "The requested edit is applied cleanly and the project's deterministic checks and tests pass.".into(),
+            ..Default::default()
+        }],
+        estimate: tm_core::Estimate::default(),
+        design: String::new(),
+        phases: Vec::new(),
+    }
+}
+
+/// True when the prompt is a short, scoped edit in an existing repository that can use the
+/// fast planning pass with the precomputed repo map (0 exploration tool calls).
+pub fn is_quick_edit(prompt: &str, existing_files: usize) -> bool {
+    if existing_files == 0 {
+        return false;
+    }
+    let text = prompt.trim().to_lowercase();
+    let len = text.chars().count();
+    if len == 0 || len > 320 {
+        return false;
+    }
+    !HEAVY_HINTS[..8].iter().any(|h| text.contains(h))
+}
+
+/// Fast single-shot planning brief for scoped edits in an existing repo, powered by the
+/// deterministic repo map so the planner skips slow file-discovery tool calls.
+pub fn quick_edit_brief(
+    prompt: &str,
+    repo_map: &str,
+    entries: &[String],
+    slots: usize,
+    worker_label: Option<&str>,
+) -> String {
+    let mut brief = format!(
+        "Plan this small product quickly. This is a focused edit in an existing repository — everything you need is in the repository map below; \
+         avoid slow exploration tool calls (or batch at most one read-only `run_code` `readMany` call if you must check a specific file).\n\n{}\nRequest:\n{prompt}\n\n",
+        worker_pool_rule(slots, worker_label),
+    );
+    if !repo_map.is_empty() {
+        brief.push_str(repo_map);
+        brief.push('\n');
+    }
+    if !entries.is_empty() {
+        brief.push_str("Stored Dictionary entries (cite by key if relevant):\n");
+        for entry in entries {
+            brief.push_str(entry);
+        }
+        brief.push('\n');
+    }
+    brief.push_str(
+        "Reply with one compact JSON plan (no `phases`, only the 1-3 units actually touched, exact existing file paths in `owned_glob`, \
+         optional `difficulty`: `\"easy\"` | `\"normal\"` | `\"hard\"`, and `done` naming the verification command). \
+         Do not edit files. Leave `estimate` at zero.\n",
+    );
+    brief.push_str(&plan_shape());
+    brief.push_str(DECIDE_RULE);
     brief
 }
 
@@ -234,6 +390,25 @@ mod tests {
         assert!(!is_small_prompt("", 0));
         assert!(!is_small_prompt(&"build a full SaaS billing platform with teams and roles ".repeat(8), 0));
         assert!(!is_small_prompt(&format!("simple {}", "x ".repeat(400)), 0));
+    }
+
+    #[test]
+    fn detects_lite_edits_in_existing_repos_and_builds_valid_plan() {
+        assert!(is_lite_edit("Fix the off-by-one bug in src/parser.rs", 5));
+        assert!(is_lite_edit("Rename fetchUser to loadUser in app/auth.ts", 5));
+        assert!(is_lite_edit("Typo in the checkout button label", 2));
+        assert!(is_lite_edit("Adjust timeout in crates/tm-daemon/src/code.rs to 120s", 4));
+        // Empty repos, multi-module/new-page features, and rewrites must NOT skip Master Planning.
+        assert!(!is_lite_edit("Fix the off-by-one bug in src/parser.rs", 0));
+        assert!(!is_lite_edit("Build page a with a greeting.", 3));
+        assert!(!is_lite_edit("Build a new dashboard page with billing and analytics", 5));
+        assert!(!is_lite_edit("Rewrite the auth architecture across all pages", 5));
+
+        let plan = lite_edit_plan("Fix off-by-one in src/parser.rs");
+        assert_eq!(plan.pages.len(), 1);
+        assert_eq!(plan.pages[0].id, "edit");
+        assert_eq!(plan.pages[0].owned_glob, "**");
+        assert!(tm_core::check_plan(&plan, &[], &std::collections::BTreeMap::new()).is_ok());
     }
 
     #[test]

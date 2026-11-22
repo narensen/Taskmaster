@@ -100,26 +100,25 @@ impl Live {
 
     /// Every entry after the first `after`, and how many there are in all.
     pub fn read(&self, run: &str, after: usize) -> (usize, Vec<Value>) {
-        let bytes = self.store.read(&Self::key(run, "agents.jsonl")).ok().flatten().unwrap_or_default();
         let mut cache = self.cache.lock().unwrap();
         let cached = cache.entry(run.to_string()).or_default();
-        let len = bytes.len() as u64;
-        if len < cached.offset {
-            *cached = Cached::default();
-        }
-        if len > cached.offset {
-            let fresh = &bytes[cached.offset as usize..];
-            // Only whole lines: a writer may be part way through the last one.
-            let whole = fresh.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
-            for line in fresh[..whole].split(|b| *b == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(value) = serde_json::from_slice::<Value>(line) {
-                    cached.entries.push(value);
-                }
+        if let Ok(Some((len, fresh))) = self.store.read_from(&Self::key(run, "agents.jsonl"), cached.offset) {
+            if len < cached.offset {
+                *cached = Cached::default();
             }
-            cached.offset += whole as u64;
+            if !fresh.is_empty() {
+                // Only whole lines: a writer may be part way through the last one.
+                let whole = fresh.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                for line in fresh[..whole].split(|b| *b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_slice::<Value>(line) {
+                        cached.entries.push(value);
+                    }
+                }
+                cached.offset += whole as u64;
+            }
         }
         let total = cached.entries.len();
         let from = after.min(total);
@@ -317,5 +316,22 @@ mod tests {
         live.push("run-42", &json!({ "id": "master" }), "thought", json!({ "text": "planning" }));
         let woken = rx.recv().await.unwrap();
         assert_eq!(woken, "run-42");
+    }
+
+    #[test]
+    fn read_from_only_reads_appended_tail_bytes() {
+        let store = tmp("tail");
+        store.append("a.jsonl", r#"{"n":1}"#).unwrap();
+        let (len1, b1) = store.read_from("a.jsonl", 0).unwrap().unwrap();
+        assert_eq!(b1, br#"{"n":1}"#.iter().copied().chain([b'\n']).collect::<Vec<_>>());
+        // Caught up: zero bytes read.
+        let (len_same, b_empty) = store.read_from("a.jsonl", len1).unwrap().unwrap();
+        assert_eq!(len_same, len1);
+        assert!(b_empty.is_empty());
+        // Appending another line reads ONLY the newly appended bytes.
+        store.append("a.jsonl", r#"{"n":2}"#).unwrap();
+        let (len2, b2) = store.read_from("a.jsonl", len1).unwrap().unwrap();
+        assert!(len2 > len1);
+        assert_eq!(b2, br#"{"n":2}"#.iter().copied().chain([b'\n']).collect::<Vec<_>>());
     }
 }

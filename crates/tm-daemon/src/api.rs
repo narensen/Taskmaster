@@ -3,7 +3,8 @@
 //! ```text
 //! GET  /                          the phone page
 //! GET  /api/health                no token needed
-//! POST /api/pair                  {code} -> {token}
+//! POST /api/pair                  {code, label?, kind?} -> {token}: the printed code, or a one-time
+//!                                 code from a pairing link (see `api/connect.rs`)
 //!
 //! GET  /api/runs                  every run, with its phase, pages and spend
 //! POST /api/runs                  {prompt | plan, id?, yes?, roles?, models?, parallel?, timeout_secs?, template?}
@@ -143,6 +144,7 @@ use tm_harness::{HARNESSES, Harness};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
+mod connect;
 mod desk;
 mod hosts;
 mod ops;
@@ -270,6 +272,8 @@ struct App {
     active: Mutex<HashMap<String, Active>>,
     /// Cached `view()` JSON for settled (inactive) runs, validated via O(1) file metadata stats.
     summary_cache: Mutex<HashMap<(PathBuf, String), (RunFingerprint, Value)>>,
+    /// The address the API listens on, for the links that pair a device.
+    addr: SocketAddr,
     /// Each harness's model list, kept so a page or a new run does not wait on five CLIs.
     providers: crate::provider_cache::ProviderCache,
     live: Arc<Live>,
@@ -289,6 +293,15 @@ struct App {
 type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
 
 impl Server {
+    /// `<route>/pair#code=<code>` for every route to this server: this computer, and the
+    /// local network and tailnet when it listens there.
+    pub fn pairing_links(&self, code: &str) -> Vec<String> {
+        let wide = self.app.addr.ip().is_unspecified();
+        let lan = if wide { connect::lan_route() } else { None };
+        let tailnet = if wide { tailscale_ipv4().ok() } else { None };
+        connect::routes(self.app.addr, lan, tailnet).into_iter().map(|route| format!("{}pair#code={code}", route.url)).collect()
+    }
+
     /// Ask every provider for its models in the background, so the first page that offers
     /// a model, and the first run, find the lists ready.
     pub fn warm_providers(&self) {
@@ -333,6 +346,7 @@ impl Server {
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
             summary_cache: Mutex::new(HashMap::new()),
+            addr,
             providers: Default::default(),
             live,
             editor: Mutex::new(options.editor),
@@ -470,6 +484,13 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/eval/suite", get(ops::eval_suite))
         .route("/api/web-access", get(ops::get_web_access).post(ops::update_web_access))
         .route("/api/web-access/cache/clear", post(ops::clear_web_cache))
+        .route("/api/connect", get(connect::overview))
+        .route("/api/pairing", post(connect::create_pairing))
+        .route("/api/devices", get(connect::devices))
+        .route("/api/devices/agent", post(connect::mint_agent))
+        .route("/api/devices/{id}/rename", post(connect::rename_device))
+        .route("/api/devices/{id}/revoke", post(connect::revoke_device))
+        .route("/mcp", post(connect::mcp).get(connect::mcp_no_stream))
         .route("/api/runs/{id}/web", get(ops::run_web_activity))
         .route_layer(middleware::from_fn_with_state(app.clone(), idempotency_guard))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
@@ -491,6 +512,11 @@ fn router(app: Arc<App>) -> Router {
 
 async fn guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
     match bearer(request.headers()).and_then(|token| app.auth.identify(token)) {
+        // An outside agent's token is for the MCP server only: it cannot pair devices,
+        // revoke them, or read the rest of the API.
+        Some(principal) if principal.is_agent() && request.uri().path() != "/mcp" => {
+            fail(StatusCode::FORBIDDEN, "an agent token works only on /mcp").into_response()
+        }
         Some(_) => next.run(request).await,
         None => fail(StatusCode::UNAUTHORIZED, "a token is required").into_response(),
     }
@@ -622,7 +648,8 @@ async fn frontend(State(app): State<Arc<App>>, method: Method, uri: Uri) -> Resp
         return fail(StatusCode::NOT_FOUND, "no such route").into_response();
     }
     let Some(web) = &app.web else {
-        return if path.is_empty() { Html(PAGE).into_response() } else { StatusCode::NOT_FOUND.into_response() };
+        // A pairing link (`/pair#code=…`) opens the built-in page, which reads the code.
+        return if path.is_empty() || path == "pair" { Html(PAGE).into_response() } else { StatusCode::NOT_FOUND.into_response() };
     };
     let rel = std::path::Path::new(path);
     let inside = rel.components().all(|part| matches!(part, std::path::Component::Normal(_)));
@@ -657,10 +684,17 @@ async fn frontend(State(app): State<Arc<App>>, method: Method, uri: Uri) -> Resp
 #[derive(Deserialize)]
 struct PairBody {
     code: String,
+    /// What the device calls itself, such as "Chrome on Android". A pairing link's own
+    /// name wins over it.
+    #[serde(default)]
+    label: String,
+    /// `browser`, `phone`, `desktop`, `machine` or `agent`.
+    #[serde(default)]
+    kind: String,
 }
 
 async fn pair(State(app): State<Arc<App>>, Json(body): Json<PairBody>) -> Reply {
-    match app.auth.enroll(&body.code) {
+    match app.auth.enroll_as(&body.code, &body.label, &body.kind) {
         Ok(Some(token)) => ok(json!({ "token": token })),
         Ok(None) => Err(fail(StatusCode::UNAUTHORIZED, "that code was refused")),
         Err(err) => Err(fail(StatusCode::TOO_MANY_REQUESTS, format!("{err:#}"))),

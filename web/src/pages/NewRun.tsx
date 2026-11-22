@@ -23,6 +23,7 @@ import { Field, Problem, useAction, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { RoleDeck } from "../components/RoleDeck";
 import { ModePicker, useRunMode } from "../components/ModePicker";
+import { promptLink, readPromptLink } from "../promptLink";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { ProviderLogo, providerName } from "../providers/logos";
 import { modelLabel } from "../components/ProviderPicker";
@@ -90,6 +91,20 @@ export function NewRun() {
 
   useEffect(() => {
     composer.current?.focus();
+    // A prompt link fills the composer; it never sends. The query goes, so a reload does not
+    // put it back over what the person typed since.
+    const link = readPromptLink(window.location.search);
+    if (!link) return;
+    window.history.replaceState(null, "", window.location.pathname);
+    composer.current?.setText(link.prompt);
+    if (link.mode) setRunMode(link.mode);
+    if (link.removed)
+      toast(
+        "Hidden characters removed",
+        `The link's prompt had ${link.removed} character${link.removed === 1 ? "" : "s"} you could not see, which can hide instructions for an agent. Read it before you send.`,
+        10000,
+      );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // A role with no provider opens the options, so the question is asked where it is answered.
@@ -262,6 +277,23 @@ export function NewRun() {
             <div className="composer-foot">
               <div className="composer-actions">
                 <ModePicker value={runMode} onChange={setRunMode} />
+                <button
+                  type="button"
+                  className="icon composer-link-btn"
+                  aria-label="Copy a link to this prompt"
+                  title="Copy a link that opens New Run with this prompt (it never sends on its own)"
+                  data-testid="copy-prompt-link"
+                  onClick={() => {
+                    const text = composer.current ? messageText(composer.current.read()) : "";
+                    if (!text.trim()) {
+                      toast("Write a prompt first", "The link carries the text in the composer.");
+                      return;
+                    }
+                    void navigator.clipboard?.writeText(promptLink(text, runMode)).then(() => toast("Prompt link copied", undefined, 2000));
+                  }}
+                >
+                  <Link2 size={14} />
+                </button>
                 <span className="foot-sep" aria-hidden />
                 <button
                   type="button"

@@ -484,12 +484,32 @@ impl Records {
         self.save(&format!("reviews/jobs/{}.json", flat(id)), job)
     }
 
-    pub fn devices(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self.load("devices.json")?.unwrap_or_default())
+    /// Paired devices. A list written before devices had names (bare hashes) reads as
+    /// unnamed browsers, so nobody paired earlier is signed out.
+    pub fn devices(&self) -> anyhow::Result<Vec<crate::auth::DeviceRecord>> {
+        let Some(raw) = self.load::<Value>("devices.json")? else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for item in raw.as_array().cloned().unwrap_or_default() {
+            match item {
+                Value::String(hash) => out.push(crate::auth::DeviceRecord {
+                    hash,
+                    label: "Paired earlier".into(),
+                    kind: "browser".into(),
+                    created: String::new(),
+                    last_seen: None,
+                }),
+                other => {
+                    if let Ok(record) = serde_json::from_value::<crate::auth::DeviceRecord>(other) {
+                        out.push(record);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
-    pub fn save_devices(&self, hashes: &[String]) -> anyhow::Result<()> {
-        self.save("devices.json", &hashes)
+    pub fn save_devices(&self, devices: &[crate::auth::DeviceRecord]) -> anyhow::Result<()> {
+        self.save("devices.json", &devices)
     }
 
     fn load<T: DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<T>> {

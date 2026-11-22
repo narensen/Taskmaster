@@ -7,6 +7,12 @@ pub fn rfc3339_now() -> String {
     rfc3339(secs)
 }
 
+/// The time `after` from now, as [`rfc3339_now`] writes it.
+pub fn rfc3339_after(after: std::time::Duration) -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    rfc3339(secs + after.as_secs())
+}
+
 /// Format `secs` since the Unix epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;

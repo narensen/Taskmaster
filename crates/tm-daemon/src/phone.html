@@ -73,15 +73,24 @@ async function load() {
     status.appendChild(block);
   }
 }
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const code = document.getElementById("code").value.trim();
-  const response = await fetch("/api/pair", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
-  if (!response.ok) { lead.textContent = "That code was refused."; return; }
+async function pair(code) {
+  const label = /iPhone|Android/i.test(navigator.userAgent) ? "Phone" : "Browser";
+  const response = await fetch("/api/pair", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, label, kind: label === "Phone" ? "phone" : "browser" }) });
+  if (!response.ok) { lead.textContent = "That code was refused. Ask for a new link."; return; }
   const body = await response.json();
   localStorage.setItem(key, body.token);
   load();
+}
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  pair(document.getElementById("code").value.trim());
 });
+// A pairing link carries its code after #; it is used once and taken out of the address.
+const linked = new URLSearchParams(location.hash.slice(1)).get("code");
+if (linked) {
+  history.replaceState(null, "", "/");
+  pair(linked);
+}
 load();
 setInterval(load, 3000);
 </script>

@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
-import { api, server, setServer, setToken, signInUrl, type Health } from "../api";
+import { api, deviceLabel, server, setServer, setToken, signInUrl, type Health } from "../api";
+
+/** The one-time code a pairing link carries after `#code=`, if this page was opened from one. */
+function linkedCode(): string | null {
+  const code = new URLSearchParams(window.location.hash.slice(1)).get("code") ?? new URLSearchParams(window.location.search).get("code");
+  return code?.trim() || null;
+}
 import { Field, Problem, Spinner, useAction } from "../ui";
+import { navigate } from "../router";
 
 export function SignIn() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -24,12 +31,28 @@ export function SignIn() {
 
   useEffect(() => {
     void probe();
+    // Opened from a pairing link: pair at once, with nothing to type, and take the code out
+    // of the address so it is not left in history or shared by accident.
+    const linked = linkedCode();
+    if (!linked) return;
+    // The code leaves the address now. The route changes once signed in: by then the
+    // router is listening (this effect runs before the router's own on the first render).
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    setCode(linked);
+    void action.run("pair", async () => {
+      const me = deviceLabel();
+      const { token } = await api.pair(linked.toUpperCase(), me.label, me.kind);
+      setToken(token);
+      if (window.location.pathname === "/pair") navigate("/", true);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const pair = (event: React.FormEvent) => {
     event.preventDefault();
     void action.run("pair", async () => {
-      const { token } = await api.pair(code.trim().toUpperCase());
+      const me = deviceLabel();
+      const { token } = await api.pair(code.trim().toUpperCase(), me.label, me.kind);
       setToken(token);
     });
   };
@@ -49,7 +72,7 @@ export function SignIn() {
 
         {health && methods.includes("pairing") && (
           <form onSubmit={pair} className="stack">
-            <Field label="Pairing code" hint="The daemon printed it when it started: tm-daemon serve <project>">
+            <Field label="Pairing code" hint="The daemon printed it, and a link, when it started. Or open a pairing link from Connect on a device that is already signed in.">
               <input
                 className="code-input"
                 value={code}
@@ -57,12 +80,12 @@ export function SignIn() {
                 autoComplete="one-time-code"
                 autoCapitalize="characters"
                 spellCheck={false}
-                maxLength={8}
+                maxLength={16}
                 placeholder="XXXXXXXX"
                 autoFocus
               />
             </Field>
-            <button className="primary" disabled={code.trim().length < 8 || action.busy !== null}>
+            <button className="primary" disabled={code.trim().length < 8 || action.busy !== null} data-testid="pair-submit">
               {action.busy ? "Pairing…" : "Pair this device"}
             </button>
           </form>

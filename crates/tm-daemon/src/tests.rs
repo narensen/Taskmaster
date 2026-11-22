@@ -2125,6 +2125,86 @@ mod http {
     }
 
     #[tokio::test]
+    async fn devices_pair_by_link_and_an_outside_agent_drives_a_run_over_mcp() {
+        let tmp = repo("connect");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let anon = Client { addr: client.addr.clone(), token: None };
+
+        // The printed code still pairs, now with a name.
+        let (_, paired) = client.post("/api/pair", json!({ "code": code, "label": "Laptop" })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let (status, view) = client.get("/api/connect").await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["routes"][0]["kind"], "this-computer");
+        assert_eq!(view["only_this_computer"], true);
+        assert!(view["mcp_url"].as_str().unwrap().ends_with("/mcp"), "{view}");
+
+        // A one-time link: needs a signed-in device to make, pairs once, and names the device.
+        assert_eq!(anon.post("/api/pairing", json!({})).await.0, 401);
+        let (status, offer) = client.post("/api/pairing", json!({ "label": "Phone", "kind": "phone" })).await;
+        assert_eq!(status, 200, "{offer}");
+        let one_time = offer["code"].as_str().unwrap().to_string();
+        assert!(offer["links"][0]["url"].as_str().unwrap().ends_with(&format!("/pair#code={one_time}")), "{offer}");
+        let (status, phone) = anon.post("/api/pair", json!({ "code": one_time.to_lowercase(), "label": "Chrome on Android" })).await;
+        assert_eq!(status, 200, "{phone}");
+        assert_eq!(anon.post("/api/pair", json!({ "code": one_time })).await.0, 401, "a link is good once");
+        let phone = Client { addr: client.addr.clone(), token: Some(phone["token"].as_str().unwrap().to_string()) };
+        let (_, listed) = phone.get("/api/devices").await;
+        let devices = listed["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2, "{listed}");
+        assert_eq!((devices[0]["label"].as_str(), devices[0]["kind"].as_str(), devices[0]["current"].as_bool()), (Some("Phone"), Some("phone"), Some(true)));
+
+        // Revoked from the laptop, the phone is out at once.
+        let phone_id = devices[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(client.post(&format!("/api/devices/{phone_id}/revoke"), json!({})).await.0, 200);
+        assert_eq!(phone.get("/api/runs").await.0, 401);
+        assert_eq!(client.post(&format!("/api/devices/{phone_id}/revoke"), json!({})).await.0, 404);
+        let laptop_id = client.get("/api/devices").await.1["devices"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(client.post(&format!("/api/devices/{laptop_id}/rename"), json!({ "label": "Work laptop" })).await.0, 200);
+        assert_eq!(client.get("/api/devices").await.1["devices"][0]["label"], "Work laptop");
+
+        // An outside agent gets its own token and drives a run over MCP.
+        let (_, minted) = client.post("/api/devices/agent", json!({ "label": "Claude Code" })).await;
+        let agent = Client { addr: client.addr.clone(), token: Some(minted["token"].as_str().unwrap().to_string()) };
+        let rpc = |id: u64, method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        assert_eq!(anon.post("/mcp", rpc(1, "initialize", json!({}))).await.0, 401);
+        let (_, init) = agent.post("/mcp", rpc(1, "initialize", json!({ "protocolVersion": "2025-06-18" }))).await;
+        assert_eq!(init["result"]["serverInfo"]["name"], "taskmaster", "{init}");
+        assert_eq!(agent.post("/mcp", json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await.0, 202);
+        let (_, tools) = agent.post("/mcp", rpc(2, "tools/list", json!({}))).await;
+        let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        for want in ["taskmaster_start_run", "taskmaster_wait", "taskmaster_read_run", "taskmaster_send_note", "taskmaster_preview"] {
+            assert!(names.contains(&want), "{names:?}");
+        }
+        let call = |id: u64, name: &str, args: Value| rpc(id, "tools/call", json!({ "name": name, "arguments": args }));
+        let (_, started) = agent.post("/mcp", call(3, "taskmaster_start_run", json!({ "prompt": "A landing page that says hello", "mode": "agent", "approve": true }))).await;
+        assert_eq!(started["result"]["isError"], false, "{started}");
+        let run = started["result"]["structuredContent"]["id"].as_str().unwrap().to_string();
+        assert!(started["result"]["structuredContent"]["link"].as_str().unwrap().ends_with(&format!("/runs/{run}")));
+        let (_, waited) = agent.post("/mcp", call(4, "taskmaster_wait", json!({ "run": run, "timeout_secs": 60 }))).await;
+        assert_eq!(waited["result"]["structuredContent"]["state"], "done", "{waited}");
+        let (_, read) = agent.post("/mcp", call(5, "taskmaster_read_run", json!({ "run": run }))).await;
+        let summary = read["result"]["structuredContent"]["summary"].as_str().unwrap();
+        assert!(summary.contains("A landing page that says hello") && summary.contains("[page:agent]"), "{summary}");
+        let (_, wrong) = agent.post("/mcp", call(6, "taskmaster_run_status", json!({ "run": "nope" }))).await;
+        assert_eq!(wrong["result"]["isError"], true, "{wrong}");
+        let (_, missing) = agent.post("/mcp", call(7, "taskmaster_start_run", json!({}))).await;
+        assert!(missing["result"]["content"][0]["text"].as_str().unwrap().contains("`prompt` is required"));
+        let devices = client.get("/api/devices").await.1;
+        assert!(devices["devices"].as_array().unwrap().iter().any(|d| d["kind"] == "agent" && d["label"] == "Claude Code"), "{devices}");
+        // The agent's token reaches the MCP server and nothing else.
+        assert_eq!(agent.get("/api/runs").await.0, 403);
+        assert_eq!(agent.post("/api/pairing", json!({})).await.0, 403);
+        assert_eq!(agent.post(&format!("/api/devices/{laptop_id}/revoke"), json!({})).await.0, 403);
+
+        // A pairing link opens a page even without the web app.
+        let (status, page) = anon.text("/pair").await;
+        assert_eq!(status, 200);
+        assert!(page.contains("Taskmaster") && !page.contains("#code") && page.contains("location.hash"), "the page reads the code from the link");
+    }
+
+    #[tokio::test]
     async fn skills_are_searched_installed_toggled_updated_and_removed_over_the_api() {
         let tmp = seeded("skills-api");
         let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());

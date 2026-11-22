@@ -3,7 +3,7 @@
 // and accessed files. A toggleable side panel holds files, diff, preview, and terminal.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertCircle, ArrowDown, Check, FileDiff, GitBranch, GitMerge, Loader2, MessageSquareText, Network, PanelRight } from "lucide-react";
+import { Activity, AlertCircle, ArrowDown, Check, FileDiff, GitBranch, GitMerge, Link2, Loader2, MessageSquareText, Network, PanelRight } from "lucide-react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import { api, type DiffStats, type ReviewJob, type RunDetail } from "../api";
 import { takeAttachments } from "../App";
@@ -764,6 +764,16 @@ export function RunView({ id }: { id: string }) {
             </button>
           )}
           {pr && <ExternalLink href={pr}>pull request</ExternalLink>}
+          <button
+            type="button"
+            className="ghost small icon-btn"
+            aria-label="Copy a link to this run"
+            title="Copy a link to this run (works on any device paired with this daemon)"
+            data-testid="copy-run-link"
+            onClick={() => void navigator.clipboard?.writeText(`${window.location.origin}/runs/${encodeURIComponent(id)}`).then(() => toast("Run link copied", undefined, 2000))}
+          >
+            <Link2 size={14} strokeWidth={1.7} aria-hidden />
+          </button>
           <button
             type="button"
             className={`ghost small icon-btn ${sideVisible ? "on" : ""}`}

@@ -3,7 +3,7 @@
 //! ```text
 //! tm-daemon providers [--harness <h>]
 //! tm-daemon report [<project>] [--run <id>] [--json]
-//! tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] [--commons <dir>]
+//! tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--dictionary <dir>] [--commons <dir>]
 //!                 [--web <dir>]
 //! tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] [--yes]
 //!           [--worker <h>] [--mid <h>] [--master <h>]
@@ -72,6 +72,8 @@ struct ServeArgs {
     project: PathBuf,
     bind: Option<SocketAddr>,
     tailscale: bool,
+    /// Listen on every address, so the local network and the tailnet can pair.
+    lan: bool,
     auto_resume: bool,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
@@ -222,6 +224,7 @@ async fn run() -> anyhow::Result<Outcome> {
             project: args.project.clone(),
             bind: None,
             tailscale: false,
+            lan: false,
             auto_resume: false,
             dictionary: config.dictionary.clone(),
             commons: config.commons.clone(),
@@ -300,6 +303,11 @@ async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Serv
     let server = Server::serve(options).await?;
     server.warm_providers();
     println!("taskmaster: api {}  code {code}", server.url);
+    // The same code as a link: open it on this machine, or on a device that can reach one
+    // of these addresses, and it signs in with nothing to type.
+    for link in server.pairing_links(&code) {
+        println!("taskmaster: pair {link}");
+    }
     Ok(server)
 }
 
@@ -332,12 +340,15 @@ fn bundled_web(exe: &std::path::Path) -> Vec<PathBuf> {
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    let bind = match (args.bind, args.tailscale) {
-        (Some(addr), _) => addr,
-        (None, true) => SocketAddr::from((IpAddr::V4(tailscale_ipv4()?), 8737)),
-        (None, false) => SocketAddr::from(([127, 0, 0, 1], 8737)),
+    let bind = match (args.bind, args.tailscale, args.lan) {
+        (Some(addr), _, _) => addr,
+        (None, _, true) => SocketAddr::from(([0, 0, 0, 0], 8737)),
+        (None, true, false) => SocketAddr::from((IpAddr::V4(tailscale_ipv4()?), 8737)),
+        (None, false, false) => SocketAddr::from(([127, 0, 0, 1], 8737)),
     };
-    if !bind.ip().is_loopback() && !matches!(bind.ip(), IpAddr::V4(ip) if tm_daemon::is_tailscale(ip)) {
+    if args.lan || bind.ip().is_unspecified() {
+        eprintln!("taskmaster: listening on the local network and the tailnet; a pairing code or link is all that keeps other devices out");
+    } else if !bind.ip().is_loopback() && !matches!(bind.ip(), IpAddr::V4(ip) if tm_daemon::is_tailscale(ip)) {
         eprintln!("taskmaster: {bind} is neither this machine nor its tailnet; anyone who can reach it can try the code");
     }
     if args.auto_resume
@@ -533,7 +544,7 @@ fn eval_args(argv: &[String]) -> anyhow::Result<EvalMode> {
 }
 
 fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
-    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--tailscale] [--auto-resume] [--dictionary <dir>] \
+    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--auto-resume] [--dictionary <dir>] \
                  [--commons <dir>] [--web <dir>]";
     let mut argv = argv.iter().cloned();
     let project = argv.next().filter(|arg| !arg.starts_with('-')).context(usage)?;
@@ -541,6 +552,7 @@ fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
         project: PathBuf::from(project),
         bind: None,
         tailscale: false,
+        lan: false,
         auto_resume: false,
         dictionary: None,
         commons: None,
@@ -549,6 +561,7 @@ fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--tailscale" => args.tailscale = true,
+            "--lan" => args.lan = true,
             "--auto-resume" => args.auto_resume = true,
             "--bind" => {
                 let value = need(&mut argv, "--bind", usage)?;
@@ -592,7 +605,7 @@ async fn print_providers(harness: Option<&str>) -> anyhow::Result<()> {
 
 /// What `tm-daemon --help` prints, and what a wrong command line is answered with.
 const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
-                     tm-daemon serve <project> [--bind <addr>] [--tailscale] [--auto-resume] [--web <dir>]\n       \
+                     tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--auto-resume] [--web <dir>]\n       \
                      tm-daemon eval --suite <dir> [--check-only]\n       \
                      tm-daemon eval --gate <baseline.jsonl> <candidate.jsonl> [--max-cost-pct <n>]\n       \
                      tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]\n       \

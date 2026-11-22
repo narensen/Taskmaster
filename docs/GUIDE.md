@@ -89,7 +89,24 @@ Or use the app:
 
 ```bash
 cd web && npm ci && npm run build
-tm-daemon serve . --web web/dist         # http://127.0.0.1:8737, pair with the printed code
+tm-daemon serve . --web web/dist         # http://127.0.0.1:8737, pair with the printed code or link
+tm-daemon serve . --lan                  # reachable from the local network and the tailnet too
+```
+
+The Connect page (`/connect`) pairs other devices with a one-time link or QR code, lists and
+revokes paired devices, adds other machines by their pairing link, and gives outside agents an
+MCP server at `/mcp` with a token of their own. The API behind it:
+
+```text
+GET  /api/connect               how this daemon can be reached: one route per address
+POST /api/pairing               {label?, kind?, ttl_secs?} -> a one-time code and a link per route
+POST /api/pair                  {code, label?, kind?} -> {token}: the printed code or a link's code
+GET  /api/devices               paired devices, the caller marked `current`
+POST /api/devices/{id}/rename   {label}
+POST /api/devices/{id}/revoke   its token stops working at once
+POST /api/devices/agent         {label} -> a token for an outside agent, shown once
+POST /mcp                       MCP (JSON-RPC over HTTP): taskmaster_list_runs, _start_run, _run_status,
+                                _wait, _read_run, _send_note, _approve, _cancel, _preview
 ```
 
 `tm-daemon` exits 0 when the run finishes clean, 1 when it fails, 2 when the plan is waiting for `--yes`, and 3 when a provider stopped it (a usage limit, no balance left, a sign-in); run the same command again to resume. `--timeout 0` lets an agent call run with no time limit.

@@ -78,6 +78,7 @@ sha256sum -c SHA256SUMS.txt
 
 ```bash
 tm-daemon serve .                            # start the Studio at http://127.0.0.1:8737
+tm-daemon serve . --lan                      # also reachable from the local network and tailnet (pair with a link)
 tm-daemon serve . --auto-resume              # resume unfinished runs on daemon startup
 tm-daemon . --prompt "A notes app with a list and an editor."
 tm-daemon . --yes                            # approve the plan and build it
@@ -87,6 +88,24 @@ tm-daemon eval --suite bench/suite --check-only
 ```
 
 The [guide](docs/GUIDE.md) covers roles, configuration, the HTTP API, Commons, and reviewing any repository standalone with `tm-review`.
+
+## Connect
+
+Everything that reaches the daemon lives on the **Connect** page (`/connect`, or `Ctrl+K` → *Pair a phone*).
+
+- **Pair a device with a link.** *Make pairing link* shows a QR code and one link per address the daemon has (this computer, the local network, Tailscale). Opening it on a phone or another computer signs that device in with nothing to type. A link works once, for ten minutes; the code rides after `#`, so it never reaches a server log. The daemon also prints a link for its startup code.
+- **Reach it from other devices.** `tm-daemon serve . --lan` listens on the local network and the tailnet; `--tailscale` on the tailnet only. By default only this computer can connect.
+- **Devices.** Every paired device has a name, a kind and a last-seen time. Rename it, or revoke it: its token stops working at once.
+- **Other machines.** Paste another daemon's pairing link to add it; its runs, status and what needs you show beside this one's.
+- **Outside agents over MCP.** Make a token for Claude Code, Codex, Cursor or any MCP client and paste the setup shown, for example:
+
+  ```bash
+  claude mcp add --transport http taskmaster http://127.0.0.1:8737/mcp --header "Authorization: Bearer <token>"
+  ```
+
+  The agent can then list, start (`mode`: auto, code or agent), wait for, read, steer, approve, cancel and preview runs. Each tool calls the same handlers the app does.
+- **Prompt links.** `/runs/new?prompt=…&mode=agent` opens New Run with the prompt ready; it never sends on its own, and hidden characters are removed with a warning. Every run has a *Copy link* button.
+- **Reconnects.** If the daemon stops answering, a line says so and retries with backoff; the page catches up when it answers.
 
 ## Web access & local-first docs
 

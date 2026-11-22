@@ -7,7 +7,7 @@ import { navigate } from "./router";
 export interface Command {
   id: string;
   label: string;
-  group: "Go" | "Run" | "Panel" | "Agent";
+  group: "Go" | "Run" | "Panel" | "Agent" | "Connect";
   hint?: string;
   run: () => void;
 }
@@ -67,6 +67,9 @@ export function commands(ctx: RunContext | null = runContext): Command[] {
     go("skills", "Skills", "/skills"),
     go("providers", "Providers", "/providers"),
     go("settings", "Settings", "/settings"),
+    { id: "pair-device", label: "Pair a phone or another computer", group: "Connect", hint: "A one-time link and QR code", run: () => navigate("/connect#pair") },
+    { id: "connect-agent", label: "Use Taskmaster from Claude Code or Codex (MCP)", group: "Connect", hint: "A token and copy-paste setup", run: () => navigate("/connect#agents") },
+    { id: "add-machine", label: "Add another machine", group: "Connect", hint: "Paste its pairing link", run: () => navigate("/connect#machines") },
   ];
   if (ctx) {
     list.push({ id: "agent-master", label: "Master", group: "Agent", run: () => ctx.focusAgent("master") });

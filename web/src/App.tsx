@@ -18,6 +18,7 @@ import {
   Loader2,
   Pin,
   PinOff,
+  Plug,
   Plus,
   Puzzle,
   Search,
@@ -29,7 +30,7 @@ import { api, setToken, token, tokenFromRedirect, type RunSummary } from "./api"
 import { Link, match, navigate, usePath } from "./router";
 import { Gallery } from "./pages/Gallery";
 import { SignIn } from "./pages/SignIn";
-import { ContextMenu, Toasts, emit, openMenu, undoLatest, useOn, type Chip } from "./overlay";
+import { ContextMenu, Toasts, emit, openMenu, toast, undoLatest, useOn, type Chip } from "./overlay";
 import type { PaletteState } from "./palette";
 import { openProject } from "./openProject";
 import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
@@ -40,6 +41,7 @@ import { useLoad } from "./ui";
 import { typing } from "./keys";
 import { RunBar } from "./run/Meter";
 import { TitleBar, type Crumb } from "./shell/TitleBar";
+import { ConnectionBanner } from "./shell/Connection";
 import { QuickTerminal } from "./lazy";
 import { TipProvider } from "./components/Tip";
 import { prefetchRun, useSettings } from "./query";
@@ -61,6 +63,7 @@ const NAV: { to: string; label: string; icon: LucideIcon; active?: (p: string) =
   { to: "/reviews", label: "Reviews", icon: GitPullRequest },
   { to: "/skills", label: "Skills", icon: Puzzle },
   { to: "/providers", label: "Providers", icon: Cpu },
+  { to: "/connect", label: "Connect", icon: Plug },
   { to: "/settings", label: "Settings", icon: Settings },
 ];
 
@@ -112,6 +115,7 @@ const loaders = {
   providers: () => import("./pages/Providers"),
   skills: () => import("./pages/Skills"),
   settings: () => import("./pages/Settings"),
+  connect: () => import("./pages/Connect"),
   files: () => import("./pages/Files"),
 };
 const Dictionary = lazy(() => loaders.dictionary().then((m) => ({ default: m.Dictionary })));
@@ -124,6 +128,7 @@ const RunView = lazy(() => loaders.run().then((m) => ({ default: m.RunView })));
 const Providers = lazy(() => loaders.providers().then((m) => ({ default: m.Providers })));
 const Skills = lazy(() => loaders.skills().then((m) => ({ default: m.Skills })));
 const SettingsPage = lazy(() => loaders.settings().then((m) => ({ default: m.Settings })));
+const ConnectPage = lazy(() => loaders.connect().then((m) => ({ default: m.Connect })));
 const Files = lazy(() => loaders.files().then((m) => ({ default: m.Files })));
 
 function usePrefetchScreens() {
@@ -151,7 +156,7 @@ function Page({ path }: { path: string }) {
 
 function Screen({ path }: { path: string }) {
   let params: Record<string, string> | null;
-  if (path === "/" || path === "/runs") return <Gallery />;
+  if (path === "/" || path === "/runs" || path === "/pair") return <Gallery />;
   if (path === "/runs/new") return <NewRun />;
   if (path === "/files") return <Files />;
   if (path === "/knowledge") return <Knowledge />;
@@ -163,6 +168,7 @@ function Screen({ path }: { path: string }) {
   if (path === "/providers") return <Providers />;
   if (path === "/skills") return <Skills />;
   if (path === "/settings") return <SettingsPage />;
+  if (path === "/connect") return <ConnectPage />;
   return (
     <div className="page">
       <h1>Nothing here</h1>
@@ -189,6 +195,7 @@ const PAGE_NAMES: Record<string, string> = {
   "/providers": "Providers",
   "/skills": "Skills",
   "/settings": "Settings",
+  "/connect": "Connect",
 };
 
 /** Project, then the run or page: parents dimmed, the current one in full ink. */
@@ -455,6 +462,14 @@ export function App() {
 
   useEffect(() => {
     if (signedIn && path === "/signed-in") navigate("/", true);
+    // A pairing link opened in a browser that is already signed in: leave the link unused,
+    // so another device can still take it.
+    if (signedIn && path === "/pair") {
+      const had = new URLSearchParams(window.location.hash.slice(1)).has("code");
+      // After this render's effects, so the router is already listening on a first load.
+      window.setTimeout(() => navigate("/", true), 0);
+      if (had) toast("Already paired", "This browser is signed in. The link was not used, so another device can still open it.", 6000);
+    }
   }, [signedIn, path]);
 
   useEffect(() => {
@@ -591,6 +606,7 @@ export function App() {
           </aside>
           {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
           <main className="main">
+            <ConnectionBanner />
             <div key={path} className="route">
               <Page path={path} />
             </div>

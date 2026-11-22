@@ -766,6 +766,85 @@ export class ApiError extends Error {
   }
 }
 
+export type DeviceKind = "browser" | "phone" | "desktop" | "machine" | "agent";
+
+/** One way to reach the daemon: this computer, the local network, the tailnet. */
+export interface ConnectRoute {
+  kind: "this-computer" | "local-network" | "tailscale" | "network";
+  address: string;
+  /** Ends in `/`. */
+  url: string;
+}
+
+export interface ConnectView {
+  version: string;
+  bind: string;
+  /** Only this computer can reach the daemon: it listens on loopback. */
+  only_this_computer: boolean;
+  routes: ConnectRoute[];
+  tailscale: { running: boolean; ip: string | null; dns: string | null };
+  mcp_url: string;
+  project: string;
+  kinds: DeviceKind[];
+}
+
+export interface PairingOffer {
+  code: string;
+  label: string;
+  kind: DeviceKind | "";
+  expires_at: string;
+  links: ConnectRoute[];
+}
+
+export interface Device {
+  id: string;
+  label: string;
+  kind: DeviceKind;
+  created: string;
+  last_seen: string | null;
+  current: boolean;
+}
+
+/** What this browser calls itself when it pairs: "Chrome on Android", "Firefox on Linux". */
+export function deviceLabel(ua = navigator.userAgent): { label: string; kind: DeviceKind } {
+  const os = /Android/i.test(ua) ? "Android" : /iPhone|iPad/i.test(ua) ? "iOS" : /Mac OS X/i.test(ua) ? "macOS" : /Windows/i.test(ua) ? "Windows" : /Linux/i.test(ua) ? "Linux" : "";
+  const browser = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+  const phone = /Android|iPhone|iPad/i.test(ua);
+  if ((window as unknown as { __TAURI__?: unknown }).__TAURI__) return { label: `Desktop app${os ? ` on ${os}` : ""}`, kind: "desktop" };
+  return { label: os ? `${browser} on ${os}` : browser, kind: phone ? "phone" : "browser" };
+}
+
+/** A pairing link's parts: the daemon's address and the one-time code after `#code=`. */
+export function parsePairingLink(text: string): { base: string; code: string } | null {
+  try {
+    const url = new URL(text.trim());
+    const code = new URLSearchParams(url.hash.slice(1)).get("code") ?? url.searchParams.get("code");
+    if (!code || !/^https?:$/.test(url.protocol)) return null;
+    return { base: url.origin, code: code.trim() };
+  } catch {
+    return null;
+  }
+}
+
+/** Pair with another daemon from its link; returns its address and the token it gave. */
+export async function pairAt(link: string, label: string): Promise<{ url: string; token: string }> {
+  const parsed = parsePairingLink(link);
+  if (!parsed) throw new Error("That is not a pairing link. It looks like http://host:8737/pair#code=…");
+  let response: Response;
+  try {
+    response = await fetch(`${parsed.base}/api/pair`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: parsed.code, label, kind: "machine" }),
+    });
+  } catch {
+    throw new Error(`Cannot reach ${parsed.base}. Is it on this network, and listening there (tm-daemon serve --lan)?`);
+  }
+  const body = (await response.json().catch(() => null)) as { token?: string; error?: string } | null;
+  if (!response.ok || !body?.token) throw new Error(body?.error ?? "That link was refused: it may be used or expired. Ask for a new one.");
+  return { url: parsed.base, token: body.token };
+}
+
 /** Call another daemon with its own address and token (for gallery cards of other daemons). */
 export async function callAt<T>(base: string, bearer: string | null, path: string): Promise<T> {
   const response = await fetch(base.replace(/\/+$/, "") + path, {
@@ -773,6 +852,20 @@ export async function callAt<T>(base: string, bearer: string | null, path: strin
   });
   if (!response.ok) throw new ApiError(response.status, `${response.status} ${response.statusText}`);
   return (await response.json()) as T;
+}
+
+/**
+ * Whether the daemon answered the last request. The connection banner listens for
+ * `taskmaster-connection` and probes `/api/health` until it answers again.
+ */
+let reachable = true;
+export function daemonReachable(): boolean {
+  return reachable;
+}
+function setReachable(next: boolean) {
+  if (next === reachable) return;
+  reachable = next;
+  window.dispatchEvent(new CustomEvent("taskmaster-connection", { detail: next }));
 }
 
 async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
@@ -788,8 +881,10 @@ async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: u
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {
+    setReachable(false);
     throw new ApiError(0, `cannot reach the daemon${server() ? ` at ${server()}` : ""}`);
   }
+  setReachable(true);
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
@@ -1160,7 +1255,13 @@ export function searchWeb(q: string, endpoint: string) {
 
 export const api = {
   health: () => call<Health>("GET", "/api/health"),
-  pair: (code: string) => call<{ token: string }>("POST", "/api/pair", { code }),
+  pair: (code: string, label?: string, kind?: DeviceKind) => call<{ token: string }>("POST", "/api/pair", { code, label: label ?? "", kind: kind ?? "" }),
+  connect: () => call<ConnectView>("GET", "/api/connect"),
+  createPairing: (body: { label?: string; kind?: DeviceKind; ttl_secs?: number }) => call<PairingOffer>("POST", "/api/pairing", body),
+  devices: () => call<{ devices: Device[] }>("GET", "/api/devices").then((r) => r.devices),
+  renameDevice: (id: string, label: string) => call<{ ok: boolean }>("POST", `/api/devices/${enc(id)}/rename`, { label }),
+  revokeDevice: (id: string) => call<{ ok: boolean }>("POST", `/api/devices/${enc(id)}/revoke`, {}),
+  mintAgent: (label: string) => call<{ token: string; id: string; mcp_url: string }>("POST", "/api/devices/agent", { label }),
 
   runs: () => call<{ runs: RunSummary[] }>("GET", "/api/runs").then((r) => r.runs),
   run: (id: string) => call<RunDetail>("GET", `/api/runs/${enc(id)}`),

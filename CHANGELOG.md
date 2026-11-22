@@ -3,7 +3,7 @@
 What changed in each release, for the people who use Taskmaster. The section for a version is
 also its GitHub release notes (`scripts/release-notes.sh` takes it from here).
 
-## Unreleased
+## 0.1.7
 
 ### Faster runs
 
@@ -32,6 +32,18 @@ also its GitHub release notes (`scripts/release-notes.sh` takes it from here).
 - Cancel is graceful (finish what is running) or immediate, and a cancelled run can be resumed.
 - A run can have a spending cap.
 - The daemon log rotates at 8 MB.
+
+### Also in this release
+
+- Web access: daemon-mediated web search, an SSRF-safe fetch with pinned DNS, local docs, OSV
+  advisories, native search passthrough, planner research, Web access settings and a per-run Web
+  sources view.
+- Operations panels, issue import, attachments, PR CI sync, and installing the daemon as a service
+  from the web UI and `install.sh`.
+- Compiled working memory, a codebase atlas, policy-as-code, a preflight doctor and the four-lens
+  run studio.
+- Repair playbooks, brief hashing, schema migrations and stratified auto-routing.
+- Ops API routes, a CLI eval gate and a benchmark suite.
 
 ## 0.1.6
 

@@ -1822,7 +1822,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tm-commons"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "tm-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "globset",
  "serde",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "tm-daemon"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "tm-dictionary"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "tm-harness"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "tm-launcher"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "libc",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "tm-review"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "serde",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "tm-token"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "tm-verify"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "globset",

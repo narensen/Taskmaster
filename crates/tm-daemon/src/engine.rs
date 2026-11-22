@@ -665,6 +665,7 @@ impl Driver {
     async fn force_cancel(&mut self) -> anyhow::Result<()> {
         eprintln!("taskmaster: force-stopping run {}", self.id);
         self.abort_active().await;
+        self.live.close_open_calls(&self.id, "Stopped: the run was cancelled.");
         self.live.push(
             &self.id,
             &serde_json::json!({ "id": "master", "role": "master" }),
@@ -871,7 +872,7 @@ impl Driver {
                         || note.to.starts_with("unit:")
                 });
                 if pending {
-                    self.push_event(Event::FollowUp)?;
+                    self.open_turn()?;
                     return Ok(Step::Continue);
                 }
                 let ok = self.run.phase == RunPhase::Done;
@@ -892,7 +893,14 @@ impl Driver {
         let mut errors: Vec<String> = Vec::new();
         let mut rejected: Option<String> = None;
         let master_notes = self.live.take_notes(&self.id, &["master"]);
-        if self.lite_edit_pass(prompt) && master_notes.is_empty() {
+        if self.config.mode == crate::RunMode::Agent {
+            let mut plan = crate::turns::agent_plan(prompt, &master_notes, self.existing_files());
+            self.settle_skills(&mut plan, prompt);
+            self.records.save_plan(&self.id, &plan)?;
+            eprintln!("taskmaster: agent mode: one agent owns the project (no master planning)");
+            return Ok(plan);
+        }
+        if self.config.mode != crate::RunMode::Code && self.lite_edit_pass(prompt) && master_notes.is_empty() {
             let mut plan = crate::small::lite_edit_plan(prompt);
             self.settle_skills(&mut plan, prompt);
             self.records.save_plan(&self.id, &plan)?;
@@ -4679,12 +4687,33 @@ impl Driver {
         self.records.save_book(&book)
     }
 
+    /// A note on a finished run starts a new turn: one agent with the note as its task, or
+    /// the master and its workers, as [`crate::turns::turn_mode`] decides.
+    fn open_turn(&mut self) -> anyhow::Result<()> {
+        let pending: Vec<crate::live::Note> = self.live.notes(&self.id).into_iter().filter(|note| !note.delivered).collect();
+        let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
+        let mode = crate::turns::turn_mode(&pending, self.config.mode);
+        if mode != crate::RunMode::Agent {
+            let (agent, fields) = crate::turns::turn_entry(turn, mode, &pending);
+            self.live.push(&self.id, &agent, "turn", fields);
+            return self.push_event(Event::FollowUp);
+        }
+        let taken = self.live.take_fresh_where(&self.id, |_| true);
+        let failed = (self.run.phase == RunPhase::Failed).then_some("the run did not pass its checks");
+        let asked = self.records.request(&self.id).ok().flatten().and_then(|request| request.prompt).or_else(|| self.config.prompt.clone());
+        let plan = crate::turns::turn_plan(turn, &taken, asked.as_deref(), self.run.plan.as_ref(), failed);
+        let (agent, fields) = crate::turns::turn_entry(turn, mode, &taken);
+        self.live.push(&self.id, &agent, "turn", fields);
+        self.push_event(Event::AgentTurn { plan })?;
+        self.grant_pages()
+    }
+
     /// True when a follow-up reopened this page and it has not been built since.
     fn opened_by_note(&self, page: &str) -> bool {
         let mut opened = false;
         for event in &self.events {
             match event {
-                Event::FollowUp => opened = true,
+                Event::FollowUp | Event::AgentTurn { .. } => opened = true,
                 Event::WorkerFinished { page: id, .. } | Event::PageFresh { page: id } if id == page => opened = false,
                 _ => {}
             }
@@ -4760,7 +4789,7 @@ impl Driver {
     fn open_tree(&mut self, base: Option<&str>) -> anyhow::Result<()> {
         let Some(branch) = self.branch.clone() else { return Ok(()) };
         if !git::branch_exists(&self.project, &branch) {
-            let followed_up = self.events.iter().any(|event| matches!(event, Event::FollowUp));
+            let followed_up = self.events.iter().any(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. }));
             if followed_up || matches!(self.run.phase, RunPhase::Done | RunPhase::Failed) {
                 // Delivered and tidied away on an earlier pass. A follow-up continues
                 // on the project as it stands, rather than recreating the old branch.

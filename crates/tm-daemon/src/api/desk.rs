@@ -189,6 +189,9 @@ pub async fn notes(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) ->
 pub struct NoteBody {
     to: String,
     text: String,
+    /// On a finished run: `agent`, `code` or `auto` for the turn this note starts.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 pub fn valid_recipient(to: &str) -> bool {
@@ -203,7 +206,13 @@ pub async fn add_note(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>,
     if body.text.trim().is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "a note needs text"));
     }
-    let note = app.live.add_note(&id, &body.to, body.text.trim())?;
+    let mode = body.mode.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    if let Some(mode) = mode
+        && crate::RunMode::parse(mode).is_none()
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, format!("unknown mode `{mode}`: use `auto`, `code` or `agent`")));
+    }
+    let note = app.live.add_note_as(&id, &body.to, body.text.trim(), mode)?;
     app.wake_for_note(&id)?;
     ok(json!(note))
 }
@@ -934,17 +943,13 @@ pub async fn preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) 
 
 pub async fn start_preview(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
     let run = app.known(&id)?;
-    if !app.previews.available() {
-        return Err(fail(StatusCode::CONFLICT, "this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file"));
-    }
     let meta = app.records().meta(&id)?;
-    if meta.is_none() || matches!(run.phase, RunPhase::Planning | RunPhase::AwaitingApproval) {
+    if meta.is_none() || matches!(run.phase, RunPhase::Planning | RunPhase::AwaitingApproval) && run.pages.values().all(|p| p.state != tm_core::PageState::Passed) {
         return Err(fail(StatusCode::CONFLICT, "there is nothing to preview until the run has started building"));
     }
-    if app.is_active(&id) && run.phase != RunPhase::Done {
-        return Err(fail(StatusCode::CONFLICT, "the run is still building; preview it when it stops"));
-    }
-    // A run still on its branch is previewed from that branch; a merged one from the project.
+    // A run still on its branch is previewed from that branch (a detached checkout, so it
+    // works while the run builds: it shows what has passed so far); a merged one from the
+    // project.
     let branch = meta.and_then(|m| m.branch).filter(|branch| crate::git::branch_exists(&app.project(), branch));
     match app.previews.start(&id, branch.as_deref()).await {
         Ok(_) => accepted(preview_view(&app, &id)),

@@ -858,6 +858,7 @@ impl App {
         }
         config.models = request.models;
         config.template = request.template;
+        config.mode = request.mode;
         config.dictionary = Some(self.dictionary().clone());
         config.commons = Some(self.commons().clone());
         config.store = self.store.clone();
@@ -884,6 +885,13 @@ impl App {
                 crate::log::note(&format!("run {id}: {line}"));
             }
             crate::telemetry::record(&app.project(), if result.is_ok() { "run_finished" } else { "run_failed" });
+            // Nothing drives the run now: a call still open was cut off, not working.
+            let why = if app.records().events(&id).ok().and_then(|events| events.last().cloned()) == Some(tm_core::Event::Cancelled) {
+                "Stopped: the run was cancelled."
+            } else {
+                "Stopped: the run ended before this call did."
+            };
+            app.live.close_open_calls(&id, why);
             app.record_outcome(&id, result);
             app.active.lock().unwrap().remove(&id);
             app.summary_cache.lock().unwrap().remove(&(app.project(), id.clone()));
@@ -898,7 +906,7 @@ impl App {
     /// A note on a finished run starts the master again. The event is written before the
     /// driver starts, so a crash mid-follow-up resumes the pages instead of stopping.
     fn wake_for_note(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
-        let _notes = self.live.write_lock();
+        let notes = self.live.write_lock();
         if self.is_active(id) {
             return Ok(());
         }
@@ -909,22 +917,48 @@ impl App {
         if !matches!(run.phase, RunPhase::Done | RunPhase::Failed) || run.pages.is_empty() {
             return Ok(());
         }
-        if !self.live.has_pending_where(id, |_| true) {
+        let pending: Vec<crate::live::Note> = self.live.notes(id).into_iter().filter(|note| !note.delivered).collect();
+        if pending.is_empty() {
             return Ok(());
         }
+        let request = self.request_for(id)?;
         let mut events = self.records().events(id)?;
-        let appended = !matches!(events.last(), Some(Event::FollowUp));
+        let turn = events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
+        let mode = crate::turns::turn_mode(&pending, request.mode);
+        let mut taken: Vec<String> = Vec::new();
+        let appended = match events.last() {
+            Some(Event::FollowUp | Event::AgentTurn { .. }) => false,
+            _ if mode == crate::RunMode::Agent => {
+                // One agent takes the notes as its task: the master does not read them first.
+                let notes_taken = self.live.take_fresh_held(&notes, id, |_| true);
+                taken = notes_taken.iter().map(|note| note.id.clone()).collect();
+                let failed = (run.phase == RunPhase::Failed).then(|| self.records().status(id).ok().flatten()).flatten();
+                let error = failed.as_ref().and_then(|status| status["error"].as_str()).map(str::to_string)
+                    .or_else(|| (run.phase == RunPhase::Failed).then(|| "the run did not pass its checks".to_string()));
+                let plan = crate::turns::turn_plan(turn, &notes_taken, request.prompt.as_deref(), run.plan.as_ref(), error.as_deref());
+                let (agent, fields) = crate::turns::turn_entry(turn, mode, &notes_taken);
+                self.live.push_held(&notes, id, &agent, "turn", fields);
+                events.push(Event::AgentTurn { plan });
+                true
+            }
+            _ => {
+                let (agent, fields) = crate::turns::turn_entry(turn, mode, &pending);
+                self.live.push_held(&notes, id, &agent, "turn", fields);
+                events.push(Event::FollowUp);
+                true
+            }
+        };
         if appended {
-            events.push(Event::FollowUp);
             self.records().save_events(id, &events)?;
         }
         // The lock is held through start so a second note cannot start a second driver.
-        match self.start(id, self.request_for(id)?, Decision::Continue) {
+        match self.start(id, request, Decision::Continue) {
             Ok(()) => Ok(()),
             Err(err) => {
                 if appended {
                     events.pop();
                     let _ = self.records().save_events(id, &events);
+                    self.live.return_held(&notes, id, &taken);
                 }
                 Err(err)
             }
@@ -1038,6 +1072,17 @@ struct NewRun {
     timeout_secs: Option<u64>,
     template: Option<String>,
     max_cost_usd: Option<f64>,
+    /// `auto` (the default), `code` (master and workers) or `agent` (one agent).
+    mode: Option<String>,
+}
+
+/// The run mode a request names. A missing one is `auto`.
+fn mode_of(text: Option<&str>) -> Result<crate::RunMode, ApiError> {
+    match text {
+        None => Ok(crate::RunMode::Auto),
+        Some(text) => crate::RunMode::parse(text)
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, format!("unknown mode `{text}`: use `auto`, `code` or `agent`"))),
+    }
 }
 
 /// The saved defaults with the request's own choices laid over them.
@@ -1083,6 +1128,7 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
         timeout_secs: body.timeout_secs,
         template: body.template,
         max_cost_usd: body.max_cost_usd,
+        mode: mode_of(body.mode.as_deref())?,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.start(&id, request.clone(), decision)?;
@@ -1386,6 +1432,8 @@ struct NewProject {
     timeout_secs: Option<u64>,
     template: Option<String>,
     max_cost_usd: Option<f64>,
+    /// `auto`, `code` or `agent`, as on a new run.
+    mode: Option<String>,
     /// Open the new project in this daemon. Defaults to true when a prompt or plan is sent.
     switch: Option<bool>,
 }
@@ -1498,6 +1546,7 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
         timeout_secs: body.timeout_secs,
         template: body.template,
         max_cost_usd: body.max_cost_usd,
+        mode: mode_of(body.mode.as_deref())?,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.start(&id, request.clone(), decision)?;

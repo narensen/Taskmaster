@@ -120,6 +120,10 @@ pub enum Event {
     /// A note arrived after the run had finished. The master reads it, then the pages
     /// are built again.
     FollowUp,
+    /// A note arrived after the run had finished, for one agent rather than the master and
+    /// its workers. `plan` is that agent's one unit, owning the whole project: it replaces
+    /// the run's plan for this turn, so nothing that already passed is built again.
+    AgentTurn { plan: Plan },
     /// A cancelled run was resumed: pages that already passed stay passed, and only
     /// unfinished pages are queued again.
     Resumed,
@@ -366,6 +370,24 @@ impl Run {
                         plan.contracts.push(contract);
                     }
                 }
+                out.push(Command::LockContracts);
+                self.settle(&mut out);
+            }
+            (RunPhase::Done | RunPhase::Failed, Event::AgentTurn { plan }) => {
+                self.phase = RunPhase::Building;
+                self.pages = plan
+                    .pages
+                    .iter()
+                    .map(|p| {
+                        let page = PageRun { state: PageState::Queued, tier: Tier::Worker, repairs: 0, stale: false, pending_errors: None, last_failure: None };
+                        (p.id.clone(), page)
+                    })
+                    .collect();
+                self.plan = Some(plan);
+                self.dirty.clear();
+                self.pending_findings.clear();
+                self.phase_at = 0;
+                self.next_phase = None;
                 out.push(Command::LockContracts);
                 self.settle(&mut out);
             }
@@ -815,6 +837,37 @@ mod tests {
         assert!(run.step(Event::PlanApproved).is_empty());
         assert!(run.step(finished("ghost", WorkerOutcome::Passed)).is_empty());
         assert_eq!(run.phase, RunPhase::Planning);
+    }
+
+    #[test]
+    fn an_agent_turn_builds_one_unit_and_leaves_the_old_pages_alone() {
+        let mut run = Run::new(4);
+        run.step(Event::PlanReady(plan(&[("a", &[]), ("b", &[])])));
+        run.step(Event::PlanApproved);
+        run.step(Event::WorkerFinished { page: "a".into(), outcome: WorkerOutcome::Passed });
+        run.step(Event::WorkerFinished { page: "b".into(), outcome: WorkerOutcome::Blocked { reason: "no shell".into() } });
+        assert_eq!(run.phase, RunPhase::Failed);
+
+        let mut agent = plan(&[("agent-1", &[])]);
+        agent.pages[0].owned_glob = "**".into();
+        let out = run.step(Event::AgentTurn { plan: agent });
+        assert_eq!(run.phase, RunPhase::Building);
+        assert_eq!(
+            out,
+            vec![Command::LockContracts, Command::SpawnWorker { page: "agent-1".into(), tier: Tier::Worker, errors: None }]
+        );
+        assert_eq!(run.pages.keys().collect::<Vec<_>>(), vec!["agent-1"], "the old pages are not rebuilt");
+
+        let out = run.step(Event::WorkerFinished { page: "agent-1".into(), outcome: WorkerOutcome::Passed });
+        assert_eq!(out, vec![Command::RunVerify]);
+        let out = run.step(Event::VerifyFinished { failing: BTreeMap::new(), ok: true });
+        assert_eq!(out, vec![Command::Finish { ok: true }]);
+        assert_eq!(run.phase, RunPhase::Done);
+        // Only a finished run takes one.
+        assert!(!run.clone().step(Event::AgentTurn { plan: plan(&[("x", &[])]) }).is_empty());
+        let mut building = Run::new(1);
+        building.step(Event::PlanReady(plan(&[("a", &[])])));
+        assert!(building.step(Event::AgentTurn { plan: plan(&[("x", &[])]) }).is_empty());
     }
 
     #[test]

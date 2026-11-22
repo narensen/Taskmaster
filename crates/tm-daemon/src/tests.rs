@@ -2425,9 +2425,9 @@ mod http {
         let (_, rest) = client.text(&format!("/api/runs/talk/stream?token={token}&agents_after={}", entries.len())).await;
         assert!(!rest.contains("event: agent"), "{rest}");
 
-        // A note after the run has finished starts a new master turn, then a worker.
+        // A note after the run has finished, in Code mode, starts a new master turn, then a worker.
         let before = world.calls.lock().unwrap().len();
-        let (status, noted) = client.post("/api/runs/talk/notes", json!({ "to": "master", "text": "rename the title" })).await;
+        let (status, noted) = client.post("/api/runs/talk/notes", json!({ "to": "master", "text": "rename the title", "mode": "code" })).await;
         assert_eq!(status, 200, "{noted}");
         client.settled("talk", "done").await;
         let briefs = world.calls.lock().unwrap().clone();
@@ -2438,6 +2438,28 @@ mod http {
         assert!(later[worker].contains("rename the title"), "the worker follows the master's decision: {}", later[worker]);
         let (_, notes) = client.get("/api/runs/talk/notes").await;
         assert!(notes["notes"].as_array().unwrap().iter().all(|note| note["delivered"] == true), "{notes}");
+
+        // In Agent mode the next note is one agent's task: no master turn, no page rebuilt.
+        assert_eq!(client.post("/api/runs/talk/notes", json!({ "to": "master", "text": "x", "mode": "nope" })).await.0, 400);
+        let before = world.calls.lock().unwrap().len();
+        let (status, noted) = client.post("/api/runs/talk/notes", json!({ "to": "master", "text": "the preview is blank: add the dev script", "mode": "agent" })).await;
+        assert_eq!(status, 200, "{noted}");
+        client.settled("talk", "done").await;
+        let briefs = world.calls.lock().unwrap().clone();
+        let later = &briefs[before..];
+        assert!(!later.iter().any(|brief| brief.contains("Read these notes")), "no master turn: {later:?}");
+        assert!(!later.iter().any(|brief| brief.contains("Build page `a`")), "page a is not rebuilt: {later:?}");
+        let agent = later.iter().find(|brief| brief.contains("agent-3")).expect("one agent takes the note");
+        assert!(agent.contains("add the dev script") && agent.contains("only agent"), "{agent}");
+        let (_, run) = client.get("/api/runs/talk").await;
+        assert_eq!(run["plan"]["pages"][0]["owned_glob"], "**", "{run}");
+        let (_, said) = client.get("/api/runs/talk/agents").await;
+        let turns: Vec<&Value> = said["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "turn").collect();
+        assert_eq!(turns.len(), 2, "each follow-up opens a turn in the transcript");
+        assert_eq!((turns[0]["mode"].as_str(), turns[0]["turn"].as_u64()), (Some("code"), Some(2)));
+        assert_eq!((turns[1]["mode"].as_str(), turns[1]["turn"].as_u64()), (Some("agent"), Some(3)));
+        assert_eq!(turns[1]["text"], "the preview is blank: add the dev script");
+        assert_eq!(turns[1]["agent"]["id"], "person");
     }
 
     #[tokio::test]
@@ -3203,6 +3225,8 @@ mod http {
         let tmp = repo("preview-cmd");
         assert_eq!(dev_command(&tmp.0, "", 3000), None);
         assert_eq!(dev_command(&tmp.0, "serve --port {port}", 4000).as_deref(), Some("serve --port 4000"));
+        // Installed packages, so no install step goes first (see the fallback test).
+        std::fs::create_dir_all(tmp.0.join("node_modules")).unwrap();
         std::fs::write(tmp.0.join("package.json"), r#"{"scripts":{"dev":"next dev"},"dependencies":{"next":"15"}}"#).unwrap();
         assert_eq!(dev_command(&tmp.0, "", 3001).as_deref(), Some("npm run dev -- -p 3001 -H 127.0.0.1"));
         std::fs::write(tmp.0.join("pnpm-lock.yaml"), "").unwrap();
@@ -3305,10 +3329,44 @@ mod http {
         until("the failure", || async { previews.status("r1").unwrap().state == "failed" }).await;
         let reason = previews.status("r1").unwrap().reason.unwrap();
         assert!(reason.contains("code 3") && reason.contains("cannot bind"), "{reason}");
-        // No dev server at all is an error before anything starts.
-        let none = Previews::new(project, String::new());
+        // No dev server and no page: the preview still opens, on a page listing the files.
+        let none = Previews::new(project.clone(), String::new());
         assert!(none.available(), "no scripts means static files");
-        assert!(none.start("r2", None).await.unwrap_err().to_string().contains("no dev server"));
+        let listed = none.start("r2", None).await.unwrap();
+        assert_eq!((listed.state, listed.command.as_str()), ("running", "built-in static file server"));
+        assert!(listed.reason.unwrap_or_default().contains("lists the project's files"));
+        none.stop("r2");
+
+        // A dev server that dies before it answers, in a project with a page: the files are
+        // served instead, and the reason says why.
+        std::fs::write(project.join("index.html"), "<h1>fallback</h1>").unwrap();
+        let dying = Previews::new(project, "echo boom >&2; exit 4".into());
+        dying.start("r3", None).await.unwrap();
+        until("the static fallback", || async { dying.status("r3").is_some_and(|s| s.state == "running" && s.command.contains("static")) }).await;
+        let fell = dying.status("r3").unwrap();
+        assert!(fell.reason.as_deref().unwrap_or("").contains("serving the project's files instead"), "{fell:?}");
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", fell.port)).await.is_ok());
+        dying.stop("r3");
+        assert_eq!(dying.status("r3").unwrap().state, "stopped");
+    }
+
+    #[test]
+    fn the_dev_command_falls_back_to_start_and_installs_missing_packages() {
+        use crate::preview::dev_command;
+        let tmp = repo("preview-scripts");
+        let dir = tmp.0.as_path();
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"start":"node server.js","test":"node --test"}}"#).unwrap();
+        assert_eq!(dev_command(dir, "", 4000).as_deref(), Some("npm run start"));
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^5"}}"#).unwrap();
+        assert_eq!(
+            dev_command(dir, "", 4000).as_deref(),
+            Some("npm install --no-audit --no-fund --loglevel=error && npm run dev -- --port 4000 --host 127.0.0.1 --strictPort")
+        );
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        assert_eq!(dev_command(dir, "", 4000).as_deref(), Some("npm run dev -- --port 4000 --host 127.0.0.1 --strictPort"));
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"node --test"}}"#).unwrap();
+        assert_eq!(dev_command(dir, "", 4000), None, "no script that serves: the static server takes it");
+        assert_eq!(dev_command(dir, "serve -p {port}", 4000).as_deref(), Some("serve -p 4000"));
     }
 
     #[tokio::test]
@@ -3908,6 +3966,34 @@ async fn direct_fast_path_skips_master_planning_for_scoped_edits_and_keeps_appro
     assert!(calls[0].contains("Repository map"), "shared prefix should include repo map: {}", calls[0]);
     assert!(calls[0].contains("src/greet.ts"), "repo map should list src/greet.ts: {}", calls[0]);
     assert!(calls[0].contains("Build unit `edit`"), "worker should run the direct edit unit: {}", calls[0]);
+}
+
+#[tokio::test]
+async fn agent_mode_builds_with_one_agent_and_code_mode_always_plans() {
+    let tmp = repo("agent-mode");
+    std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+    std::fs::write(tmp.0.join("src/greet.ts"), "export function hello(name: string) { return `Helo ${name}`; }\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "seed existing repo"]);
+
+    // Agent mode: no planning call even for a request the fast path would not take.
+    let world = World::new(Mode::Write);
+    let mut cfg = prompt_config(&tmp.0, "Add a settings panel and wire it to the header and the footer", true);
+    cfg.mode = crate::RunMode::Agent;
+    let outcome = run(cfg, &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(planner_calls(&world).is_empty(), "agent mode makes no planning call");
+    let calls = world.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one agent: {calls:?}");
+    assert!(calls[0].contains("only agent") && calls[0].contains("live preview"), "{}", calls[0]);
+
+    // Code mode: a scoped edit the fast path would take still goes to the master.
+    let world = World::new(Mode::Write);
+    let mut cfg = prompt_config(&tmp.0, "Fix the typo in src/greet.ts", true);
+    cfg.run_id = "code-mode".into();
+    cfg.mode = crate::RunMode::Code;
+    let _ = run(cfg, &world).await;
+    assert!(!planner_calls(&world).is_empty(), "code mode always plans");
 }
 
 #[tokio::test]

@@ -48,6 +48,10 @@ pub struct Note {
     pub at: String,
     #[serde(default)]
     pub delivered: bool,
+    /// Who should take it when it starts a new turn on a finished run: `agent`, `code` or
+    /// `auto`. `None` follows the run's own mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 impl Live {
@@ -79,7 +83,13 @@ impl Live {
 
     /// Append one entry. A failure to write is reported and otherwise ignored: the
     /// transcript is a view, and a run must not stop because of it.
-    pub fn push(&self, run: &str, agent: &Value, kind: &str, mut fields: Value) {
+    pub fn push(&self, run: &str, agent: &Value, kind: &str, fields: Value) {
+        let guard = self.write.lock().unwrap();
+        self.push_held(&guard, run, agent, kind, fields);
+    }
+
+    /// [`Live::push`] for a caller that already holds [`Live::write_lock`].
+    pub fn push_held(&self, _held: &std::sync::MutexGuard<'_, ()>, run: &str, agent: &Value, kind: &str, mut fields: Value) {
         if !fields.is_object() {
             fields = json!({});
         }
@@ -89,14 +99,38 @@ impl Live {
         object.insert("agent".into(), agent.clone());
         object.insert("kind".into(), json!(kind));
         let line = serde_json::to_string(&fields).unwrap_or_default();
-        {
-            let _guard = self.write.lock().unwrap();
-            if let Err(err) = self.store.append(&Self::key(run, "agents.jsonl"), &line) {
-                eprintln!("taskmaster: the agent transcript of {run} was not written: {err}");
-                return;
-            }
+        if let Err(err) = self.store.append(&Self::key(run, "agents.jsonl"), &line) {
+            eprintln!("taskmaster: the agent transcript of {run} was not written: {err}");
+            return;
         }
         let _ = self.wake.send(run.to_string());
+    }
+
+    /// End every agent call of `run` that started and has no `end`, marked stopped. An agent
+    /// aborted by a cancel, a crash or a stalled driver never writes its own, and a reader
+    /// would otherwise show it working forever. Returns how many calls it closed.
+    pub fn close_open_calls(&self, run: &str, why: &str) -> usize {
+        let (_, entries) = self.read(run, 0);
+        let mut open: Vec<(String, Value)> = Vec::new();
+        for entry in &entries {
+            let agent = &entry["agent"];
+            let id = agent["id"].as_str().unwrap_or("");
+            // Only real calls carry a call number; run-level lines (cancelling, budget) do not.
+            let Some(call) = agent["call"].as_u64() else { continue };
+            if id.is_empty() || id == "runtime" || id == "person" {
+                continue;
+            }
+            let key = format!("{id}#{call}");
+            if entry["kind"] == "end" {
+                open.retain(|(k, _)| *k != key);
+            } else if !open.iter().any(|(k, _)| *k == key) {
+                open.push((key, agent.clone()));
+            }
+        }
+        for (_, agent) in &open {
+            self.push(run, agent, "end", json!({ "ok": false, "stopped": true, "error": why }));
+        }
+        open.len()
     }
 
     /// Every entry after the first `after`, and how many there are in all.
@@ -157,6 +191,11 @@ impl Live {
     }
 
     pub fn add_note(&self, run: &str, to: &str, text: &str) -> anyhow::Result<Note> {
+        self.add_note_as(run, to, text, None)
+    }
+
+    /// [`Live::add_note`] with the mode a new turn should run in (see [`Note::mode`]).
+    pub fn add_note_as(&self, run: &str, to: &str, text: &str, mode: Option<&str>) -> anyhow::Result<Note> {
         let _guard = self.write.lock().unwrap();
         let mut notes = self.notes(run);
         let note = Note {
@@ -165,6 +204,7 @@ impl Live {
             text: text.to_string(),
             at: rfc3339_now(),
             delivered: false,
+            mode: mode.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string),
         };
         notes.push(note.clone());
         self.save_notes(run, &notes)?;
@@ -190,7 +230,12 @@ impl Live {
 
     /// Undelivered notes matching `pred`, marked delivered. A note is read once.
     pub fn take_fresh_where(&self, run: &str, pred: impl Fn(&Note) -> bool) -> Vec<Note> {
-        let _guard = self.write.lock().unwrap();
+        let guard = self.write.lock().unwrap();
+        self.take_fresh_held(&guard, run, pred)
+    }
+
+    /// [`Live::take_fresh_where`] for a caller that already holds [`Live::write_lock`].
+    pub fn take_fresh_held(&self, _held: &std::sync::MutexGuard<'_, ()>, run: &str, pred: impl Fn(&Note) -> bool) -> Vec<Note> {
         let mut notes = self.notes(run);
         let mut out = Vec::new();
         let mut changed = false;
@@ -206,6 +251,19 @@ impl Live {
             let _ = self.save_notes(run, &notes);
         }
         out
+    }
+
+    /// Put notes back as undelivered, for a turn that did not start after all.
+    pub fn return_held(&self, _held: &std::sync::MutexGuard<'_, ()>, run: &str, ids: &[String]) {
+        let mut notes = self.notes(run);
+        let mut changed = false;
+        for note in notes.iter_mut().filter(|note| ids.contains(&note.id)) {
+            changed |= note.delivered;
+            note.delivered = false;
+        }
+        if changed {
+            let _ = self.save_notes(run, &notes);
+        }
     }
 
     /// True when an undelivered note matches `pred`.

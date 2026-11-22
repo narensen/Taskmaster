@@ -67,6 +67,7 @@ pub mod supply_chain;
 pub mod template;
 mod telemetry;
 mod time;
+mod turns;
 mod undo;
 pub mod web_access;
 
@@ -228,6 +229,38 @@ pub async fn check_models(roles: &Roles, models: &Models) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Who does the work. `Code` is the master planning parallel workers. `Agent` is one agent
+/// owning the whole project, with no planning call: it fixes what is wrong across as many
+/// files as it needs. `Auto` lets the daemon choose: a scoped edit or a follow-up goes to
+/// one agent, anything bigger to the master.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Auto,
+    Code,
+    Agent,
+}
+
+impl RunMode {
+    pub fn parse(text: &str) -> Option<RunMode> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(RunMode::Auto),
+            "code" | "master" | "plan" => Some(RunMode::Code),
+            "agent" | "single" => Some(RunMode::Agent),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            RunMode::Auto => "auto",
+            RunMode::Code => "code",
+            RunMode::Agent => "agent",
+        }
+    }
+}
+
 /// How a run was asked for. It is stored with the run, so a plan approved later, from
 /// another process or another device, is built by the harnesses that were chosen then.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +276,8 @@ pub struct RunRequest {
     pub max_cost_usd: Option<f64>,
     /// `next`, or a directory. See [`template`].
     pub template: Option<String>,
+    /// Who does the work: see [`RunMode`]. Runs saved before modes existed are `Auto`.
+    pub mode: RunMode,
 }
 
 /// Optional model names passed through to the harness. The harness id is the default.
@@ -314,6 +349,8 @@ pub struct Config {
     /// Direct / Lite Fast-Path: scoped bug fixes and small edits in existing repos skip heavy
     /// Master Planning and go straight to 1 Code-Mode worker + deterministic free checks.
     pub fast_path: bool,
+    /// Who does the work: one agent, the master and its workers, or the daemon's choice.
+    pub mode: RunMode,
     /// Optional 2-mode cancel signal (`Graceful` drains active workers; `Force` kills active
     /// agent process groups and aborts immediately). Works alongside legacy `cancel`.
     pub cancel_mode: Option<watch::Receiver<CancelMode>>,
@@ -396,6 +433,7 @@ impl Config {
             checker: false,
             code_mode: true,
             fast_path: true,
+            mode: RunMode::Auto,
             cancel_mode: None,
             max_cost_usd: None,
             resume_cancelled: false,

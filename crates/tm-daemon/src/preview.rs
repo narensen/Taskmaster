@@ -4,7 +4,10 @@
 //! that still sits on its branch is previewed from a throwaway checkout of that branch,
 //! which borrows the project's installed packages and is removed when the server stops.
 //! The server listens on this machine only, on a port chosen here. Its command is the
-//! settings file's `preview.command`, or the project's own `dev` script. A project with neither is served as static files.
+//! settings file's `preview.command`, or the project's own `dev` script (then `start`, then
+//! `preview`), after installing its packages when they are missing. A project with none of
+//! those is served as static files, and so is one whose dev server dies before it answers:
+//! a preview always opens.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,8 @@ use crate::time::rfc3339_now;
 
 /// How long a dev server may take to start answering.
 const START_WITHIN: Duration = Duration::from_secs(90);
+/// The same, when its packages are installed first.
+const INSTALL_WITHIN: Duration = Duration::from_secs(300);
 const KEEP_LOG: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,9 +45,22 @@ pub struct Status {
 struct Entry {
     status: Arc<Mutex<Status>>,
     pid: Option<u32>,
-    /// The built-in static server, when that is what runs.
-    task: Option<tokio::task::AbortHandle>,
+    /// The built-in static server, when that is what runs: from the start, or once the dev
+    /// server died and the watcher took over.
+    task: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     log: Arc<Mutex<String>>,
+}
+
+/// Removes a throwaway checkout when the server that used it ends or is aborted.
+struct Cleanup(PathBuf, Option<PathBuf>);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if let Some(tree) = &self.1 {
+            let _ = git::remove_worktree(&self.0, tree);
+            let _ = std::fs::remove_dir_all(tree);
+        }
+    }
 }
 
 /// Dev servers started for runs. Dropping the handle stops each one.
@@ -52,8 +70,9 @@ pub struct Previews {
     runs: Mutex<HashMap<String, Entry>>,
 }
 
-/// The command that starts a dev server in `dir` on `port`, from the settings' command or
-/// the project's `dev` script.
+/// The command that starts a dev server in `dir` on `port`: the settings' command, or the
+/// project's `dev` script, else its `start` or `preview` script. Packages are installed
+/// first when `package.json` lists some and `node_modules` is missing.
 pub fn dev_command(dir: &Path, configured: &str, port: u16) -> Option<String> {
     let configured = configured.trim();
     if !configured.is_empty() {
@@ -61,7 +80,7 @@ pub fn dev_command(dir: &Path, configured: &str, port: u16) -> Option<String> {
     }
     let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
     let package: Value = serde_json::from_str(&text).ok()?;
-    let script = package["scripts"]["dev"].as_str()?;
+    let (name, script) = ["dev", "start", "preview"].into_iter().find_map(|name| package["scripts"][name].as_str().map(|script| (name, script)))?;
     let runner = if dir.join("pnpm-lock.yaml").is_file() {
         "pnpm"
     } else if dir.join("yarn.lock").is_file() {
@@ -72,20 +91,41 @@ pub fn dev_command(dir: &Path, configured: &str, port: u16) -> Option<String> {
         "npm"
     };
     let deps = |name: &str| package["dependencies"][name].is_string() || package["devDependencies"][name].is_string();
-    // Say the port the way the framework's own server wants it.
-    let flags = if script.contains("next") || deps("next") {
+    // Say the port the way the framework's own server wants it. A `start` script is only
+    // told when it runs the framework itself; anything else reads `$PORT`.
+    let dev = name == "dev";
+    let flags = if script.contains("next") || (dev && deps("next")) {
         format!("-p {port} -H 127.0.0.1")
-    } else if script.contains("vite") || deps("vite") {
+    } else if script.contains("vite") || (dev && deps("vite")) {
         format!("--port {port} --host 127.0.0.1 --strictPort")
     } else {
         String::new()
     };
-    Some(match (runner, flags.is_empty()) {
-        ("yarn" | "bun", true) => format!("{runner} run dev"),
-        ("yarn" | "bun", false) => format!("{runner} run dev {flags}"),
-        (_, true) => format!("{runner} run dev"),
-        (_, false) => format!("{runner} run dev -- {flags}"),
+    let run = match (runner, flags.is_empty()) {
+        ("yarn" | "bun", true) => format!("{runner} run {name}"),
+        ("yarn" | "bun", false) => format!("{runner} run {name} {flags}"),
+        (_, true) => format!("{runner} run {name}"),
+        (_, false) => format!("{runner} run {name} -- {flags}"),
+    };
+    Some(match needs_install(dir, &package) {
+        true => format!("{} && {run}", install_command(runner)),
+        false => run,
     })
+}
+
+/// `package.json` lists packages and none are installed.
+fn needs_install(dir: &Path, package: &Value) -> bool {
+    let lists = |key: &str| package[key].as_object().is_some_and(|deps| !deps.is_empty());
+    (lists("dependencies") || lists("devDependencies")) && !dir.join("node_modules").is_dir()
+}
+
+fn install_command(runner: &str) -> &'static str {
+    match runner {
+        "pnpm" => "pnpm install",
+        "yarn" => "yarn install",
+        "bun" => "bun install",
+        _ => "npm install --no-audit --no-fund --loglevel=error",
+    }
 }
 
 impl Previews {
@@ -103,9 +143,10 @@ impl Previews {
         *self.project.lock().unwrap() = project;
     }
 
-    /// Whether this project has a dev server to start.
+    /// Whether this project can be previewed. Always: a project with no dev server is
+    /// served as static files, and one with no page gets a page listing its files.
     pub fn available(&self) -> bool {
-        dev_command(&self.project(), &self.command, 0).is_some() || crate::static_site::has_no_scripts(&self.project())
+        true
     }
 
     pub fn status(&self, run: &str) -> Option<Status> {
@@ -139,16 +180,9 @@ impl Previews {
             None => (self.project(), None),
         };
         let Some(command) = dev_command(&dir, &self.command, port) else {
-            if crate::static_site::has_no_scripts(&dir) && crate::static_site::start_page(&dir).is_some() {
-                return self.start_static(run, listener, dir, tree, claim).await;
-            }
-            if let Some(tree) = &tree {
-                let _ = git::remove_worktree(&self.project(), tree);
-            }
-            let reason = "this project has no dev server: add a `dev` script to package.json or set `preview.command` in the settings file";
-            self.fail_start(run, reason);
-            anyhow::bail!("{reason}");
+            return self.start_static(run, listener, dir, tree, claim).await;
         };
+        let within = if command.contains(" install") && command.contains(" && ") { INSTALL_WITHIN } else { START_WITHIN };
         // The dev server binds the port itself.
         drop(listener);
         let mut process = Command::new("sh");
@@ -211,14 +245,17 @@ impl Previews {
             });
         }
         let pid = child.id();
-        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid, task: None, log: log.clone() });
+        let slot: Arc<Mutex<Option<tokio::task::AbortHandle>>> = Arc::default();
+        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid, task: slot.clone(), log: log.clone() });
         claim.live = false;
 
-        // Watch it: running once it answers, stopped or failed once it exits.
+        // Watch it: running once it answers, stopped or failed once it exits. One that dies
+        // before it answers is replaced by the static server when there is a page to serve.
         let project = self.project();
         let (watched, watched_log) = (status.clone(), log);
+        let served = dir.clone();
         tokio::spawn(async move {
-            let deadline = Instant::now() + START_WITHIN;
+            let deadline = Instant::now() + within;
             let mut answered = false;
             let exit = loop {
                 tokio::select! {
@@ -234,12 +271,44 @@ impl Previews {
                         if !answered && Instant::now() > deadline {
                             let _ = child.start_kill();
                             let mut status = watched.lock().unwrap();
-                            status.reason = Some(format!("it did not answer on port {port} within {} seconds", START_WITHIN.as_secs()));
+                            status.reason = Some(format!("it did not answer on port {port} within {} seconds", within.as_secs()));
                         }
                     }
                 }
             };
             let output = tail(&watched_log.lock().unwrap());
+            let asked = watched.lock().unwrap().state == "stopped";
+            if !answered && !asked && crate::static_site::any_page(&served).is_some() {
+                let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => Some(listener),
+                    Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await.ok(),
+                };
+                if let Some(listener) = listener {
+                    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                    let cleanup = Cleanup(project.clone(), tree.clone());
+                    let root = served.clone();
+                    let task = tokio::spawn(async move {
+                        let _cleanup = cleanup;
+                        crate::static_site::serve(listener, root).await;
+                    });
+                    *slot.lock().unwrap() = Some(task.abort_handle());
+                    let mut status = watched.lock().unwrap();
+                    if status.state == "stopped" {
+                        task.abort();
+                    } else {
+                        let why = status.reason.take().unwrap_or_else(|| {
+                            let code = exit.and_then(|e| e.code()).map(|c| format!(" with code {c}")).unwrap_or_default();
+                            format!("`{}` exited{code}", status.command)
+                        });
+                        status.state = "running";
+                        status.port = bound;
+                        status.url = format!("http://127.0.0.1:{bound}/");
+                        status.reason = Some(format!("{why}{}; serving the project's files instead", if output.is_empty() { String::new() } else { format!(": {output}") }));
+                        status.command = "built-in static file server".into();
+                    }
+                    return;
+                }
+            }
             {
                 let mut status = watched.lock().unwrap();
                 let asked = status.state == "stopped";
@@ -262,19 +331,10 @@ impl Previews {
 
     /// Serve the project's files from this process, on `port`.
     async fn start_static(&self, run: &str, listener: tokio::net::TcpListener, dir: PathBuf, tree: Option<PathBuf>, mut claim: ClearClaim<'_>) -> anyhow::Result<Status> {
-        /// Removes the throwaway checkout when the server task ends or is aborted.
-        struct Cleanup(PathBuf, Option<PathBuf>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                if let Some(tree) = &self.1 {
-                    let _ = git::remove_worktree(&self.0, tree);
-                    let _ = std::fs::remove_dir_all(tree);
-                }
-            }
-        }
         let cleanup = Cleanup(self.project(), tree);
         let port = listener.local_addr()?.port();
         let root = dir.clone();
+        let page = crate::static_site::any_page(&dir);
         let task = tokio::spawn(async move {
             let _cleanup = cleanup;
             crate::static_site::serve(listener, root).await;
@@ -286,10 +346,11 @@ impl Previews {
             command: "built-in static file server".into(),
             dir: dir.display().to_string(),
             started: rfc3339_now(),
-            reason: None,
+            reason: page.is_none().then(|| "no page and no dev script yet: the preview lists the project's files".to_string()),
         }));
         let log = Arc::new(Mutex::new(String::new()));
-        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid: None, task: Some(task.abort_handle()), log });
+        let slot = Arc::new(Mutex::new(Some(task.abort_handle())));
+        self.runs.lock().unwrap().insert(run.to_string(), Entry { status: status.clone(), pid: None, task: slot, log });
         claim.live = false;
         let status = status.lock().unwrap().clone();
         Ok(status)
@@ -311,7 +372,7 @@ impl Previews {
         if let Some(pid) = entry.pid {
             kill_group(pid);
         }
-        if let Some(task) = &entry.task {
+        if let Some(task) = entry.task.lock().unwrap().as_ref() {
             task.abort();
         }
     }
@@ -350,7 +411,7 @@ impl Previews {
                         reason: None,
                     }));
                     let log = Arc::new(Mutex::new(String::new()));
-                    runs.insert(run.to_string(), Entry { status, pid: None, task: None, log });
+                    runs.insert(run.to_string(), Entry { status, pid: None, task: Arc::default(), log });
                     Claim::Mine
                 }
             };

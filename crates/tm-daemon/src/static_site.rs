@@ -1,6 +1,7 @@
 //! A tiny static file server for projects with no dev script: plain HTML in the project,
 //! served on this machine only. Dotfiles and dot-directories (`.git`, `.taskmaster`, ...)
-//! are never served, and there are no directory listings.
+//! are never served. A project with no page at all gets one page listing its files, so a
+//! preview always shows something.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,76 @@ pub fn start_page(root: &Path) -> Option<&'static str> {
     ["index.html", "app/index.html", "public/index.html", "dist/index.html", "src/index.html"]
         .into_iter()
         .find(|page| root.join(page).is_file())
+}
+
+/// Folders a page is never looked for in.
+const SKIP_DIRS: [&str; 6] = ["node_modules", "target", "coverage", "vendor", "__pycache__", "venv"];
+
+/// Any page a browser could open: [`start_page`], else the first `.html` file at the root,
+/// else one a folder down. Dot-folders and dependency folders are skipped.
+pub fn any_page(root: &Path) -> Option<String> {
+    if let Some(page) = start_page(root) {
+        return Some(page.to_string());
+    }
+    let html = |dir: &Path| -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.') && (name.ends_with(".html") || name.ends_with(".htm")))
+            .collect();
+        found.sort();
+        found
+    };
+    if let Some(first) = html(root).into_iter().next() {
+        return Some(first);
+    }
+    let mut dirs: Vec<String> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()))
+        .collect();
+    dirs.sort();
+    dirs.into_iter().find_map(|dir| html(&root.join(&dir)).into_iter().next().map(|page| format!("{dir}/{page}")))
+}
+
+/// A page listing the project's files, for a project with no page of its own.
+fn listing(root: &Path) -> String {
+    let mut files = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten().flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if rel.matches('/').count() < 3 {
+                    stack.push((entry.path(), rel));
+                }
+            } else if files.len() < 400 {
+                files.push(rel);
+            }
+        }
+    }
+    files.sort();
+    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let items: String = files.iter().map(|f| format!("<li><a href=\"/{0}\">{1}</a></li>", escape(f), escape(f))).collect();
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Project files</title><style>body{{font:14px/1.5 system-ui,sans-serif;margin:32px;color:#222;background:#fafafa}}\
+h1{{font-size:18px;margin:0 0 4px}}p{{color:#666;margin:0 0 16px}}ul{{padding-left:18px}}a{{color:#0b57d0}}</style></head>\
+<body><h1>No page to show yet</h1><p>This project has no <code>index.html</code> and no <code>dev</code> script, so the preview lists its files.</p>\
+<ul>{items}</ul></body></html>"
+    )
 }
 
 /// Whether the project has no script of its own that would serve it.
@@ -81,9 +152,9 @@ fn content_type(file: &Path) -> &'static str {
 async fn serve_file(State(root): State<PathBuf>, uri: Uri) -> Response {
     let path = uri.path();
     if path == "/" && !root.join("index.html").is_file() {
-        return match start_page(&root) {
+        return match any_page(&root) {
             Some(page) => Redirect::temporary(&format!("/{page}")).into_response(),
-            None => StatusCode::NOT_FOUND.into_response(),
+            None => ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], listing(&root)).into_response(),
         };
     }
     match resolve(&root, path) {
@@ -122,6 +193,17 @@ mod tests {
         assert_eq!(start_page(&site("b", &["src/index.html", "public/index.html"])), Some("public/index.html"));
         assert_eq!(start_page(&site("c", &["app/index.html", "dist/index.html"])), Some("app/index.html"));
         assert_eq!(start_page(&site("d", &["readme.md"])), None);
+    }
+
+    #[test]
+    fn any_page_looks_past_the_usual_folders() {
+        assert_eq!(any_page(&site("g", &["index.html"])).as_deref(), Some("index.html"));
+        assert_eq!(any_page(&site("h", &["about.html", "zeta.html"])).as_deref(), Some("about.html"));
+        assert_eq!(any_page(&site("i", &["web/home.html", "node_modules/x/index.html"])).as_deref(), Some("web/home.html"));
+        assert_eq!(any_page(&site("j", &["node_modules/x/index.html", ".cache/a.html", "src/main.rs"])), None);
+        let page = listing(&site("k", &["src/main.rs", "README.md", ".env", "node_modules/a.js"]));
+        assert!(page.contains("src/main.rs") && page.contains("README.md"), "{page}");
+        assert!(!page.contains(".env") && !page.contains("node_modules"), "{page}");
     }
 
     #[test]

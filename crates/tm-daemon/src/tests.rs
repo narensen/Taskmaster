@@ -1493,6 +1493,9 @@ fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
         agent: None,
         unit: None,
         priced_by: by.map(str::to_string),
+        brief_hash: None,
+        difficulty: None,
+        language: None,
     };
     assert!(cost_words(&[call(None, None)]).starts_with("unpriced"), "no price is not $0.00");
     assert!(cost_words(&[call(Some(0.0), Some("provider"))]).contains("charged nothing (a free model)"));
@@ -3575,6 +3578,133 @@ mod http {
         assert_eq!(forked["forked_from"], "studio");
         let fork_done = client.settled("studio-fork", "done").await;
         assert_eq!(fork_done["phase"], "done");
+    }
+
+    #[tokio::test]
+    async fn ops_endpoints_and_idempotency_middleware_work_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = repo("ops-e2e");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code, "name": "ops" })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        // 1. Prometheus /metrics endpoint (public text/plain)
+        let (m_status, metrics_text) = client.text("/metrics").await;
+        assert_eq!(m_status, 200);
+        assert!(metrics_text.contains("taskmaster_active_runs"));
+
+        // 2. Monthly spend + egress log + GC
+        let (s_status, spend) = client.get("/api/metrics/spend?threshold=50").await;
+        assert_eq!(s_status, 200, "{spend}");
+        assert_eq!(spend["spend"]["alert_triggered"], false);
+
+        let (e_status, egress) = client.get("/api/egress?limit=10").await;
+        assert_eq!(e_status, 200, "{egress}");
+        assert!(egress["entries"].is_array());
+
+        let (gc_status, gc) = client.post("/api/gc", json!({ "max_runs": 10 })).await;
+        assert_eq!(gc_status, 200, "{gc}");
+        assert!(gc["gc"]["removed_runs"].is_array());
+
+        // 3. Idempotency-Key deduplication on POST /api/schedules
+        let post_with_key = |addr: String, token: String, key: &'static str, body: String| async move {
+            let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let req = format!(
+                "POST /api/schedules HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nauthorization: Bearer {token}\r\nidempotency-key: {key}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+            let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+            (status, serde_json::from_str::<Value>(rest).unwrap_or(Value::Null))
+        };
+        let token = client.token.clone().unwrap();
+        let sched_body = json!({ "name": "Nightly audit", "schedule": "nightly", "prompt": "Run checks" }).to_string();
+        let (st1, r1) = post_with_key(client.addr.clone(), token.clone(), "idem-sched-1", sched_body.clone()).await;
+        let (st2, r2) = post_with_key(client.addr.clone(), token.clone(), "idem-sched-1", sched_body).await;
+        assert_eq!(st1, 200, "{r1}");
+        assert_eq!(st2, 200, "{r2}");
+        assert_eq!(r1["schedule"]["id"], r2["schedule"]["id"]);
+        let (_, listed_scheds) = client.get("/api/schedules").await;
+        assert_eq!(listed_scheds["schedules"].as_array().unwrap().len(), 1);
+
+        // 4. Remote runners & environments never leak tokens in API JSON
+        let (r_status, runner) = client
+            .post(
+                "/api/runners",
+                json!({ "name": "gpu-box", "url": "http://127.0.0.1:9999", "token": "super-secret-runner-tok" }),
+            )
+            .await;
+        assert_eq!(r_status, 200, "{runner}");
+        let runner_text = serde_json::to_string(&runner).unwrap();
+        assert!(!runner_text.contains("super-secret-runner-tok"));
+        assert_eq!(runner["runner"]["has_token"], true);
+
+        let (env_status, env_res) = client
+            .post(
+                "/api/environments",
+                json!({ "name": "staging-vm", "url": "http://127.0.0.1:9998", "token": "env-secret-tok" }),
+            )
+            .await;
+        assert_eq!(env_status, 200, "{env_res}");
+        assert!(!serde_json::to_string(&env_res).unwrap().contains("env-secret-tok"));
+
+        // 5. User MCP servers keep secret_env out of API JSON
+        let (mcp_status, mcp) = client
+            .post(
+                "/api/mcp",
+                json!({
+                    "name": "postgres",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                    "roles": ["worker"],
+                    "secret_env": { "PGPASSWORD": "db-password-999" }
+                }),
+            )
+            .await;
+        assert_eq!(mcp_status, 200, "{mcp}");
+        assert!(!serde_json::to_string(&mcp).unwrap().contains("db-password-999"));
+        assert_eq!(mcp["server"]["secret_env_keys"], json!(["PGPASSWORD"]));
+
+        // 6. Notifications config validation & save
+        let (n_bad, _) = client
+            .post("/api/notifications", json!({ "desktop": false, "webhook_url": "http://evil.example/hook" }))
+            .await;
+        assert_eq!(n_bad, 400);
+        let (n_ok, notif) = client
+            .post("/api/notifications", json!({ "desktop": true, "webhook_url": "https://hooks.example.com/tm", "on_approval": true, "on_limit": true, "on_finish": true }))
+            .await;
+        assert_eq!(n_ok, 200, "{notif}");
+
+        // 7. Issue URL parser, attachments, stratified scorecard, and eval suite
+        let (i_status, parsed) = client
+            .post("/api/issues/parse", json!({ "url": "https://github.com/acme/app/issues/77" }))
+            .await;
+        assert_eq!(i_status, 200, "{parsed}");
+        assert_eq!(parsed["issue"]["number"], 77);
+        assert_eq!(parsed["closing_link"], "Closes #77 (https://github.com/acme/app/issues/77)");
+
+        let (a_status, att) = client
+            .post(
+                "/api/runs/demo-att/attachments",
+                json!({ "name": "mockup.png", "mime": "image/png", "data_base64": "iVBORw0KGgo=" }),
+            )
+            .await;
+        assert_eq!(a_status, 200, "{att}");
+        let (al_status, listed_att) = client.get("/api/runs/demo-att/attachments").await;
+        assert_eq!(al_status, 200, "{listed_att}");
+        assert_eq!(listed_att["attachments"].as_array().unwrap().len(), 1);
+
+        let (sc_status, strat) = client.get("/api/scorecard/stratified").await;
+        assert_eq!(sc_status, 200, "{strat}");
+        assert!(strat["slices"].is_array());
+
+        let (ev_status, suite) = client.get("/api/eval/suite").await;
+        assert_eq!(ev_status, 200, "{suite}");
+        assert!(suite["tasks"].is_array());
     }
 
 }

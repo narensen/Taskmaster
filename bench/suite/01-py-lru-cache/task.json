@@ -1,0 +1,16 @@
+{
+  "id": "01-py-lru-cache",
+  "category": "python",
+  "language": "py",
+  "difficulty": "normal",
+  "prompt": "Implement an O(1) LRUCache(capacity) class in cache.py with get(key) -> value|None and put(key, value) evicting the least recently used key.",
+  "starter_files": {
+    "cache.py": "class LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n    def get(self, key):\n        return None\n    def put(self, key, value):\n        pass\n"
+  },
+  "hidden_test_file": "_hidden_test.py",
+  "hidden_test_content": "from cache import LRUCache\nc = LRUCache(2)\nc.put('a', 1); c.put('b', 2)\nassert c.get('a') == 1\nc.put('c', 3)\nassert c.get('b') is None\nassert c.get('a') == 1 and c.get('c') == 3\nc.put('a', 10); c.put('d', 4)\nassert c.get('c') is None and c.get('a') == 10\n",
+  "hidden_test_command": [
+    "python3",
+    "_hidden_test.py"
+  ]
+}

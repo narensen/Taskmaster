@@ -1,0 +1,16 @@
+{
+  "id": "05-cli-json-query",
+  "category": "cli",
+  "language": "py",
+  "difficulty": "normal",
+  "prompt": "Build a CLI script jq_mini.py accepting a dotted path argument (e.g. a.b.0.name) and reading JSON from stdin, printing the JSON value and exiting 1 if missing.",
+  "starter_files": {
+    "jq_mini.py": "import sys\nprint('null')\n"
+  },
+  "hidden_test_file": "_hidden_test.py",
+  "hidden_test_content": "import subprocess, json\np = subprocess.run(['python3', 'jq_mini.py', 'users.1.name'], input='{\"users\":[{\"name\":\"a\"},{\"name\":\"b\"}]}', text=True, capture_output=True)\nassert p.returncode == 0 and json.loads(p.stdout) == 'b'\np2 = subprocess.run(['python3', 'jq_mini.py', 'users.9.name'], input='{\"users\":[]}', text=True, capture_output=True)\nassert p2.returncode != 0\n",
+  "hidden_test_command": [
+    "python3",
+    "_hidden_test.py"
+  ]
+}

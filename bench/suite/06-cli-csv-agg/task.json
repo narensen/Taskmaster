@@ -1,0 +1,16 @@
+{
+  "id": "06-cli-csv-agg",
+  "category": "cli",
+  "language": "py",
+  "difficulty": "easy",
+  "prompt": "Build a CLI script agg.py --group COL --sum VAL reading CSV from stdin and printing sorted `group,total` lines rounded to 2 decimals.",
+  "starter_files": {
+    "agg.py": "import sys\n"
+  },
+  "hidden_test_file": "_hidden_test.py",
+  "hidden_test_content": "import subprocess\ncsv_in = 'team,cost\\neng,1.5\\nops,2.0\\neng,2.25\\n'\np = subprocess.run(['python3', 'agg.py', '--group', 'team', '--sum', 'cost'], input=csv_in, text=True, capture_output=True)\nassert p.returncode == 0\nassert p.stdout.strip().splitlines() == ['eng,3.75', 'ops,2.00']\n",
+  "hidden_test_command": [
+    "python3",
+    "_hidden_test.py"
+  ]
+}

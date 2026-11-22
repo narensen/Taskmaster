@@ -76,6 +76,10 @@ const testAffected = (paths) => call("testAffected", { files: Array.isArray(path
 const probe = {
   ast: (path) => call("probeAst", { path }),
 };
+const diagnostics = (files) => call("diagnostics", { files: Array.isArray(files) ? files : (files ? [files] : []) });
+const outline = (path) => call("outline", { path });
+const definition = (symbol) => call("definition", { symbol: String(symbol) });
+const references = (symbol) => call("references", { symbol: String(symbol) });
 const sh = (command) => call("sh", { command });
 const check = () => call("check", {});
 const browser = (action, args = {}) => call("browser", { action, args });
@@ -89,7 +93,8 @@ async function runBody(code) {
   try {
     fn = new AsyncFunction(
       "read", "write", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
-      "readMany", "test", "testAffected", "probe", "sh", "check", "browser", "console", "require",
+      "readMany", "test", "testAffected", "probe", "diagnostics", "outline", "definition", "references",
+      "sh", "check", "browser", "console", "require",
       `return (async () => {\n${code}\n})();`
     );
   } catch (err) {
@@ -99,7 +104,8 @@ async function runBody(code) {
   try {
     const result = await fn(
       read, write, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
-      readMany, test, testAffected, probe, sh, check, browser, scopedConsole, require
+      readMany, test, testAffected, probe, diagnostics, outline, definition, references,
+      sh, check, browser, scopedConsole, require
     );
     send({ done: true, result: result === undefined ? null : result, logs });
   } catch (err) {
@@ -790,6 +796,39 @@ impl CodeTools {
                     "exports": exports,
                     "imports": imports,
                 }))
+            }
+            "diagnostics" => {
+                self.allowed(scope, op, ToolKind::Read, None, None).await?;
+                let mut files: Vec<String> = args["files"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                if files.is_empty() {
+                    files = crate::lsp::workspace_source_files(&scope.cwd).into_iter().take(25).collect();
+                }
+                let mgr = crate::lsp::LspManager::new();
+                let diags = mgr.diagnostics_for_files(&scope.cwd, &files);
+                mgr.shutdown_root(&scope.cwd);
+                Ok(serde_json::to_value(diags)?)
+            }
+            "outline" => {
+                let file = path("path")?;
+                self.allowed(scope, op, ToolKind::Read, Some(&file), None).await?;
+                let rel = args["path"].as_str().unwrap_or("");
+                let syms = crate::lsp::outline_file(&scope.cwd, rel);
+                Ok(serde_json::to_value(syms)?)
+            }
+            "definition" => {
+                self.allowed(scope, op, ToolKind::Read, None, None).await?;
+                let sym = args["symbol"].as_str().unwrap_or("").trim();
+                let defs = crate::lsp::find_definitions(&scope.cwd, sym);
+                Ok(serde_json::to_value(defs)?)
+            }
+            "references" => {
+                self.allowed(scope, op, ToolKind::Read, None, None).await?;
+                let sym = args["symbol"].as_str().unwrap_or("").trim();
+                let refs = crate::lsp::find_references(&scope.cwd, sym, 60);
+                Ok(serde_json::to_value(refs)?)
             }
             other => bail!("no function `{other}`"),
         }

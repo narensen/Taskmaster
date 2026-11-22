@@ -83,6 +83,7 @@ impl Live {
         if !fields.is_object() {
             fields = json!({});
         }
+        crate::secrets::redact_json(&mut fields);
         let object = fields.as_object_mut().expect("an object");
         object.insert("at".into(), json!(rfc3339_now()));
         object.insert("agent".into(), agent.clone());

@@ -1,0 +1,16 @@
+{
+  "id": "08-js-glob-match",
+  "category": "library",
+  "language": "js",
+  "difficulty": "hard",
+  "prompt": "Implement matchGlob(pattern, path) in glob.mjs supporting `*` (single segment), `**` (any depth), and `?` (single char).",
+  "starter_files": {
+    "glob.mjs": "export function matchGlob(pattern, path) { return false; }\n"
+  },
+  "hidden_test_file": "_hidden_test.mjs",
+  "hidden_test_content": "import assert from 'node:assert/strict';\nimport { matchGlob } from './glob.mjs';\nassert.equal(matchGlob('src/**/*.ts', 'src/a/b/c.ts'), true);\nassert.equal(matchGlob('src/*.ts', 'src/a/b.ts'), false);\nassert.equal(matchGlob('src/?.ts', 'src/x.ts'), true);\nassert.equal(matchGlob('src/?.ts', 'src/xy.ts'), false);\n",
+  "hidden_test_command": [
+    "node",
+    "_hidden_test.mjs"
+  ]
+}

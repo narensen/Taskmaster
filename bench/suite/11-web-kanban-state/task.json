@@ -1,0 +1,16 @@
+{
+  "id": "11-web-kanban-state",
+  "category": "web",
+  "language": "js",
+  "difficulty": "normal",
+  "prompt": "Implement a pure Kanban board store in store.mjs with createBoard(), addCard(board, col, title), moveCard(board, id, toCol, index), and filterCards(board, query).",
+  "starter_files": {
+    "store.mjs": "export function createBoard() { return { columns: { todo: [], doing: [], done: [] } }; }\nexport function addCard(b) { return b; }\nexport function moveCard(b) { return b; }\nexport function filterCards() { return []; }\n"
+  },
+  "hidden_test_file": "_hidden_test.mjs",
+  "hidden_test_content": "import assert from 'node:assert/strict';\nimport { createBoard, addCard, moveCard, filterCards } from './store.mjs';\nlet b = createBoard();\nb = addCard(b, 'todo', 'Build auth');\nb = addCard(b, 'todo', 'Write tests');\nconst id = b.columns.todo[0].id;\nb = moveCard(b, id, 'doing', 0);\nassert.equal(b.columns.todo.length, 1);\nassert.equal(b.columns.doing.length, 1);\nassert.equal(filterCards(b, 'auth').length, 1);\n",
+  "hidden_test_command": [
+    "node",
+    "_hidden_test.mjs"
+  ]
+}

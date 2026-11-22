@@ -41,7 +41,14 @@ fn append(path: &Path, line: &str, max_bytes: u64) {
         let _ = std::fs::rename(path, path.with_extension("log.1"));
     }
     let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
-    let _ = writeln!(file, "{} {line}", crate::time::rfc3339_now());
+    let scrubbed = crate::secrets::redact_text(line);
+    let ts = crate::time::rfc3339_now();
+    if std::env::var("TASKMASTER_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json")) {
+        let obj = serde_json::json!({ "at": ts, "level": "info", "msg": scrubbed });
+        let _ = writeln!(file, "{obj}");
+    } else {
+        let _ = writeln!(file, "{ts} {scrubbed}");
+    }
 }
 
 /// The last `max_lines` lines, and the path they were read from. Only the end of the file

@@ -281,11 +281,26 @@ impl Records {
     }
 
     pub fn events(&self, run: &str) -> anyhow::Result<Vec<Event>> {
-        self.lines(&format!("runs/{run}/events.jsonl"))
+        let key = format!("runs/{run}/events.jsonl");
+        let Some(bytes) = self.store.read(&key)? else { return Ok(Vec::new()) };
+        let text = String::from_utf8(bytes).with_context(|| format!("{key} is not UTF-8"))?;
+        let mut out = Vec::new();
+        for (line_no, raw) in text.lines().enumerate() {
+            let Some(unwrapped) = tm_core::unwrap_event_line(raw) else { continue };
+            let ev: Event = serde_json::from_str(&unwrapped)
+                .with_context(|| format!("cannot read {key} line {}", line_no + 1))?;
+            out.push(ev);
+        }
+        Ok(out)
     }
 
     pub fn save_events(&self, run: &str, events: &[Event]) -> anyhow::Result<()> {
-        self.save_lines(&format!("runs/{run}/events.jsonl"), events)
+        let mut out = String::new();
+        for item in events {
+            out.push_str(&serde_json::to_string(item)?);
+            out.push('\n');
+        }
+        self.store.write(&format!("runs/{run}/events.jsonl"), out.as_bytes())
     }
 
     pub fn changes(&self, run: &str) -> anyhow::Result<Vec<ChangeEntry>> {
@@ -331,11 +346,13 @@ impl Records {
     }
 
     pub fn status(&self, run: &str) -> anyhow::Result<Option<Value>> {
-        self.load(&format!("runs/{run}/status.json"))
+        let raw: Option<Value> = self.load(&format!("runs/{run}/status.json"))?;
+        Ok(raw.map(|v| tm_core::migrate_status(v).0))
     }
 
     pub fn save_status(&self, run: &str, status: &Value) -> anyhow::Result<()> {
-        self.save(&format!("runs/{run}/status.json"), status)
+        let (versioned, _) = tm_core::migrate_status(status.clone());
+        self.save(&format!("runs/{run}/status.json"), &versioned)
     }
 
     pub fn save_plan(&self, run: &str, plan: &Plan) -> anyhow::Result<()> {
@@ -349,8 +366,8 @@ impl Records {
         Ok(text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect())
     }
 
-    /// The model scorecard over the ledgers of the last `recent` runs that spent anything.
-    pub fn scorecard(&self, recent: usize) -> anyhow::Result<tm_core::ModelScorecard> {
+    /// Ledgers of the last `recent` runs that spent anything.
+    pub fn recent_ledgers(&self, recent: usize) -> anyhow::Result<Vec<Vec<LedgerEntry>>> {
         let ids = self.run_ids()?;
         let mut ledgers = Vec::new();
         for id in &ids[ids.len().saturating_sub(recent)..] {
@@ -360,7 +377,27 @@ impl Records {
                 ledgers.push(entries);
             }
         }
-        Ok(tm_core::scorecard(&ledgers))
+        Ok(ledgers)
+    }
+
+    /// The model scorecard over the ledgers of the last `recent` runs that spent anything.
+    pub fn scorecard(&self, recent: usize) -> anyhow::Result<tm_core::ModelScorecard> {
+        Ok(tm_core::scorecard(&self.recent_ledgers(recent)?))
+    }
+
+    /// Learned auto-router recommendation for `(difficulty, language)` (Item 5.3).
+    pub fn auto_route(
+        &self,
+        recent: usize,
+        difficulty: Option<&str>,
+        language: Option<&str>,
+    ) -> anyhow::Result<Option<tm_core::ModelScore>> {
+        Ok(tm_core::auto_route(&self.recent_ledgers(recent)?, difficulty, language))
+    }
+
+    /// Stratified per-(model, difficulty, language) scores for the UI/API.
+    pub fn stratified_scores(&self, recent: usize) -> anyhow::Result<Vec<tm_core::StratifiedScore>> {
+        Ok(tm_core::stratified_scores(&self.recent_ledgers(recent)?))
     }
 
     pub fn charge(&self, run: &str, entry: &LedgerEntry) -> anyhow::Result<()> {

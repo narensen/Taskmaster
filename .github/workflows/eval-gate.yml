@@ -1,0 +1,20 @@
+name: Eval Regression Gate
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: clippy
+      - name: Verify eval suite integrity and regression gate
+        run: |
+          cargo test -p tm-core -p tm-daemon --lib eval_suite::
+          cargo run -p tm-daemon -- eval --suite bench/suite --check-only
+          cargo clippy -p tm-core -p tm-daemon --all-targets -- -D warnings

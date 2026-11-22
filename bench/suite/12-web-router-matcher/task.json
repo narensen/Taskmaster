@@ -1,0 +1,16 @@
+{
+  "id": "12-web-router-matcher",
+  "category": "web",
+  "language": "js",
+  "difficulty": "normal",
+  "prompt": "Implement a URL router in router.mjs exporting matchRoute(routes, pathname) supporting :param segments and static-before-param precedence.",
+  "starter_files": {
+    "router.mjs": "export function matchRoute(routes, pathname) { return null; }\n"
+  },
+  "hidden_test_file": "_hidden_test.mjs",
+  "hidden_test_content": "import assert from 'node:assert/strict';\nimport { matchRoute } from './router.mjs';\nconst routes = ['/users/:id', '/users/new', '/posts/:slug/comments/:cid'];\nassert.deepEqual(matchRoute(routes, '/users/new'), { route: '/users/new', params: {} });\nassert.deepEqual(matchRoute(routes, '/users/42'), { route: '/users/:id', params: { id: '42' } });\nassert.deepEqual(matchRoute(routes, '/posts/hi/comments/7'), { route: '/posts/:slug/comments/:cid', params: { slug: 'hi', cid: '7' } });\nassert.equal(matchRoute(routes, '/unknown'), null);\n",
+  "hidden_test_command": [
+    "node",
+    "_hidden_test.mjs"
+  ]
+}

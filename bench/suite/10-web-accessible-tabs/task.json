@@ -1,0 +1,17 @@
+{
+  "id": "10-web-accessible-tabs",
+  "category": "web",
+  "language": "html",
+  "difficulty": "easy",
+  "prompt": "Create an accessible tabs widget in index.html + tabs.mjs with ARIA roles (tablist, tab, tabpanel), aria-selected, and arrow-key navigation.",
+  "starter_files": {
+    "index.html": "<!doctype html><html><body></body></html>\n",
+    "tabs.mjs": "export function initTabs() {}\n"
+  },
+  "hidden_test_file": "_hidden_test.mjs",
+  "hidden_test_content": "import fs from 'node:fs';\nimport assert from 'node:assert/strict';\nconst html = fs.readFileSync('index.html', 'utf8');\nassert.match(html, /role=\"tablist\"/);\nassert.match(html, /role=\"tab\"/);\nassert.match(html, /role=\"tabpanel\"/);\nassert.match(html, /aria-selected/);\n",
+  "hidden_test_command": [
+    "node",
+    "_hidden_test.mjs"
+  ]
+}

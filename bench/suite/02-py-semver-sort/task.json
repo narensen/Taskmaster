@@ -1,0 +1,16 @@
+{
+  "id": "02-py-semver-sort",
+  "category": "python",
+  "language": "py",
+  "difficulty": "easy",
+  "prompt": "Implement parse_semver(s) and sort_versions(versions) in semver.py handling major.minor.patch and optional -prerelease ordering.",
+  "starter_files": {
+    "semver.py": "def sort_versions(versions):\n    return list(versions)\n"
+  },
+  "hidden_test_file": "_hidden_test.py",
+  "hidden_test_content": "from semver import sort_versions\nassert sort_versions(['1.10.0', '1.2.0', '1.2.0-alpha.1', '2.0.0']) == ['1.2.0-alpha.1', '1.2.0', '1.10.0', '2.0.0']\n",
+  "hidden_test_command": [
+    "python3",
+    "_hidden_test.py"
+  ]
+}

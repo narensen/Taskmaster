@@ -60,6 +60,9 @@ struct Bill {
     /// The agent's id in the transcript, and the part of a split unit it built.
     agent: Option<String>,
     unit: Option<String>,
+    brief_hash: Option<String>,
+    difficulty: Option<String>,
+    language: Option<String>,
 }
 
 /// What the checker is given about a page that just passed.
@@ -228,8 +231,39 @@ struct Feed {
 impl AgentRequest {
     fn bill(&self, role: Role, page: Option<&str>) -> Bill {
         let tag = |key: &str| self.feed.as_ref().and_then(|f| f.agent[key].as_str()).map(str::to_string);
-        Bill { role, page: page.map(str::to_string), harness: self.harness.id().to_string(), model: self.model.clone(), agent: tag("id"), unit: tag("unit") }
+        Bill {
+            role,
+            page: page.map(str::to_string),
+            harness: self.harness.id().to_string(),
+            model: self.model.clone(),
+            agent: tag("id"),
+            unit: tag("unit"),
+            brief_hash: Some(tm_core::brief_hash(&self.brief)),
+            difficulty: None,
+            language: None,
+        }
     }
+}
+
+/// Infer a short language tag (`ts`, `rs`, `py`, `go`, `js`, `html`, `css`) from a unit's owned glob.
+pub(crate) fn infer_glob_language(glob: &str) -> Option<String> {
+    let lower = glob.to_ascii_lowercase();
+    for (needle, lang) in [
+        (".tsx", "ts"),
+        (".ts", "ts"),
+        (".rs", "rs"),
+        (".py", "py"),
+        (".go", "go"),
+        (".jsx", "js"),
+        (".js", "js"),
+        (".html", "html"),
+        (".css", "css"),
+    ] {
+        if lower.contains(needle) {
+            return Some(lang.to_string());
+        }
+    }
+    None
 }
 
 /// Shared-file repairs the master gets in one run.
@@ -782,17 +816,27 @@ impl Driver {
     async fn idle(&mut self) -> anyhow::Result<Step> {
         match self.run.phase {
             RunPhase::Planning => {
-                let plan = if let Some(plan) = self.config.plan.clone() {
+                let (mut plan, drafted) = if let Some(plan) = self.config.plan.clone() {
                     self.config.plan = None;
-                    plan
+                    (plan, false)
                 } else if self.config.prompt.as_ref().is_some_and(|prompt| !prompt.trim().is_empty()) {
                     let prompt = self.config.prompt.clone().unwrap_or_default();
                     let plan = self.draft_plan(&prompt).await?;
                     self.config.prompt = None;
-                    plan
+                    (plan, true)
                 } else {
                     bail!("no plan for this run; pass --plan <file> or --prompt <text>");
                 };
+                let review_findings = crate::gates::review_plan_structure(&plan);
+                if !review_findings.is_empty() {
+                    let revised = drafted && crate::gates::apply_mechanical_plan_fixes(&mut plan);
+                    self.live.push(
+                        &self.id,
+                        &serde_json::json!({ "id": "reviewer", "role": "plan_review" }),
+                        "plan_review",
+                        serde_json::json!({ "findings": review_findings, "revised": revised }),
+                    );
+                }
                 let plan = self.with_forecast(plan)?;
                 self.push_event(Event::PlanReady(plan))?;
                 self.grant_pages()?;
@@ -1308,6 +1352,11 @@ impl Driver {
 
     fn planner_brief(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
         let mut brief = self.planner_brief_inner(prompt, errors)?;
+        let attached = crate::attachments::prompt_section(&self.project, &self.id);
+        if !attached.is_empty() {
+            brief.push('\n');
+            brief.push_str(&attached);
+        }
         brief.push_str(&self.skills_offer(prompt));
         Ok(brief)
     }
@@ -1685,7 +1734,9 @@ impl Driver {
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
                 feed.agent["unit"] = serde_json::json!(unit);
             }
-            let bill = request.bill(Role::builder(tier), Some(&page));
+            let mut bill = request.bill(Role::builder(tier), Some(&page));
+            bill.difficulty = self.run.plan.as_ref().and_then(|p| p.pages.iter().find(|pg| pg.id == page)).and_then(|pg| pg.difficulty.clone());
+            bill.language = infer_glob_language(&units[index].owned_glob);
             let (page, slots) = (page.clone(), self.slots.clone());
             let mut rx = restart_rx.clone();
             if warm.is_some() {
@@ -3714,6 +3765,17 @@ impl Driver {
         if !page.context.trim().is_empty() {
             brief.push_str(&format!("\nContext from planner:\n{}\n", page.context.trim()));
         }
+        let contract_paths: Vec<String> = contracts.iter().map(|c| c.path.clone()).collect();
+        let pack = crate::lsp::build_context_pack(&self.tree, &contract_paths, owned, 3072);
+        if !pack.is_empty() {
+            brief.push('\n');
+            brief.push_str(&pack);
+        }
+        let attached = crate::attachments::prompt_section(&self.project, &self.id);
+        if !attached.is_empty() {
+            brief.push('\n');
+            brief.push_str(&attached);
+        }
         if ui {
             brief.push_str("A link or import inside a file is relative to that file (from app/index.html, app/styles.css is `styles.css`).\n");
         }
@@ -3753,6 +3815,11 @@ impl Driver {
             brief.push_str("\nChecks failed last time. This is their output; fix what it shows and leave every other unit alone:\n");
             brief.push_str(&tm_core::digest(errors));
             brief.push('\n');
+            let playbooks = tm_core::format_playbooks(errors);
+            if !playbooks.is_empty() {
+                brief.push('\n');
+                brief.push_str(&playbooks);
+            }
             brief.push_str(&self.handoff(page_id, tier)?);
         }
         let model = self.model_byline(tier);
@@ -4151,6 +4218,9 @@ impl Driver {
             agent: bill.agent.clone(),
             unit: bill.unit.clone(),
             priced_by,
+            brief_hash: bill.brief_hash.clone(),
+            difficulty: bill.difficulty.clone(),
+            language: bill.language.clone(),
         };
         self.records.charge(&self.id, &entry)
     }
@@ -4647,6 +4717,27 @@ impl Driver {
             eprintln!("taskmaster: run {} {why}; what it built is on branch `{branch}`", self.id);
             self.delivery = Some((branch, false));
             return;
+        }
+        // Item 3.3: inspect newly added dependencies for typosquats, advisories, or disallowed licenses.
+        if std::env::var_os("TASKMASTER_ALLOW_UNVERIFIED_DEPS").is_none()
+            && let Ok(diff) = git::git(&self.project, &["diff", &format!("HEAD..{branch}")])
+        {
+            let added = crate::supply_chain::parse_added_dependencies(&diff);
+            if !added.is_empty() {
+                let verdict = crate::supply_chain::evaluate_dependencies(
+                    &added,
+                    &crate::supply_chain::OfflineOracle,
+                    crate::supply_chain::DEFAULT_ALLOWED_LICENSES,
+                );
+                if !verdict.allowed {
+                    eprintln!("taskmaster: supply-chain gate held merge of `{branch}`:");
+                    for f in &verdict.findings {
+                        eprintln!("  - [{} / {}] {}", f.category, f.severity, f.reason);
+                    }
+                    self.delivery = Some((branch, false));
+                    return;
+                }
+            }
         }
         let (merged, before) = {
             let _project = PROJECT.lock().unwrap();

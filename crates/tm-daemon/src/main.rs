@@ -72,9 +72,15 @@ struct ServeArgs {
     project: PathBuf,
     bind: Option<SocketAddr>,
     tailscale: bool,
+    auto_resume: bool,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
     web: Option<PathBuf>,
+}
+
+enum EvalMode {
+    Suite { dir: PathBuf, check_only: bool },
+    Gate { baseline: PathBuf, candidate: PathBuf, max_cost_pct: f64 },
 }
 
 fn main() -> ExitCode {
@@ -109,6 +115,10 @@ async fn run() -> anyhow::Result<Outcome> {
         Invocation::Serve(args) => {
             serve(args).await?;
             return Ok(Outcome::Finished { ok: true });
+        }
+        Invocation::Eval(mode) => {
+            let ok = run_eval_cli(mode)?;
+            return Ok(Outcome::Finished { ok });
         }
         Invocation::Version => {
             println!("tm-daemon {}", env!("CARGO_PKG_VERSION"));
@@ -152,6 +162,11 @@ async fn run() -> anyhow::Result<Outcome> {
         };
         args.roles = Roles::resolve(&Settings::saved_roles(&project), &chosen)
             .context("pass --master, --mid, --worker, --reviewer and --verifier, or save them in Settings")?;
+        if let Ok(settings) = Settings::load(&project)
+            && let Ok(records) = settings.records(&project)
+        {
+            args.roles.resolve_auto(&records, &mut args.models, "normal", "general");
+        }
         if args.baseline.is_empty() {
             args.baseline = args.roles.master.clone();
         }
@@ -207,6 +222,7 @@ async fn run() -> anyhow::Result<Outcome> {
             project: args.project.clone(),
             bind: None,
             tailscale: false,
+            auto_resume: false,
             dictionary: config.dictionary.clone(),
             commons: config.commons.clone(),
             web: None,
@@ -323,9 +339,116 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if !bind.ip().is_loopback() && !matches!(bind.ip(), IpAddr::V4(ip) if tm_daemon::is_tailscale(ip)) {
         eprintln!("taskmaster: {bind} is neither this machine nor its tailnet; anyone who can reach it can try the code");
     }
+    if args.auto_resume
+        && let Ok(project) = args.project.canonicalize()
+        && let Ok(settings) = Settings::load(&project)
+        && let Ok(records) = settings.records(&project)
+        && let Ok(runs) = records.run_ids()
+    {
+        let resumable: Vec<_> = runs
+            .into_iter()
+            .filter(|id| {
+                records
+                    .status(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v["state"].as_str().map(str::to_string))
+                    .is_some_and(|s| matches!(s.as_str(), "running" | "stopped" | "interrupted"))
+            })
+            .collect();
+        if !resumable.is_empty() {
+            eprintln!(
+                "taskmaster: --auto-resume detected {} interrupted run(s): {}",
+                resumable.len(),
+                resumable.join(", ")
+            );
+        }
+    }
     let _server = start_server(&args, bind).await?;
-    tokio::signal::ctrl_c().await.context("cannot wait for ctrl-c")?;
+    wait_for_shutdown().await?;
     Ok(())
+}
+
+async fn wait_for_shutdown() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("cannot listen for SIGTERM")?;
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => { res.context("cannot wait for ctrl-c")?; }
+            _ = term.recv() => { eprintln!("taskmaster: received SIGTERM, shutting down cleanly"); }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("cannot wait for ctrl-c")?;
+        Ok(())
+    }
+}
+
+fn run_eval_cli(mode: EvalMode) -> anyhow::Result<bool> {
+    match mode {
+        EvalMode::Suite { dir, check_only } => {
+            let tasks = tm_daemon::eval_suite::load_suite(&dir)
+                .with_context(|| format!("cannot load eval suite from {}", dir.display()))?;
+            if tasks.is_empty() {
+                bail!("no eval tasks found under {}", dir.display());
+            }
+            let mut ok = true;
+            let mut summary = Vec::new();
+            for task in &tasks {
+                if check_only {
+                    let scratch = std::env::temp_dir().join(format!(
+                        "tm-eval-check-{}-{}",
+                        std::process::id(),
+                        task.id
+                    ));
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    tm_daemon::eval_suite::seed_task(task, &scratch)?;
+                    let (passed_on_starter, _) = tm_daemon::eval_suite::run_hidden_test(task, &scratch)?;
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    let valid = !passed_on_starter;
+                    if !valid {
+                        ok = false;
+                    }
+                    summary.push(serde_json::json!({
+                        "id": task.id,
+                        "category": task.category,
+                        "language": task.language,
+                        "difficulty": task.difficulty,
+                        "starter_fails_hidden_test": valid,
+                    }));
+                } else {
+                    summary.push(serde_json::json!({
+                        "id": task.id,
+                        "category": task.category,
+                        "language": task.language,
+                        "difficulty": task.difficulty,
+                        "hidden_test_file": task.hidden_test_file,
+                    }));
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": ok,
+                    "count": tasks.len(),
+                    "tasks": summary,
+                }))?
+            );
+            Ok(ok)
+        }
+        EvalMode::Gate { baseline, candidate, max_cost_pct } => {
+            let base = tm_daemon::eval_suite::read_results_jsonl(&baseline)
+                .with_context(|| format!("cannot read baseline {}", baseline.display()))?;
+            let cand = tm_daemon::eval_suite::read_results_jsonl(&candidate)
+                .with_context(|| format!("cannot read candidate {}", candidate.display()))?;
+            let verdict = tm_daemon::eval_suite::check_regression_gate(&base, &cand, max_cost_pct);
+            println!("{}", serde_json::to_string_pretty(&verdict)?);
+            Ok(verdict.ok)
+        }
+    }
 }
 
 enum Invocation {
@@ -334,6 +457,7 @@ enum Invocation {
     Help,
     /// `tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]`
     Report { project: PathBuf, run: String, json: bool, append: Option<PathBuf> },
+    Eval(EvalMode),
     Serve(ServeArgs),
     Drive(Box<Args>),
 }
@@ -348,6 +472,9 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
     }
     if argv.first().is_some_and(|arg| arg == "--help" || arg == "-h" || arg == "help") {
         return Ok(Invocation::Help);
+    }
+    if argv.first().is_some_and(|arg| arg == "eval") {
+        return Ok(Invocation::Eval(eval_args(&argv[1..])?));
     }
     if argv.first().is_some_and(|arg| arg == "report") {
         let usage = "usage: tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]";
@@ -370,16 +497,58 @@ fn invocation_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Inv
     Ok(Invocation::Drive(Box::new(args_from(argv)?)))
 }
 
+fn eval_args(argv: &[String]) -> anyhow::Result<EvalMode> {
+    let usage = "usage: tm-daemon eval --suite <dir> [--check-only]\n       \
+                 tm-daemon eval --gate <baseline.jsonl> <candidate.jsonl> [--max-cost-pct <n>]";
+    let mut it = argv.iter().cloned();
+    let mut suite: Option<PathBuf> = None;
+    let mut check_only = false;
+    let mut gate: Option<(PathBuf, PathBuf)> = None;
+    let mut max_cost_pct = 10.0_f64;
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--suite" => suite = Some(need(&mut it, "--suite", usage)?.into()),
+            "--check-only" => check_only = true,
+            "--gate" => {
+                let base = need(&mut it, "--gate", usage)?.into();
+                let cand = need(&mut it, "--gate", usage)?.into();
+                gate = Some((base, cand));
+            }
+            "--max-cost-pct" => {
+                max_cost_pct = need(&mut it, "--max-cost-pct", usage)?
+                    .parse()
+                    .context("--max-cost-pct needs a number")?;
+            }
+            other => bail!("unknown argument `{other}`\n{usage}"),
+        }
+    }
+    if let Some((baseline, candidate)) = gate {
+        Ok(EvalMode::Gate { baseline, candidate, max_cost_pct })
+    } else if let Some(dir) = suite {
+        Ok(EvalMode::Suite { dir, check_only })
+    } else {
+        bail!("{usage}")
+    }
+}
+
 fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
-    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--tailscale] [--dictionary <dir>] \
+    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--tailscale] [--auto-resume] [--dictionary <dir>] \
                  [--commons <dir>] [--web <dir>]";
     let mut argv = argv.iter().cloned();
     let project = argv.next().filter(|arg| !arg.starts_with('-')).context(usage)?;
-    let mut args =
-        ServeArgs { project: PathBuf::from(project), bind: None, tailscale: false, dictionary: None, commons: None, web: None };
+    let mut args = ServeArgs {
+        project: PathBuf::from(project),
+        bind: None,
+        tailscale: false,
+        auto_resume: false,
+        dictionary: None,
+        commons: None,
+        web: None,
+    };
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--tailscale" => args.tailscale = true,
+            "--auto-resume" => args.auto_resume = true,
             "--bind" => {
                 let value = need(&mut argv, "--bind", usage)?;
                 args.bind = Some(value.parse().with_context(|| format!("`{value}` is not an address like 127.0.0.1:8737"))?);
@@ -422,17 +591,19 @@ async fn print_providers(harness: Option<&str>) -> anyhow::Result<()> {
 
 /// What `tm-daemon --help` prints, and what a wrong command line is answered with.
 const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
-                     tm-daemon serve <project> [--bind <addr>] [--tailscale] [--web <dir>]\n       \
+                     tm-daemon serve <project> [--bind <addr>] [--tailscale] [--auto-resume] [--web <dir>]\n       \
+                     tm-daemon eval --suite <dir> [--check-only]\n       \
+                     tm-daemon eval --gate <baseline.jsonl> <candidate.jsonl> [--max-cost-pct <n>]\n       \
                      tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]\n       \
                      tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] \
-                     [--yes] [--worker <h>] [--mid <h>] [--master <h>] [--reviewer <h>] \
+                     [--yes] [--worker <h | auto>] [--mid <h>] [--master <h>] [--reviewer <h>] \
                      [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
                      [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
                      [--timeout <secs, 0 for none>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
                      [--template <next | dir>] [--no-runtime-checks] \
                      [--eval] [--baseline <h>] [--pair]\n       \
                      tm-daemon --version\n\
-                     harnesses: claude, agy, grok, codex, opencode";
+                     harnesses: claude, agy, grok, codex, opencode (worker also accepts auto)";
 
 fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
     let usage = USAGE;
@@ -612,7 +783,12 @@ mod args_tests {
     fn providers_lists_models_without_a_project() {
         match invocation_from(["providers".to_string()]).unwrap() {
             Invocation::Providers { harness: None } => {}
-            Invocation::Drive(_) | Invocation::Serve(_) | Invocation::Report { .. } | Invocation::Version | Invocation::Help => {
+            Invocation::Drive(_)
+            | Invocation::Serve(_)
+            | Invocation::Report { .. }
+            | Invocation::Eval(_)
+            | Invocation::Version
+            | Invocation::Help => {
                 panic!("providers was read as a project")
             }
             Invocation::Providers { harness: Some(name) } => panic!("unexpected filter {name}"),
@@ -626,5 +802,28 @@ mod args_tests {
             Ok(_) => panic!("unknown harness was accepted"),
         };
         assert!(err.contains("unknown harness"), "{err}");
+    }
+
+    #[test]
+    fn eval_and_auto_resume_flags_parse() {
+        match invocation_from(["eval".into(), "--suite".into(), "bench/suite".into(), "--check-only".into()]).unwrap() {
+            Invocation::Eval(EvalMode::Suite { dir, check_only }) => {
+                assert_eq!(dir, PathBuf::from("bench/suite"));
+                assert!(check_only);
+            }
+            _ => panic!("expected Eval::Suite"),
+        }
+        match invocation_from(["eval".into(), "--gate".into(), "base.jsonl".into(), "cand.jsonl".into()]).unwrap() {
+            Invocation::Eval(EvalMode::Gate { baseline, candidate, max_cost_pct }) => {
+                assert_eq!(baseline, PathBuf::from("base.jsonl"));
+                assert_eq!(candidate, PathBuf::from("cand.jsonl"));
+                assert!((max_cost_pct - 10.0).abs() < 1e-6);
+            }
+            _ => panic!("expected Eval::Gate"),
+        }
+        match invocation_from(["serve".into(), ".".into(), "--auto-resume".into()]).unwrap() {
+            Invocation::Serve(args) => assert!(args.auto_resume),
+            _ => panic!("expected Serve"),
+        }
     }
 }

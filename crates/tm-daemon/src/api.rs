@@ -56,11 +56,42 @@
 //! GET  /api/runs/{id}/checkpoints git checkpoints and unit commits for time-travel
 //! POST /api/runs/{id}/fork        {id?, prompt?, plan?, yes?, parallel?, max_cost_usd?, note?}
 //! GET  /api/runs/{id}/bundle      secret-redacted portable .tmrun.json Flight Recorder bundle
+//!
+//! GET  /metrics                   Prometheus text exposition metrics
+//! GET  /api/metrics/spend         monthly project spend and budget alert
+//! GET  /api/egress                daemon egress audit log
+//! POST /api/gc                    retention garbage collection
+//! GET  /api/runners               remote runner mesh nodes
+//! POST /api/runners               add or update a remote runner
+//! POST /api/runners/{id}/remove   remove a remote runner
+//! POST /api/runners/{id}/probe    probe a remote runner's /api/health
+//! GET  /api/environments          remote headless daemon environments
+//! POST /api/environments          add or update an environment
+//! POST /api/environments/{id}/remove  remove an environment
+//! GET  /api/mcp                   user-configured MCP servers
+//! POST /api/mcp                   add or update a user MCP server
+//! POST /api/mcp/{name}/remove     remove a user MCP server
+//! GET  /api/notifications         notification preferences
+//! POST /api/notifications         update notification preferences
+//! POST /api/notifications/test    send a test notification
+//! GET  /api/schedules             scheduled recurring runs
+//! POST /api/schedules             add or update a schedule
+//! POST /api/schedules/{id}/toggle enable or disable a schedule
+//! POST /api/schedules/{id}/remove remove a schedule
+//! POST /api/issues/parse          parse/fetch GitHub or GitLab issue URL into a prompt
+//! GET  /api/runs/{id}/attachments list run attachments
+//! POST /api/runs/{id}/attachments upload an image or context attachment
+//! GET  /api/runs/{id}/pr/status   CI check status via gh
+//! POST /api/runs/{id}/pr/sync     attribute CI failures and PR review comments into notes
+//! POST /api/runs/{id}/contracts/propose evaluate mid-flight Contract RFC (additive vs breaking)
+//! GET  /api/scorecard/stratified  stratified per-(model, difficulty, language) scorecard & auto-route
+//! GET  /api/eval/suite            list bench/suite evaluation tasks
 //! ```
 //!
 //! Installing, updating and signing in to harness CLIs is in `api/setup.rs`, and the
 //! skills store in `api/skills.rs`. Terminals a person opens (a shell on a PTY in the
-//! project) are in `api/terms.rs`. Studio endpoints are in `api/studio.rs`.
+//! project) are in `api/terms.rs`. Studio endpoints are in `api/studio.rs`, and production
+//! ops/workflow endpoints are in `api/ops.rs`.
 //!
 //! The control surface's own routes (the agent transcript, notes, the terminal, diffs,
 //! opening files in an editor, completions, gh) are listed in `api/desk.rs`.
@@ -89,7 +120,7 @@ use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use axum::extract::{Path as UrlPath, Query, Request, State};
@@ -110,6 +141,7 @@ use tokio::sync::{oneshot, watch};
 
 mod desk;
 mod hosts;
+mod ops;
 mod setup;
 mod skills;
 mod studio;
@@ -244,7 +276,11 @@ struct App {
     terms: terms::Terminals,
     skills_root: PathBuf,
     skills_fetch: Arc<dyn crate::skills::Fetch>,
+    /// Cached responses for POST requests carrying an `Idempotency-Key` header (Item 3.9).
+    idempotency: Mutex<HashMap<String, IdempotencyEntry>>,
 }
+
+type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
 
 impl Server {
     pub async fn serve(options: ServerOptions) -> anyhow::Result<Self> {
@@ -290,6 +326,7 @@ impl Server {
             terms: terms::Terminals::default(),
             skills_root: options.skills,
             skills_fetch: options.skills_fetch,
+            idempotency: Mutex::new(HashMap::new()),
         });
         app.close_interrupted_reviews();
         let (tx, rx) = oneshot::channel();
@@ -393,8 +430,32 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/checkpoints", get(studio::checkpoints))
         .route("/api/runs/{id}/fork", post(studio::fork_run))
         .route("/api/runs/{id}/bundle", get(studio::bundle))
+        .route("/api/metrics/spend", get(ops::monthly_spend))
+        .route("/api/egress", get(ops::egress_log))
+        .route("/api/gc", post(ops::run_gc))
+        .route("/api/runners", get(ops::list_runners).post(ops::upsert_runner))
+        .route("/api/runners/{id}/remove", post(ops::remove_runner))
+        .route("/api/runners/{id}/probe", post(ops::probe_runner))
+        .route("/api/environments", get(ops::list_environments).post(ops::upsert_environment))
+        .route("/api/environments/{id}/remove", post(ops::remove_environment))
+        .route("/api/mcp", get(ops::list_mcp).post(ops::upsert_mcp))
+        .route("/api/mcp/{name}/remove", post(ops::remove_mcp))
+        .route("/api/notifications", get(ops::get_notifications).post(ops::update_notifications))
+        .route("/api/notifications/test", post(ops::test_notification))
+        .route("/api/schedules", get(ops::list_schedules).post(ops::upsert_schedule))
+        .route("/api/schedules/{id}/toggle", post(ops::toggle_schedule))
+        .route("/api/schedules/{id}/remove", post(ops::remove_schedule))
+        .route("/api/issues/parse", post(ops::parse_issue))
+        .route("/api/runs/{id}/attachments", get(ops::list_attachments).post(ops::add_attachment))
+        .route("/api/runs/{id}/pr/status", get(ops::pr_status))
+        .route("/api/runs/{id}/pr/sync", post(ops::pr_sync))
+        .route("/api/runs/{id}/contracts/propose", post(ops::propose_contract))
+        .route("/api/scorecard/stratified", get(ops::stratified_scorecard))
+        .route("/api/eval/suite", get(ops::eval_suite))
+        .route_layer(middleware::from_fn_with_state(app.clone(), idempotency_guard))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
+        .route("/metrics", get(ops::prometheus_metrics))
         .route("/api/runs/{id}/stream", get(run_stream))
         .route("/api/setup/jobs/{id}/stream", get(setup::stream_job))
         .route("/api/terminals/{id}/stream", get(terms::stream))
@@ -416,6 +477,47 @@ async fn guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Res
     }
 }
 
+/// Replay cached JSON responses for POST requests repeating an `Idempotency-Key` header (Item 3.9).
+async fn idempotency_guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let Some(raw_key) = request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && k.len() <= 128)
+        .map(str::to_string)
+    else {
+        return next.run(request).await;
+    };
+    let cache_key = format!("{}::{}", request.uri().path(), raw_key);
+    let ttl = Duration::from_secs(600);
+    {
+        let mut cache = app.idempotency.lock().unwrap();
+        cache.retain(|_, (at, _, _)| at.elapsed() < ttl);
+        if let Some((_, status, body)) = cache.get(&cache_key) {
+            return (*status, [(header::CONTENT_TYPE, "application/json")], body.clone()).into_response();
+        }
+    }
+    let response = next.run(request).await;
+    let status = response.status();
+    if status.is_success() {
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024).await.unwrap_or_default().to_vec();
+        {
+            let mut cache = app.idempotency.lock().unwrap();
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(cache_key, (Instant::now(), status, bytes.clone()));
+        }
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    response
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
@@ -427,7 +529,7 @@ async fn cors(request: Request, next: Next) -> Response {
     let mut response = if preflight { StatusCode::NO_CONTENT.into_response() } else { next.run(request).await };
     let headers = response.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type, idempotency-key"));
     headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
     response
 }
@@ -958,8 +1060,9 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     let saved = crate::settings::Settings::load(&app.project()).unwrap_or_default();
     let bad_request = |err: anyhow::Error| fail(StatusCode::BAD_REQUEST, format!("{err:#}"));
     // A request that names roles but no models does not inherit the saved models, which belong to the saved harnesses.
-    let models: Models = if body.roles.is_empty() { with_defaults(&saved.models, body.models).map_err(bad_request)? } else { with_defaults(&Models::default(), body.models).map_err(bad_request)? };
-    let roles = Roles::resolve(&crate::settings::Settings::saved_roles(&app.project()), &body.roles).map_err(bad_request)?;
+    let mut models: Models = if body.roles.is_empty() { with_defaults(&saved.models, body.models).map_err(bad_request)? } else { with_defaults(&Models::default(), body.models).map_err(bad_request)? };
+    let mut roles = Roles::resolve(&crate::settings::Settings::saved_roles(&app.project()), &body.roles).map_err(bad_request)?;
+    roles.resolve_auto(&app.records(), &mut models, "normal", "general");
     check_models(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;

@@ -1,0 +1,16 @@
+{
+  "id": "09-js-promise-pool",
+  "category": "library",
+  "language": "js",
+  "difficulty": "hard",
+  "prompt": "Implement mapLimit(items, limit, fn) in pool.mjs running at most `limit` async tasks concurrently while preserving output order.",
+  "starter_files": {
+    "pool.mjs": "export async function mapLimit(items, limit, fn) { return []; }\n"
+  },
+  "hidden_test_file": "_hidden_test.mjs",
+  "hidden_test_content": "import assert from 'node:assert/strict';\nimport { mapLimit } from './pool.mjs';\nlet active = 0, peak = 0;\nconst out = await mapLimit([1,2,3,4,5], 2, async (x) => {\n  active++; peak = Math.max(peak, active);\n  await new Promise(r => setTimeout(r, 10));\n  active--; return x * 10;\n});\nassert.deepEqual(out, [10,20,30,40,50]);\nassert.ok(peak <= 2 && peak >= 2, `peak=${peak}`);\n",
+  "hidden_test_command": [
+    "node",
+    "_hidden_test.mjs"
+  ]
+}

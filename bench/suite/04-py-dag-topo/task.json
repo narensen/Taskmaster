@@ -1,0 +1,16 @@
+{
+  "id": "04-py-dag-topo",
+  "category": "library",
+  "language": "py",
+  "difficulty": "hard",
+  "prompt": "Implement topo_sort(deps: dict[str, list[str]]) -> list[str] in dag.py returning lexicographically deterministic topological order and raising ValueError on cycles.",
+  "starter_files": {
+    "dag.py": "def topo_sort(deps):\n    return []\n"
+  },
+  "hidden_test_file": "_hidden_test.py",
+  "hidden_test_content": "from dag import topo_sort\nassert topo_sort({'b': ['a'], 'c': ['a'], 'd': ['b', 'c'], 'a': []}) == ['a', 'b', 'c', 'd']\ntry:\n    topo_sort({'a': ['b'], 'b': ['a']})\n    assert False, 'expected cycle ValueError'\nexcept ValueError:\n    pass\n",
+  "hidden_test_command": [
+    "python3",
+    "_hidden_test.py"
+  ]
+}

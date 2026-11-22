@@ -1,0 +1,16 @@
+[Unit]
+Description=Taskmaster orchestration daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tm-daemon serve --auto-resume
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Environment=TASKMASTER_LOG_FORMAT=json
+
+[Install]
+WantedBy=default.target

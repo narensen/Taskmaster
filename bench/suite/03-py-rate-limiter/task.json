@@ -1,0 +1,16 @@
+{
+  "id": "03-py-rate-limiter",
+  "category": "python",
+  "language": "py",
+  "difficulty": "hard",
+  "prompt": "Implement a TokenBucket(rate_per_sec, burst) in limiter.py with allow(now, cost=1) supporting monotonic timestamps and fractional refill without exceeding burst.",
+  "starter_files": {
+    "limiter.py": "class TokenBucket:\n    def __init__(self, rate_per_sec: float, burst: float):\n        pass\n    def allow(self, now: float, cost: float = 1.0) -> bool:\n        return False\n"
+  },
+  "hidden_test_file": "_hidden_test.py",
+  "hidden_test_content": "from limiter import TokenBucket\nb = TokenBucket(2.0, 3.0)\nassert b.allow(0.0, 2.0) is True\nassert b.allow(0.0, 2.0) is False\nassert b.allow(0.5, 2.0) is True\nassert b.allow(10.0, 3.0) is True\nassert b.allow(10.0, 0.1) is False\n",
+  "hidden_test_command": [
+    "python3",
+    "_hidden_test.py"
+  ]
+}

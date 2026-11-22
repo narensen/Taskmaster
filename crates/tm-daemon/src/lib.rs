@@ -17,6 +17,7 @@
 pub mod api;
 pub mod approvals;
 pub mod atlas;
+pub mod attachments;
 pub mod auth;
 mod browser;
 pub mod audit;
@@ -25,22 +26,36 @@ mod checker;
 mod code;
 mod checks;
 pub mod doctor;
+pub mod egress;
 mod engine;
 mod eval;
+pub mod eval_suite;
+pub mod gates;
 mod git;
 mod hosts;
+pub mod issues;
 mod log;
 pub mod jobs;
 pub mod live;
+pub mod lsp;
+pub mod mcp_user;
 pub mod memory;
+pub mod merge_queue;
+pub mod mesh;
+pub mod metrics;
+pub mod notify;
 pub mod policy;
+pub mod pr_loop;
 pub mod preview;
 pub mod repomap;
 pub mod reply;
 pub mod report;
 mod resume;
+pub mod retention;
 mod runtime;
+pub mod scheduler;
 mod secret;
+pub mod secrets;
 mod small;
 mod static_site;
 pub mod search;
@@ -48,6 +63,7 @@ pub mod settings;
 pub mod skills;
 pub mod sqlite;
 pub mod store;
+pub mod supply_chain;
 pub mod template;
 mod telemetry;
 mod time;
@@ -156,6 +172,28 @@ impl Roles {
             bail!("choose a provider for the {} role{}", missing.join(", "), if missing.len() == 1 { "" } else { "s" });
         }
         Ok(roles)
+    }
+
+    /// Resolve `"auto"` on the worker role using the project's stratified ledger scorecard
+    /// (Item 5.3), falling back to `mid` when no model has enough history yet.
+    pub fn resolve_auto(&mut self, records: &crate::store::Records, models: &mut Models, difficulty: &str, language: &str) {
+        if !self.worker.eq_ignore_ascii_case("auto") {
+            return;
+        }
+        if let Ok(Some(picked)) = records.auto_route(crate::store::SCORECARD_RUNS, Some(difficulty), Some(language))
+            && HARNESSES.contains(&picked.harness.as_str())
+        {
+            self.worker = picked.harness;
+            if models.worker.is_none() {
+                models.worker = picked.model;
+            }
+            return;
+        }
+        self.worker = if !self.mid.is_empty() && !self.mid.eq_ignore_ascii_case("auto") {
+            self.mid.clone()
+        } else {
+            self.master.clone()
+        };
     }
 }
 

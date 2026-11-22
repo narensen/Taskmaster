@@ -51,6 +51,7 @@ pub async fn provider_action(State(app): State<Arc<App>>, UrlPath((id, action)):
     let Some(action) = Action::parse(&action) else {
         return Err(fail(StatusCode::NOT_FOUND, format!("no action `{action}`: use install, update or login")));
     };
+    app.forget_provider(&id);
     started(app.jobs.start(Target::Provider(&id), action))
 }
 

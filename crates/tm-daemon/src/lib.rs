@@ -68,6 +68,7 @@ pub mod template;
 mod telemetry;
 mod time;
 mod turns;
+pub mod provider_cache;
 mod undo;
 pub mod web_access;
 
@@ -202,6 +203,19 @@ impl Roles {
 /// A chosen model must be one its provider lists right now. A role with no model chosen
 /// keeps the provider's default, and the provider is not asked.
 pub async fn check_models(roles: &Roles, models: &Models) -> anyhow::Result<()> {
+    check_models_with(roles, models, |id: &str| {
+        let id = id.to_string();
+        async move { provider_report(&id).await }
+    })
+    .await
+}
+
+/// [`check_models`] with the reports from `report_of`, such as the daemon's cache.
+pub async fn check_models_with<F, Fut>(roles: &Roles, models: &Models, report_of: F) -> anyhow::Result<()>
+where
+    F: Fn(&str) -> Fut,
+    Fut: std::future::Future<Output = tm_harness::ProviderReport>,
+{
     let chosen = [
         ("--worker-model", roles.worker.as_str(), models.worker.as_deref()),
         ("--mid-model", roles.mid.as_str(), models.mid.as_deref()),
@@ -218,7 +232,7 @@ pub async fn check_models(roles: &Roles, models: &Models) -> anyhow::Result<()> 
         groups.entry(id).or_default().push((flag, model));
     }
     for (id, chosen) in groups {
-        let report = provider_report(id).await;
+        let report = report_of(id).await;
         if let Some(note) = report.error.as_deref().filter(|_| !report.models.is_empty()) {
             eprintln!("taskmaster: {id}: {note}");
         }

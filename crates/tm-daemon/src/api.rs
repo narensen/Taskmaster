@@ -139,7 +139,7 @@ use serde_json::{Value, json};
 use futures_util::stream::{self, Stream};
 use tm_core::{DictTier, DictionaryEntry, EntryStats, Event, Plan, Run, RunPhase, totals, valid_key};
 use tm_dictionary::{Catalog, CommonsRemote, LocalStore};
-use tm_harness::{HARNESSES, Harness, provider_report, provider_reports};
+use tm_harness::{HARNESSES, Harness};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
@@ -161,7 +161,7 @@ use crate::live::Live;
 use crate::secret::random_hex;
 use crate::store::{Records, Store};
 use crate::time::rfc3339_now;
-use crate::{Config, Harnesses, Models, Outcome, Roles, RunRequest, check_models, drive};
+use crate::{Config, Harnesses, Models, Outcome, Roles, RunRequest, drive};
 
 const PAGE: &str = include_str!("phone.html");
 
@@ -270,6 +270,8 @@ struct App {
     active: Mutex<HashMap<String, Active>>,
     /// Cached `view()` JSON for settled (inactive) runs, validated via O(1) file metadata stats.
     summary_cache: Mutex<HashMap<(PathBuf, String), (RunFingerprint, Value)>>,
+    /// Each harness's model list, kept so a page or a new run does not wait on five CLIs.
+    providers: crate::provider_cache::ProviderCache,
     live: Arc<Live>,
     /// The editor override; the settings file's value until `POST /api/settings` changes it.
     editor: Mutex<String>,
@@ -287,6 +289,15 @@ struct App {
 type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
 
 impl Server {
+    /// Ask every provider for its models in the background, so the first page that offers
+    /// a model, and the first run, find the lists ready.
+    pub fn warm_providers(&self) {
+        let cache = self.app.providers.clone();
+        tokio::spawn(async move {
+            cache.reports(false).await;
+        });
+    }
+
     pub async fn serve(options: ServerOptions) -> anyhow::Result<Self> {
         let project = options
             .project
@@ -322,6 +333,7 @@ impl Server {
             web: options.web.filter(|dir| dir.join("index.html").is_file()),
             active: Mutex::new(HashMap::new()),
             summary_cache: Mutex::new(HashMap::new()),
+            providers: Default::default(),
             live,
             editor: Mutex::new(options.editor),
             previews: crate::preview::Previews::new(project_for_previews, options.preview_command),
@@ -774,10 +786,23 @@ impl App {
                 None => (false, None, None),
             }
         };
+        // What the gallery and the sidebar show for a run comes with the list, so they do
+        // not fetch each run's ledger and request one by one.
+        let ledger = self.records().ledger(id)?;
+        let started_at = ledger.iter().map(|entry| entry.at.as_str()).min();
+        let last_at = ledger.iter().map(|entry| entry.at.as_str()).max();
+        let request = self.records().request(id).ok().flatten();
+        let prompt_head = request.as_ref().and_then(|r| r.prompt.as_deref()).and_then(|prompt| {
+            prompt.lines().map(str::trim).find(|line| !line.is_empty()).map(|line| line.chars().take(160).collect::<String>())
+        });
         Ok(json!({
             "id": id,
             "phase": run.phase,
             "parallel": self.parallel(id),
+            "prompt_head": prompt_head,
+            "mode": request.as_ref().map(|r| r.mode),
+            "started_at": started_at,
+            "last_at": last_at,
             "cancelled": cancelled,
             "cancelling": cancelling,
             "budget_usd": budget_usd,
@@ -792,7 +817,7 @@ impl App {
             "undone": status.get("undone"),
             "pages": pages,
             "estimate": run.plan.as_ref().map(|plan| &plan.estimate),
-            "spent": totals(&self.records().ledger(id)?),
+            "spent": totals(&ledger),
             "review_rounds": run.review_rounds,
             "amendments": run.amendments,
             "phase_at": run.phase_at,
@@ -1115,7 +1140,7 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
     let mut models: Models = if body.roles.is_empty() { with_defaults(&saved.models, body.models).map_err(bad_request)? } else { with_defaults(&Models::default(), body.models).map_err(bad_request)? };
     let mut roles = Roles::resolve(&crate::settings::Settings::saved_roles(&app.project()), &body.roles).map_err(bad_request)?;
     roles.resolve_auto(&app.records(), &mut models, "normal", "general");
-    check_models(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    app.check_models_cached(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     }
@@ -1410,13 +1435,41 @@ async fn cancel_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>, b
 
 // What the project knows.
 
-async fn providers(Query(query): Query<HashMap<String, String>>) -> Reply {
+async fn providers(State(app): State<Arc<App>>, Query(query): Query<HashMap<String, String>>) -> Reply {
+    // `fresh=1` asks the CLIs now; otherwise a recent list is answered at once.
+    let fresh = query.get("fresh").is_some_and(|v| v == "1" || v == "true");
     let reports = match query.get("harness") {
-        Some(id) if HARNESSES.contains(&id.as_str()) => vec![provider_report(id).await],
+        Some(id) if HARNESSES.contains(&id.as_str()) => vec![if fresh { app.providers.fetch(id).await } else { app.providers.report(id).await }],
         Some(id) => return Err(fail(StatusCode::BAD_REQUEST, format!("unknown harness `{id}`"))),
-        None => provider_reports().await,
+        None => app.providers.reports(fresh).await,
     };
     ok(json!({ "providers": reports }))
+}
+
+impl App {
+    /// [`check_models`] from the cached lists, asking the CLIs again only when a model is not
+    /// in them (it may be newer than the list).
+    async fn check_models_cached(&self, roles: &Roles, models: &Models) -> anyhow::Result<()> {
+        let cache = self.providers.clone();
+        let cached = crate::check_models_with(roles, models, |id: &str| {
+            let (cache, id) = (cache.clone(), id.to_string());
+            async move { cache.report(&id).await }
+        })
+        .await;
+        if cached.is_ok() {
+            return cached;
+        }
+        crate::check_models_with(roles, models, |id: &str| {
+            let (cache, id) = (cache.clone(), id.to_string());
+            async move { cache.fetch(&id).await }
+        })
+        .await
+    }
+
+    /// A provider was installed, updated or signed in to: its list is asked for again.
+    pub(crate) fn forget_provider(&self, id: &str) {
+        self.providers.forget(id);
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1534,7 +1587,7 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
         with_defaults(&Models::default(), body.models).map_err(bad_request)?
     };
     let roles = Roles::resolve(&crate::settings::Settings::saved_roles(&path), &body.roles).map_err(bad_request)?;
-    check_models(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    app.check_models_cached(&roles, &models).await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     if let Some(name) = &body.template {
         crate::template::load(name).map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
     }

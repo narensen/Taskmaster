@@ -12,6 +12,7 @@ import {
   type TerminalKey,
 } from "../api";
 import { toast } from "../overlay";
+import { keys, queryClient } from "../query";
 import { Loading, Problem, useLoad } from "../ui";
 
 const ACTION_DONE: Record<SetupAction, string> = { install: "Installed", update: "Updated", login: "Signed in" };
@@ -400,9 +401,16 @@ const ORDER = ["claude", "grok", "agy", "codex", "opencode"];
 export function Providers() {
   const setup = useLoad(() => api.setup(), []);
   const models = useLoad(() => api.providers(), []);
+  // After an install, an update or a sign-in, the lists are asked for again, not from the cache.
   const reload = () => {
     void setup.reload();
-    void models.reload();
+    void api.providers(undefined, true).then(
+      (fresh) => {
+        models.setData(fresh);
+        queryClient.setQueryData(keys.providers, fresh);
+      },
+      () => void models.reload(),
+    );
   };
   const ids = useMemo(() => {
     const known = new Set([...(setup.data?.providers ?? []).map((p) => p.id), ...(models.data ?? []).map((p) => p.id)]);

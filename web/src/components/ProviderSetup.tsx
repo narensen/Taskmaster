@@ -2,7 +2,7 @@
 // pick, say what Taskmaster needs, how to get each CLI, and where to install it from here.
 
 import { Copy, ExternalLink, RefreshCw } from "lucide-react";
-import type { Provider } from "../api";
+import { api, type Provider } from "../api";
 import { toast } from "../overlay";
 import { ProviderLogo } from "../providers/logos";
 import { keys, queryClient } from "../query";
@@ -68,7 +68,7 @@ export function ProviderSetup({ providers, checking }: { providers: Provider[]; 
           type="button"
           className="ghost small"
           disabled={checking}
-          onClick={() => void queryClient.invalidateQueries({ queryKey: keys.providers })}
+          onClick={() => void queryClient.fetchQuery({ queryKey: keys.providers, queryFn: () => api.providers(undefined, true), staleTime: 0 })}
         >
           <RefreshCw size={13} aria-hidden className={checking ? "spin-icon" : ""} /> {checking ? "Checking…" : "Check again"}
         </button>

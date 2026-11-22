@@ -49,12 +49,33 @@ export function morphName(id: string): string {
 const shots = new Map<string, string | null>();
 const prompts = new Map<string, string | null>();
 
-function useShot(run: RunSummary): { shot: string | null | undefined; prompt: string | null | undefined } {
+/** True once `el` has come within a screen of the viewport, so off-screen cards fetch nothing. */
+function useSeen(el: RefObject<HTMLElement | null>): boolean {
+  const [seen, setSeen] = useState(false);
+  useEffect(() => {
+    const node = el.current;
+    if (seen || !node) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setSeen(true);
+      return;
+    }
+    const io = new IntersectionObserver((hits) => hits.some((h) => h.isIntersecting) && setSeen(true), { rootMargin: "400px" });
+    io.observe(node);
+    return () => io.disconnect();
+  }, [el, seen]);
+  return seen;
+}
+
+function useShot(run: RunSummary, visible: boolean): { shot: string | null | undefined; prompt: string | null | undefined } {
   const key = `${run.id}:${run.pages.length}:${run.phase}`;
   const [shot, setShot] = useState<string | null | undefined>(shots.get(key));
-  const [prompt, setPrompt] = useState<string | null | undefined>(prompts.get(run.id));
+  // A daemon that sends the first line with the list saves a request per card.
+  const listed = "prompt_head" in run;
+  const [fetched, setPrompt] = useState<string | null | undefined>(prompts.get(run.id));
+  const prompt = listed ? (run.prompt_head ?? null) : fetched;
   useEffect(() => {
     let stale = false;
+    if (!visible) return;
     if (!shots.has(key)) {
       api
         .screens(run.id)
@@ -66,7 +87,7 @@ function useShot(run: RunSummary): { shot: string | null | undefined; prompt: st
         })
         .catch(() => !stale && setShot(null));
     }
-    if (!prompts.has(run.id)) {
+    if (!listed && !prompts.has(run.id)) {
       api
         .run(run.id)
         .then((detail) => {
@@ -79,16 +100,18 @@ function useShot(run: RunSummary): { shot: string | null | undefined; prompt: st
     return () => {
       stale = true;
     };
-  }, [key, run.id]);
+  }, [key, run.id, listed, visible]);
   return { shot, prompt };
 }
 
 function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: number; folder: string | null }) {
-  const { shot, prompt } = useShot(run);
+  const card = useRef<HTMLElement>(null);
+  const { shot, prompt } = useShot(run, useSeen(card));
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
   return (
     <article
+      ref={card}
       className="card gallery-card"
       onMouseEnter={() => prefetchRun(run.id)}
       onFocus={() => prefetchRun(run.id)}

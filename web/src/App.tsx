@@ -202,9 +202,21 @@ function crumbsFor(path: string, project: string): Crumb[] {
 }
 
 /** First and last ledger timestamps, so Working can show elapsed time and Settled a relative time. */
-function useClocks(ids: string[]) {
+function useClocks(ids: string[], runs: RunSummary[] = []) {
   const [clocks, setClocks] = useState<Record<string, { start: number; end: number }>>({});
   const fetched = useRef(new Set<string>());
+  // A daemon that sends the timestamps with the list needs no ledger fetch per run.
+  const listed = useMemo(() => {
+    const out: Record<string, { start: number; end: number }> = {};
+    for (const run of runs) {
+      if (!("started_at" in run)) continue;
+      const start = run.started_at ? Date.parse(run.started_at) : NaN;
+      const end = run.last_at ? Date.parse(run.last_at) : NaN;
+      if (!Number.isNaN(start) && !Number.isNaN(end)) out[run.id] = { start, end };
+      fetched.current.add(run.id);
+    }
+    return out;
+  }, [runs]);
   const key = ids.join("|");
   useEffect(() => {
     let cancel = false;
@@ -226,7 +238,7 @@ function useClocks(ids: string[]) {
       cancel = true;
     };
   }, [key]);
-  return clocks;
+  return useMemo(() => ({ ...clocks, ...listed }), [clocks, listed]);
 }
 
 function RunMark({ group }: { group: Group }) {
@@ -341,7 +353,7 @@ const RunList = memo(function RunList({ runs, path, onPick }: { runs: RunSummary
     const recent = list.slice(0, 12).map((x) => x.run.id);
     return [...new Set([...active, ...recent])];
   }, [list]);
-  const clocks = useClocks(clockIds);
+  const clocks = useClocks(clockIds, runs);
   const [folded, setFolded] = useState<Partial<Record<Group, boolean>>>({});
   const scroller = useRef<HTMLDivElement>(null);
   const counts = new Map<Group, number>();

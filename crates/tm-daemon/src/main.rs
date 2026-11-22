@@ -298,6 +298,7 @@ async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Serv
     options.commons = args.commons.clone().or_else(home_commons);
     options.web = args.web.clone().or_else(installed_web);
     let server = Server::serve(options).await?;
+    server.warm_providers();
     println!("taskmaster: api {}  code {code}", server.url);
     Ok(server)
 }

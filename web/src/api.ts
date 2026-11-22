@@ -168,6 +168,11 @@ export interface RunSummary {
   amendments: number;
   /** Risky tool calls waiting for a person. */
   pending_approvals?: number;
+  /** The first line of the prompt, sent with the list so a card need not fetch the run. */
+  prompt_head?: string | null;
+  /** First and last ledger timestamps, for the sidebar's clocks. */
+  started_at?: string | null;
+  last_at?: string | null;
 }
 
 export interface RunLimit {
@@ -1200,10 +1205,11 @@ export const api = {
   savePolicy: (policy: Policy, repoFile = false) =>
     call<{ ok: boolean } & PolicyResponse>("POST", "/api/policy", { policy, repo_file: repoFile }),
 
-  providers: (harness?: string) =>
-    call<{ providers: Provider[] }>("GET", `/api/providers${harness ? `?harness=${enc(harness)}` : ""}`).then(
-      (r) => r.providers,
-    ),
+  /** The providers' model lists. The daemon answers from a recent list unless `fresh`. */
+  providers: (harness?: string, fresh = false) => {
+    const query = [harness ? `harness=${enc(harness)}` : "", fresh ? "fresh=1" : ""].filter(Boolean).join("&");
+    return call<{ providers: Provider[] }>("GET", `/api/providers${query ? `?${query}` : ""}`).then((r) => r.providers);
+  },
   setup: () => call<{ providers: ProviderStatus[]; runtimes: RuntimeStatus[]; jobs: SetupJob[] }>("GET", "/api/setup"),
   startProviderJob: (id: string, action: SetupAction) => call<SetupJob>("POST", `/api/setup/providers/${enc(id)}/${action}`, {}),
   installRuntime: (id: string) => call<SetupJob>("POST", `/api/setup/runtimes/${enc(id)}/install`, {}),

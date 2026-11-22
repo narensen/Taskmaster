@@ -381,6 +381,10 @@ pub struct Config {
     pub package_indexes: bool,
     /// Dollars per million tokens by model id or harness id, for calls with no reported price.
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+    /// Best-of-N on `difficulty: hard` units (W3): off by default.
+    pub best_of_n: bool,
+    /// Optional explicit second harness for Best-of-N races (defaults to mid/master when distinct).
+    pub best_of_n_alt: Option<Arc<dyn Harness>>,
 }
 
 /// How an active run should stop when cancelled.
@@ -456,6 +460,8 @@ impl Config {
             worker_shell: true,
             package_indexes: true,
             prices: crate::settings::built_in_prices(),
+            best_of_n: false,
+            best_of_n_alt: None,
         }
     }
 }

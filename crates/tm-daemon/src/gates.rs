@@ -236,13 +236,15 @@ pub struct CandidateResult {
     pub checks_passed: bool,
     pub tests_passed: bool,
     pub warnings: usize,
+    #[serde(default)]
+    pub diff_lines: usize,
     pub cost_usd: f64,
     pub seconds: f64,
 }
 
 /// Pick the winning candidate from a Best-of-N race on a `hard` unit.
 /// Prefers: (1) checks + tests passed, (2) checks passed, (3) fewest warnings,
-/// (4) lowest cost, (5) fastest wall time. Returns `(winner_index, loser_worktrees)`.
+/// (4) smaller diff, (5) lowest cost, (6) fastest wall time. Returns `(winner_index, loser_worktrees)`.
 pub fn pick_best_candidate(candidates: &[CandidateResult]) -> Option<(usize, Vec<String>)> {
     if candidates.is_empty() {
         return None;
@@ -259,6 +261,7 @@ pub fn pick_best_candidate(candidates: &[CandidateResult]) -> Option<(usize, Vec
         score(a)
             .cmp(&score(b))
             .then_with(|| a.warnings.cmp(&b.warnings))
+            .then_with(|| a.diff_lines.cmp(&b.diff_lines))
             .then_with(|| a.cost_usd.partial_cmp(&b.cost_usd).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.seconds.partial_cmp(&b.seconds).unwrap_or(std::cmp::Ordering::Equal))
     })?;
@@ -269,6 +272,58 @@ pub fn pick_best_candidate(candidates: &[CandidateResult]) -> Option<(usize, Vec
         .map(|(_, c)| c.worktree.clone())
         .collect();
     Some((best_idx, losers))
+}
+
+/// True when a prompt asks to fix a bug or regression (eligible for W2 red/green proof).
+pub fn is_bug_fix_prompt(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    ["fix ", "bug", "regression", "broken", "crash", "failing", "fails ", "error when", "doesn't work", "does not work"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// True when a repository-relative path looks like an automated test file.
+pub fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = Path::new(&lower).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    lower.starts_with("tests/")
+        || lower.starts_with("test/")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+        || name.starts_with("test_")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with("_test.py")
+        || name.ends_with("_test.go")
+        || name.ends_with("_test.rs")
+}
+
+/// Minimal throwing stub for an implementation file during W4 contract mutation sanity.
+pub fn mutation_stub_for(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".py") {
+        Some("raise RuntimeError('taskmaster mutation stub')\n")
+    } else if lower.ends_with(".ts") || lower.ends_with(".tsx") || lower.ends_with(".js") || lower.ends_with(".jsx") || lower.ends_with(".mjs") {
+        Some("throw new Error('taskmaster mutation stub');\n")
+    } else if lower.ends_with(".sh") {
+        Some("#!/usr/bin/env sh\nexit 1\n")
+    } else {
+        None
+    }
+}
+
+/// Choose a direct runnable command for a single standalone test file, when possible.
+pub fn standalone_test_command(path: &str) -> Option<Vec<String>> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".py") {
+        Some(vec!["python3".into(), path.into()])
+    } else if lower.ends_with(".mjs") || lower.ends_with(".cjs") || lower.ends_with(".js") {
+        Some(vec!["node".into(), path.into()])
+    } else if lower.ends_with(".sh") {
+        Some(vec!["sh".into(), path.into()])
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +529,7 @@ mod tests {
                 checks_passed: true,
                 tests_passed: false,
                 warnings: 0,
+                diff_lines: 10,
                 cost_usd: 0.02,
                 seconds: 5.0,
             },
@@ -484,6 +540,7 @@ mod tests {
                 checks_passed: true,
                 tests_passed: true,
                 warnings: 0,
+                diff_lines: 20,
                 cost_usd: 0.08,
                 seconds: 9.0,
             },

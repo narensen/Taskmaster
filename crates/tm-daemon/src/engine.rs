@@ -410,6 +410,10 @@ struct Driver {
     /// Snapshot of Phase 1 web access settings taken at run start so the shared prefix
     /// and role permissions stay deterministic for every agent in this run.
     web_access: crate::web_access::WebAccessSettings,
+    /// Agents already nudged once by the W1 release gate so we never nudge twice.
+    release_nudged: BTreeSet<String>,
+    /// Pages currently racing multiple providers (W3 Best-of-N): maps page -> candidate count.
+    race_pages: HashMap<PageId, usize>,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -583,6 +587,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         next_plan: None,
         warm: VecDeque::new(),
         web_access: loaded_settings.web_access,
+        release_nudged: BTreeSet::new(),
+        race_pages: HashMap::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -1721,49 +1727,99 @@ impl Driver {
             return Err(err);
         }
         let units = self.page(&page)?.work_units();
+        // W3: Best-of-N on `difficulty: hard` units (off by default, budget-guarded).
+        let is_hard = self
+            .page(&page)?
+            .difficulty
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+            == Some("hard");
+        let race_alt = if self.config.best_of_n && !repair && units.len() == 1 && is_hard && self.budget_exceeded().is_none() {
+            self.best_of_n_alt_harness(tier)
+        } else {
+            None
+        };
+
         let mut prepared: Vec<(AgentRequest, PathBuf, Option<Warm>)> = Vec::new();
         let mut failure = None;
-        for (index, unit) in units.iter().enumerate() {
-            let label = if units.len() == 1 { format!("page-{page}") } else { format!("page-{page}-{}", unit.id) };
-            let key = if units.len() == 1 { page.clone() } else { format!("{page}/{}", unit.id) };
-            // A repair goes to the agent that built the unit, when its session is still open:
-            // it already has the task, the files and the provider's cache.
-            let warm = if errors.is_some() { self.take_warm(&key, tier) } else { None };
-            if let Some(warm) = warm {
-                let step = git::sync_worktree(&warm.worktree, &self.tree)
-                    .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()))
-                    .map(|mut request| {
-                        request.brief = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
-                        request
-                    });
-                match step {
-                    Ok(request) => {
-                        let worktree = warm.worktree.clone();
-                        prepared.push((request, worktree, Some(warm)));
-                        continue;
+        if let Some(alt_harness) = race_alt {
+            // Spawn primary + alternate provider in sibling worktrees.
+            let candidates: Vec<(String, Option<Arc<dyn Harness>>)> = vec![
+                (format!("page-{page}-cand0"), None),
+                (format!("page-{page}-cand1"), Some(alt_harness)),
+            ];
+            for (label, custom_harness) in candidates {
+                let step = self.fresh_worktree(&label).and_then(|worktree| {
+                    let built = self
+                        .worker_request(&page, 0, 1, tier, errors.as_deref(), worktree.clone())
+                        .map(|mut req| {
+                            if let Some(h) = custom_harness {
+                                req.harness = h;
+                                req.model = None;
+                            }
+                            req
+                        });
+                    if built.is_err() {
+                        self.drop_worktree(&worktree);
                     }
+                    built.map(|request| (request, worktree, None))
+                });
+                match step {
+                    Ok(done) => prepared.push(done),
                     Err(err) => {
-                        eprintln!("taskmaster: the open session for {key} could not be reused ({err:#}); starting a fresh agent");
-                        self.drop_worktree(&warm.worktree);
+                        failure = Some(err);
+                        break;
                     }
                 }
             }
-            let step = self.fresh_worktree(&label).and_then(|worktree| {
-                let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
-                if built.is_err() {
-                    self.drop_worktree(&worktree);
+            if failure.is_none() && prepared.len() == 2 {
+                self.race_pages.insert(page.clone(), prepared.len());
+            }
+        } else {
+            for (index, unit) in units.iter().enumerate() {
+                let label = if units.len() == 1 { format!("page-{page}") } else { format!("page-{page}-{}", unit.id) };
+                let key = if units.len() == 1 { page.clone() } else { format!("{page}/{}", unit.id) };
+                // A repair goes to the agent that built the unit, when its session is still open:
+                // it already has the task, the files and the provider's cache.
+                let warm = if errors.is_some() { self.take_warm(&key, tier) } else { None };
+                if let Some(warm) = warm {
+                    let step = git::sync_worktree(&warm.worktree, &self.tree)
+                        .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()))
+                        .map(|mut request| {
+                            request.brief = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
+                            request
+                        });
+                    match step {
+                        Ok(request) => {
+                            let worktree = warm.worktree.clone();
+                            prepared.push((request, worktree, Some(warm)));
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("taskmaster: the open session for {key} could not be reused ({err:#}); starting a fresh agent");
+                            self.drop_worktree(&warm.worktree);
+                        }
+                    }
                 }
-                built.map(|request| (request, worktree, None))
-            });
-            match step {
-                Ok(done) => prepared.push(done),
-                Err(err) => {
-                    failure = Some(err);
-                    break;
+                let step = self.fresh_worktree(&label).and_then(|worktree| {
+                    let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
+                    if built.is_err() {
+                        self.drop_worktree(&worktree);
+                    }
+                    built.map(|request| (request, worktree, None))
+                });
+                match step {
+                    Ok(done) => prepared.push(done),
+                    Err(err) => {
+                        failure = Some(err);
+                        break;
+                    }
                 }
             }
         }
         if let Some(err) = failure {
+            self.race_pages.remove(&page);
             for (_, worktree, _) in &prepared {
                 self.drop_worktree(worktree);
             }
@@ -1771,7 +1827,10 @@ impl Driver {
             let _ = self.persist();
             return Err(err);
         }
-        if units.len() == 1 {
+        let is_race = self.race_pages.contains_key(&page);
+        if is_race {
+            eprintln!("taskmaster: racing {} candidates for hard unit {page}", prepared.len());
+        } else if units.len() == 1 {
             eprintln!("taskmaster: building {page} ({})", tier_name(tier));
         } else {
             eprintln!("taskmaster: building {page} ({} workers, {})", units.len(), tier_name(tier));
@@ -1785,14 +1844,23 @@ impl Driver {
         });
         for (index, (mut request, worktree, warm)) in prepared.into_iter().enumerate() {
             // Each unit is its own agent: `page:<page>/<unit>` when the page is split.
-            let unit = (units.len() > 1).then(|| units[index].id.as_str());
-            let agent = self.agent_id(&page, unit);
-            self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[index].owned_glob));
-            if units.len() == 1 && warm.is_none() {
+            let unit_idx = if is_race { 0 } else { index };
+            let unit = (!is_race && units.len() > 1).then(|| units[unit_idx].id.as_str());
+            let agent = if is_race {
+                format!("{}:cand{}", self.agent_id(&page, None), index + 1)
+            } else {
+                self.agent_id(&page, unit)
+            };
+            self.tag(&mut request, &agent, tier_name(tier), Some(&page), Some(&units[unit_idx].owned_glob));
+            if !is_race && units.len() == 1 && warm.is_none() {
                 self.offer_browser(&page, &worktree, &mut request);
             }
             // Every builder and every repair gets run_code when Code Mode is on.
-            let scope = if units.len() > 1 { format!("{page}/{}", units[index].id) } else { page.clone() };
+            let scope = if !is_race && units.len() > 1 {
+                format!("{page}/{}", units[unit_idx].id)
+            } else {
+                page.clone()
+            };
             self.offer_code(&scope, &worktree, &mut request);
             // Code Mode only means something when run_code is there to use (it needs Node).
             request.code_mode = self.code.is_some();
@@ -1801,7 +1869,7 @@ impl Driver {
             }
             let mut bill = request.bill(Role::builder(tier), Some(&page));
             bill.difficulty = self.run.plan.as_ref().and_then(|p| p.pages.iter().find(|pg| pg.id == page)).and_then(|pg| pg.difficulty.clone());
-            bill.language = infer_glob_language(&units[index].owned_glob);
+            bill.language = infer_glob_language(&units[unit_idx].owned_glob);
             let (page, slots) = (page.clone(), self.slots.clone());
             let mut rx = restart_rx.clone();
             if warm.is_some() {
@@ -1856,10 +1924,11 @@ impl Driver {
         if let Some(code) = &self.code {
             code.detach_page(&page);
         }
-        let product = match result {
+        let mut product = match result {
             Ok(WorkerJob::Finished(product)) => *product,
             Ok(WorkerJob::Restarted(worktree)) => {
                 self.drop_worktree(&worktree);
+                self.race_pages.remove(&page);
                 if let Some(partial) = self.batches.remove(&page) {
                     for (_, p) in partial {
                         self.drop_worktree(&p.worktree);
@@ -1883,6 +1952,7 @@ impl Driver {
                 return Ok(());
             }
             Err(err) => {
+                self.race_pages.remove(&page);
                 if let Some(map) = &self.config.worker_restarts {
                     map.lock().unwrap().remove(&page);
                 }
@@ -1891,7 +1961,20 @@ impl Driver {
             }
         };
         self.charge(&product.bill, &product.answer)?;
-        let wanted = self.page(&page).map(|p| p.work_units().len()).unwrap_or(1);
+        // W1: Release gate — if a worker with a shell and available tests released without
+        // running them, send the nudge once as a follow-up turn before judging/checking.
+        if !self.is_stale(&page)
+            && !self.race_pages.contains_key(&page)
+            && product.answer.ok
+            && reply::parse_flag(&product.answer.text).is_none()
+        {
+            self.maybe_release_gate_nudge(&page, index, &mut product).await?;
+        }
+        let wanted = self
+            .race_pages
+            .get(&page)
+            .copied()
+            .unwrap_or_else(|| self.page(&page).map(|p| p.work_units().len()).unwrap_or(1));
         let batch = self.batches.entry(page.clone()).or_default();
         batch.push((index, product));
         if batch.len() < wanted {
@@ -1900,6 +1983,7 @@ impl Driver {
         let mut products = self.batches.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
         let cmd = self.take_running(&page);
+        let was_race = self.race_pages.remove(&page).is_some();
         if let Some(map) = &self.config.worker_restarts {
             map.lock().unwrap().remove(&page);
         }
@@ -1916,6 +2000,10 @@ impl Driver {
             Some(Command::SpawnWorker { tier, errors, .. }) => (*tier, errors.clone()),
             _ => (Tier::Worker, None),
         };
+        // W3: Pick the best candidate from a Best-of-N race and remove every loser worktree.
+        if was_race && products.len() > 1 {
+            products = self.select_race_winner(&page, products);
+        }
         let text = products.iter().map(|(_, p)| p.answer.text.as_str()).collect::<Vec<_>>().join("\n");
         let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
         // What the checker needs, read before the worktrees go.
@@ -1937,7 +2025,7 @@ impl Driver {
                 return Err(err);
             }
         };
-        let settling = Settling { tier, errors, text, refused, review, shot, wanted };
+        let settling = Settling { tier, errors, text, refused, review, shot, wanted: if was_race { 1 } else { wanted } };
         if matches!(outcome, WorkerOutcome::Passed)
             && let Some(cmd) = cmd
             && let Some(files) = self.early_files(&page)
@@ -1946,6 +2034,279 @@ impl Driver {
             return Ok(());
         }
         self.settle(&page, outcome, settling)
+    }
+
+    /// W1: If a worker had a shell (or Code Mode) and tests available, changed files, and
+    /// released without running tests, send the release-gate nudge once as a follow-up turn.
+    async fn maybe_release_gate_nudge(
+        &mut self,
+        page: &str,
+        index: usize,
+        product: &mut Product,
+    ) -> anyhow::Result<()> {
+        let tier = match product.bill.role {
+            Role::Mid => Tier::Mid,
+            Role::Master => Tier::Master,
+            _ => Tier::Worker,
+        };
+        let has_shell = self.code.is_some() || (self.config.worker_shell && self.harness_for(tier).sandboxed_shell());
+        let has_tests = runtime::has_tests(&product.worktree) || runtime::python_tests(&product.worktree);
+        if !has_shell || !has_tests {
+            return Ok(());
+        }
+        // Only nudge workers that actually produced file changes.
+        let changed = git::worktree_changes(&product.worktree).unwrap_or_default();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let agent_id = product
+            .bill
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.agent_id(page, None));
+        self.live.flush(&self.id);
+        let (_, entries) = self.live.read(&self.id, 0);
+        let Some(nudge) = crate::gates::release_gate_nudge(
+            true,
+            self.release_nudged.contains(&agent_id),
+            &entries,
+            &agent_id,
+        ) else {
+            return Ok(());
+        };
+        self.release_nudged.insert(agent_id.clone());
+        eprintln!("taskmaster: release gate nudging {agent_id} to run tests once");
+        let units = self.page(page).map(|p| p.work_units()).unwrap_or_default();
+        let units_len = units.len().max(1);
+        let mut req = self.worker_request(page, index.min(units_len - 1), units_len, tier, None, product.worktree.clone())?;
+        req.brief = nudge.to_string();
+        let glob = units.get(index).map(|u| u.owned_glob.as_str());
+        self.tag(&mut req, &agent_id, tier_name(tier), Some(page), glob);
+        let bill = req.bill(Role::builder(tier), Some(page));
+        let ans = match product.answer.kept.take() {
+            Some(session) => follow(req, session).await?,
+            None => ask(req).await?,
+        };
+        self.charge(&bill, &ans)?;
+        product.answer.ok = ans.ok;
+        if !ans.text.trim().is_empty() {
+            if !product.answer.text.is_empty() {
+                product.answer.text.push('\n');
+            }
+            product.answer.text.push_str(&ans.text);
+        }
+        product.answer.refused.extend(ans.refused);
+        product.answer.kept = ans.kept;
+        Ok(())
+    }
+
+    /// W3: Pick an alternate provider harness for Best-of-N races on `difficulty: hard` units.
+    fn best_of_n_alt_harness(&self, tier: Tier) -> Option<Arc<dyn Harness>> {
+        if let Some(alt) = &self.config.best_of_n_alt {
+            return Some(alt.clone());
+        }
+        let primary = self.harness_for(tier).id();
+        if self.harnesses.mid.id() != primary {
+            return Some(self.harnesses.mid.clone());
+        }
+        if self.harnesses.master.id() != primary {
+            return Some(self.harnesses.master.clone());
+        }
+        None
+    }
+
+    /// W3: Score sibling worktree candidates via `gates::pick_best_candidate`, drop losers, and
+    /// return the single winning product ready for `judge`.
+    fn select_race_winner(&mut self, page: &str, mut products: Vec<(usize, Product)>) -> Vec<(usize, Product)> {
+        let owners = self.plan().ok().and_then(|p| Owners::from_plan(p).ok());
+        let candidates: Vec<crate::gates::CandidateResult> = products
+            .iter()
+            .map(|(_, p)| {
+                let changes: Vec<git::Change> = git::worktree_changes(&p.worktree)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| !git::same_as(&p.worktree, &self.tree, c))
+                    .collect();
+                let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+                let owned_ok = !paths.is_empty()
+                    && owners
+                        .as_ref()
+                        .is_none_or(|o| outside_owned(o, page, &paths).is_empty());
+                let checks_passed = p.answer.ok && owned_ok && checks::html_sanity(&p.worktree, &paths).is_empty();
+                let test_files: Vec<&str> = paths
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|path| crate::gates::is_test_path(path))
+                    .collect();
+                let tests_passed = if !checks_passed {
+                    false
+                } else if !test_files.is_empty() {
+                    test_files.iter().all(|tf| {
+                        crate::gates::standalone_test_command(tf)
+                            .map(|cmd| {
+                                std::process::Command::new(&cmd[0])
+                                    .args(&cmd[1..])
+                                    .current_dir(&p.worktree)
+                                    .status()
+                                    .is_ok_and(|s| s.success())
+                            })
+                            .unwrap_or(true)
+                    })
+                } else {
+                    true
+                };
+                let diff_lines = git::worktree_diff(&p.worktree)
+                    .map(|d| d.lines().count())
+                    .unwrap_or(usize::MAX);
+                crate::gates::CandidateResult {
+                    harness: p.bill.harness.clone(),
+                    model: p.bill.model.clone(),
+                    worktree: p.worktree.display().to_string(),
+                    checks_passed,
+                    tests_passed,
+                    warnings: p.answer.refused.len(),
+                    diff_lines,
+                    cost_usd: p.answer.cost_usd.unwrap_or(0.0),
+                    seconds: p.answer.seconds,
+                }
+            })
+            .collect();
+
+        let winner_idx = crate::gates::pick_best_candidate(&candidates).map(|(i, _)| i).unwrap_or(0);
+        let winner_harness = candidates.get(winner_idx).map(|c| c.harness.as_str()).unwrap_or("unknown");
+        eprintln!(
+            "taskmaster: best-of-{} winner for {page}: candidate #{} ({winner_harness})",
+            candidates.len(),
+            winner_idx + 1
+        );
+        let mut winner = None;
+        for (i, (_, product)) in products.drain(..).enumerate() {
+            if i == winner_idx {
+                winner = Some((0, product));
+            } else {
+                self.drop_worktree(&product.worktree);
+            }
+        }
+        winner.into_iter().collect()
+    }
+
+    /// W2: For Agent-mode turns and bug-fix prompts, verify any newly added test file fails on
+    /// the base commit (red) and passes in the worker's tree (green).
+    fn check_red_green_proof(&self, all: &[(PathBuf, git::Change)]) -> anyhow::Result<Option<String>> {
+        let eligible = self.config.mode == crate::RunMode::Agent
+            || self.events.iter().any(|e| matches!(e, Event::AgentTurn { .. }))
+            || self.config.prompt.as_deref().is_some_and(crate::gates::is_bug_fix_prompt);
+        if !eligible {
+            return Ok(None);
+        }
+        let added_tests: Vec<&(PathBuf, git::Change)> = all
+            .iter()
+            .filter(|(_, c)| matches!(c.status, 'A' | '?') && crate::gates::is_test_path(&c.path))
+            .collect();
+        if added_tests.is_empty() {
+            return Ok(None);
+        }
+        let Ok(head) = git::head(&self.tree) else {
+            return Ok(None);
+        };
+        for (idx, (worktree, change)) in added_tests.into_iter().enumerate() {
+            let Some(cmd) = crate::gates::standalone_test_command(&change.path) else {
+                continue;
+            };
+            let base_dir = std::env::temp_dir().join(format!(
+                "tm-rg-{}-{}-{idx}",
+                self.id,
+                std::process::id()
+            ));
+            let _ = git::remove_worktree(&self.tree, &base_dir);
+            let _ = fs::remove_dir_all(&base_dir);
+            if git::add_worktree(&self.tree, &base_dir, &head).is_err() {
+                let _ = fs::remove_dir_all(&base_dir);
+                continue;
+            }
+            let dest = base_dir.join(&change.path);
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let copied = fs::copy(worktree.join(&change.path), &dest).is_ok();
+            let res = if copied {
+                let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+                crate::gates::verify_red_green(&base_dir, worktree, &refs).ok()
+            } else {
+                None
+            };
+            let _ = git::remove_worktree(&self.tree, &base_dir);
+            let _ = fs::remove_dir_all(&base_dir);
+            if let Some(rg) = res
+                && !rg.ok
+            {
+                eprintln!("taskmaster: red/green gate refused `{}`: {}", change.path, rg.reason);
+                return Ok(Some(format!("Red/green proof failed for `{}`: {}", change.path, rg.reason)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// W4: Mutation sanity on locked contract tests — temporarily stub the target implementation
+    /// to fail and ensure the contract test actually fails (is not vacuous).
+    fn check_contract_mutations(&self, plan: &Plan, owners: &Owners) -> BTreeMap<PageId, String> {
+        let mut vacuous: BTreeMap<PageId, String> = BTreeMap::new();
+        let test_contracts: Vec<&tm_core::ContractFile> = plan
+            .contracts
+            .iter()
+            .filter(|c| c.is_test() && self.tree.join(&c.path).is_file())
+            .collect();
+        if test_contracts.is_empty() {
+            return vacuous;
+        }
+        let sources = load_sources(&self.tree).ok();
+        let graph = sources.as_ref().map(|s| ImportGraph::build(s, ""));
+        let built_files: Vec<String> = self
+            .changes
+            .iter()
+            .filter(|c| matches!(c.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired))
+            .flat_map(|c| c.files.iter().cloned())
+            .filter(|f| !crate::gates::is_test_path(f) && self.tree.join(f).is_file())
+            .collect();
+
+        for contract in test_contracts {
+            let Some(cmd) = crate::gates::standalone_test_command(&contract.path) else {
+                continue;
+            };
+            let mut targets: Vec<String> = graph
+                .as_ref()
+                .and_then(|g| g.edges.get(&contract.path))
+                .into_iter()
+                .flatten()
+                .filter(|f| !crate::gates::is_test_path(f) && self.tree.join(f).is_file())
+                .cloned()
+                .collect();
+            if targets.is_empty() {
+                targets = built_files.clone();
+            }
+            let Some((impl_path, stub)) = targets
+                .into_iter()
+                .find_map(|p| crate::gates::mutation_stub_for(&p).map(|s| (p, s)))
+            else {
+                continue;
+            };
+            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            if let Ok(false) = crate::gates::contract_mutation_sanity(&self.tree, &impl_path, stub, &refs) {
+                let author = owners
+                    .owner(&impl_path)
+                    .cloned()
+                    .or_else(|| plan.pages.first().map(|p| p.id.clone()));
+                let msg = format!(
+                    "Contract test `{}` is vacuous: it still passes when `{}` is replaced with a failing stub.",
+                    contract.path, impl_path
+                );
+                eprintln!("taskmaster: {msg}");
+                if let Some(page) = author {
+                    vacuous.insert(page, msg);
+                }
+            }
+        }
+        vacuous
     }
 
     /// Log a page's outcome, learn from it, and hand it to the run.
@@ -2351,6 +2712,10 @@ impl Driver {
                 why.push_str(&format!("\nWhat it said last:\n{said}"));
             }
             return Ok(failed(why));
+        }
+        // W2: Red/green proof for Agent-mode turns and bug-fix prompts when a new test file is added.
+        if let Some(reason) = self.check_red_green_proof(&all)? {
+            return Ok(failed(reason));
         }
         let mut files = Vec::new();
         for (worktree, change) in &all {
@@ -2871,6 +3236,17 @@ impl Driver {
                 };
                 self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
                 return Ok((false, BTreeMap::new()));
+            }
+        }
+        // W4: Contract mutation sanity — stub the implementation and ensure locked contract tests fail.
+        if failing.is_empty() {
+            let vacuous = self.check_contract_mutations(&plan, &owners);
+            for (page, msg) in vacuous {
+                let entry = failing.entry(page).or_default();
+                if !entry.is_empty() && !entry.ends_with('\n') {
+                    entry.push('\n');
+                }
+                entry.push_str(&msg);
             }
         }
         if let Some(note) = self.run_verify_script()? {

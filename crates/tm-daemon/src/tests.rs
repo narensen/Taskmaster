@@ -4461,5 +4461,252 @@ async fn p5_window_recent_bounds_900_call_transcript_and_stubs_large_outputs() {
     drop(server);
 }
 
+#[tokio::test]
+async fn w1_release_gate_nudges_worker_that_skips_tests_exactly_once() {
+    struct SkipTestsHarness {
+        briefs: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for SkipTestsHarness {
+        fn id(&self) -> &'static str {
+            "skip-tests"
+        }
+        fn sandboxed_shell(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "export const ok = true;\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("w1-release-gate");
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("tests/test_smoke.py"), "assert True\n").unwrap();
+    git(&tmp.0, &["add", "tests/test_smoke.py"]);
+    git(&tmp.0, &["commit", "-q", "-m", "add smoke test"]);
+
+    let h = Arc::new(SkipTestsHarness { briefs: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.worker_shell = true;
+    cfg.code_mode = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let briefs = h.briefs.lock().unwrap();
+    assert_eq!(briefs.len(), 2, "expected initial turn + exactly one release-gate nudge, got: {briefs:#?}");
+    assert!(briefs[1].contains("Release gate:"), "second turn should be the release-gate nudge: {}", briefs[1]);
+}
+
+#[tokio::test]
+async fn w2_red_green_gate_refuses_new_test_that_already_passes_on_base() {
+    struct VacuousTestHarness {
+        attempts: AtomicUsize,
+        briefs: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for VacuousTestHarness {
+        fn id(&self) -> &'static str {
+            "vacuous-rg"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let app_file = task.cwd.join("app/a/mod.py");
+            let test_file = task.cwd.join("app/a/test_fix.py");
+            std::fs::create_dir_all(app_file.parent().unwrap())?;
+            if n == 0 {
+                // First attempt adds a test that already passes on base!
+                std::fs::write(&app_file, "VALUE = 2\n")?;
+                std::fs::write(&test_file, "assert True\n")?;
+            } else {
+                // Second attempt writes a genuine red/green test that fails on base (no app/a/mod.py) and passes here.
+                std::fs::write(&app_file, "VALUE = 2\n")?;
+                std::fs::write(&test_file, "import sys\nsys.path.insert(0, 'app/a')\nimport mod\nassert mod.VALUE == 2\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("w2-red-green");
+    let h = Arc::new(VacuousTestHarness { attempts: AtomicUsize::new(0), briefs: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.mode = crate::RunMode::Agent;
+    cfg.prompt = Some("Fix the bug in module a".into());
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let briefs = h.briefs.lock().unwrap();
+    assert_eq!(briefs.len(), 2, "expected vacuous test refused on attempt 1 and accepted on attempt 2: {briefs:#?}");
+    assert!(
+        briefs[1].contains("already passes on the base commit"),
+        "repair brief should carry red/green refusal sentence: {}",
+        briefs[1]
+    );
+}
+
+#[tokio::test]
+async fn w3_best_of_n_races_hard_unit_merges_winner_removes_loser_and_bills_both() {
+    struct NamedCandidateHarness {
+        name: &'static str,
+        body: &'static str,
+        worktree_seen: Mutex<Option<PathBuf>>,
+    }
+    #[async_trait]
+    impl Harness for NamedCandidateHarness {
+        fn id(&self) -> &'static str {
+            self.name
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            *self.worktree_seen.lock().unwrap() = Some(task.cwd.clone());
+            let file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, self.body)?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.02), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("w3-best-of-n");
+    let mut p = plan(&[("a", &[])]);
+    p.pages[0].difficulty = Some("hard".into());
+
+    // Primary writes a larger diff; alt writes a concise 1-line diff -> alt wins via smaller diff!
+    let primary = Arc::new(NamedCandidateHarness {
+        name: "cand-primary",
+        body: "// line1\n// line2\n// line3\n// line4\n// line5\nexport const winner = 'primary';\n",
+        worktree_seen: Mutex::new(None),
+    });
+    let alt = Arc::new(NamedCandidateHarness {
+        name: "cand-alt",
+        body: "export const winner = 'alt';\n",
+        worktree_seen: Mutex::new(None),
+    });
+    let harnesses = Harnesses {
+        worker: primary.clone(),
+        mid: primary.clone(),
+        master: primary.clone(),
+        reviewer: primary.clone(),
+        verifier: primary.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.best_of_n = true;
+    cfg.best_of_n_alt = Some(alt.clone());
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    // Winner's concise change was merged.
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const winner = 'alt';\n");
+    // Loser's worktree was removed.
+    let loser_wt = primary.worktree_seen.lock().unwrap().clone().expect("primary ran");
+    assert!(!loser_wt.exists(), "loser worktree should be removed: {}", loser_wt.display());
+    // Both candidates were billed to the ledger.
+    let ledger = Records::files(&tmp.0).ledger("current").unwrap();
+    let worker_calls: Vec<&str> = ledger
+        .iter()
+        .filter(|e| e.page.as_deref() == Some("a"))
+        .map(|e| e.harness.as_str())
+        .collect();
+    assert_eq!(worker_calls.len(), 2, "expected both candidates in ledger: {worker_calls:?}");
+    assert!(worker_calls.contains(&"cand-primary"));
+    assert!(worker_calls.contains(&"cand-alt"));
+}
+
+#[tokio::test]
+async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
+    struct ImplHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for ImplHarness {
+        fn id(&self) -> &'static str {
+            "w4-impl"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("w4-mutation");
+    let mut p = plan(&[("a", &[])]);
+    p.contracts.push(ContractFile {
+        path: "contracts/test_contract.py".into(),
+        content: "# Vacuous contract test that never exercises app/a/mod.py\nassert 1 + 1 == 2\n".into(),
+    });
+    let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    // Because the locked contract test stays vacuous, verify rejects it and routes the error back to page `a`.
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    let calls = h.calls.lock().unwrap();
+    assert!(
+        calls.iter().any(|b| b.contains("vacuous")),
+        "expected vacuous contract test error routed back to page `a`, got calls: {calls:#?}"
+    );
+}
+
+
 
 

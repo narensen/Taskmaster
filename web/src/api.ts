@@ -745,6 +745,26 @@ export interface ProjectEntry {
   current: boolean;
 }
 
+export interface ProjectConfigData {
+  setup?: string;
+  preview?: string;
+  test?: string;
+  shared?: string[];
+  copy?: string[];
+  archive?: string;
+}
+
+export interface ProjectConfigPayload {
+  exists: boolean;
+  path: string;
+  raw?: string;
+  config?: ProjectConfigData;
+  hash?: string;
+  has_commands: boolean;
+  trusted: boolean;
+  error?: string;
+}
+
 export interface TerminalInfo {
   id: string;
   cwd: string;
@@ -1422,6 +1442,9 @@ export const api = {
   grep: (q: string) => call<{ hits: GrepHit[]; truncated: boolean }>("GET", `/api/grep?q=${enc(q)}`),
   projects: () => call<{ projects: ProjectEntry[]; workspace: string }>("GET", "/api/projects"),
   openProject: (path: string) => call<{ project: string }>("POST", "/api/projects/open", { path }),
+  projectConfig: () => call<ProjectConfigPayload>("GET", "/api/project-config"),
+  trustProjectConfig: (hash?: string) => call<ProjectConfigPayload>("POST", "/api/project-config/trust", hash ? { hash } : {}),
+  generateProjectConfig: (overwrite = false) => call<ProjectConfigPayload>("POST", "/api/project-config/generate", { overwrite }),
   terminals: () => call<{ terminals: TerminalInfo[] }>("GET", "/api/terminals").then((r) => r.terminals),
   openTerminal: (cols: number, rows: number) => call<TerminalInfo>("POST", "/api/terminals", { cols, rows }),
   terminalInput: (id: string, data: string) => call("POST", `/api/terminals/${enc(id)}/input`, { data }),

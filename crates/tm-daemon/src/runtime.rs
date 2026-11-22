@@ -125,6 +125,12 @@ fn walk(dir: &Path, depth: usize) -> Vec<PathBuf> {
 /// Whether the project has tests of its own. Such a project must have them run: a verify
 /// that ran nothing is a failure, not a pass.
 pub fn has_tests(tree: &Path) -> bool {
+    if let Ok(Some(loaded)) = crate::project_config::load(tree)
+        && loaded.trusted
+        && loaded.config.test.as_deref().is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
     let npm_test = std::fs::read_to_string(tree.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -259,6 +265,13 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
 /// `venv`, an environment of the run's own that is made and filled on first use.
 pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
     let mut out = Vec::new();
+    if let Ok(Some(loaded)) = crate::project_config::load(tree)
+        && loaded.trusted
+        && let Some(test_cmd) = loaded.config.test.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        out.push(Step::new("test", "sh", &["-c", test_cmd]));
+        return out;
+    }
     if let Ok(text) = std::fs::read_to_string(tree.join("package.json"))
         && let Ok(package) = serde_json::from_str::<Value>(&text)
         && tree.join("node_modules").exists()

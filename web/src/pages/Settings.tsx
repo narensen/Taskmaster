@@ -335,6 +335,86 @@ function Keys({ text }: { text: string }) {
   );
 }
 
+function ProjectYamlCard() {
+  const cfg = useLoad(api.projectConfig, []);
+  const [busy, setBusy] = useState(false);
+
+  const generate = async () => {
+    setBusy(true);
+    try {
+      await api.generateProjectConfig(false);
+      toast("Created taskmaster.yaml");
+      cfg.reload();
+    } catch (err) {
+      toast("Could not create taskmaster.yaml", err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const approve = async () => {
+    if (!cfg.data?.hash) return;
+    setBusy(true);
+    try {
+      await api.trustProjectConfig(cfg.data.hash);
+      toast("Approved taskmaster.yaml commands");
+      cfg.reload();
+    } catch (err) {
+      toast("Could not approve commands", err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const d = cfg.data;
+  if (cfg.loading && !d) return <div className="muted small">Checking taskmaster.yaml…</div>;
+  if (cfg.error) return <Problem error={cfg.error} onRetry={cfg.reload} />;
+  if (!d) return null;
+
+  return (
+    <div className="yaml-card" data-testid="project-yaml" style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
+      <div className="row between gap wrap">
+        <div>
+          <strong className="small">taskmaster.yaml</strong>
+          <div className="muted small">
+            {!d.exists
+              ? "Not present. Create one to define worktree setup, preview, test, shared directories and copied .env files."
+              : d.error
+                ? `Parse error: ${d.error}`
+                : !d.has_commands
+                  ? "Loaded (no commands to approve)."
+                  : d.trusted
+                    ? "Loaded and approved for this file hash."
+                    : "Loaded — commands need approval before runs execute them."}
+          </div>
+        </div>
+        <div className="row gap">
+          {!d.exists && (
+            <button type="button" className="small" disabled={busy} onClick={() => void generate()}>
+              {busy ? "Creating…" : "Create from this project"}
+            </button>
+          )}
+          {d.exists && d.has_commands && !d.trusted && (
+            <button type="button" className="primary small" disabled={busy} onClick={() => void approve()}>
+              {busy ? "Approving…" : "Approve commands"}
+            </button>
+          )}
+        </div>
+      </div>
+      {d.exists && d.config && (
+        <dl className="small muted" style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "4px 12px", margin: "10px 0 0" }}>
+          {d.config.setup && (<><dt>setup</dt><dd className="mono" style={{ margin: 0 }}>{d.config.setup}</dd></>)}
+          {d.config.preview && (<><dt>preview</dt><dd className="mono" style={{ margin: 0 }}>{d.config.preview}</dd></>)}
+          {d.config.test && (<><dt>test</dt><dd className="mono" style={{ margin: 0 }}>{d.config.test}</dd></>)}
+          {d.config.shared && d.config.shared.length > 0 && (<><dt>shared</dt><dd className="mono" style={{ margin: 0 }}>{d.config.shared.join(", ")}</dd></>)}
+          {d.config.copy && d.config.copy.length > 0 && (<><dt>copy</dt><dd className="mono" style={{ margin: 0 }}>{d.config.copy.join(", ")}</dd></>)}
+          {d.config.archive && (<><dt>archive</dt><dd className="mono" style={{ margin: 0 }}>{d.config.archive}</dd></>)}
+        </dl>
+      )}
+    </div>
+  );
+}
+
 export function Settings() {
   const p = usePrefs();
   const health = useLoad(api.health, []);
@@ -510,6 +590,7 @@ export function Settings() {
 
       <Section title="Project path" note="To serve another project, start the daemon there: tm-daemon serve <project>. That is a restart.">
         <div className="break">{daemon.data?.project ?? "…"}</div>
+        <ProjectYamlCard />
       </Section>
 
       <Section title="Commons" note={`Set in ${daemon.data?.config ?? daemon.data?.config_default ?? ".taskmaster/config.json"}; a change needs a config edit and a restart.`}>

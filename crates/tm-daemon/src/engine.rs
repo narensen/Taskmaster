@@ -414,6 +414,11 @@ struct Driver {
     release_nudged: BTreeSet<String>,
     /// Pages currently racing multiple providers (W3 Best-of-N): maps page -> candidate count.
     race_pages: HashMap<PageId, usize>,
+    /// Loaded `taskmaster.yaml` worktree config from the project root (O1).
+    project_config: Option<crate::project_config::LoadedProjectConfig>,
+    /// Untracked files created by `taskmaster.yaml` setup/copy before the worker ran, so
+    /// ownership checks do not reject setup artifacts like `.ready`.
+    setup_artifacts: HashMap<PathBuf, BTreeSet<String>>,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -536,6 +541,20 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into(), unit: String::new() });
     mcp.grant(&master_token, Grant { run: run_id, page: "master".into(), unit: String::new() });
 
+    let project_config = crate::project_config::load(&project)?;
+    if let Some(loaded) = &project_config
+        && loaded.has_commands
+        && !loaded.trusted
+    {
+        let short = &loaded.hash[..loaded.hash.len().min(12)];
+        let summary = format!(
+            "Approve taskmaster.yaml commands (hash {short}) before running worktrees: {}",
+            loaded.config.command_summary()
+        );
+        eprintln!("taskmaster: {summary}");
+        return Ok(Outcome::NeedsApproval { summary });
+    }
+
     let mut driver = Driver {
         config,
         tree: project.clone(),
@@ -589,6 +608,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         web_access: loaded_settings.web_access,
         release_nudged: BTreeSet::new(),
         race_pages: HashMap::new(),
+        project_config,
+        setup_artifacts: HashMap::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -2637,9 +2658,11 @@ impl Driver {
         for (index, product) in products {
             // A file the same as the run's tree is no change: a warm worktree holds what other
             // units built since, and a rewrite of a file to what it already was is nothing.
+            let ignored = self.setup_artifacts.get(&product.worktree);
             let changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
                 .into_iter()
                 .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
+                .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
                 .collect();
             for change in &changes {
                 if !git::safe_rel(&change.path) {
@@ -4900,10 +4923,41 @@ impl Driver {
         let head = git::head(&self.tree)?;
         git::add_worktree(&self.project, &path, &head)?;
         self.trees.push(path.clone());
+        let yaml_cfg = self.project_config.as_ref().map(|l| &l.config);
+        crate::project_config::apply_shared_and_copy(&self.project, &path, yaml_cfg);
+        if let Some(loaded) = &self.project_config
+            && loaded.trusted
+            && let Some(setup_cmd) = loaded.config.setup.as_deref().filter(|s| !s.trim().is_empty())
+        {
+            self.terminal(
+                "command",
+                serde_json::json!({ "command": setup_cmd, "cwd": path.display().to_string() }),
+            );
+            let (ok, output) = crate::project_config::run_setup(&path, setup_cmd)?;
+            self.terminal("output", serde_json::json!({ "ok": ok, "text": output }));
+            if !ok {
+                bail!("taskmaster.yaml setup `{setup_cmd}` failed: {}", clip(output.trim(), 500));
+            }
+        }
+        let pre: BTreeSet<String> = git::worktree_changes(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        if !pre.is_empty() {
+            self.setup_artifacts.insert(path.clone(), pre);
+        }
         Ok(path)
     }
 
     fn drop_worktree(&mut self, path: &Path) {
+        if let Some(loaded) = &self.project_config
+            && loaded.trusted
+            && let Some(archive_cmd) = loaded.config.archive.as_deref().filter(|s| !s.trim().is_empty())
+        {
+            crate::project_config::run_archive(path, archive_cmd);
+        }
+        self.setup_artifacts.remove(path);
         let _ = git::remove_worktree(&self.project, path);
         let _ = fs::remove_dir_all(path);
         self.trees.retain(|have| have != path);
@@ -5193,7 +5247,8 @@ impl Driver {
         self.trees.push(path.clone());
         // The project's installed packages are what its typecheck and linters run from.
         // They are not in git, so the checkout borrows them.
-        git::borrow_node_modules(&self.project, &path);
+        let yaml_cfg = self.project_config.as_ref().map(|l| &l.config);
+        crate::project_config::apply_shared_and_copy(&self.project, &path, yaml_cfg);
         self.tree = path;
         Ok(())
     }

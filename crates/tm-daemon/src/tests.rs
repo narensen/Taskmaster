@@ -4707,6 +4707,187 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
     );
 }
 
+#[tokio::test]
+async fn o1_taskmaster_yaml_setup_copy_and_trust_by_hash() {
+    struct CheckWorktreeHarness {
+        saw_ready: Mutex<bool>,
+        saw_env: Mutex<Option<String>>,
+        calls: Mutex<usize>,
+    }
+    #[async_trait]
+    impl Harness for CheckWorktreeHarness {
+        fn id(&self) -> &'static str {
+            "o1-check"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            *self.calls.lock().unwrap() += 1;
+            *self.saw_ready.lock().unwrap() = task.cwd.join(".ready").is_file();
+            *self.saw_env.lock().unwrap() = std::fs::read_to_string(task.cwd.join(".env")).ok();
+            let file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "export const ok = true;\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("o1-yaml");
+    // Ignore .env in git so it's NOT tracked, yet still gets copied into every worktree via `copy: [.env]`.
+    std::fs::write(tmp.0.join(".gitignore"), ".env\n.ready\n").unwrap();
+    git(&tmp.0, &["add", ".gitignore"]);
+    git(&tmp.0, &["commit", "-m", "ignore env"]);
+    std::fs::write(tmp.0.join(".env"), "API_KEY=local-secret\n").unwrap();
+
+    // Commit taskmaster.yaml with setup + copy.
+    std::fs::write(
+        tmp.0.join("taskmaster.yaml"),
+        "setup: touch .ready\ncopy: [.env]\n",
+    )
+    .unwrap();
+    git(&tmp.0, &["add", "taskmaster.yaml"]);
+    git(&tmp.0, &["commit", "-m", "add taskmaster.yaml"]);
+
+    let h = Arc::new(CheckWorktreeHarness {
+        saw_ready: Mutex::new(false),
+        saw_env: Mutex::new(None),
+        calls: Mutex::new(0),
+    });
+    let harnesses = || Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+
+    // 1. Unapproved taskmaster.yaml asks for approval before spawning workers.
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+    let unapproved = drive(cfg, harnesses()).await.unwrap();
+    assert!(
+        matches!(unapproved, Outcome::NeedsApproval { ref summary } if summary.contains("taskmaster.yaml")),
+        "expected NeedsApproval for unapproved taskmaster.yaml, got {unapproved:?}"
+    );
+    assert_eq!(*h.calls.lock().unwrap(), 0, "worker must not run before taskmaster.yaml is approved");
+
+    // 2. Trust this file's command hash, then run -> setup creates `.ready` and `copy` copies `.env`.
+    let loaded = crate::project_config::load(&tmp.0).unwrap().expect("yaml loaded");
+    crate::project_config::trust(&tmp.0, &loaded.hash).unwrap();
+    let mut cfg2 = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg2.run_id = "o1-run-2".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.worker_shell = false;
+    let ok = drive(cfg2, harnesses()).await.unwrap();
+    assert_eq!(ok, Outcome::Finished { ok: true });
+    assert!(*h.saw_ready.lock().unwrap(), "setup command should have created .ready before worker ran");
+    assert_eq!(
+        h.saw_env.lock().unwrap().as_deref(),
+        Some("API_KEY=local-secret\n"),
+        "copy: [.env] should copy gitignored .env into each worktree"
+    );
+
+    // 3. Changing `setup` invalidates the hash and asks for approval again.
+    std::fs::write(
+        tmp.0.join("taskmaster.yaml"),
+        "setup: touch .ready2\ncopy: [.env]\n",
+    )
+    .unwrap();
+    let mut cfg3 = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg3.run_id = "o1-run-3".into();
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    cfg3.code_mode = false;
+    cfg3.worker_shell = false;
+    let changed = drive(cfg3, harnesses()).await.unwrap();
+    assert!(
+        matches!(changed, Outcome::NeedsApproval { .. }),
+        "changing setup command must require re-approval, got {changed:?}"
+    );
+}
+
+#[tokio::test]
+async fn o1_project_config_http_generate_and_trust_roundtrip() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let parsed = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    let tmp = repo("o1-http");
+    std::fs::write(
+        tmp.0.join("package.json"),
+        r#"{"name":"demo","scripts":{"dev":"vite","test":"vitest run"}}"#,
+    )
+    .unwrap();
+
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (_, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    let (st, initial) = call(&addr, Some(&token), "GET", "/api/project-config", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(initial["exists"], false);
+
+    let (st, generated) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/project-config/generate",
+        Some(serde_json::json!({ "overwrite": false })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(generated["exists"], true);
+    assert_eq!(generated["has_commands"], true);
+    assert_eq!(generated["trusted"], true);
+
+    // Editing a command in taskmaster.yaml invalidates trust until approved via POST /trust.
+    std::fs::write(tmp.0.join("taskmaster.yaml"), "setup: echo hi\n").unwrap();
+    let (st, edited) = call(&addr, Some(&token), "GET", "/api/project-config", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(edited["trusted"], false);
+    let hash = edited["hash"].as_str().unwrap().to_string();
+
+    let (st, trusted) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/project-config/trust",
+        Some(serde_json::json!({ "hash": hash })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(trusted["trusted"], true);
+
+    drop(server);
+}
+
+
 
 
 

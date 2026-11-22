@@ -1260,6 +1260,92 @@ pub async fn decide(State(app): State<Arc<App>>, UrlPath((id, decision)): UrlPat
     }
 }
 
+// Project worktree config (`taskmaster.yaml`, O1).
+
+fn project_config_view(project: &Path) -> Value {
+    let path = project.join(crate::project_config::CONFIG_FILE);
+    match crate::project_config::load(project) {
+        Ok(Some(loaded)) => json!({
+            "exists": true,
+            "path": path.display().to_string(),
+            "raw": loaded.raw,
+            "config": loaded.config,
+            "hash": loaded.hash,
+            "has_commands": loaded.has_commands,
+            "trusted": loaded.trusted,
+        }),
+        Ok(None) => json!({
+            "exists": false,
+            "path": path.display().to_string(),
+            "trusted": true,
+            "has_commands": false,
+        }),
+        Err(err) => json!({
+            "exists": path.is_file(),
+            "path": path.display().to_string(),
+            "trusted": false,
+            "has_commands": true,
+            "error": format!("{err:#}"),
+        }),
+    }
+}
+
+pub async fn project_config(State(app): State<Arc<App>>) -> Reply {
+    ok(project_config_view(&app.project()))
+}
+
+#[derive(Deserialize, Default)]
+pub struct TrustProjectBody {
+    pub hash: Option<String>,
+}
+
+pub async fn trust_project_config(
+    State(app): State<Arc<App>>,
+    body: Option<Json<TrustProjectBody>>,
+) -> Reply {
+    let project = app.project();
+    let Some(loaded) = crate::project_config::load(&project)
+        .map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?
+    else {
+        return Err(fail(StatusCode::NOT_FOUND, "taskmaster.yaml does not exist in this project"));
+    };
+    if let Some(expected) = body.and_then(|Json(b)| b.hash)
+        && expected != loaded.hash
+    {
+        return Err(fail(StatusCode::CONFLICT, "taskmaster.yaml changed since it was read; review and approve again"));
+    }
+    crate::project_config::trust(&project, &loaded.hash)
+        .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    ok(project_config_view(&project))
+}
+
+#[derive(Deserialize, Default)]
+pub struct GenerateProjectBody {
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+pub async fn generate_project_config(
+    State(app): State<Arc<App>>,
+    body: Option<Json<GenerateProjectBody>>,
+) -> Reply {
+    let project = app.project();
+    let path = project.join(crate::project_config::CONFIG_FILE);
+    let overwrite = body.map(|Json(b)| b.overwrite).unwrap_or(false);
+    if path.is_file() && !overwrite {
+        return Err(fail(StatusCode::CONFLICT, "taskmaster.yaml already exists"));
+    }
+    let content = crate::project_config::generate_from_project(&project);
+    std::fs::write(&path, &content)
+        .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write taskmaster.yaml: {err}")))?;
+    if let Ok(Some(loaded)) = crate::project_config::load(&project)
+        && loaded.has_commands
+    {
+        let _ = crate::project_config::trust(&project, &loaded.hash);
+    }
+    ok(project_config_view(&project))
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct SettingsBody {

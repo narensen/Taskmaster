@@ -166,20 +166,31 @@ impl Previews {
         // process can take the port in between.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
+        let proj = self.project();
+        let loaded_yaml = crate::project_config::load(&proj).ok().flatten();
+        let yaml_cfg = loaded_yaml.as_ref().map(|l| &l.config);
         let (dir, tree) = match branch {
             Some(branch) => {
-                let tree = git::worktree_dir(&self.project(), run, "preview");
+                let tree = git::worktree_dir(&proj, run, "preview");
                 if tree.exists() {
-                    let _ = git::remove_worktree(&self.project(), &tree);
+                    let _ = git::remove_worktree(&proj, &tree);
                     let _ = std::fs::remove_dir_all(&tree);
                 }
-                git::add_worktree(&self.project(), &tree, branch)?;
-                git::borrow_node_modules(&self.project(), &tree);
+                git::add_worktree(&proj, &tree, branch)?;
+                crate::project_config::apply_shared_and_copy(&proj, &tree, yaml_cfg);
                 (tree.clone(), Some(tree))
             }
-            None => (self.project(), None),
+            None => (proj.clone(), None),
         };
-        let Some(command) = dev_command(&dir, &self.command, port) else {
+        let yaml_preview = loaded_yaml
+            .as_ref()
+            .filter(|l| l.trusted)
+            .and_then(|l| l.config.preview.as_deref())
+            .map(|cmd| {
+                cmd.replace("$PORT", &port.to_string())
+                    .replace("${PORT}", &port.to_string())
+            });
+        let Some(command) = yaml_preview.or_else(|| dev_command(&dir, &self.command, port)) else {
             return self.start_static(run, listener, dir, tree, claim).await;
         };
         let within = if command.contains(" install") && command.contains(" && ") { INSTALL_WITHIN } else { START_WITHIN };

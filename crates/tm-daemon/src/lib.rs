@@ -47,6 +47,7 @@ pub mod notify;
 pub mod policy;
 pub mod pr_loop;
 pub mod preview;
+pub mod project_config;
 pub mod repomap;
 pub mod reply;
 pub mod report;

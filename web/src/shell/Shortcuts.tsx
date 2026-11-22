@@ -31,6 +31,10 @@ export const SHORTCUTS: { group: string; items: [string, string[]][] }[] = [
     ],
   },
   {
+    group: "Composer",
+    items: [["Put the draft aside, or bring it back in an empty box", [MOD, "S"]]],
+  },
+  {
     group: "Files",
     items: [
       ["Find in the open file", [MOD, "F"]],

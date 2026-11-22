@@ -7,6 +7,7 @@ import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, 
 import { navigate } from "./router";
 import { api, type Skill } from "./api";
 import { commands, type Command } from "./commands";
+import { MOD } from "./desktop";
 import { emit, toast, useOn, type Chip } from "./overlay";
 import { prefs, rememberPrompt } from "./prefs";
 
@@ -138,6 +139,58 @@ function serialize(root: HTMLElement): { text: string; chips: Chip[] } {
   };
   root.childNodes.forEach(walk);
   return { text: text.replace(/\u00a0/g, " "), chips };
+}
+
+/** A6: a stashed draft, its text and chips in order, and its attachments. */
+type Part = { t: string } | { chip: Chip };
+interface Stash {
+  parts: Part[];
+  attachments: Chip[];
+}
+
+const STASH_KEY = "taskmaster.stash";
+let stashInTab: Stash | null = null;
+
+function partsOf(root: HTMLElement): Part[] {
+  const parts: Part[] = [];
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) parts.push({ t: node.textContent ?? "" });
+    else if (node instanceof HTMLElement) {
+      if (node.dataset.chip) parts.push({ chip: JSON.parse(node.dataset.chip) as Chip });
+      else if (node.tagName === "BR") parts.push({ t: "\n" });
+      else {
+        if ((node.tagName === "DIV" || node.tagName === "P") && parts.length) parts.push({ t: "\n" });
+        node.childNodes.forEach(walk);
+      }
+    }
+  };
+  root.childNodes.forEach(walk);
+  return parts;
+}
+
+/** Keep the stash in this browser; a stash too big for storage stays for this tab. */
+function saveStash(stash: Stash): "kept" | "tab" {
+  stashInTab = stash;
+  try {
+    localStorage.setItem(STASH_KEY, JSON.stringify(stash));
+    return "kept";
+  } catch {
+    localStorage.removeItem(STASH_KEY);
+    return "tab";
+  }
+}
+
+function takeStash(): Stash | null {
+  let stash = stashInTab;
+  try {
+    const raw = localStorage.getItem(STASH_KEY);
+    if (raw) stash = JSON.parse(raw) as Stash;
+  } catch {
+    // A damaged stash is no stash.
+  }
+  stashInTab = null;
+  localStorage.removeItem(STASH_KEY);
+  return stash;
 }
 
 export function readFile(file: File): Promise<Chip> {
@@ -389,7 +442,41 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     sync();
   };
 
+  // A6: Ctrl/Cmd+S puts the draft aside; on an empty box it brings it back.
+  const stashOrRestore = () => {
+    const el = ref.current;
+    if (!el) return;
+    const blank = !el.textContent?.trim() && !el.querySelector("[data-chip]") && attachments.length === 0;
+    if (!blank) {
+      const where = saveStash({ parts: partsOf(el), attachments });
+      clear();
+      toast("Draft stashed", `${MOD}+S on an empty box brings it back${where === "tab" ? " (kept in this tab only: it is too big to store)" : ""}.`, 4000);
+      return;
+    }
+    const stash = takeStash();
+    if (!stash) {
+      toast("Nothing stashed", `${MOD}+S puts a draft aside.`, 2500);
+      return;
+    }
+    el.innerHTML = "";
+    for (const part of stash.parts) {
+      el.appendChild("chip" in part ? chipNode(part.chip) : document.createTextNode(part.t));
+    }
+    setAttachments(stash.attachments ?? []);
+    sync();
+    el.focus();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+  };
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      return stashOrRestore();
+    }
     if (popup && options.length) {
       if (e.key === "ArrowDown") {
         e.preventDefault();

@@ -129,3 +129,25 @@ for (const theme of ["dark", "light"] as const) {
     }
   });
 }
+
+test("Ctrl-S puts a draft aside with its chips and attachments, and brings it back in an empty box", async ({ open, page }) => {
+  await open("/runs/new");
+  const box = page.locator(".composer-input");
+  await box.click();
+  await page.keyboard.type("Make the header sticky with $");
+  await expect(page.getByRole("listbox").getByRole("option", { name: /tidy-css/ })).toBeVisible();
+  await page.keyboard.type("tid");
+  await page.keyboard.press("Enter");
+  await expect(box.locator(".chip")).toHaveCount(1);
+  await page.keyboard.press("Control+s");
+  await expect(page.getByText("Draft stashed")).toBeVisible();
+  await expect(box).toHaveText("");
+  await page.keyboard.press("Control+s");
+  await expect(box).toContainText("Make the header sticky with");
+  await expect(box.locator(".chip-skill")).toHaveText("$tidy-css");
+  // The stash is gone once taken back.
+  await box.evaluate((el) => (el.innerHTML = ""));
+  await box.click();
+  await page.keyboard.press("Control+s");
+  await expect(page.getByText("Nothing stashed")).toBeVisible();
+});

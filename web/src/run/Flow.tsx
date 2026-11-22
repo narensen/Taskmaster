@@ -14,11 +14,12 @@ import {
   Layers,
   Loader2,
   Pencil,
+  RotateCcw,
   Search,
   Sparkles,
   SquareTerminal,
 } from "lucide-react";
-import type { Phase, Plan, RunDetail, ToolApproval } from "../api";
+import type { DiffStat, DiffStats, Phase, Plan, RunDetail, ToolApproval } from "../api";
 import { tokens, usd } from "../format";
 import { KnownPath, Rich, looksLikePath } from "../paths";
 import { unitPrefix, type Call, type Item, type Surface, type ToolItem } from "./model";
@@ -145,6 +146,112 @@ function planSoFar(call: Call | undefined): number {
   return (text.match(/"owned_glob"\s*:/g) ?? []).length;
 }
 
+interface DraftWorker {
+  id: string;
+  glob: string;
+  route?: string;
+  brief?: string;
+  dependsOn?: string[];
+}
+
+interface DraftPlan {
+  summary?: string;
+  workers: DraftWorker[];
+}
+
+function unescapeJsonString(raw: string): string {
+  try {
+    return JSON.parse(`"${raw}"`) as string;
+  } catch {
+    return raw;
+  }
+}
+
+/** Incrementally parse partial worker entries while Master streams its plan JSON. */
+function parseDraftPlan(call: Call | undefined): DraftPlan | null {
+  if (!call) return null;
+  const text = call.items.map((item) => (item.t === "text" ? item.text : "")).join("");
+  if (!text.includes("\"owned_glob\"") && !text.includes("\"summary\"")) return null;
+
+  const summaryMatch = text.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const summary = summaryMatch ? unescapeJsonString(summaryMatch[1]!) : undefined;
+
+  const workers: DraftWorker[] = [];
+  const seen = new Set<string>();
+  const globRe = /"owned_glob"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = globRe.exec(text)) !== null) {
+    const objStart = text.lastIndexOf("{", match.index);
+    if (objStart < 0) continue;
+    const objEnd = text.indexOf("}", match.index + match[0].length);
+    const slice = text.slice(objStart, objEnd > 0 ? objEnd + 1 : text.length);
+    const idMatch = slice.match(/"id"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    if (!idMatch) continue;
+    const id = unescapeJsonString(idMatch[1]!);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const glob = unescapeJsonString(match[1]!);
+    const routeMatch = slice.match(/"route"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    const briefMatch = slice.match(/"brief"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    const depsMatch = slice.match(/"depends_on"\s*:\s*\[([^\]]*)\]/);
+    const dependsOn = depsMatch
+      ? [...depsMatch[1]!.matchAll(/"((?:\\.|[^"\\])*)"/g)].map((m) => unescapeJsonString(m[1]!)).filter(Boolean)
+      : undefined;
+    workers.push({
+      id,
+      glob,
+      route: routeMatch ? unescapeJsonString(routeMatch[1]!) : undefined,
+      brief: briefMatch ? unescapeJsonString(briefMatch[1]!) : undefined,
+      dependsOn: dependsOn && dependsOn.length > 0 ? dependsOn : undefined,
+    });
+  }
+  if (!summary && workers.length === 0) return null;
+  return { summary, workers };
+}
+
+const DraftingPlan = memo(function DraftingPlan({ draft }: { draft: DraftPlan }) {
+  return (
+    <div className="plan-card plan-drafting" data-testid="drafting-plan">
+      <div className="plan-card-head">
+        <span className="plan-card-title">
+          <Loader2 size={13} strokeWidth={1.8} className="spin-ico" aria-hidden />
+          Drafting overall plan
+        </span>
+        <span className="plan-card-meta">
+          <span className="plan-pill">
+            {draft.workers.length} worker{draft.workers.length === 1 ? "" : "s"} so far
+          </span>
+        </span>
+      </div>
+      {draft.summary?.trim() && <p className="plan-summary">{draft.summary.trim()}</p>}
+      {draft.workers.length > 0 && (
+        <div className="plan-workers">
+          {draft.workers.map((w) => (
+            <div key={w.id} className="plan-worker waiting">
+              <div className="plan-worker-row">
+                <div className="plan-worker-btn">
+                  <StatusGlyph state="waiting" />
+                  <span className="plan-worker-id mono">{w.id}</span>
+                  {w.route && <span className="plan-worker-route muted">{w.route}</span>}
+                  {w.dependsOn && w.dependsOn.length > 0 && (
+                    <span className="plan-dep-pill mono" title={`Waits for ${w.dependsOn.join(", ")}`}>
+                      after {w.dependsOn.join(", ")}
+                    </span>
+                  )}
+                  <span className="plan-worker-glob mono muted clip" title={w.glob}>
+                    {w.glob}
+                  </span>
+                </div>
+              </div>
+              {w.brief && <p className="plan-worker-brief clip">{w.brief.split("\n")[0]}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+});
+
 const Step = memo(function Step({ item, seconds, force }: { item: ToolItem; seconds: string | null; force: boolean }) {
   const [open, setOpen] = useState(false);
   const shown = force || open;
@@ -263,6 +370,7 @@ interface PlannedWorkerRow {
   brief: string;
   context?: string;
   done?: string;
+  dependsOn?: string[];
   state: string;
 }
 
@@ -292,6 +400,7 @@ const OverallPlan = memo(function OverallPlan({
         return parts.map((u) => {
           const agentId = `${prefix}:${page.id}/${u.id}`;
           const s = surfaceById.get(agentId);
+          const deps = u.depends_on?.length ? u.depends_on : page.depends_on;
           return {
             agentId,
             label: `${page.id} / ${u.id}`,
@@ -300,6 +409,7 @@ const OverallPlan = memo(function OverallPlan({
             brief: u.brief.trim(),
             context: u.context?.trim() || page.context?.trim(),
             done: u.done?.trim() || page.done?.trim(),
+            dependsOn: deps?.length ? deps : undefined,
             state: s ? s.state : pageState === "passed" ? "done" : pageState === "failed" ? "failed" : "waiting",
           };
         });
@@ -315,6 +425,7 @@ const OverallPlan = memo(function OverallPlan({
           brief: page.brief.trim(),
           context: page.context?.trim(),
           done: page.done?.trim(),
+          dependsOn: page.depends_on?.length ? page.depends_on : undefined,
           state: s ? s.state : pageState === "passed" ? "done" : pageState === "failed" ? "failed" : "waiting",
         },
       ];
@@ -368,6 +479,11 @@ const OverallPlan = memo(function OverallPlan({
                   <StatusGlyph state={w.state} />
                   <span className="plan-worker-id mono">{w.label}</span>
                   {w.route && <span className="plan-worker-route muted">{w.route}</span>}
+                  {w.dependsOn && w.dependsOn.length > 0 && (
+                    <span className="plan-dep-pill mono" title={`Waits for ${w.dependsOn.join(", ")}`}>
+                      after {w.dependsOn.join(", ")}
+                    </span>
+                  )}
                   <span className="plan-worker-glob mono muted clip" title={w.glob}>
                     {w.glob}
                   </span>
@@ -538,9 +654,43 @@ const AgentActivity = memo(function AgentActivity({
   const hidden = showAll ? 0 : Math.max(0, activity.length - ROWS_SHOWN);
   const visible = hidden ? activity.slice(hidden) : activity;
   const hasFiles = editedFiles.length > 0 || readFiles.length > 0;
+  const hasUsage = surface.usage || surface.tokens > 0 || surface.cost > 0;
 
   return (
     <div className="agent-activity" data-testid="agent-activity">
+      {hasUsage && (
+        <div className="agent-usage-bar mono" data-testid="agent-usage">
+          <span>{tokens(surface.split.output)} out</span>
+          <span aria-hidden>·</span>
+          <span>{tokens(surface.split.input)} in</span>
+          {surface.split.cache_read > 0 && (
+            <>
+              <span aria-hidden>·</span>
+              <span>{tokens(surface.split.cache_read)} cached</span>
+            </>
+          )}
+          {surface.split.cache_write > 0 && (
+            <>
+              <span aria-hidden>·</span>
+              <span>{tokens(surface.split.cache_write)} cache write</span>
+            </>
+          )}
+          {surface.cost > 0 && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="agent-usage-cost">{usd(surface.cost)}</span>
+            </>
+          )}
+          {surface.calls_billed > 0 && (
+            <>
+              <span aria-hidden>·</span>
+              <span>
+                {surface.calls_billed} call{surface.calls_billed === 1 ? "" : "s"}
+              </span>
+            </>
+          )}
+        </div>
+      )}
       {hasFiles && (
         <div className="agent-files" data-testid="agent-files">
           {editedFiles.length > 0 && (
@@ -644,6 +794,9 @@ const AgentBlock = memo(function AgentBlock({
   focused,
   expanded,
   onToggle,
+  diffStat,
+  onOpenDiff,
+  onRestartWorker,
   plan,
   ask,
 }: {
@@ -652,6 +805,9 @@ const AgentBlock = memo(function AgentBlock({
   focused: boolean;
   expanded: boolean;
   onToggle: (id: string) => void;
+  diffStat?: DiffStat;
+  onOpenDiff?: (page: string) => void;
+  onRestartWorker?: (page: string) => void;
   plan?: ReactNode;
   ask?: ReactNode;
 }) {
@@ -660,7 +816,11 @@ const AgentBlock = memo(function AgentBlock({
   const openCall = surface.calls.length ? surface.calls[surface.calls.length - 1] : undefined;
   const running = openCall && !openCall.end ? openCall : undefined;
   const planning = master && detail.phase === "planning" && surface.state !== "done" && surface.state !== "failed";
-  const written = planning ? planSoFar(running) : 0;
+  const draft = useMemo(
+    () => (planning && !detail.plan ? parseDraftPlan(running ?? openCall) : null),
+    [planning, detail.plan, running, openCall],
+  );
+  const written = planning ? (draft?.workers.length || planSoFar(running)) : 0;
 
   const { headline, thoughtGlimpse, editedFiles, readFiles, toolCount, error, latestStart, latestEnd } = surface.summary;
   const totalFiles = editedFiles.length + readFiles.length;
@@ -678,6 +838,9 @@ const AgentBlock = memo(function AgentBlock({
   if (toolCount > 0) counts.push(`${toolCount} step${toolCount === 1 ? "" : "s"}`);
   if (duration) counts.push(duration);
 
+  const hasDiff = !!diffStat && (diffStat.added > 0 || diffStat.removed > 0 || diffStat.files > 0);
+  const canRestart = !master && !!surface.page && !!onRestartWorker && (state === "working" || state === "failed");
+
   return (
     <section
       className={`agent-card ${master ? "is-master" : "is-worker"} ${expanded ? "is-open" : ""} ${focused ? "focused" : ""}`}
@@ -686,25 +849,51 @@ const AgentBlock = memo(function AgentBlock({
       data-state={state}
       tabIndex={-1}
     >
-      <button
-        type="button"
-        className="agent-headline-bar"
-        data-testid="agent-headline"
-        aria-expanded={expanded}
-        onClick={() => onToggle(surface.id)}
-      >
-        <StatusGlyph state={state} />
-        <span className="agent-name">{label}</span>
-        <span className="agent-headline-text clip" title={displayHeadline}>
-          {displayHeadline}
-        </span>
-        <span className="agent-meta">
-          {counts.length > 0 && <span className="agent-stat mono">{counts.join(" · ")}</span>}
-          {running && <Since at={running.at} />}
-          <span className="agent-by clip">{byline(surface, detail)}</span>
-          <ChevronRight size={14} className={`agent-chev ${expanded ? "open" : ""}`} aria-hidden />
-        </span>
-      </button>
+      <div className="agent-head-row">
+        <button
+          type="button"
+          className="agent-headline-bar"
+          data-testid="agent-headline"
+          aria-expanded={expanded}
+          onClick={() => onToggle(surface.id)}
+        >
+          <StatusGlyph state={state} />
+          <span className="agent-name">{label}</span>
+          <span className="agent-headline-text clip" title={displayHeadline}>
+            {displayHeadline}
+          </span>
+          <span className="agent-meta">
+            {counts.length > 0 && <span className="agent-stat mono">{counts.join(" · ")}</span>}
+            {running && <Since at={running.at} />}
+            <span className="agent-by clip">{byline(surface, detail)}</span>
+            <ChevronRight size={14} className={`agent-chev ${expanded ? "open" : ""}`} aria-hidden />
+          </span>
+        </button>
+        {!master && surface.page && hasDiff && onOpenDiff && (
+          <button
+            type="button"
+            className="agent-diff-btn mono"
+            data-testid="worker-diff-stat"
+            title={`View diff for ${surface.page} (${diffStat.files} file${diffStat.files === 1 ? "" : "s"})`}
+            onClick={() => onOpenDiff(surface.page!)}
+          >
+            <span className="diff-add">+{diffStat.added}</span>
+            {diffStat.removed > 0 && <span className="diff-del">-{diffStat.removed}</span>}
+          </button>
+        )}
+        {canRestart && (
+          <button
+            type="button"
+            className="agent-retry-btn"
+            data-testid={state === "working" ? "worker-restart" : "worker-retry"}
+            title={state === "working" ? `Restart ${label} without disturbing sibling workers` : `Retry ${label}`}
+            onClick={() => onRestartWorker!(surface.page!)}
+          >
+            <RotateCcw size={12} aria-hidden />
+            {state === "working" ? "Restart" : "Retry"}
+          </button>
+        )}
+      </div>
 
       {thoughtGlimpse && !expanded && (
         <div className={`agent-glimpse ${running ? "live" : ""}`} data-testid="agent-glimpse">
@@ -735,7 +924,7 @@ const AgentBlock = memo(function AgentBlock({
 
       {expanded && <AgentActivity surface={surface} force={false} />}
 
-      {master && plan}
+      {master && (plan ?? (draft ? <DraftingPlan draft={draft} /> : null))}
       {ask}
     </section>
   );
@@ -762,6 +951,9 @@ export function Flow({
   focus,
   blown,
   onToggleAgent,
+  diffStats,
+  onOpenDiff,
+  onRestartWorker,
   ask,
   approvals,
   onTool,
@@ -773,6 +965,9 @@ export function Flow({
   /** Agents whose activity drawers are open. */
   blown: ReadonlySet<string>;
   onToggleAgent: (agentId: string) => void;
+  diffStats?: DiffStats | null;
+  onOpenDiff?: (page: string) => void;
+  onRestartWorker?: (page: string) => void;
   /** Plan approval, rendered under the master. */
   ask?: ReactNode;
   approvals?: ToolApproval[];
@@ -802,6 +997,7 @@ export function Flow({
     const mine = onTool ? pending.filter((a) => ownerOf(a, list) === surface.id) : [];
     const isMaster = surface.id === "master";
     const hasAsk = (isMaster && !!ask) || mine.length > 0;
+    const stat = !isMaster && surface.page ? diffStats?.pages[surface.page] : undefined;
     return (
       <AgentBlock
         key={surface.id}
@@ -810,6 +1006,9 @@ export function Flow({
         focused={focus === surface.id}
         expanded={blown.has(surface.id)}
         onToggle={onToggleAgent}
+        diffStat={stat}
+        onOpenDiff={onOpenDiff}
+        onRestartWorker={onRestartWorker}
         plan={
           isMaster && detail.plan ? (
             <OverallPlan plan={detail.plan} detail={detail} surfaces={list} onJump={onFocusAgent} />

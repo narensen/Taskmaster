@@ -2,12 +2,9 @@
 // card (that one gates the build); these gate one call and time out into a denial.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import { ShieldAlert } from "lucide-react";
 import { api, type AgentEntry, type ToolApproval } from "../api";
 import { toast } from "../overlay";
-import { motionOn } from "../prefs";
-import { bezier, fadeUp } from "../motion";
 
 /** Pending approvals for a run, kept in step with the run payload count and the live stream. */
 export function useToolApprovals(run: string, pending: number | undefined, entries: AgentEntry[], onAnswered: () => void) {
@@ -72,75 +69,64 @@ export function ToolApprovals({ list, answer }: { list: ToolApproval[]; answer: 
   const [busy, setBusy] = useState<string | null>(null);
   return (
     <section className="tool-approvals" aria-label="Tool approvals">
-      <AnimatePresence initial={false}>
-        {list.map((a) => {
-          const left = Math.max(0, Math.round((Date.parse(a.at) + a.timeout_secs * 1000 - now) / 1000));
-          return (
-            <motion.div
-              key={a.id}
-              layout="position"
-              className={`tool-approval kind-${a.kind}`}
-              data-testid="tool-approval"
-              initial={motionOn() ? { ...fadeUp.initial, scale: 0.98 } : false}
-              animate={{ ...fadeUp.animate, scale: 1 }}
-              exit={{ opacity: 0, transition: { duration: 0 } }}
-              transition={{ duration: motionOn() ? fadeUp.transition.duration : 0, ease: bezier.out }}
-            >
-              <div className="row between gap wrap">
-                <div className="row gap tool-approval-head">
-                  <span className="approval-ico small-ico" aria-hidden>
-                    <ShieldAlert size={14} />
-                  </span>
-                  <span className="strong">{a.tool}</span>
-                  <span className="badge ask">{a.kind}</span>
-                  <span className="muted small">{agentLabel(a.agent)}</span>
-                </div>
-                <span className="muted small nowrap">{Number.isFinite(left) ? `denies in ${left}s` : ""}</span>
+      {list.map((a) => {
+        const left = Math.max(0, Math.round((Date.parse(a.at) + a.timeout_secs * 1000 - now) / 1000));
+        return (
+          <div key={a.id} className={`tool-approval kind-${a.kind}`} data-testid="tool-approval">
+            <div className="row between gap wrap">
+              <div className="row gap tool-approval-head">
+                <span className="approval-ico small-ico" aria-hidden>
+                  <ShieldAlert size={14} />
+                </span>
+                <span className="strong">{a.tool}</span>
+                <span className="badge ask">{a.kind}</span>
+                <span className="muted small">{agentLabel(a.agent)}</span>
               </div>
-              {a.command && <pre className="tool-approval-cmd">{a.command}</pre>}
-              {a.paths.length > 0 && (
-                <ul className="tool-approval-paths small">
-                  {a.paths.map((p) => (
-                    <li key={p} className="break">
-                      {p}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <div className="tool-approval-reason">{a.reason}</div>
-              <div className="row gap tool-approval-actions">
-                <button
-                  className="small"
-                  data-testid="tool-deny"
-                  disabled={busy === a.id}
-                  onClick={() => {
-                    setBusy(a.id);
-                    void answer(a.id, false).finally(() => setBusy(null));
-                  }}
-                >
-                  Deny
-                </button>
-                <button
-                  className="primary small"
-                  data-testid="tool-approve"
-                  disabled={busy === a.id}
-                  onClick={() => {
-                    setBusy(a.id);
-                    void answer(a.id, true).finally(() => setBusy(null));
-                  }}
-                >
-                  Approve
-                </button>
+              <span className="muted small nowrap">{Number.isFinite(left) ? `denies in ${left}s` : ""}</span>
+            </div>
+            {a.command && <pre className="tool-approval-cmd">{a.command}</pre>}
+            {a.paths.length > 0 && (
+              <ul className="tool-approval-paths small">
+                {a.paths.map((p) => (
+                  <li key={p} className="break">
+                    {p}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="tool-approval-reason">{a.reason}</div>
+            <div className="row gap tool-approval-actions">
+              <button
+                className="small"
+                data-testid="tool-deny"
+                disabled={busy === a.id}
+                onClick={() => {
+                  setBusy(a.id);
+                  void answer(a.id, false).finally(() => setBusy(null));
+                }}
+              >
+                Deny
+              </button>
+              <button
+                className="primary small"
+                data-testid="tool-approve"
+                disabled={busy === a.id}
+                onClick={() => {
+                  setBusy(a.id);
+                  void answer(a.id, true).finally(() => setBusy(null));
+                }}
+              >
+                Approve
+              </button>
+            </div>
+            {Number.isFinite(left) && a.timeout_secs > 0 && (
+              <div className="countdown" aria-hidden>
+                <div className="countdown-fill" style={{ width: `${Math.min(100, (100 * left) / a.timeout_secs)}%` }} />
               </div>
-              {Number.isFinite(left) && a.timeout_secs > 0 && (
-                <div className="countdown" aria-hidden>
-                  <div className="countdown-fill" style={{ width: `${Math.min(100, (100 * left) / a.timeout_secs)}%` }} />
-                </div>
-              )}
-            </motion.div>
-          );
-        })}
-      </AnimatePresence>
+            )}
+          </div>
+        );
+      })}
     </section>
   );
 }

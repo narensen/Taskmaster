@@ -135,6 +135,7 @@ export function describe(event: RunEvent): Described {
   if (event === "plan_approved") return { title: "Plan approved", tone: "good" };
   if (event === "plan_rejected") return { title: "Plan rejected", tone: "ask" };
   if (event === "cancelled") return { title: "Cancelled", tone: "bad" };
+  if (event === "resumed") return { title: "Resumed from cancelled state", tone: "busy" };
   if (event === "follow_up") return { title: "A note reopened this run", tone: "busy" };
   if ("plan_ready" in event) {
     const plan = event.plan_ready;

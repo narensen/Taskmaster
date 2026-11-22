@@ -44,6 +44,9 @@ test("run view shows live headline, reasoning glimpses, Master overall plan, and
     await expect(master.getByTestId("agent-headline")).toHaveAttribute("aria-expanded", "true");
     const masterActivity = master.getByTestId("agent-activity");
     await expect(masterActivity).toBeVisible();
+    await expect(masterActivity.getByTestId("agent-usage")).toBeVisible();
+    await expect(masterActivity.getByTestId("agent-usage")).toContainText(/out/);
+    await expect(masterActivity.getByTestId("agent-usage")).toContainText(/in/);
     await expect(masterActivity.getByTestId("agent-files")).toContainText("README.md");
     await expect(masterActivity.locator("details.agent-raw")).not.toHaveAttribute("open", "");
 
@@ -51,6 +54,7 @@ test("run view shows live headline, reasoning glimpses, Master overall plan, and
     await planWorkers.locator(".plan-worker", { hasText: "home" }).getByRole("button", { name: "Inspect" }).click();
     const worker = page.locator("[data-agent='page:home'], [data-agent='unit:home']").first();
     await expect(worker.getByTestId("agent-headline")).toHaveAttribute("aria-expanded", "true");
+    await expect(worker.getByTestId("agent-activity").getByTestId("agent-usage")).toContainText(/out/);
     await expect(worker.getByTestId("agent-activity").getByTestId("agent-files")).toContainText("home/page.tsx");
     await expect(worker.getByTestId("agent-activity").getByTestId("agent-files")).toContainText("types.ts");
 
@@ -58,6 +62,16 @@ test("run view shows live headline, reasoning glimpses, Master overall plan, and
     await worker.getByTestId("agent-headline").click();
     await expect(worker.getByTestId("agent-headline")).toHaveAttribute("aria-expanded", "false");
     await expect(worker.getByTestId("agent-activity")).toHaveCount(0);
+
+    // Per-worker and total diff stats render and clicking opens the scoped Diff tab
+    await expect(page.getByTestId("run-diff-stat")).toBeVisible();
+    const workerDiff = worker.getByTestId("worker-diff-stat");
+    await expect(workerDiff).toBeVisible();
+    await expect(workerDiff).toContainText(/\+\d+/);
+    await workerDiff.click();
+    const rightPanel = page.getByTestId("right-panel");
+    await expect(rightPanel).toBeVisible();
+    await expect(rightPanel.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
 
     // Contrast holds in both dark and light themes on the redesigned Run View
     expect(await lowContrast(page)).toEqual([]);
@@ -68,6 +82,8 @@ test("run view shows live headline, reasoning glimpses, Master overall plan, and
     await page.reload();
     await expect(page.locator(".shell")).toHaveClass(/theme-light/);
     await expect(page.getByTestId("run-headline")).toBeVisible();
+    await page.locator("#agent-master").getByTestId("agent-headline").click();
+    await expect(page.locator("#agent-master").getByTestId("agent-usage")).toBeVisible();
     expect(await lowContrast(page)).toEqual([]);
   } finally {
     await fetch(`${daemon.fixture!.url}/api/projects/open`, {
@@ -75,5 +91,35 @@ test("run view shows live headline, reasoning glimpses, Master overall plan, and
       headers,
       body: JSON.stringify({ path: before }),
     });
+  }
+});
+
+test("a merged run is undone from its header after one confirm, and says so after a reload", async ({ openFixture, page, daemon }) => {
+  test.setTimeout(90_000);
+  const headers = { "content-type": "application/json", authorization: `Bearer ${daemon.fixture!.token}` };
+  const before = ((await (await fetch(`${daemon.fixture!.url}/api/settings`, { headers })).json()) as { project: string }).project;
+  const made = await fetch(`${daemon.fixture!.url}/api/projects`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: `undo${Date.now().toString().slice(-6)}`, switch: true }),
+  });
+  expect(made.ok).toBe(true);
+  try {
+    await finishedRun(daemon.fixture!, "undo-me", "Plan this small product quickly. A bookshop with home, books, and cart.");
+    await openFixture("/runs/undo-me");
+    const merged = page.getByTestId("merged-into");
+    await expect(merged).toBeVisible();
+    await merged.getByTestId("undo-merge").click();
+    await expect(merged).toContainText("Put back every file it changed");
+    await merged.getByTestId("undo-merge-confirm").click();
+    await expect(merged.getByTestId("run-undone")).toContainText(/undone in [0-9a-f]{7,}/);
+    await page.reload();
+    await expect(page.getByTestId("merged-into").getByTestId("run-undone")).toBeVisible();
+    await expect(page.getByTestId("undo-merge")).toHaveCount(0);
+    const again = await fetch(`${daemon.fixture!.url}/api/runs/undo-me/undo`, { method: "POST", headers, body: "{}" });
+    expect(again.status).toBe(409);
+    expect(((await again.json()) as { error: string }).error).toContain("already undone");
+  } finally {
+    await fetch(`${daemon.fixture!.url}/api/projects/open`, { method: "POST", headers, body: JSON.stringify({ path: before }) });
   }
 });

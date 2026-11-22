@@ -6,7 +6,7 @@ import { lazy, Suspense, type ComponentProps } from "react";
 const FilesPanelLazy = lazy(() => import("./files/FilesPanel").then((m) => ({ default: m.FilesPanel })));
 const QuickTerminalLazy = lazy(() => import("./terminal/QuickTerminal").then((m) => ({ default: m.QuickTerminal })));
 const TranscriptLazy = lazy(() => import("./terminal/Xterm").then((m) => ({ default: m.Transcript })));
-const EmptyRunsLazy = lazy(() => import("./art/EmptyRuns").then((m) => ({ default: m.EmptyRuns })));
+export { EmptyRuns } from "./art/EmptyRuns";
 
 function Lines({ n = 6 }: { n?: number }) {
   return (
@@ -38,14 +38,6 @@ export function Transcript(props: ComponentProps<typeof TranscriptLazy>) {
   return (
     <Suspense fallback={<Lines />}>
       <TranscriptLazy {...props} />
-    </Suspense>
-  );
-}
-
-export function EmptyRuns() {
-  return (
-    <Suspense fallback={<div className="empty-art" />}>
-      <EmptyRunsLazy />
     </Suspense>
   );
 }

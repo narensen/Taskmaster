@@ -2,12 +2,11 @@
 // open project's folder, on the daemon's PTY. Several tabs; drag the top edge to resize;
 // the height is remembered. Hiding it keeps every shell running.
 
-import { AnimatePresence, motion } from "motion/react";
 import { Plus, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type TerminalInfo } from "../api";
 import { toast, useOn } from "../overlay";
-import { setPrefs, useMotion, usePrefs } from "../prefs";
+import { setPrefs, usePrefs } from "../prefs";
 import { useHealth, useSettings } from "../query";
 import { TerminalSession } from "./Xterm";
 import { MOD } from "../desktop";
@@ -16,7 +15,6 @@ const MIN = 140;
 
 export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const p = usePrefs();
-  const on = useMotion();
   const settings = useSettings();
   // A daemon with no terminal (Windows, for now) says so here instead of failing to open one.
   const health = useHealth();
@@ -113,40 +111,27 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
   };
 
   return (
-    <motion.section
+    <section
       ref={box}
-      className="qterm"
+      className={`qterm ${open ? "open" : ""}`}
       aria-label="Terminal"
       aria-hidden={!open}
       inert={!open}
       style={{ height }}
-      initial={false}
-      animate={open ? { y: 0, opacity: 1 } : { y: "100%", opacity: 0 }}
-      transition={on ? { type: "spring", duration: 0.2, bounce: 0 } : { duration: 0 }}
     >
       <div className="qterm-grip" role="separator" aria-orientation="horizontal" aria-label="Resize the terminal" tabIndex={0} onPointerDown={drag} onKeyDown={nudge} />
       <div className="qterm-bar">
         <div className="qterm-tabs" role="tablist" aria-label="Shells">
-          <AnimatePresence initial={false}>
-            {tabs.map((t, i) => (
-              <motion.div
-                key={t.id}
-                layout="position"
-                className={`qterm-tab ${t.id === active ? "on" : ""}`}
-                initial={on ? { opacity: 0, y: 4 } : false}
-                animate={{ opacity: 1, y: 0 }}
-                exit={on ? { opacity: 0 } : undefined}
-                transition={{ duration: 0.15 }}
-              >
-                <button type="button" role="tab" aria-selected={t.id === active} className="qterm-tab-name" onClick={() => setActive(t.id)}>
-                  {t.shell.split("/").pop()} {i + 1}
-                </button>
-                <button type="button" className="qterm-x" aria-label={`Close shell ${i + 1}`} onClick={() => close(t.id)}>
-                  <X size={12} />
-                </button>
-              </motion.div>
-            ))}
-          </AnimatePresence>
+          {tabs.map((t, i) => (
+            <div key={t.id} className={`qterm-tab ${t.id === active ? "on" : ""}`}>
+              <button type="button" role="tab" aria-selected={t.id === active} className="qterm-tab-name" onClick={() => setActive(t.id)}>
+                {t.shell.split("/").pop()} {i + 1}
+              </button>
+              <button type="button" className="qterm-x" aria-label={`Close shell ${i + 1}`} onClick={() => close(t.id)}>
+                <X size={12} />
+              </button>
+            </div>
+          ))}
           {!unavailable && (
             <button type="button" className="tb-btn" aria-label="New shell" onClick={() => void add()}>
               <Plus size={13} />
@@ -186,6 +171,6 @@ export function QuickTerminal({ open, onClose }: { open: boolean; onClose: () =>
           </div>
         ))}
       </div>
-    </motion.section>
+    </section>
   );
 }

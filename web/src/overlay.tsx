@@ -3,11 +3,8 @@
 // bus that lets any part of a run hand a chip to the composer or a file to the preview.
 
 import { useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import * as Menu from "@radix-ui/react-dropdown-menu";
 import { Toaster, toast as sonner } from "sonner";
-import { bezier } from "./motion";
-import { useMotion } from "./prefs";
 
 // A tiny store helper.
 function store<T>(initial: T) {
@@ -222,7 +219,6 @@ export function useOn<T>(name: string, handler: Handler<T>) {
 }
 
 export function Sheet({ open, onClose, children }: { open: boolean; onClose: () => void; children: ReactNode }) {
-  const on = useMotion();
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -231,33 +227,19 @@ export function Sheet({ open, onClose, children }: { open: boolean; onClose: () 
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
+  if (!open) return null;
   return (
-    <AnimatePresence>
-      {open && (
-        <motion.div
-          className="sheet-back"
-          onClick={onClose}
-          initial={on ? { opacity: 0 } : false}
-          animate={{ opacity: 1 }}
-          exit={on ? { opacity: 0 } : undefined}
-          transition={{ duration: on ? 0.16 : 0, ease: bezier.out }}
-        >
-          <motion.div
-            className="sheet"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Panel"
-            onClick={(e) => e.stopPropagation()}
-            initial={on ? { y: 28 } : false}
-            animate={{ y: 0 }}
-            exit={on ? { y: 20 } : undefined}
-            transition={{ duration: on ? 0.18 : 0, ease: bezier.out }}
-          >
-            <button type="button" className="sheet-grip" aria-label="Close panel" onClick={onClose} />
-            {children}
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
+    <div className="sheet-back" onClick={onClose}>
+      <div
+        className="sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Panel"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button type="button" className="sheet-grip" aria-label="Close panel" onClick={onClose} />
+        {children}
+      </div>
+    </div>
   );
 }

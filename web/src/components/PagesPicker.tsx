@@ -1,9 +1,7 @@
 // Pages at once: one click picks how many pages build side by side. Max is what this
 // machine can run; workers always run here.
 
-import { motion } from "motion/react";
 import { useId, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { bezier, dur } from "../motion";
 import { rove } from "./roving";
 
 export const STEPS = [1, 2, 3, 4, 6, 8] as const;
@@ -51,7 +49,7 @@ export function PagesPicker({ value, onChange, max }: { value: Pages | null; onC
               className={`seg-item ${on ? "on" : ""}`}
               onClick={() => onChange(o.v)}
             >
-              {on && <motion.span layoutId={`${id}-thumb`} className="seg-thumb" transition={{ duration: dur.base, ease: bezier.out }} />}
+              {on && <span className="seg-thumb" />}
               <span className="seg-text">{o.label}</span>
             </button>
           );

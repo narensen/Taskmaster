@@ -2,7 +2,6 @@
 // a line (⌘G), search every file (⌘⇧F), and for a run, show the run's change to the open
 // file as a diff (D). Open tabs, the active one and the split are remembered.
 
-import { AnimatePresence, motion } from "motion/react";
 import { ChevronDown, ChevronUp, FileDiff as DiffIcon, ExternalLink, Search, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
@@ -11,9 +10,8 @@ import { api, type GrepHit } from "../api";
 import { typing } from "../keys";
 import { MOD } from "../desktop";
 import { openPathMenu } from "../paths";
-import { setPrefs, prefs, useMotion, usePrefs } from "../prefs";
+import { setPrefs, prefs, usePrefs } from "../prefs";
 import { useFile, useProjectFiles, useRunDiff, useSettings, prefetchFile } from "../query";
-import { bezier, dur } from "../motion";
 import { Tip } from "../components/Tip";
 import { CodeView, findMatches } from "./CodeView";
 import { FileTree } from "./FileTree";
@@ -43,7 +41,6 @@ function relative(path: string, project: string): string {
 
 export function FilesPanel({ run, open: openRequest, layout = "horizontal" }: { run?: string; open?: { path: string; line?: number; n: number } | null; layout?: "horizontal" | "vertical" }) {
   const p = usePrefs();
-  const on = useMotion();
   const settings = useSettings();
   const project = settings.data?.project ?? "";
   const files = useProjectFiles();
@@ -188,39 +185,28 @@ export function FilesPanel({ run, open: openRequest, layout = "horizontal" }: { 
         <Panel id="viewer" minSize={layout === "vertical" ? "30%" : "40%"} className="files-main">
           {tabs.length > 0 && (
             <div className="ftabs" role="tablist" aria-label="Open files">
-              <AnimatePresence initial={false}>
-                {tabs.map((t) => (
-                  <motion.div
-                    key={t}
-                    layout="position"
-                    className={`ftab ${t === active ? "on" : ""}`}
-                    initial={on ? { opacity: 0, y: 3 } : false}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={on ? { opacity: 0, transition: { duration: 0.12 } } : undefined}
-                    transition={{ duration: dur.fast, ease: bezier.out, layout: { duration: dur.base, ease: bezier.out } }}
-                    onMouseEnter={() => prefetchFile(t)}
+              {tabs.map((t) => (
+                <div key={t} className={`ftab ${t === active ? "on" : ""}`} onMouseEnter={() => prefetchFile(t)}>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={t === active}
+                    className="ftab-name"
+                    title={t}
+                    onClick={() => {
+                      setActiveState(t);
+                      persist(tabs, t);
+                    }}
+                    onAuxClick={(e) => e.button === 1 && closeTab(t)}
                   >
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={t === active}
-                      className="ftab-name"
-                      title={t}
-                      onClick={() => {
-                        setActiveState(t);
-                        persist(tabs, t);
-                      }}
-                      onAuxClick={(e) => e.button === 1 && closeTab(t)}
-                    >
-                      {t.split("/").pop()}
-                      {changed.has(t) && <span className="tree-mark">{changed.get(t)}</span>}
-                    </button>
-                    <button type="button" className="ftab-x" aria-label={`Close ${t}`} onClick={() => closeTab(t)}>
-                      <X size={11} />
-                    </button>
-                  </motion.div>
-                ))}
-              </AnimatePresence>
+                    {t.split("/").pop()}
+                    {changed.has(t) && <span className="tree-mark">{changed.get(t)}</span>}
+                  </button>
+                  <button type="button" className="ftab-x" aria-label={`Close ${t}`} onClick={() => closeTab(t)}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
             </div>
           )}
           {active ? (
@@ -278,72 +264,64 @@ export function FilesPanel({ run, open: openRequest, layout = "horizontal" }: { 
                   </Tip>
                 </div>
               </div>
-              <AnimatePresence>
-                {(find.open || goto !== null) && (
-                  <motion.div
-                    className="findbar"
-                    initial={on ? { opacity: 0, y: -4 } : false}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={on ? { opacity: 0, y: -4 } : undefined}
-                    transition={{ duration: dur.fast, ease: bezier.out }}
-                  >
-                    {goto !== null ? (
-                      <form
-                        className="findbar-row"
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          const n = Number(goto);
-                          if (n >= 1) setTarget((t) => ({ ...t, [active]: { n: Math.min(n, lines.length), at: Date.now() } }));
-                          setGoto(null);
+              {(find.open || goto !== null) && (
+                <div className="findbar">
+                  {goto !== null ? (
+                    <form
+                      className="findbar-row"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const n = Number(goto);
+                        if (n >= 1) setTarget((t) => ({ ...t, [active]: { n: Math.min(n, lines.length), at: Date.now() } }));
+                        setGoto(null);
+                      }}
+                    >
+                      <span className="findbar-label">Go to line</span>
+                      <input
+                        ref={gotoInput}
+                        autoFocus
+                        inputMode="numeric"
+                        value={goto}
+                        onChange={(e) => setGoto(e.target.value.replace(/\D/g, ""))}
+                        onKeyDown={(e) => e.key === "Escape" && (e.preventDefault(), setGoto(null))}
+                        placeholder={`1 to ${lines.length}`}
+                        aria-label="Line number"
+                      />
+                    </form>
+                  ) : (
+                    <div className="findbar-row">
+                      <input
+                        ref={findInput}
+                        autoFocus
+                        value={find.q}
+                        onChange={(e) => setFind({ open: true, q: e.target.value, i: 0 })}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setFind({ open: false, q: "", i: 0 });
+                          } else if (e.key === "Enter" && matchCount) {
+                            e.preventDefault();
+                            setFind((f) => ({ ...f, i: (f.i + (e.shiftKey ? matchCount - 1 : 1)) % matchCount }));
+                          }
                         }}
-                      >
-                        <span className="findbar-label">Go to line</span>
-                        <input
-                          ref={gotoInput}
-                          autoFocus
-                          inputMode="numeric"
-                          value={goto}
-                          onChange={(e) => setGoto(e.target.value.replace(/\D/g, ""))}
-                          onKeyDown={(e) => e.key === "Escape" && (e.preventDefault(), setGoto(null))}
-                          placeholder={`1 to ${lines.length}`}
-                          aria-label="Line number"
-                        />
-                      </form>
-                    ) : (
-                      <div className="findbar-row">
-                        <input
-                          ref={findInput}
-                          autoFocus
-                          value={find.q}
-                          onChange={(e) => setFind({ open: true, q: e.target.value, i: 0 })}
-                          onKeyDown={(e) => {
-                            if (e.key === "Escape") {
-                              e.preventDefault();
-                              setFind({ open: false, q: "", i: 0 });
-                            } else if (e.key === "Enter" && matchCount) {
-                              e.preventDefault();
-                              setFind((f) => ({ ...f, i: (f.i + (e.shiftKey ? matchCount - 1 : 1)) % matchCount }));
-                            }
-                          }}
-                          placeholder="Find in this file"
-                          aria-label="Find in this file"
-                          spellCheck={false}
-                        />
-                        <span className="findbar-count">{find.q ? (matchCount ? `${find.i + 1} of ${matchCount}` : "none") : ""}</span>
-                        <button type="button" className="icon" aria-label="Previous match" disabled={!matchCount} onClick={() => setFind((f) => ({ ...f, i: (f.i + matchCount - 1) % matchCount }))}>
-                          <ChevronUp size={14} />
-                        </button>
-                        <button type="button" className="icon" aria-label="Next match" disabled={!matchCount} onClick={() => setFind((f) => ({ ...f, i: (f.i + 1) % matchCount }))}>
-                          <ChevronDown size={14} />
-                        </button>
-                        <button type="button" className="icon" aria-label="Close find" onClick={() => setFind({ open: false, q: "", i: 0 })}>
-                          <X size={14} />
-                        </button>
-                      </div>
-                    )}
-                  </motion.div>
-                )}
-              </AnimatePresence>
+                        placeholder="Find in this file"
+                        aria-label="Find in this file"
+                        spellCheck={false}
+                      />
+                      <span className="findbar-count">{find.q ? (matchCount ? `${find.i + 1} of ${matchCount}` : "none") : ""}</span>
+                      <button type="button" className="icon" aria-label="Previous match" disabled={!matchCount} onClick={() => setFind((f) => ({ ...f, i: (f.i + matchCount - 1) % matchCount }))}>
+                        <ChevronUp size={14} />
+                      </button>
+                      <button type="button" className="icon" aria-label="Next match" disabled={!matchCount} onClick={() => setFind((f) => ({ ...f, i: (f.i + 1) % matchCount }))}>
+                        <ChevronDown size={14} />
+                      </button>
+                      <button type="button" className="icon" aria-label="Close find" onClick={() => setFind({ open: false, q: "", i: 0 })}>
+                        <X size={14} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="fview">
                 {showDiff ? (
                   runDiff.isLoading ? (

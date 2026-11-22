@@ -15,7 +15,7 @@ import { RoleMark } from "./marks";
 import { emit, toast } from "./overlay";
 import { prefs, setPrefs, usePrefs } from "./prefs";
 import { ProviderLogo } from "./providers/logos";
-import { keys, prefetchRun, queryClient, useProjectFiles, useProviders, useSettings } from "./query";
+import { keys, prefetchRun, useProjectFiles, useProviders, useSettings } from "./query";
 import { rememberChoice, savedChoice, SEATS, type Seat } from "./rolechoice";
 import { navigate } from "./router";
 import { ordered, useRuns } from "./runs";
@@ -52,17 +52,8 @@ function best<T>(list: T[], q: string, text: (x: T) => string, limit: number): T
     .map((m) => m.x);
 }
 
-export function openProject(path: string, name: string) {
-  void api
-    .openProject(path)
-    .then(() => {
-      setPrefs({ lastProject: path });
-      void queryClient.invalidateQueries();
-      navigate("/");
-      toast(`Opened ${name}`, path, 3000);
-    })
-    .catch((err) => toast("The project did not open", err instanceof Error ? err.message : String(err)));
-}
+export { openProject } from "./openProject";
+import { openProject } from "./openProject";
 
 export function Palette({ state, onClose }: { state: PaletteState; onClose: () => void }) {
   const [q, setQ] = useState(state.mode === "slash" ? "/" : "");

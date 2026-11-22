@@ -68,7 +68,9 @@ export interface PagePlan {
   context?: string;
   /** How the page's agent knows it is finished. */
   done?: string;
-  units?: { id: string; owned_glob: string; brief: string; context?: string; done?: string }[];
+  /** Optional upstream worker/page IDs that must finish before this worker starts. */
+  depends_on?: string[];
+  units?: { id: string; owned_glob: string; brief: string; context?: string; done?: string; depends_on?: string[] }[];
   /** Skills from the store the planner attached; the page's agents read each SKILL.md. */
   skills?: string[];
   /** The phase of the sketch this unit belongs to, from 0. */
@@ -146,6 +148,8 @@ export interface RunSummary {
   /** The branch the run was merged into, and the short merge commit. */
   base?: string | null;
   merge_commit?: string | null;
+  /** Set once the merge was taken back out: the undo commit, when, and how many files. */
+  undone?: { commit: string; at: string; files: number } | null;
   pages: PageView[];
   estimate: Estimate | null;
   spent: Totals;
@@ -163,6 +167,8 @@ export interface RunLimit {
   raw: string;
 }
 
+export type CancelMode = "graceful" | "force";
+
 export interface RunDetail extends RunSummary {
   plan: Plan | null;
   /** The phase being built, from 0, and the one being planned after it passed. */
@@ -171,6 +177,10 @@ export interface RunDetail extends RunSummary {
   prompt: string | null;
   roles: Roles;
   models: Models;
+  /** Active cancellation mode while the run is stopping. */
+  cancelling?: CancelMode | null;
+  /** Per-run USD spend cap, when configured. */
+  budget_usd?: number | null;
 }
 
 export interface Flag {
@@ -194,6 +204,7 @@ export type RunEvent =
   | "plan_approved"
   | "plan_rejected"
   | "cancelled"
+  | "resumed"
   | "follow_up"
   | { plan_ready: Plan }
   | { worker_finished: { page: string; outcome: WorkerOutcome } }
@@ -344,6 +355,33 @@ export interface Book {
   models: Record<string, Mistake[]>;
 }
 
+/** One harness/model's record across recent runs, from the cost ledger. */
+export interface ModelScore {
+  key: string;
+  harness: string;
+  model?: string;
+  calls: number;
+  ok_calls: number;
+  units_built: number;
+  first_pass_units: number;
+  first_pass_rate: number;
+  total_tokens: number;
+  cache_read: number;
+  cache_hit_rate: number;
+  total_usd: number;
+  avg_usd_per_call: number;
+  priced_calls: number;
+  avg_seconds: number;
+}
+
+export interface ModelScorecard {
+  runs_sampled: number;
+  models: ModelScore[];
+  recommended_worker?: string;
+  /** Builders that pass under half their units first time, over 3 units or more. */
+  struggling?: string[];
+}
+
 /** A mistake seen this often is put in front of the model that keeps making it. */
 export const PROMOTE_AT = 3;
 
@@ -404,6 +442,7 @@ export interface NewRun {
   parallel?: number;
   timeout_secs?: number;
   template?: string;
+  max_cost_usd?: number;
 }
 
 export interface NewProject {
@@ -415,6 +454,7 @@ export interface NewProject {
   parallel?: number;
   timeout_secs?: number;
   template?: string;
+  max_cost_usd?: number;
   switch?: boolean;
 }
 
@@ -448,7 +488,7 @@ export interface AgentTag {
 export interface AgentEntry {
   at: string;
   agent: AgentTag;
-  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved" | "stalled" | "released";
+  kind: "start" | "text" | "thought" | "tool_call" | "permission" | "end" | "command" | "output" | "preview" | "approval_requested" | "approval_resolved" | "stalled" | "released" | "restarted";
   /** Tool call id, on a `tool_call` and on the `output` that belongs to it. */
   id?: string;
   text?: string;
@@ -512,7 +552,7 @@ export interface DaemonSettings {
   sandbox?: { shell: boolean; package_indexes: boolean; available: boolean };
   telemetry?: { enabled: boolean };
   /** Seconds one agent call may run; 0 is no limit. */
-  agents?: { timeout_secs: number };
+  agents?: { timeout_secs: number; budget_usd?: number };
 }
 
 export type ApprovalMode = "always" | "risky" | "never";
@@ -700,6 +740,17 @@ export interface SearchHit {
   engine: string;
 }
 
+export interface DiffStat {
+  added: number;
+  removed: number;
+  files: number;
+}
+
+export interface DiffStats {
+  pages: Record<string, DiffStat>;
+  total: DiffStat;
+}
+
 export function searchWeb(q: string, endpoint: string) {
   const params = new URLSearchParams({ q });
   if (endpoint) params.set("endpoint", endpoint);
@@ -733,7 +784,12 @@ export const api = {
   approve: (id: string, note?: string) => call("POST", `/api/runs/${enc(id)}/approve`, note ? { note } : {}),
   reject: (id: string, prompt?: string) => call("POST", `/api/runs/${enc(id)}/reject`, { prompt }),
   resume: (id: string) => call("POST", `/api/runs/${enc(id)}/resume`, {}),
-  cancel: (id: string) => call("POST", `/api/runs/${enc(id)}/cancel`, {}),
+  /** One commit that puts back every file a merged run changed. 409 says why it cannot. */
+  undo: (id: string) => call<{ id: string; commit: string; files: number }>("POST", `/api/runs/${enc(id)}/undo`, {}),
+  cancel: (id: string, mode?: CancelMode) =>
+    call<{ id: string; mode: CancelMode }>("POST", `/api/runs/${enc(id)}/cancel`, mode ? { mode } : {}),
+  restartWorker: (id: string, page: string) =>
+    call<{ ok: boolean; mode: "restarted" | "queued"; page: string }>("POST", `/api/runs/${enc(id)}/workers/${enc(page)}/restart`, {}),
 
   providers: (harness?: string) =>
     call<{ providers: Provider[] }>("GET", `/api/providers${harness ? `?harness=${enc(harness)}` : ""}`).then(
@@ -750,6 +806,7 @@ export const api = {
     call<{ entries: DictionaryEntry[] }>("GET", `/api/dictionary?q=${enc(q)}`).then((r) => r.entries),
   entry: (key: string) => call<DictionaryEntry>("GET", `/api/dictionary/${enc(key)}`),
   errorography: () => call<Book>("GET", "/api/errorography"),
+  scorecard: () => call<ModelScorecard>("GET", "/api/scorecard"),
 
   agents: (id: string, after = 0) =>
     call<{ next: number; entries: AgentEntry[] }>("GET", `/api/runs/${enc(id)}/agents?after=${after}`),
@@ -764,6 +821,7 @@ export const api = {
       "GET",
       `/api/runs/${enc(id)}/diff?scope=${scope}${page ? `&page=${enc(page)}` : ""}`,
     ),
+  diffStats: (id: string) => call<DiffStats>("GET", `/api/runs/${enc(id)}/diff-stats`),
   draftPr: (id: string) => call<{ url: string }>("POST", `/api/runs/${enc(id)}/pr`, {}),
   approvals: (run: string) =>
     call<{ approvals: ToolApproval[]; mode: ApprovalMode; timeout_secs: number }>("GET", `/api/approvals?run=${enc(run)}`),

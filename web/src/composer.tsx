@@ -4,13 +4,11 @@
 // skill. A big paste or a dropped file becomes an attachment.
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import { navigate } from "./router";
 import { api, type Skill } from "./api";
 import { commands, type Command } from "./commands";
-import { bezier, dur } from "./motion";
 import { emit, toast, useOn, type Chip } from "./overlay";
-import { prefs, rememberPrompt, useMotion } from "./prefs";
+import { prefs, rememberPrompt } from "./prefs";
 
 export const BIG_PASTE = 32 * 1024;
 
@@ -165,7 +163,6 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const [focused, setFocused] = useState(false);
   const historyAt = useRef<number | null>(null);
   const saved = useRef<Range | null>(null);
-  const motionOk = useMotion();
 
   const pages = useMemo(() => props.pages ?? [], [props.pages]);
   const agents = useMemo(() => props.agents ?? ["master", "worker", "mid", "reviewer", "verifier"], [props.agents]);
@@ -480,59 +477,27 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         }
       }}
     >
-      <motion.span
-        className="composer-ring"
+      <span
+        className={`composer-ring ${focused || drag ? "on" : ""}`}
         aria-hidden
-        initial={false}
-        animate={{ opacity: focused || drag ? 1 : 0 }}
-        transition={{ duration: motionOk ? 0.18 : 0, ease: [0.22, 1, 0.36, 1] }}
       />
-      <AnimatePresence>
-        {drag && (
-          <motion.div
-            key="drop"
-            className="composer-drop"
-            initial={motionOk ? { opacity: 0 } : false}
-            animate={{ opacity: 1 }}
-            exit={motionOk ? { opacity: 0 } : undefined}
-            transition={{ duration: 0.15 }}
-          >
-            Drop to attach
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {drag && <div className="composer-drop">Drop to attach</div>}
       {attachments.length > 0 && (
         <div className="attachments">
           {attachments.map((a, i) => (
-            <motion.span
-              key={`${a.label}-${i}`}
-              layout="position"
-              initial={motionOk ? { opacity: 0, scale: 0.96 } : false}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
-              className="chip chip-attachment"
-            >
+            <span key={`${a.label}-${i}`} className="chip chip-attachment">
               {a.thumb && <img src={a.thumb} alt="" className="thumb" />}
               <span>{a.label}</span>
               {a.bytes !== undefined && <span className="muted">{Math.ceil(a.bytes / 1024)} KiB</span>}
               <button className="chip-x" aria-label={`Remove ${a.label}`} onClick={() => setAttachments((all) => all.filter((_, j) => j !== i))}>
                 ×
               </button>
-            </motion.span>
+            </span>
           ))}
         </div>
       )}
-      <AnimatePresence>
-        {popup && options.length > 0 && (
-        <motion.div
-          key="suggest"
-          className="popup"
-          role="listbox"
-          initial={motionOk ? { opacity: 0, y: 4 } : false}
-          animate={{ opacity: 1, y: 0 }}
-          exit={motionOk ? { opacity: 0, y: 4 } : { opacity: 1, transition: { duration: 0 } }}
-          transition={{ duration: motionOk ? dur.fast : 0, ease: bezier.out }}
-        >
+      {popup && options.length > 0 && (
+        <div className="popup" role="listbox">
           {options.map((o, i) => (
             <button
               key={o.id}
@@ -548,9 +513,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               <span className="muted small">{o.group}</span>
             </button>
           ))}
-        </motion.div>
-        )}
-      </AnimatePresence>
+        </div>
+      )}
       <div
         ref={ref}
         className="composer-input"

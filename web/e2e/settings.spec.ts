@@ -15,16 +15,23 @@ test("the mid-tier checker is off by default and its switch is kept by the daemo
   await expect(toggle).toHaveAttribute("aria-checked", "false");
 });
 
-test("Code Mode is off by default and can be switched on", async ({ open, page }) => {
+test("Code Mode is on by default and can be switched off", async ({ open, page }) => {
   await open("/settings");
   const toggle = page.getByTestId("code-mode-setting").getByRole("switch", { name: "Use Code Mode for workers" });
-  await expect(toggle).toHaveAttribute("aria-checked", "false");
-  await toggle.click();
   await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
   await page.reload();
-  await expect(toggle).toHaveAttribute("aria-checked", "true");
-  await toggle.click();
   await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+});
+
+test("the model scorecard shows an empty state before any run", async ({ open, page }) => {
+  await open("/settings");
+  const card = page.getByTestId("model-scorecard");
+  await expect(card).toBeVisible();
+  await expect(card).toContainText(/No runs yet|runs sampled/);
 });
 
 test("the worker sandbox's shell and package indexes are on by default and each can be turned off", async ({ open, page, daemon }) => {

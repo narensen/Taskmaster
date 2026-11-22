@@ -1,5 +1,4 @@
 import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MotionConfig, motion } from "motion/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Archive,
@@ -26,26 +25,28 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { api, setToken, token, tokenFromRedirect, type RunSummary } from "./api";
-import { Link, isMorph, match, navigate, usePath } from "./router";
+import { Link, match, navigate, usePath } from "./router";
 import { Gallery } from "./pages/Gallery";
 import { SignIn } from "./pages/SignIn";
 import { ContextMenu, Toasts, emit, openMenu, undoLatest, useOn, type Chip } from "./overlay";
-import { Palette, openProject, type PaletteState } from "./palette";
+import type { PaletteState } from "./palette";
+import { openProject } from "./openProject";
 import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan } from "./format";
 import { readFile } from "./composer";
-import { bezier } from "./motion";
 import { useLoad } from "./ui";
 import { typing } from "./keys";
 import { RunBar } from "./run/Meter";
 import { TitleBar, type Crumb } from "./shell/TitleBar";
-import { Shortcuts } from "./shell/Shortcuts";
 import { QuickTerminal } from "./lazy";
 import { TipProvider } from "./components/Tip";
 import { prefetchRun, useSettings } from "./query";
 import { watchRuns } from "./notify";
 import { MOD, isDesktop, isMac } from "./desktop";
+
+const PaletteLazy = lazy(() => import("./palette").then((m) => ({ default: m.Palette })));
+const ShortcutsLazy = lazy(() => import("./shell/Shortcuts").then((m) => ({ default: m.Shortcuts })));
 
 export { typing };
 
@@ -524,67 +525,67 @@ export function App() {
   if (!signedIn) return <SignIn />;
 
   return (
-    <MotionConfig reducedMotion={motionOn ? "never" : "always"}>
-      <TipProvider>
-        <RunsContext.Provider value={runsState}>
-          <div className={`shell theme-${p.theme} density-${p.density} ${motionOn ? "" : "no-motion"} ${term ? "term-open" : ""} ${isDesktop() && isMac ? "desktop-mac" : ""}`}>
-            <TitleBar
-              crumbs={crumbs}
-              onPalette={() => setPalette({ open: true, mode: "all" })}
-              onTerminal={toggleTerm}
-              onMenu={() => setDrawer(!drawer)}
-              terminalOpen={term}
-              extra={/^\/runs\/(?!new$)[^/]+/.test(path) ? <RunBar /> : null}
-            />
-            <aside className={`side ${drawer ? "open" : ""}`} aria-label="Main">
-              <Link to="/" className="brand side-brand" onClick={() => setDrawer(false)}>
-                <img src="/icon.png" alt="" width={16} height={16} />
-                <span>Taskmaster</span>
+    <TipProvider>
+      <RunsContext.Provider value={runsState}>
+        <div className={`shell theme-${p.theme} density-${p.density} ${motionOn ? "" : "no-motion"} ${term ? "term-open" : ""} ${isDesktop() && isMac ? "desktop-mac" : ""}`}>
+          <TitleBar
+            crumbs={crumbs}
+            onPalette={() => setPalette({ open: true, mode: "all" })}
+            onTerminal={toggleTerm}
+            onMenu={() => setDrawer(!drawer)}
+            terminalOpen={term}
+            extra={/^\/runs\/(?!new$)[^/]+/.test(path) ? <RunBar /> : null}
+          />
+          <aside className={`side ${drawer ? "open" : ""}`} aria-label="Main">
+            <Link to="/" className="brand side-brand" onClick={() => setDrawer(false)}>
+              <img src="/icon.png" alt="" width={16} height={16} />
+              <span>Taskmaster</span>
+            </Link>
+            <div className="side-search">
+              <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
+                <Search size={14} />
+                <span>Search</span>
+                <kbd>{MOD} K</kbd>
+              </button>
+              <Link to="/runs/new" className="side-new" aria-label="New run" title="New run (N)" onClick={() => setDrawer(false)}>
+                <SquarePen size={14} />
               </Link>
-              <div className="side-search">
-                <button className="palette-hint" onClick={() => setPalette({ open: true, mode: "all" })}>
-                  <Search size={14} />
-                  <span>Search</span>
-                  <kbd>{MOD} K</kbd>
-                </button>
-                <Link to="/runs/new" className="side-new" aria-label="New run" title="New run (N)" onClick={() => setDrawer(false)}>
-                  <SquarePen size={14} />
-                </Link>
-              </div>
-              <nav className="nav">
-                {NAV.map((item) => {
-                  const on = item.active ? item.active(path) : path === item.to || path.startsWith(item.to + "/");
-                  const Icon = item.icon;
-                  return (
-                    <Link key={item.to} to={item.to} className={on ? "on" : ""} aria-current={on ? "page" : undefined} onClick={() => setDrawer(false)}>
-                      <Icon size={15} strokeWidth={1.75} />
-                      <span>{item.label}</span>
-                    </Link>
-                  );
-                })}
-              </nav>
-              <RunList runs={runs.data ?? []} path={path} onPick={() => setDrawer(false)} />
-            </aside>
-            {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
-            <main className="main">
-              <motion.div
-                key={path}
-                className="route"
-                initial={motionOn && !isMorph() ? { opacity: 0 } : false}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.15, ease: bezier.out }}
-              >
-                <Page path={path} />
-              </motion.div>
-            </main>
-            {termMounted && <QuickTerminal open={term} onClose={() => setTerm(false)} />}
-            {palette && <Palette state={palette} onClose={() => setPalette(null)} />}
-            <Shortcuts open={keys} onOpenChange={setKeys} />
-            <ContextMenu />
-            <Toasts theme={p.theme} />
-          </div>
-        </RunsContext.Provider>
-      </TipProvider>
-    </MotionConfig>
+            </div>
+            <nav className="nav">
+              {NAV.map((item) => {
+                const on = item.active ? item.active(path) : path === item.to || path.startsWith(item.to + "/");
+                const Icon = item.icon;
+                return (
+                  <Link key={item.to} to={item.to} className={on ? "on" : ""} aria-current={on ? "page" : undefined} onClick={() => setDrawer(false)}>
+                    <Icon size={15} strokeWidth={1.75} />
+                    <span>{item.label}</span>
+                  </Link>
+                );
+              })}
+            </nav>
+            <RunList runs={runs.data ?? []} path={path} onPick={() => setDrawer(false)} />
+          </aside>
+          {drawer && <div className="drawer-back" onClick={() => setDrawer(false)} />}
+          <main className="main">
+            <div key={path} className="route">
+              <Page path={path} />
+            </div>
+          </main>
+          {termMounted && <QuickTerminal open={term} onClose={() => setTerm(false)} />}
+          {palette && (
+            <Suspense fallback={null}>
+              <PaletteLazy state={palette} onClose={() => setPalette(null)} />
+            </Suspense>
+          )}
+          {keys && (
+            <Suspense fallback={null}>
+              <ShortcutsLazy open={keys} onOpenChange={setKeys} />
+            </Suspense>
+          )}
+          <ContextMenu />
+          <Toasts theme={p.theme} />
+        </div>
+      </RunsContext.Provider>
+    </TipProvider>
   );
 }

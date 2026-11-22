@@ -208,6 +208,75 @@ function Section({ id, title, children, note }: { id?: string; title: string; ch
   );
 }
 
+const pct = (n: number) => `${Math.round(n * 100)}%`;
+
+/** What each harness and model has cost and delivered across recent runs, from their ledgers. */
+function ModelScorecardSection() {
+  const card = useLoad(api.scorecard, []);
+  const models = card.data?.models ?? [];
+  const struggling = new Set(card.data?.struggling ?? []);
+  return (
+    <Section
+      id="scorecard"
+      title="Model scorecard"
+      note="From the cost ledgers of the last 50 runs here. First pass is the share of units a model built without a repair. The recommended worker passes at least 85% first time, over 3 units or more, for the least cost and time. A model under 50% needs a repair more often than not."
+    >
+      <div data-testid="model-scorecard">
+        {card.error ? (
+          <p className="muted small">The scorecard is not available from this daemon.</p>
+        ) : card.loading && !card.data ? (
+          <p className="muted small">Loading…</p>
+        ) : models.length === 0 ? (
+          <p className="muted small">No runs yet. The scorecard fills in as runs finish.</p>
+        ) : (
+          <>
+            {card.data?.recommended_worker && (
+              <p className="small" data-testid="scorecard-recommended">
+                Recommended worker: <span className="badge good">{card.data.recommended_worker}</span>
+              </p>
+            )}
+            <table className="table small scorecard-table">
+              <thead>
+                <tr>
+                  <th scope="col">Model</th>
+                  <th scope="col" className="num">Calls</th>
+                  <th scope="col" className="num">First pass</th>
+                  <th scope="col" className="num">Cache hits</th>
+                  <th scope="col" className="num">Avg cost</th>
+                  <th scope="col" className="num">Avg time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {models.map((m) => (
+                  <tr key={m.key}>
+                    <td>
+                      {m.key}
+                      {struggling.has(m.key) && (
+                        <>
+                          {" "}
+                          <span className="badge bad" data-testid="scorecard-struggling">
+                            Needs repairs
+                          </span>
+                        </>
+                      )}
+                    </td>
+                    <td className="num">{m.calls}</td>
+                    <td className="num">{m.units_built > 0 ? pct(m.first_pass_rate) : "–"}</td>
+                    <td className="num">{pct(m.cache_hit_rate)}</td>
+                    <td className="num">{m.priced_calls > 0 ? `$${m.avg_usd_per_call.toFixed(3)}` : "–"}</td>
+                    <td className="num">{`${m.avg_seconds.toFixed(1)}s`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="muted small">{`${card.data?.runs_sampled ?? 0} runs sampled`}</p>
+          </>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 /** The agent time limits offered, with the one in the settings file if it is another. */
 function limitChoices(current: number): number[] {
   const offered = [0, 600, 1200, 1800, 3600];
@@ -230,6 +299,7 @@ const TOC: { group: string; items: [string, string][] }[] = [
       ["time-limit", "Agent time limit"],
       ["checker", "Mid-tier checker"],
       ["code-mode", "Code Mode"],
+      ["scorecard", "Model scorecard"],
       ["sandbox", "Worker sandbox"],
       ["telemetry", "Telemetry"],
       ["tool-approvals", "Tool approvals"],
@@ -525,11 +595,11 @@ export function Settings() {
         <Section
           id="code-mode"
           title="Code Mode"
-          note="Workers get run_code: one call runs a short JavaScript program that reads, edits, searches and checks their files, instead of a tool call per step. It runs in Node with no file, process or network access of its own, under the same permissions as the worker's tools. Claude Code workers use Claude Code's own code mode in an interactive session. Off until the benchmark says it is faster for your projects."
+          note="Every agent gets run_code: one call runs a short JavaScript program that reads, edits, patches, searches and checks files, instead of a tool call per step. Builders get the full set; the planner, reviewers and verifiers get a read-only one. It runs in Node with no file, process or network access of its own, under the same permissions as the agent's tools. Claude Code workers use Claude Code's own code mode. On by default for every harness."
         >
           <label className="row gap" data-testid="code-mode-setting">
             <Switch
-              on={daemon.data.code_mode?.enabled ?? false}
+              on={daemon.data.code_mode?.enabled ?? true}
               label="Use Code Mode for workers"
               onChange={(on) =>
                 void api.setCodeMode(on).then(
@@ -545,6 +615,8 @@ export function Settings() {
           </label>
         </Section>
       )}
+
+      <ModelScorecardSection />
 
       {daemon.data && (
         <Section

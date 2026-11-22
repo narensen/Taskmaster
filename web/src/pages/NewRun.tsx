@@ -34,7 +34,16 @@ export function NewRun() {
   const [advanced, setAdvanced] = useState(false);
   const list = providers.data ?? [];
   const master = seatChoice(choice, "master");
-  const pill = master ? `${list.find((p) => p.id === master.harness)?.name ?? providerName(master.harness)} · ${modelLabel(list, master)}` : "Choose providers";
+  const worker = seatChoice(choice, "worker");
+  const masterName = master ? (list.find((p) => p.id === master.harness)?.name ?? providerName(master.harness)) : null;
+  const workerName = worker ? (list.find((p) => p.id === worker.harness)?.name ?? providerName(worker.harness)) : null;
+  const pill = master ? `Master · ${masterName} · ${modelLabel(list, master)}` : "Choose providers";
+  const workersLabel =
+    pages == null
+      ? workerName
+        ? `Workers · ${workerName}`
+        : "Choose workers"
+      : `${pages === "max" ? `Max (${max ?? "…"})` : `${pages} worker${pages === 1 ? "" : "s"}`}${workerName ? ` · ${workerName}` : ""}`;
   const project = settings.data?.project?.split(/[/\\]/).filter(Boolean).pop();
 
   useEffect(() => {
@@ -97,15 +106,23 @@ export function NewRun() {
                   className={`model-pill ${advanced ? "on" : ""}`}
                   aria-expanded={advanced}
                   onClick={() => setAdvanced((v) => !v)}
-                  title="Roles and pages"
+                  title="Master provider and roles"
                 >
                   <ProviderLogo id={master?.harness} size={14} />
                   <span className="clip">{pill}</span>
                 </button>
                 <span className="foot-sep" aria-hidden />
-                <span className="foot-note">
-                  <Users size={13} aria-hidden /> {pages == null ? "Choose pages" : pages === "max" ? `Max (${max ?? "…"})` : `${pages} at once`}
-                </span>
+                <button
+                  type="button"
+                  className={`model-pill composer-worker-pill ${advanced ? "on" : ""}`}
+                  aria-expanded={advanced}
+                  onClick={() => setAdvanced((v) => !v)}
+                  title="Worker pool provider and parallel count"
+                >
+                  <Users size={13} aria-hidden />
+                  {worker?.harness && <ProviderLogo id={worker.harness} size={13} />}
+                  <span className="clip">{workersLabel}</span>
+                </button>
               </div>
               <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
                 {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}

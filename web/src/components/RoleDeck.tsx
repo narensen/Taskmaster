@@ -1,13 +1,11 @@
 // The four seats of a run, each with its provider and model, changed in place before the
 // run starts. A quiet switch keeps the choice for the project.
 
-import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
 import { api, type Provider, type ProviderStatus } from "../api";
 import { RoleMark } from "../marks";
 import { SEATS, problemWith, seatChoice, type Choice, type Seat } from "../rolechoice";
 import type { RoleDefault } from "../prefs";
-import { bezier, dur } from "../motion";
 import { ProviderPicker } from "./ProviderPicker";
 
 function harnessLine(provider: ProviderStatus): string {
@@ -56,19 +54,11 @@ export function RoleDeck({
   }, [fresh]);
   return (
     <section className="role-deck" aria-label="Who plays each role">
-      <AnimatePresence initial={false}>
-        {fresh && missing.length > 0 && (
-          <motion.p
-            className="deck-ask"
-            initial={{ opacity: 0, y: -4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: dur.base, ease: bezier.out }}
-          >
-            Pick a provider for each role. Taskmaster keeps your answer for this project, so you only do this once.
-          </motion.p>
-        )}
-      </AnimatePresence>
+      {fresh && missing.length > 0 && (
+        <p className="deck-ask">
+          Pick a provider for each role. Taskmaster keeps your answer for this project, so you only do this once.
+        </p>
+      )}
       {fresh && harness && harness.length > 0 && (
         <ul className="deck-harness" data-testid="harness-state">
           {harness.map((provider) => (

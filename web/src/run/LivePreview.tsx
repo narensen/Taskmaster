@@ -2,12 +2,9 @@
 // Not the file preview tab (a code table); this is the running app.
 
 import { useCallback, useEffect, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import { MonitorPlay, Play, Square, ExternalLink as Out } from "lucide-react";
 import { api, type PreviewView, type RunDetail } from "../api";
 import { toast } from "../overlay";
-import { motionOn } from "../prefs";
-import { bezier } from "../motion";
 
 const TONE: Record<PreviewView["state"], string> = { none: "quiet", starting: "ask", running: "good", stopped: "quiet", failed: "bad" };
 
@@ -91,22 +88,15 @@ export function LivePreview({ id, detail }: { id: string; detail: RunDetail }) {
           {view.output && <pre>{view.output}</pre>}
         </div>
       )}
-      <AnimatePresence initial={false}>
-        {frame && live && view.url && (
-          <motion.iframe
-            key="frame"
-            className="live-preview-frame"
-            title="Live preview"
-            src={view.url}
-            data-testid="live-preview-frame"
-            style={{ height: 320, transformOrigin: "top center" }}
-            initial={motionOn() ? { opacity: 0, scaleY: 0.96 } : false}
-            animate={{ opacity: 1, scaleY: 1 }}
-            exit={motionOn() ? { opacity: 0, scaleY: 0.98 } : { opacity: 0, transition: { duration: 0 } }}
-            transition={{ duration: motionOn() ? 0.18 : 0, ease: bezier.out }}
-          />
-        )}
-      </AnimatePresence>
+      {frame && live && view.url && (
+        <iframe
+          className="live-preview-frame"
+          title="Live preview"
+          src={view.url}
+          data-testid="live-preview-frame"
+          style={{ height: 320 }}
+        />
+      )}
     </section>
   );
 }

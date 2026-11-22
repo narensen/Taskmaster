@@ -3,7 +3,6 @@
 // Nothing here scans the disk.
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, GitBranch, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
 import { api, callAt, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
@@ -19,13 +18,12 @@ import { Loading } from "../ui";
 import { Link, navigate } from "../router";
 import { ExternalLink } from "../paths";
 import { approvalLabel, isUnpriced, phaseLabel, tokens, usd } from "../format";
-import { bezier, dur, fadeUp, stagger } from "../motion";
 import { motionOn, prefs, setPrefs, usePrefs } from "../prefs";
 import { byRecent, ordered, toggleFlag, useRuns } from "../runs";
 import { dropOnRun } from "../App";
 import { consumeCloneRequest } from "../commands";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
-import { openProject } from "../palette";
+import { openProject } from "../openProject";
 import { Problem, useAction, useLoad } from "../ui";
 
 /** A name the View Transitions API accepts for a run, shared by its card and its page. */
@@ -70,21 +68,12 @@ function useShot(run: RunSummary): { shot: string | null | undefined; prompt: st
   return { shot, prompt };
 }
 
-function RunCard({ run, index, folder }: { run: RunSummary; group?: string; index: number; folder: string | null }) {
+function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: number; folder: string | null }) {
   const { shot, prompt } = useShot(run);
   const p = usePrefs();
   const flags = p.runFlags[run.id] ?? {};
-  const on = motionOn();
   return (
-    <motion.article
-      layout
-      initial={on ? fadeUp.initial : false}
-      animate={fadeUp.animate}
-      transition={{
-        ...fadeUp.transition,
-        delay: on ? stagger(index) : 0,
-        layout: { duration: on ? dur.base : 0, ease: bezier.out },
-      }}
+    <article
       className="card gallery-card"
       onMouseEnter={() => prefetchRun(run.id)}
       onFocus={() => prefetchRun(run.id)}
@@ -127,25 +116,14 @@ function RunCard({ run, index, folder }: { run: RunSummary; group?: string; inde
           </button>
         </div>
       </div>
-    </motion.article>
+    </article>
   );
 }
 
-function DaemonCard({ url, token, pinned, index }: { url: string; token: string | null; pinned: boolean; index: number }) {
+function DaemonCard({ url, token, pinned }: { url: string; token: string | null; pinned: boolean; index?: number }) {
   const state = useLoad(() => callAt<{ runs: RunSummary[] }>(url, token, "/api/runs"), [url, token], 15000);
-  const on = motionOn();
   return (
-    <motion.article
-      layout
-      className="card gallery-card"
-      initial={on ? fadeUp.initial : false}
-      animate={fadeUp.animate}
-      transition={{
-        ...fadeUp.transition,
-        delay: on ? stagger(index) : 0,
-        layout: { duration: on ? dur.base : 0, ease: bezier.out },
-      }}
-    >
+    <article className="card gallery-card">
       <div className="frame typed">
         <div className="typed-line">{url}</div>
         <div className="typed-phase">
@@ -165,7 +143,7 @@ function DaemonCard({ url, token, pinned, index }: { url: string; token: string 
           <span className="sr-only">{pinned ? "unpin" : "pin"}</span>
         </button>
       </div>
-    </motion.article>
+    </article>
   );
 }
 
@@ -583,30 +561,21 @@ export function Gallery() {
       </div>
       <div className="home-below">
         {firstRun && <ProviderSetup providers={providerList} checking={providers.isFetching} />}
-        <AnimatePresence initial={false}>
-          {rolesOpen && (
-            <motion.div
-              key="roles"
-              className="home-roles"
-              initial={motionOn() ? { opacity: 0, y: -6 } : false}
-              animate={{ opacity: 1, y: 0 }}
-              exit={motionOn() ? { opacity: 0, y: -4 } : undefined}
-              transition={{ duration: dur.base, ease: bezier.out }}
-            >
-              <RoleDeck
-                choice={choice}
-                providers={providerList}
-                loading={providers.isLoading}
-                onSeat={setSeat}
-                remember={remember}
-                onRemember={setRemember}
-                fresh={fresh}
-                missing={missing}
-              />
-              <PagesPicker value={pages} onChange={setPages} max={max} />
-            </motion.div>
-          )}
-        </AnimatePresence>
+        {rolesOpen && (
+          <div className="home-roles">
+            <RoleDeck
+              choice={choice}
+              providers={providerList}
+              loading={providers.isLoading}
+              onSeat={setSeat}
+              remember={remember}
+              onRemember={setRemember}
+              fresh={fresh}
+              missing={missing}
+            />
+            <PagesPicker value={pages} onChange={setPages} max={max} />
+          </div>
+        )}
       {!settings.data && runs.length === 0 && <Loading rows={2} tall label="Loading the gallery" />}
       {settings.data && list.length === 0 && (
         <section className="home-empty" aria-label="No runs yet">

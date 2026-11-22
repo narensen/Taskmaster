@@ -301,6 +301,14 @@ function blankSurface(id: string): Surface {
   };
 }
 
+function findLastTool(items: Item[], match: (t: ToolItem) => boolean): ToolItem | undefined {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item && item.t === "tool" && match(item)) return item;
+  }
+  return undefined;
+}
+
 /**
  * Builds the agents' transcript from entries as they arrive, touching only what changed.
  * A streamed fragment replaces the one item it extends and the call and agent it sits in;
@@ -393,8 +401,8 @@ export class SurfaceBuilder {
           call.items.push({ t: "tool", name: "command", target: e.command ?? null, at: e.at });
           break;
         case "output": {
-          const byTool = e.id ? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.id === e.id) : undefined;
-          const open = byTool ?? [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.output === undefined && i.diff === undefined);
+          const byTool = e.id ? findLastTool(call.items, (i) => i.id === e.id) : undefined;
+          const open = byTool ?? findLastTool(call.items, (i) => i.output === undefined && i.diff === undefined);
           if (open) {
             const change: Partial<ToolItem> = {};
             if (e.text) change.output = mergeChunk(open.output, e.text);
@@ -407,13 +415,17 @@ export class SurfaceBuilder {
           call.items.push({ t: "tool", name: "browser", target: e.routes?.map((r) => r.route).join(" ") || e.step || null, at: e.at });
           break;
         case "permission": {
-          const open = [...call.items].reverse().find((i): i is ToolItem => i.t === "tool" && i.allowed === undefined && i.name === (e.tool ?? e.name));
+          const targetName = e.tool ?? e.name;
+          const open = findLastTool(call.items, (i) => i.allowed === undefined && i.name === targetName);
           if (open) replace(call, open, { allowed: e.allowed });
           else call.items.push({ t: "tool", name: e.tool ?? "tool", target: null, allowed: e.allowed, at: e.at });
           break;
         }
         case "stalled":
           call.items.push({ t: "life", text: `Stalled waiting on its model; fresh agent ${e.restart ?? 1} started.`, at: e.at });
+          break;
+        case "restarted":
+          call.items.push({ t: "life", text: "Restarted by user; starting a fresh worker.", at: e.at });
           break;
         case "released": {
           const left = e.lingering ? `${e.lingering} still running` : "nothing left running";
@@ -504,19 +516,22 @@ export function surfaces(detail: RunDetail | null, entries: AgentEntry[], ledger
 }
 
 /** [`surfaces`], kept up to date as entries stream in: only new entries are read. */
-export function useSurfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[]): Surface[] {
+export function useSurfaces(detail: RunDetail | null, entries: AgentEntry[], ledger: LedgerEntry[], version = 0): Surface[] {
   const builder = useRef<SurfaceBuilder | null>(null);
   return useMemo(() => {
+    void version;
     let b = builder.current;
     if (!b || !b.continues(entries)) b = builder.current = new SurfaceBuilder();
     return b.apply(entries).snapshot(detail, ledger);
-  }, [detail, entries, ledger]);
+  }, [detail, entries, ledger, version]);
 }
 
 export interface RunData {
   detail: RunDetail | null;
   events: RunEvent[];
   entries: AgentEntry[];
+  /** Monotonic counter bumped whenever entries are appended or replaced. */
+  entriesVersion: number;
   ledger: { totals: Totals; entries: LedgerEntry[] } | null;
   notes: Note[];
   error: unknown;
@@ -542,7 +557,9 @@ export function useRun(id: string): RunData {
     [id],
   );
   const [events, setEvents] = useState<RunEvent[]>([]);
-  const [entries, setEntries] = useState<AgentEntry[]>([]);
+  // Zero-copy append buffer: streamed batches push in place and bump entriesVersion once per frame.
+  const entriesRef = useRef<AgentEntry[]>([]);
+  const [entriesVersion, setEntriesVersion] = useState(0);
   const [ledger, setLedger] = useState<RunData["ledger"]>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   const [error, setError] = useState<unknown>(null);
@@ -597,7 +614,10 @@ export function useRun(id: string): RunData {
       frame.current = 0;
       const batch = pending.current;
       pending.current = [];
-      if (batch.length) setEntries((all) => all.concat(batch));
+      if (batch.length) {
+        entriesRef.current.push(...batch);
+        setEntriesVersion((v) => v + 1);
+      }
     });
   }, []);
   useEffect(
@@ -614,7 +634,8 @@ export function useRun(id: string): RunData {
       const ag = await api.agents(id, counts.current.entries);
       if (!ag.entries.length || ag.next <= counts.current.entries) return;
       counts.current.entries = ag.next;
-      setEntries((all) => [...all, ...ag.entries]);
+      entriesRef.current.push(...ag.entries);
+      setEntriesVersion((v) => v + 1);
     } catch {
       // The poll below picks it up.
     }
@@ -660,8 +681,14 @@ export function useRun(id: string): RunData {
     let stale = false;
     counts.current = { events: 0, entries: 0 };
     loaded.current = false;
+    pending.current = [];
+    if (frame.current) {
+      cancelAnimationFrame(frame.current);
+      frame.current = 0;
+    }
     setEvents([]);
-    setEntries([]);
+    entriesRef.current = [];
+    setEntriesVersion((v) => v + 1);
     setPlanArrived(false);
     void (async () => {
       try {
@@ -669,7 +696,8 @@ export function useRun(id: string): RunData {
         if (stale) return;
         counts.current = { events: ev.next, entries: ag.next };
         setEvents(ev.events);
-        setEntries(ag.entries);
+        entriesRef.current = ag.entries;
+        setEntriesVersion((v) => v + 1);
         await reload();
         loaded.current = true;
         refollow();
@@ -695,7 +723,8 @@ export function useRun(id: string): RunData {
         if (ev.events.length || ag.entries.length || d.active) {
           if (ag.entries.length) {
             counts.current.entries = ag.next;
-            setEntries((all) => [...all, ...ag.entries]);
+            entriesRef.current.push(...ag.entries);
+            setEntriesVersion((v) => v + 1);
           }
           if (ev.events.length) {
             counts.current.events = ev.next;
@@ -713,7 +742,7 @@ export function useRun(id: string): RunData {
 
   const patch = useCallback((change: Partial<RunDetail>) => setDetailState((d) => (d ? { ...d, ...change } : d)), []);
 
-  return { detail, events, entries, ledger, notes, error, planArrived, reload, refollow, reloadNotes, catchUp, patch };
+  return { detail, events, entries: entriesRef.current, entriesVersion, ledger, notes, error, planArrived, reload, refollow, reloadNotes, catchUp, patch };
 }
 
 /** A glob as the daemon's owners read it: `**` any depth, `*` within a segment. */

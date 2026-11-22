@@ -100,6 +100,10 @@ function Highlighted({ text, find }: { text: string; find: string }) {
   );
 }
 
+const AUTO_COLLAPSE_FILE_LINES = 300;
+const AUTO_COLLAPSE_TOTAL_LINES = 800;
+const MAX_LINES_PER_FILE = 400;
+
 export function DiffTab({
   run,
   detail,
@@ -120,8 +124,15 @@ export function DiffTab({
   const [hit, setHit] = useState(0);
   const [comment, setComment] = useState<{ file: string; line: number; text: string } | null>(null);
   const [queued, setQueued] = useState<{ file: string; line: number; text: string }[]>([]);
+  const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
+  const [fullFiles, setFullFiles] = useState<Record<string, boolean>>({});
   const body = useRef<HTMLDivElement>(null);
   const p = usePrefs();
+
+  useEffect(() => {
+    setOpenFiles({});
+    setFullFiles({});
+  }, [text]);
 
   useEffect(() => {
     if (!request) return;
@@ -158,10 +169,23 @@ export function DiffTab({
   }, [run, scope, page, attempt, attempts, detail?.phase]);
 
   const files = useMemo(() => parseDiff(text), [text]);
-  const hits = useMemo(() => {
-    if (!find) return 0;
+  const totalLines = useMemo(() => files.reduce((n, f) => n + f.lines.length, 0), [files]);
+  const { hits, matchedFiles } = useMemo(() => {
+    if (!find) return { hits: 0, matchedFiles: new Set<string>() };
     const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-    return files.reduce((n, f) => n + f.lines.reduce((m, l) => m + (l.text.match(re)?.length ?? 0), 0), 0);
+    let count = 0;
+    const matched = new Set<string>();
+    for (const f of files) {
+      let fileHits = 0;
+      for (const l of f.lines) {
+        fileHits += l.text.match(re)?.length ?? 0;
+      }
+      if (fileHits > 0) {
+        matched.add(f.path);
+        count += fileHits;
+      }
+    }
+    return { hits: count, matchedFiles: matched };
   }, [files, find]);
 
   useEffect(() => {
@@ -242,8 +266,13 @@ export function DiffTab({
       <div className="diff-body" ref={body}>
         {files.map((f) => {
           const viewed = isViewed(f);
+          const autoCollapsed = f.lines.length > AUTO_COLLAPSE_FILE_LINES || totalLines > AUTO_COLLAPSE_TOTAL_LINES;
+          const explicit = openFiles[f.path];
+          const collapsed = viewed || (matchedFiles.has(f.path) ? false : explicit !== undefined ? !explicit : autoCollapsed);
+          const showFull = !!fullFiles[f.path] || matchedFiles.has(f.path) || f.lines.length <= MAX_LINES_PER_FILE;
+          const visibleLines = showFull ? f.lines : f.lines.slice(0, MAX_LINES_PER_FILE);
           return (
-            <section key={f.path} className={`diff-file ${viewed ? "viewed" : ""}`}>
+            <section key={f.path} className={`diff-file ${viewed ? "viewed" : ""} ${collapsed ? "collapsed" : ""}`}>
               <header
                 className="diff-file-head"
                 onContextMenu={(e) => {
@@ -253,10 +282,30 @@ export function DiffTab({
                   openPathMenu(e.clientX, e.clientY, full, { raw: f.path });
                 }}
               >
+                {!viewed && (
+                  <button
+                    type="button"
+                    className="diff-fold-btn"
+                    aria-expanded={!collapsed}
+                    aria-label={collapsed ? `Expand ${f.path}` : `Collapse ${f.path}`}
+                    onClick={() => setOpenFiles((m) => ({ ...m, [f.path]: collapsed }))}
+                  >
+                    {collapsed ? "▸" : "▾"}
+                  </button>
+                )}
                 <KnownPath path={f.path} />
                 <span className="small">
                   <span className="diff-add">+{f.added}</span> <span className="diff-del">−{f.removed}</span>
                 </span>
+                {collapsed && !viewed && (
+                  <button
+                    type="button"
+                    className="link small"
+                    onClick={() => setOpenFiles((m) => ({ ...m, [f.path]: true }))}
+                  >
+                    Show {f.lines.length} lines
+                  </button>
+                )}
                 <label className="check small">
                   <input
                     type="checkbox"
@@ -268,10 +317,10 @@ export function DiffTab({
                   viewed
                 </label>
               </header>
-              {!viewed && (
+              {!collapsed && (
                 <table className="diff-lines">
                   <tbody>
-                    {f.lines.map((l, i) => {
+                    {visibleLines.map((l, i) => {
                       const target = l.new ?? l.old ?? 0;
                       const canComment = l.kind === "add" || l.kind === "ctx";
                       const open = comment && comment.file === f.path && comment.line === target && canComment;
@@ -347,6 +396,19 @@ export function DiffTab({
                         </FragmentRow>
                       );
                     })}
+                    {!showFull && (
+                      <tr className="dl diff-more-row">
+                        <td colSpan={3}>
+                          <button
+                            type="button"
+                            className="link small diff-more-btn"
+                            onClick={() => setFullFiles((m) => ({ ...m, [f.path]: true }))}
+                          >
+                            Show all {f.lines.length} lines ({f.lines.length - visibleLines.length} more)
+                          </button>
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               )}

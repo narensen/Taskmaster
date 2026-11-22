@@ -3,13 +3,14 @@
 // and accessed files. A toggleable side panel holds files, diff, preview, and terminal.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, Check, GitBranch, GitMerge, Loader2, PanelRight } from "lucide-react";
+import { AlertCircle, ArrowDown, Check, GitBranch, GitMerge, Loader2, PanelRight } from "lucide-react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
-import { api, type ReviewJob, type RunDetail } from "../api";
+import { api, type DiffStats, type ReviewJob, type RunDetail } from "../api";
 import { takeAttachments } from "../App";
 import { setRunContext } from "../commands";
+import { CancelControl, type ActiveWorkerItem } from "../components/CancelControl";
 import { Composer, messageText, type ComposerHandle } from "../composer";
-import { phaseLabel } from "../format";
+import { phaseLabel, usd } from "../format";
 import { FilesPanel } from "../lazy";
 import { emit, Sheet, toast, undoable, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, looksLikePath, resolvedPath } from "../paths";
@@ -55,6 +56,25 @@ function useNarrow(): boolean {
 function typingTarget(target: EventTarget | null): boolean {
   const el = target instanceof Element ? target : null;
   return !!el?.closest("input, textarea, select, [contenteditable='true'], .xterm, [role='dialog']");
+}
+
+function noteTarget(chips: Chip[]): string {
+  for (const c of chips) {
+    if (c.kind === "agent") {
+      if (c.value.startsWith("worker:")) return `page:${c.value.slice(7)}`;
+      if (["master", "workers", "reviewer", "verifier"].includes(c.value)) return c.value;
+    }
+    if (c.kind === "page") return `page:${c.value}`;
+  }
+  return "master";
+}
+
+function noteTargetLabel(to: string): string {
+  if (to === "master") return "the master";
+  if (to === "workers") return "all workers";
+  if (to.startsWith("page:")) return `worker ${to.slice(5)}`;
+  if (to.startsWith("unit:")) return `worker ${to.slice(5)}`;
+  return to;
 }
 
 function ApprovalAsk({
@@ -243,6 +263,8 @@ export function RunView({ id }: { id: string }) {
   const narrow = useNarrow();
   const composer = useRef<ComposerHandle>(null);
   const runRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [pinned, setPinned] = useState(true);
   const settings = useSettings();
   const toolApprovals = useToolApprovals(id, detail?.pending_approvals, data.entries, () => void data.reload());
   const gh = useLoadGh();
@@ -263,6 +285,7 @@ export function RunView({ id }: { id: string }) {
   const splitPanel = usePanelRef();
   const split = useDefaultLayout({ id: "taskmaster-run", storage: localStorage });
   const [diffRequest, setDiffRequest] = useState<{ scope: Scope; page?: string; attempt?: number; n: number } | null>(null);
+  const [diffStats, setDiffStats] = useState<DiffStats | null>(null);
   const setTab = useCallback(
     (t: string) => {
       const next = panelTab(t);
@@ -274,13 +297,71 @@ export function RunView({ id }: { id: string }) {
 
   const shown = entries;
   const ledgerEntries = useMemo(() => ledger?.entries ?? [], [ledger]);
-  const list = useSurfaces(detail, shown, ledgerEntries);
+  const list = useSurfaces(detail, shown, ledgerEntries, data.entriesVersion);
+  const activeWorkers = useMemo<ActiveWorkerItem[]>(
+    () =>
+      list
+        .filter((s) => s.state === "working" && s.page)
+        .map((s) => ({
+          id: s.id,
+          page: s.page!,
+          label: s.title || s.page!,
+          headline: s.summary.headline || undefined,
+        })),
+    [list],
+  );
   const pages = detail?.plan?.pages.map((p) => p.id) ?? detail?.pages.map((p) => p.id) ?? [];
   const phase = detail?.phase;
+  const pageStatesKey = detail?.pages.map((p) => `${p.id}:${p.state}:${p.repairs}`).join(",") ?? "";
 
   useEffect(() => {
     rememberRun(id);
+    setPinned(true);
   }, [id]);
+
+  // Smart auto-scroll: stay pinned to the bottom during active runs until the user scrolls up.
+  useEffect(() => {
+    if (!detail?.active || !pinned) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [detail?.active, pinned, data.entriesVersion, list.length]);
+
+  useEffect(() => {
+    if (!detail?.branch) {
+      setDiffStats(null);
+      return;
+    }
+    let live = true;
+    void api
+      .diffStats(id)
+      .then((stats) => {
+        if (live) setDiffStats(stats);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [id, detail?.branch, phase, pageStatesKey]);
+
+  const openPageDiff = useCallback((page: string) => {
+    emit("diff", { scope: "page", page });
+  }, []);
+
+  const restartWorker = useCallback(
+    async (page: string) => {
+      try {
+        const res = await api.restartWorker(id, page);
+        data.reloadNotes();
+        void data.reload();
+        data.refollow();
+        toast(res.mode === "restarted" ? "Restarting worker" : "Queued worker retry", page, 2500);
+      } catch (err) {
+        toast(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [id, data],
+  );
 
   useEffect(() => {
     if (ledger?.totals) setRunChrome({ totals: ledger.totals });
@@ -480,8 +561,9 @@ export function RunView({ id }: { id: string }) {
   const send = async (message: { text: string; chips: Chip[]; attachments: Chip[] }) => {
     const text = messageText(message);
     if (!text) return;
+    const to = noteTarget(message.chips);
     try {
-      await api.addNote(id, "master", text);
+      await api.addNote(id, to, text);
       composer.current?.clear();
       data.reloadNotes();
     } catch (err) {
@@ -496,6 +578,8 @@ export function RunView({ id }: { id: string }) {
   const delivered = notes.filter((n) => n.delivered);
   const settled = !detail.active && (detail.phase === "done" || detail.phase === "failed");
   const sideVisible = narrow ? sheet : panelOpen;
+  const totalDiff = diffStats?.total;
+  const hasTotalDiff = !!totalDiff && (totalDiff.added > 0 || totalDiff.removed > 0 || totalDiff.files > 0);
 
   const panel = (
     <div className="panel" data-testid="right-panel">
@@ -537,6 +621,18 @@ export function RunView({ id }: { id: string }) {
             {runHeadline}
           </span>
           <span className="flow-top-phase">{phaseLabel(detail)}</span>
+          {hasTotalDiff && (
+            <button
+              type="button"
+              className="agent-diff-btn mono"
+              data-testid="run-diff-stat"
+              title={`View full run diff (${totalDiff.files} file${totalDiff.files === 1 ? "" : "s"})`}
+              onClick={() => emit("diff", { scope: "run" })}
+            >
+              <span className="diff-add">+{totalDiff.added}</span>
+              {totalDiff.removed > 0 && <span className="diff-del">-{totalDiff.removed}</span>}
+            </button>
+          )}
           {detail.merged && detail.merge_commit ? (
             <span className="merged-into" data-testid="merged-into">
               <GitMerge size={12} aria-hidden /> {detail.base || "the project"}{" "}
@@ -550,6 +646,7 @@ export function RunView({ id }: { id: string }) {
               >
                 {detail.merge_commit}
               </button>
+              {!detail.active && <UndoMerge id={id} undone={detail.undone} onDone={() => void data.reload()} />}
             </span>
           ) : (
             detail.branch && (
@@ -558,17 +655,46 @@ export function RunView({ id }: { id: string }) {
               </span>
             )
           )}
+          {detail.budget_usd && detail.budget_usd > 0 && (
+            <span
+              className="flow-top-budget mono"
+              title={`Spend cap: ${usd(detail.spent.cost_usd)} of ${usd(detail.budget_usd)}`}
+            >
+              {usd(detail.spent.cost_usd)} / {usd(detail.budget_usd)}
+            </span>
+          )}
         </div>
         <div className="flow-top-actions">
-          {!detail.active && !["done", "failed", "awaiting_approval"].includes(detail.phase) && (
-            <button type="button" className="ghost small" onClick={() => void api.resume(id).then(() => (data.refollow(), data.reload()))}>
+          {!detail.active && (detail.cancelled || !["done", "failed", "awaiting_approval"].includes(detail.phase)) && (
+            <button
+              type="button"
+              className="ghost small"
+              data-testid="run-resume"
+              title={detail.cancelled ? "Resume this cancelled run, keeping any passed pages" : "Resume run"}
+              onClick={() =>
+                void api
+                  .resume(id)
+                  .then(() => {
+                    data.refollow();
+                    void data.reload();
+                  })
+                  .catch((err) => toast("Could not resume run", err instanceof Error ? err.message : String(err)))
+              }
+            >
               Resume
             </button>
           )}
           {(detail.active || detail.phase === "awaiting_approval") && (
-            <button type="button" className="ghost small" onClick={() => void api.cancel(id).then(() => data.reload())}>
-              Cancel
-            </button>
+            <CancelControl
+              id={id}
+              detail={detail}
+              activeWorkers={activeWorkers}
+              onCancelled={(mode) => {
+                data.patch({ cancelling: mode });
+                void data.reload();
+              }}
+              onRestartWorker={(page) => void restartWorker(page)}
+            />
           )}
           {detail.phase === "done" && gh && detail.branch && (
             <button
@@ -590,7 +716,7 @@ export function RunView({ id }: { id: string }) {
             className={`ghost small icon-btn ${sideVisible ? "on" : ""}`}
             aria-label={sideVisible ? "Hide side panel" : "Show side panel"}
             aria-pressed={sideVisible}
-            title="Toggle side panel (⌘\\)"
+            title="Toggle side panel (⌘\)"
             onClick={() => (narrow ? setSheet((v) => !v) : setPanelOpen(!panelOpen))}
           >
             <PanelRight size={14} strokeWidth={1.7} aria-hidden />
@@ -598,7 +724,15 @@ export function RunView({ id }: { id: string }) {
         </div>
       </header>
 
-      <div className="run-scroll">
+      <div
+        ref={scrollRef}
+        className="run-scroll"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 64;
+          setPinned((prev) => (prev === nearBottom ? prev : nearBottom));
+        }}
+      >
         <div className="run-thread">
           <Flow
             detail={detail}
@@ -607,6 +741,9 @@ export function RunView({ id }: { id: string }) {
             blown={blown}
             onToggleAgent={toggleAgent}
             onFocusAgent={inspectAgent}
+            diffStats={diffStats}
+            onOpenDiff={openPageDiff}
+            onRestartWorker={(page) => void restartWorker(page)}
             approvals={toolApprovals.list}
             onTool={toolApprovals.answer}
             ask={
@@ -643,7 +780,7 @@ export function RunView({ id }: { id: string }) {
                 <div key={n.id} className="flow-note" data-testid="draft">
                   <header className="flow-role">
                     <h2>You</h2>
-                    <span className="flow-state">waiting for the master</span>
+                    <span className="flow-state">waiting for {noteTargetLabel(n.to)}</span>
                     <button
                       type="button"
                       className="link small"
@@ -667,7 +804,7 @@ export function RunView({ id }: { id: string }) {
                           });
                           toast("The note was not removed");
                         });
-                        undoable("Removed the note", () => void api.addNote(id, "master", n.text).then(data.reloadNotes));
+                        undoable("Removed the note", () => void api.addNote(id, n.to, n.text).then(data.reloadNotes));
                       }}
                     >
                       remove
@@ -680,20 +817,35 @@ export function RunView({ id }: { id: string }) {
               ))}
               {delivered.map((n) => (
                 <p key={n.id} className="flow-life">
-                  Note to the master: <Rich text={n.text} />
+                  Note to {noteTargetLabel(n.to)}: <Rich text={n.text} />
                 </p>
               ))}
             </section>
           )}
         </div>
       </div>
+      {detail.active && !pinned && (
+        <button
+          type="button"
+          className="jump-live"
+          data-testid="jump-live"
+          onClick={() => {
+            setPinned(true);
+            const el = scrollRef.current;
+            if (el) el.scrollTop = el.scrollHeight;
+          }}
+        >
+          <ArrowDown size={13} aria-hidden />
+          Live
+        </button>
+      )}
       <div className="composer-bar">
         <Composer
           ref={composer}
           bus
           pages={pages}
-          agents={["master", "reviewer", "verifier", ...pages.map((p) => `worker:${p}`)]}
-          placeholder="A note for the master. @ files, # pull requests, $ skills, / commands"
+          agents={["master", "workers", "reviewer", "verifier", ...pages.map((p) => `worker:${p}`)]}
+          placeholder="Steer master or @worker:<id>. @ files, # pull requests, $ skills, / commands"
           onSend={(m) => void send(m)}
         />
       </div>
@@ -761,4 +913,49 @@ function useLoadGh(): boolean {
     api.gh().then((g) => setOk(!!g.account)).catch(() => setOk(false));
   }, []);
   return ok;
+}
+
+/** Take a merged run back out of the project, after asking once. The daemon refuses, with
+ * the reason, when the run's files were edited since. */
+function UndoMerge({ id, undone, onDone }: { id: string; undone?: RunDetail["undone"]; onDone: () => void }) {
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (undone) {
+    return (
+      <span className="undo-merge-done" data-testid="run-undone">
+        undone in <span className="mono">{undone.commit}</span>
+      </span>
+    );
+  }
+  if (!asking) {
+    return (
+      <button type="button" className="undo-merge-btn" data-testid="undo-merge" title="Put back every file this run changed" onClick={() => setAsking(true)}>
+        Undo
+      </button>
+    );
+  }
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      const done = await api.undo(id);
+      toast("Run undone", `Commit ${done.commit} put ${done.files} file${done.files === 1 ? "" : "s"} back.`);
+      onDone();
+    } catch (err) {
+      toast("Not undone", err instanceof Error ? err.message : String(err), 10000);
+    } finally {
+      setBusy(false);
+      setAsking(false);
+    }
+  };
+  return (
+    <span className="undo-merge-ask" role="group" aria-label="Undo this run">
+      <span>Put back every file it changed, in a new commit?</span>
+      <button type="button" className="undo-merge-btn" data-testid="undo-merge-confirm" disabled={busy} onClick={() => void confirm()}>
+        {busy ? "Undoing…" : "Undo run"}
+      </button>
+      <button type="button" className="undo-merge-btn quiet" disabled={busy} onClick={() => setAsking(false)}>
+        Keep
+      </button>
+    </span>
+  );
 }

@@ -3,14 +3,11 @@
 // be picked.
 
 import * as Popover from "@radix-ui/react-popover";
-import { motion } from "motion/react";
 import { Check, ChevronDown } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Provider } from "../api";
 import type { RoleDefault } from "../prefs";
 import { ProviderLogo, providerName } from "../providers/logos";
-import { bezier, dur } from "../motion";
-import { useMotion } from "../prefs";
 import { rove } from "./roving";
 
 export function modelLabel(providers: Provider[], pick: RoleDefault | null): string {
@@ -39,7 +36,6 @@ export function ProviderPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [browse, setBrowse] = useState<string | null>(value?.harness ?? null);
-  const on = useMotion();
   const models = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (open) setBrowse(value?.harness ?? providers.find((p) => p.installed)?.id ?? null);
@@ -82,12 +78,7 @@ export function ProviderPicker({
       {open && (
           <Popover.Portal>
             <Popover.Content asChild sideOffset={6} align="start" collisionPadding={12} sticky="always" hideWhenDetached>
-              <motion.div
-                className="pop prov-pop"
-                initial={on ? { opacity: 0 } : false}
-                animate={{ opacity: 1 }}
-                transition={{ duration: dur.fast, ease: bezier.out }}
-              >
+              <div className="pop prov-pop">
                 <div className="prov-cols">
                   <div className="prov-list" role="listbox" aria-label="Providers" onKeyDown={(e) => rove(e)}>
                     <div className="pop-label">Provider</div>
@@ -162,7 +153,7 @@ export function ProviderPicker({
                     )}
                   </div>
                 </div>
-              </motion.div>
+              </div>
             </Popover.Content>
           </Popover.Portal>
       )}

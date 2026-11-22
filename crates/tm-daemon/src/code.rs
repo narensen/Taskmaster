@@ -65,12 +65,17 @@ const write = (path, text) => call("write", { path, text: String(text) });
 const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
 const patch = (path, edits) => call("patch", { path, edits });
 const applyPatch = (diff) => call("applyPatch", { diff: String(diff) });
+const tryPatch = (diff) => call("tryPatch", { diff: String(diff) });
 const grep = (text, glob) => call("grep", { text, glob });
 const ls = (glob) => call("ls", { glob });
 const diff = (glob) => call("diff", { glob });
 const symbols = (glob) => call("symbols", { glob });
 const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
 const test = () => call("test", {});
+const testAffected = (paths) => call("testAffected", { files: Array.isArray(paths) ? paths : (paths ? [paths] : []) });
+const probe = {
+  ast: (path) => call("probeAst", { path }),
+};
 const sh = (command) => call("sh", { command });
 const check = () => call("check", {});
 const browser = (action, args = {}) => call("browser", { action, args });
@@ -83,8 +88,8 @@ async function runBody(code) {
   let fn;
   try {
     fn = new AsyncFunction(
-      "read", "write", "edit", "patch", "applyPatch", "grep", "ls", "diff", "symbols",
-      "readMany", "test", "sh", "check", "browser", "console", "require",
+      "read", "write", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
+      "readMany", "test", "testAffected", "probe", "sh", "check", "browser", "console", "require",
       `return (async () => {\n${code}\n})();`
     );
   } catch (err) {
@@ -93,8 +98,8 @@ async function runBody(code) {
   }
   try {
     const result = await fn(
-      read, write, edit, patch, applyPatch, grep, ls, diff, symbols,
-      readMany, test, sh, check, browser, scopedConsole, require
+      read, write, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
+      readMany, test, testAffected, probe, sh, check, browser, scopedConsole, require
     );
     send({ done: true, result: result === undefined ? null : result, logs });
   } catch (err) {
@@ -371,8 +376,13 @@ impl CodeTools {
     }
 
     async fn op(&self, grant: &Grant, scope: &Scope, op: &str, args: &Value) -> anyhow::Result<Value> {
-        if scope.read_only && matches!(op, "write" | "edit" | "patch" | "applyPatch" | "sh" | "test" | "browser") {
-            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, check)");
+        if scope.read_only
+            && matches!(
+                op,
+                "write" | "edit" | "patch" | "applyPatch" | "tryPatch" | "sh" | "test" | "testAffected" | "browser"
+            )
+        {
+            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
         }
         let path = |key: &str| -> anyhow::Result<PathBuf> {
             let raw = args[key].as_str().context("a path is required")?;
@@ -596,6 +606,190 @@ impl CodeTools {
                 }
                 let first = &reply["content"][0];
                 Ok(if first["type"] == "image" { json!("(a screenshot was taken; call browser_screenshot yourself to see it)") } else { first["text"].clone() })
+            }
+            "tryPatch" => {
+                let raw = args["diff"].as_str().filter(|d| !d.trim().is_empty()).context("`diff` is required")?;
+                let patches = match parse_unified_diff(raw) {
+                    Ok(p) if !p.is_empty() => p,
+                    Ok(_) => return Ok(json!({ "applied": false, "error": "no unified diff hunks found", "files": [], "diagnostics": [] })),
+                    Err(err) => return Ok(json!({ "applied": false, "error": format!("{err:#}"), "files": [], "diagnostics": [] })),
+                };
+                let policy = crate::policy::Policy::load(&scope.cwd);
+                let mut staged: Vec<(PathBuf, Option<String>, String)> = Vec::new();
+                for file_patch in &patches {
+                    let rel = file_patch.target_path();
+                    if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
+                        return Ok(json!({
+                            "applied": false,
+                            "error": format!("policy denied write to `{rel}` (matched `{glob}`)"),
+                            "files": [],
+                            "diagnostics": [],
+                        }));
+                    }
+                    let full = if Path::new(rel).is_absolute() { PathBuf::from(rel) } else { scope.cwd.join(rel) };
+                    if let Err(err) = self.allowed(scope, "tryPatch", ToolKind::Edit, Some(&full), None).await {
+                        return Ok(json!({
+                            "applied": false,
+                            "error": format!("{err:#}"),
+                            "files": [],
+                            "diagnostics": [],
+                        }));
+                    }
+                    let next = if file_patch.is_delete() {
+                        let existing = match std::fs::read_to_string(&full) {
+                            Ok(t) => t,
+                            Err(err) => return Ok(json!({ "applied": false, "error": format!("cannot read {rel}: {err}"), "files": [], "diagnostics": [] })),
+                        };
+                        if let Err(err) = apply_file_hunks(rel, &existing, &file_patch.hunks) {
+                            return Ok(json!({ "applied": false, "error": format!("{err:#}"), "files": [], "diagnostics": [] }));
+                        }
+                        None
+                    } else {
+                        let existing = if file_patch.is_create() && !full.exists() {
+                            String::new()
+                        } else {
+                            match std::fs::read_to_string(&full) {
+                                Ok(t) => t,
+                                Err(err) => return Ok(json!({ "applied": false, "error": format!("cannot read {rel}: {err}"), "files": [], "diagnostics": [] })),
+                            }
+                        };
+                        match apply_file_hunks(rel, &existing, &file_patch.hunks) {
+                            Ok(updated) => Some(updated),
+                            Err(err) => return Ok(json!({ "applied": false, "error": format!("{err:#}"), "files": [], "diagnostics": [] })),
+                        }
+                    };
+                    staged.push((full, next, rel.to_string()));
+                }
+                let mut touched = Vec::with_capacity(staged.len());
+                for (full, content, rel) in staged {
+                    match content {
+                        Some(text) => {
+                            if let Some(dir) = full.parent() {
+                                std::fs::create_dir_all(dir)?;
+                            }
+                            std::fs::write(&full, text)?;
+                        }
+                        None => {
+                            if full.exists() {
+                                std::fs::remove_file(&full)?;
+                            }
+                        }
+                    }
+                    touched.push(rel);
+                }
+                // Run fast static checks immediately on touched files in the same turn.
+                let mut diagnostics: Vec<String> = crate::checks::html_sanity(&scope.cwd, &touched)
+                    .into_iter()
+                    .chain(crate::checks::html_quality(&scope.cwd, &touched))
+                    .map(|(file, problem)| format!("{file}: {problem}"))
+                    .collect();
+                for file in touched.iter().filter(|f| f.ends_with(".json")) {
+                    if let Ok(text) = std::fs::read_to_string(scope.cwd.join(file))
+                        && let Err(err) = serde_json::from_str::<Value>(&text)
+                    {
+                        diagnostics.push(format!("{file}: not valid JSON ({err})"));
+                    }
+                }
+                Ok(json!({ "applied": true, "files": touched, "diagnostics": diagnostics }))
+            }
+            "testAffected" => {
+                self.allowed(scope, op, ToolKind::Execute, None, Some("affected project tests")).await?;
+                let requested: Vec<String> = args["files"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                let changed: Vec<String> = if !requested.is_empty() {
+                    requested
+                } else {
+                    let out = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&scope.cwd)
+                        .args(["status", "--porcelain"])
+                        .output()
+                        .ok();
+                    out.map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .filter_map(|l| l.get(3..))
+                            .map(|s| s.trim().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+                };
+                let all_files = files(&scope.cwd, None).unwrap_or_default();
+                let stems: Vec<String> = changed
+                    .iter()
+                    .filter_map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()).map(str::to_ascii_lowercase))
+                    .collect();
+                let matched_tests: Vec<String> = all_files
+                    .into_iter()
+                    .filter(|f| {
+                        let lower = f.to_ascii_lowercase();
+                        let looks_test = lower.contains(".test.")
+                            || lower.contains(".spec.")
+                            || lower.contains("test_")
+                            || lower.ends_with("_test.rs");
+                        looks_test && (stems.is_empty() || stems.iter().any(|st| lower.contains(st)))
+                    })
+                    .take(12)
+                    .collect();
+                let venv = scope
+                    .shell
+                    .as_ref()
+                    .and_then(|s| s.writable.first())
+                    .map(|scratch| scratch.join("venv"))
+                    .unwrap_or_else(|| scope.cwd.join(".venv"));
+                let steps = crate::runtime::steps(&scope.cwd, &venv);
+                if !steps.iter().any(|step| !step.setup) {
+                    return Ok(json!({
+                        "ok": true,
+                        "ran": false,
+                        "affectedFiles": changed,
+                        "testFiles": matched_tests,
+                        "failed": [],
+                        "output": "no tests were found to run"
+                    }));
+                }
+                let command = test_command(&steps);
+                let (code, text) = self.sandboxed(scope, &command).await?;
+                Ok(json!({
+                    "ok": code == Some(0),
+                    "ran": true,
+                    "affectedFiles": changed,
+                    "testFiles": matched_tests,
+                    "failed": failed_tests(&text),
+                    "output": tail(&text, 6000)
+                }))
+            }
+            "probeAst" => {
+                let file = path("path")?;
+                self.allowed(scope, op, ToolKind::Read, Some(&file), None).await?;
+                let rel = args["path"].as_str().unwrap_or("");
+                let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {rel}"))?;
+                let mut exports = Vec::new();
+                let mut imports = Vec::new();
+                for (idx, line) in text.lines().enumerate() {
+                    let t = line.trim();
+                    if t.starts_with("export ")
+                        || t.starts_with("pub fn ")
+                        || t.starts_with("pub async fn ")
+                        || t.starts_with("pub struct ")
+                        || t.starts_with("pub enum ")
+                        || t.starts_with("pub trait ")
+                        || t.starts_with("def ")
+                        || t.starts_with("class ")
+                    {
+                        exports.push(json!({ "line": idx + 1, "sig": t.chars().take(120).collect::<String>() }));
+                    } else if t.starts_with("import ") || t.starts_with("use ") || t.starts_with("from ") {
+                        imports.push(json!({ "line": idx + 1, "raw": t.chars().take(120).collect::<String>() }));
+                    }
+                }
+                Ok(json!({
+                    "path": rel,
+                    "lines": text.lines().count(),
+                    "exports": exports,
+                    "imports": imports,
+                }))
             }
             other => bail!("no function `{other}`"),
         }
@@ -897,13 +1091,14 @@ impl Extension for CodeTools {
         };
         let description = if scope.read_only {
             "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
-             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), check(), and console.log. \
+             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), check(), and console.log. \
              Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
         } else {
             "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
              Functions: read(path), readMany(globs), write(path, text), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
-             applyPatch(diff) for unified diffs, grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), sh(command), \
-             test() which runs the project's tests and returns {ok, failed, output}, check(), browser(action, args) with action open|click|type|console, \
+             applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
+             grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), sh(command), \
+             test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
              and console.log. Paths are relative to your worktree. The same permissions as your own tools apply. \
              Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
         };
@@ -1216,6 +1411,40 @@ mod tests {
             assert!(res.contains("disabled in a read-only scope"), "{op} => {res}");
         }
         tools.detach("planner");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn try_patch_and_probe_ast_work_in_the_same_turn() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("trypatch");
+        std::fs::write(
+            dir.join("app/math.ts"),
+            "import { x } from './x';\nexport function add(a: number, b: number) { return a + b; }\n",
+        )
+        .unwrap();
+        tools.attach("p1", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+        let g = Grant { run: "r".into(), page: "p1".into(), unit: String::new() };
+
+        let out = tools
+            .run(
+                &g,
+                r#"
+                const ast = await probe.ast("app/math.ts");
+                const denied = await tryPatch("--- /dev/null\n+++ b/.env\n@@ -0,0 +1,1 @@\n+SECRET=1\n");
+                const badJson = await tryPatch("--- a/app/data.json\n+++ b/app/data.json\n@@ -1,1 +1,1 @@\n-{\"ok\": true}\n+{broken\n");
+                return { ast, denied, badJson };
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("export function add"), "{out}");
+        assert!(out.contains("policy denied write"), "{out}");
+        assert!(out.contains("not valid JSON"), "{out}");
+        assert!(!dir.join(".env").exists(), "policy denied file must never be created");
+        tools.detach("p1");
         std::fs::remove_dir_all(dir).ok();
     }
 }

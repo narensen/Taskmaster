@@ -3892,7 +3892,45 @@ impl Driver {
         if attempts.is_empty() {
             return Ok(String::new());
         }
-        let mut out = String::from("\nWhat was tried on this page before, latest last:\n");
+        let mut out = String::new();
+        if attempts.len() >= 2 {
+            let memos: Vec<crate::memory::AttemptMemo> = attempts
+                .iter()
+                .enumerate()
+                .map(|(i, attempt)| {
+                    let mut diagnostics = Vec::new();
+                    if let Some(failure) = &attempt.failure {
+                        for line in failure.lines().take(6) {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                diagnostics.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    if let Some(fixing) = &attempt.fixing {
+                        for line in fixing.lines().take(4) {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                diagnostics.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    crate::memory::AttemptMemo {
+                        attempt: i + 1,
+                        tier: tier_name(attempt.tier).to_string(),
+                        outcome: attempt.outcome.clone(),
+                        files: attempt.files.clone(),
+                        diagnostics,
+                    }
+                })
+                .collect();
+            let projected = crate::memory::render_repair_projection(&memos, None, 5);
+            if !projected.is_empty() {
+                out.push('\n');
+                out.push_str(&projected);
+            }
+        }
+        out.push_str("\nWhat was tried on this page before, latest last:\n");
         let shown = &attempts[attempts.len().saturating_sub(2)..];
         for attempt in shown {
             out.push_str(&format!("\n- {} ({}) — {}.", attempt.model, tier_name(attempt.tier), attempt.outcome));

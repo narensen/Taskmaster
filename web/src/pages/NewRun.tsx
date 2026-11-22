@@ -1,7 +1,20 @@
-import { useEffect, useRef, useState } from "react";
-import { ArrowUp, GitMerge, ListChecks, Settings2, Users, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  ArrowUp,
+  CheckCircle2,
+  Coins,
+  GitMerge,
+  ListChecks,
+  Settings2,
+  ShieldAlert,
+  Sparkles,
+  Users,
+  X,
+  Zap,
+} from "lucide-react";
 import { RoleMark } from "../marks";
-import { api } from "../api";
+import { api, type DoctorReport } from "../api";
 import { navigate } from "../router";
 import { Composer, messageText, type ComposerHandle, type Message } from "../composer";
 import { Field, Problem, useAction, useLoad } from "../ui";
@@ -15,9 +28,19 @@ import { useProviders, useSettings } from "../query";
 import { ProviderSetup, noneInstalled } from "../components/ProviderSetup";
 import { runStarted } from "../notify";
 
+const BUDGET_PRESETS = [
+  { label: "Unlimited", value: "" },
+  { label: "$0.50", value: "0.5" },
+  { label: "$2", value: "2" },
+  { label: "$5", value: "5" },
+  { label: "$15", value: "15" },
+];
+
 export function NewRun() {
   const providers = useProviders();
   const templates = useLoad(api.templates, []);
+  const doctor = useLoad(api.doctor, []);
+  const [doctorOpen, setDoctorOpen] = useState(false);
   const [template, setTemplate] = useState("");
   const settings = useSettings();
   const max = settings.data?.machine?.max_parallel ?? null;
@@ -28,6 +51,7 @@ export function NewRun() {
   };
   const [yes, setYes] = useState(false);
   const [remember, setRemember] = useState(false);
+  const [budgetCap, setBudgetCap] = useState<string>("");
   const { choice, setSeat, missing, fresh } = useChoice(settings.data);
   const composer = useRef<ComposerHandle>(null);
   const action = useAction();
@@ -45,6 +69,14 @@ export function NewRun() {
         : "Choose workers"
       : `${pages === "max" ? `Max (${max ?? "…"})` : `${pages} worker${pages === 1 ? "" : "s"}`}${workerName ? ` · ${workerName}` : ""}`;
   const project = settings.data?.project?.split(/[/\\]/).filter(Boolean).pop();
+
+  const doctorReport: DoctorReport | null = doctor.data ?? null;
+  const doctorTone = useMemo(() => {
+    if (!doctorReport) return "muted";
+    if (!doctorReport.ok) return "rose";
+    if (doctorReport.checks.some((c) => c.status === "warn")) return "amber";
+    return "emerald";
+  }, [doctorReport]);
 
   useEffect(() => {
     composer.current?.focus();
@@ -75,7 +107,9 @@ export function NewRun() {
       }
       const { roles, models } = toRequest(choice);
       const parallel = resolvePages(pages, max ?? 32);
-      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models });
+      const parsedCap = budgetCap.trim() ? Number(budgetCap.trim()) : undefined;
+      const max_cost_usd = parsedCap && Number.isFinite(parsedCap) && parsedCap > 0 ? parsedCap : undefined;
+      const { id } = await api.createRun({ prompt, template: template || undefined, parallel, yes, roles, models, max_cost_usd });
       void afterStart(choice, settings.data, remember);
       runStarted(id);
       composer.current?.clear();
@@ -93,6 +127,61 @@ export function NewRun() {
           Describe the next run{project ? <> for <span className="ask-project">{project}</span></> : null}
         </h1>
         <p className="ask-sub muted">A master plans it, workers build the pages, and a different model checks the result.</p>
+
+        {/* Live Preflight Doctor + Mode Telemetry Strip */}
+        <div className="ask-preflight-row">
+          {doctorReport && (
+            <button
+              type="button"
+              className={`doctor-pill tone-${doctorTone}`}
+              onClick={() => setDoctorOpen((v) => !v)}
+              aria-expanded={doctorOpen}
+              data-testid="doctor-pill"
+            >
+              {doctorTone === "emerald" ? (
+                <CheckCircle2 size={13} aria-hidden />
+              ) : doctorTone === "rose" ? (
+                <ShieldAlert size={13} aria-hidden />
+              ) : (
+                <AlertTriangle size={13} aria-hidden />
+              )}
+              <span>{doctorReport.summary}</span>
+            </button>
+          )}
+          <span className="studio-pill tone-indigo" title="Scoped bugfixes auto-route to 0-planner Direct Fast-Path; larger prompts build a parallel DAG.">
+            <Zap size={12} aria-hidden /> Auto Fast-Path / Parallel DAG
+          </span>
+          <span className="studio-pill tone-cyan" title="Shared prefix caching + Code Mode sandboxes enabled">
+            <Sparkles size={12} aria-hidden /> Code Mode v2
+          </span>
+        </div>
+
+        {doctorOpen && doctorReport && (
+          <section className="doctor-drawer" aria-label="Preflight readiness checks" data-testid="doctor-drawer">
+            <div className="row between">
+              <strong>Preflight Doctor</strong>
+              <button type="button" className="icon" onClick={() => setDoctorOpen(false)} aria-label="Close doctor">
+                <X size={14} />
+              </button>
+            </div>
+            <ul className="doctor-list">
+              {doctorReport.checks.map((c) => (
+                <li key={c.id} className={`doctor-item st-${c.status}`}>
+                  <span className={`doctor-dot st-${c.status}`} aria-hidden />
+                  <div className="doctor-item-copy">
+                    <div className="row gap">
+                      <strong>{c.label}</strong>
+                      <span className="muted small mono">{c.category}</span>
+                    </div>
+                    <div className="small muted">{c.detail}</div>
+                    {c.fix && <div className="doctor-fix small">{c.fix}</div>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         <Composer
           ref={composer}
           bus
@@ -123,6 +212,21 @@ export function NewRun() {
                   {worker?.harness && <ProviderLogo id={worker.harness} size={13} />}
                   <span className="clip">{workersLabel}</span>
                 </button>
+                <span className="foot-sep" aria-hidden />
+                <label className="model-pill budget-select-pill" title="Maximum USD spend cap for this run">
+                  <Coins size={13} aria-hidden />
+                  <select
+                    aria-label="Run budget cap"
+                    value={budgetCap}
+                    onChange={(e) => setBudgetCap(e.target.value)}
+                  >
+                    {BUDGET_PRESETS.map((b) => (
+                      <option key={b.label} value={b.value}>
+                        Cap: {b.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
               <button type="button" className="send-btn" aria-label="Start planning" disabled={action.busy !== null} onClick={() => submit()}>
                 {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
@@ -172,6 +276,17 @@ export function NewRun() {
                     <option key={name} value={name} />
                   ))}
                 </datalist>
+              </Field>
+              <Field label="Custom budget cap (USD)" hint="Stops the run gracefully once spend reaches this ceiling.">
+                <input
+                  type="number"
+                  min="0.1"
+                  step="0.5"
+                  className="mono"
+                  value={budgetCap}
+                  onChange={(e) => setBudgetCap(e.target.value)}
+                  placeholder="unlimited"
+                />
               </Field>
             </div>
             <div>

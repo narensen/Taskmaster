@@ -3,7 +3,7 @@
 // and accessed files. A toggleable side panel holds files, diff, preview, and terminal.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, ArrowDown, Check, GitBranch, GitMerge, Loader2, PanelRight } from "lucide-react";
+import { Activity, AlertCircle, ArrowDown, Check, FileDiff, GitBranch, GitMerge, Loader2, MessageSquareText, Network, PanelRight } from "lucide-react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import { api, type DiffStats, type ReviewJob, type RunDetail } from "../api";
 import { takeAttachments } from "../App";
@@ -19,14 +19,21 @@ import { useSettings } from "../query";
 import { navigate } from "../router";
 import { setRunChrome } from "../shell/runChrome";
 import { Problem } from "../ui";
+import { ApprovalDock } from "../run/ApprovalDock";
 import { DiffTab, type Scope } from "../run/Diff";
 import { Flow, FlowSkeleton, fileTarget } from "../run/Flow";
 import { LimitNotice } from "../run/LimitNotice";
 import { LivePreview } from "../run/LivePreview";
+import { MissionLens } from "../run/MissionLens";
+import { ReviewLens } from "../run/ReviewLens";
+import { TelemetryLens } from "../run/TelemetryLens";
 import { useRun, useSurfaces } from "../run/model";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
 import { morphName } from "./Gallery";
+
+type Lens = "mission" | "stream" | "review" | "telemetry";
+type StreamFilter = "all" | "active" | "edits" | "issues";
 
 const PANELS = ["files", "diff", "preview", "terminal"] as const;
 const TAB_LABEL: Record<(typeof PANELS)[number], string> = {
@@ -268,6 +275,8 @@ export function RunView({ id }: { id: string }) {
   const settings = useSettings();
   const toolApprovals = useToolApprovals(id, detail?.pending_approvals, data.entries, () => void data.reload());
   const gh = useLoadGh();
+  const [lens, setLens] = useState<Lens>("stream");
+  const [streamFilter, setStreamFilter] = useState<StreamFilter>("all");
   const [focus, setFocus] = useState<string | null>(null);
   const [blown, setBlown] = useState<Set<string>>(() => new Set());
   const [sheet, setSheet] = useState(false);
@@ -298,6 +307,13 @@ export function RunView({ id }: { id: string }) {
   const shown = entries;
   const ledgerEntries = useMemo(() => ledger?.entries ?? [], [ledger]);
   const list = useSurfaces(detail, shown, ledgerEntries, data.entriesVersion);
+  const filteredList = useMemo(() => {
+    if (streamFilter === "all") return list;
+    if (streamFilter === "active") return list.filter((s) => s.state === "working" || s.id === "master");
+    if (streamFilter === "edits") return list.filter((s) => s.summary.editedFiles.length > 0 || s.id === "master");
+    if (streamFilter === "issues") return list.filter((s) => s.state === "failed" || !!s.summary.error || s.id === "master");
+    return list;
+  }, [list, streamFilter]);
   const activeWorkers = useMemo<ActiveWorkerItem[]>(
     () =>
       list
@@ -518,6 +534,26 @@ export function RunView({ id }: { id: string }) {
         return;
       }
       if (mod || e.altKey) return;
+      if (e.key === "1") {
+        e.preventDefault();
+        setLens("mission");
+        return;
+      }
+      if (e.key === "2") {
+        e.preventDefault();
+        setLens("stream");
+        return;
+      }
+      if (e.key === "3") {
+        e.preventDefault();
+        setLens("review");
+        return;
+      }
+      if (e.key === "4") {
+        e.preventDefault();
+        setLens("telemetry");
+        return;
+      }
       const nodes = [...(runRef.current?.querySelectorAll<HTMLElement>("[data-agent]") ?? [])];
       const ids = nodes.map((n) => n.dataset.agent!).filter(Boolean);
       if (!ids.length) return;
@@ -724,107 +760,230 @@ export function RunView({ id }: { id: string }) {
         </div>
       </header>
 
+      {/* 4-Lens Run Studio Switcher */}
+      <nav className="lens-bar" role="tablist" aria-label="Run studio lenses" data-testid="lens-bar">
+        <div className="lens-tabs">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={lens === "mission"}
+            className={`lens-tab ${lens === "mission" ? "on" : ""}`}
+            onClick={() => setLens("mission")}
+            data-testid="lens-mission"
+          >
+            <Network size={13} aria-hidden />
+            <span>Mission</span>
+            {detail.plan && <span className="lens-badge mono">{detail.plan.pages.length}</span>}
+            <kbd>1</kbd>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={lens === "stream"}
+            className={`lens-tab ${lens === "stream" ? "on" : ""}`}
+            onClick={() => setLens("stream")}
+            data-testid="lens-stream"
+          >
+            <MessageSquareText size={13} aria-hidden />
+            <span>Stream</span>
+            {activeWorkers.length > 0 && <span className="lens-badge live mono">{activeWorkers.length}</span>}
+            <kbd>2</kbd>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={lens === "review"}
+            className={`lens-tab ${lens === "review" ? "on" : ""}`}
+            onClick={() => setLens("review")}
+            data-testid="lens-review"
+          >
+            <FileDiff size={13} aria-hidden />
+            <span>Review</span>
+            {hasTotalDiff && <span className="lens-badge diff mono">+{totalDiff.added}</span>}
+            <kbd>3</kbd>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={lens === "telemetry"}
+            className={`lens-tab ${lens === "telemetry" ? "on" : ""}`}
+            onClick={() => setLens("telemetry")}
+            data-testid="lens-telemetry"
+          >
+            <Activity size={13} aria-hidden />
+            <span>Telemetry</span>
+            {detail.spent.cost_usd > 0 && <span className="lens-badge mono">{usd(detail.spent.cost_usd)}</span>}
+            <kbd>4</kbd>
+          </button>
+        </div>
+
+        {lens === "stream" && list.length > 1 && (
+          <div className="stream-filters" role="group" aria-label="Filter stream">
+            {(
+              [
+                ["all", "All"],
+                ["active", "Active"],
+                ["edits", "Edits"],
+                ["issues", "Issues"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                className={`filter-chip ${streamFilter === key ? "on" : ""}`}
+                onClick={() => setStreamFilter(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+      </nav>
+
       <div
         ref={scrollRef}
-        className="run-scroll"
+        className={`run-scroll ${lens !== "stream" ? "run-scroll-wide" : ""}`}
         onScroll={(e) => {
           const el = e.currentTarget;
           const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 64;
           setPinned((prev) => (prev === nearBottom ? prev : nearBottom));
         }}
       >
-        <div className="run-thread">
-          <Flow
+        {lens === "mission" && (
+          <MissionLens
+            id={id}
             detail={detail}
-            list={list}
-            focus={focus}
-            blown={blown}
-            onToggleAgent={toggleAgent}
-            onFocusAgent={inspectAgent}
+            surfaces={list}
             diffStats={diffStats}
-            onOpenDiff={openPageDiff}
+            onReload={() => void data.reload()}
             onRestartWorker={(page) => void restartWorker(page)}
-            approvals={toolApprovals.list}
-            onTool={toolApprovals.answer}
-            ask={
-              phase === "awaiting_approval" ? (
-                <ApprovalAsk
-                  id={id}
-                  detail={detail}
-                  composer={composer}
-                  onOptimistic={data.patch}
-                  onDone={() => {
-                    void data.reload();
-                    data.refollow();
-                  }}
-                />
-              ) : null
-            }
+            onOpenDiff={(page) => {
+              openPageDiff(page);
+            }}
+            onJumpToStream={(agentId) => {
+              setLens("stream");
+              window.setTimeout(() => inspectAgent(agentId), 30);
+            }}
+            onApproved={() => {
+              void data.reload();
+              data.refollow();
+            }}
           />
+        )}
 
-          {detail.limit && detail.error && phase !== "done" && phase !== "failed" ? (
-            <LimitNotice id={id} limit={detail.limit} message={detail.error} onDone={() => { void data.reload(); data.refollow(); }} />
-          ) : (
-            detail.error && phase !== "done" && phase !== "failed" && (
-              <p className="flow-fail">
-                <Rich text={detail.error} />
-              </p>
-            )
-          )}
-          {settled && <EndLine detail={detail} onDiff={() => openTab("diff")} onRetry={() => { void data.reload(); data.refollow(); }} />}
-          {settled && detail.branch && <ReviewAsk id={id} />}
+        {lens === "review" && (
+          <ReviewLens
+            id={id}
+            detail={detail}
+            diffStats={diffStats}
+            ghReady={!!gh}
+            onReload={() => {
+              void data.reload();
+              data.reloadNotes();
+            }}
+          />
+        )}
 
-          {(pending.length > 0 || delivered.length > 0) && (
-            <section className="flow-notes">
-              {pending.map((n) => (
-                <div key={n.id} className="flow-note" data-testid="draft">
-                  <header className="flow-role">
-                    <h2>You</h2>
-                    <span className="flow-state">waiting for {noteTargetLabel(n.to)}</span>
-                    <button
-                      type="button"
-                      className="link small"
-                      onClick={() => {
-                        const text = window.prompt("Edit the note", n.text);
-                        if (text !== null) void api.editNote(id, n.id, text || undefined).then(data.reloadNotes);
-                      }}
-                    >
-                      edit
-                    </button>
-                    <button
-                      type="button"
-                      className="link small"
-                      onClick={() => {
-                        setRemoved((r) => new Set(r).add(n.id));
-                        void api.editNote(id, n.id).then(data.reloadNotes, () => {
-                          setRemoved((r) => {
-                            const next = new Set(r);
-                            next.delete(n.id);
-                            return next;
-                          });
-                          toast("The note was not removed");
-                        });
-                        undoable("Removed the note", () => void api.addNote(id, n.to, n.text).then(data.reloadNotes));
-                      }}
-                    >
-                      remove
-                    </button>
-                  </header>
-                  <div className="flow-said">
-                    <Rich text={n.text} />
-                  </div>
-                </div>
-              ))}
-              {delivered.map((n) => (
-                <p key={n.id} className="flow-life">
-                  Note to {noteTargetLabel(n.to)}: <Rich text={n.text} />
+        {lens === "telemetry" && <TelemetryLens id={id} detail={detail} ledger={ledger} />}
+
+        {lens === "stream" && (
+          <div className="run-thread">
+            <Flow
+              detail={detail}
+              list={filteredList}
+              focus={focus}
+              blown={blown}
+              onToggleAgent={toggleAgent}
+              onFocusAgent={inspectAgent}
+              diffStats={diffStats}
+              onOpenDiff={openPageDiff}
+              onRestartWorker={(page) => void restartWorker(page)}
+              approvals={toolApprovals.list}
+              onTool={toolApprovals.answer}
+              ask={
+                phase === "awaiting_approval" ? (
+                  <ApprovalAsk
+                    id={id}
+                    detail={detail}
+                    composer={composer}
+                    onOptimistic={data.patch}
+                    onDone={() => {
+                      void data.reload();
+                      data.refollow();
+                    }}
+                  />
+                ) : null
+              }
+            />
+
+            {detail.limit && detail.error && phase !== "done" && phase !== "failed" ? (
+              <LimitNotice id={id} limit={detail.limit} message={detail.error} onDone={() => { void data.reload(); data.refollow(); }} />
+            ) : (
+              detail.error && phase !== "done" && phase !== "failed" && (
+                <p className="flow-fail">
+                  <Rich text={detail.error} />
                 </p>
-              ))}
-            </section>
-          )}
-        </div>
+              )
+            )}
+            {settled && <EndLine detail={detail} onDiff={() => setLens("review")} onRetry={() => { void data.reload(); data.refollow(); }} />}
+            {settled && detail.branch && <ReviewAsk id={id} />}
+
+            {(pending.length > 0 || delivered.length > 0) && (
+              <section className="flow-notes">
+                {pending.map((n) => (
+                  <div key={n.id} className="flow-note" data-testid="draft">
+                    <header className="flow-role">
+                      <h2>You</h2>
+                      <span className="flow-state">waiting for {noteTargetLabel(n.to)}</span>
+                      <button
+                        type="button"
+                        className="link small"
+                        onClick={() => {
+                          const text = window.prompt("Edit the note", n.text);
+                          if (text !== null) void api.editNote(id, n.id, text || undefined).then(data.reloadNotes);
+                        }}
+                      >
+                        edit
+                      </button>
+                      <button
+                        type="button"
+                        className="link small"
+                        onClick={() => {
+                          setRemoved((r) => new Set(r).add(n.id));
+                          void api.editNote(id, n.id).then(data.reloadNotes, () => {
+                            setRemoved((r) => {
+                              const next = new Set(r);
+                              next.delete(n.id);
+                              return next;
+                            });
+                            toast("The note was not removed");
+                          });
+                          undoable("Removed the note", () => void api.addNote(id, n.to, n.text).then(data.reloadNotes));
+                        }}
+                      >
+                        remove
+                      </button>
+                    </header>
+                    <div className="flow-said">
+                      <Rich text={n.text} />
+                    </div>
+                  </div>
+                ))}
+                {delivered.map((n) => (
+                  <p key={n.id} className="flow-life">
+                    Note to {noteTargetLabel(n.to)}: <Rich text={n.text} />
+                  </p>
+                ))}
+              </section>
+            )}
+          </div>
+        )}
       </div>
-      {detail.active && !pinned && (
+
+      {/* Ambient Floating Approval Dock across all 4 lenses */}
+      {lens !== "stream" && <ApprovalDock list={toolApprovals.list} onAnswer={toolApprovals.answer} />}
+
+      {lens === "stream" && detail.active && !pinned && (
         <button
           type="button"
           className="jump-live"

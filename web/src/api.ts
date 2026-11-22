@@ -77,6 +77,8 @@ export interface PagePlan {
   phase?: number;
   /** Shown in a browser even though the plan is not web (true), or not although it is (false). */
   ui?: boolean;
+  /** Difficulty hint (`easy`, `normal`, `hard`) used for model tier and effort routing. */
+  difficulty?: string;
 }
 
 /** One agent a plan starts. Mirrors `Plan::agents` in tm-core. */
@@ -751,6 +753,128 @@ export interface DiffStats {
   total: DiffStat;
 }
 
+export interface LanguageStat {
+  language: string;
+  files: number;
+  lines: number;
+}
+
+export interface ModuleCluster {
+  name: string;
+  files: number;
+  lines: number;
+  exports: number;
+  tests: number;
+}
+
+export interface HubFile {
+  path: string;
+  imports_in: number;
+  exports: number;
+  lines: number;
+}
+
+export interface ChurnFile {
+  path: string;
+  touches: number;
+}
+
+export interface TestLink {
+  module: string;
+  test_files: string[];
+}
+
+export interface Atlas {
+  head: string | null;
+  generated_at: string;
+  total_files: number;
+  total_lines: number;
+  languages: LanguageStat[];
+  modules: ModuleCluster[];
+  hubs: HubFile[];
+  hotspots: ChurnFile[];
+  test_map: TestLink[];
+  conventions: string[];
+}
+
+export type CheckStatus = "ok" | "warn" | "fail";
+
+export interface DoctorCheck {
+  id: string;
+  label: string;
+  category: string;
+  status: CheckStatus;
+  detail: string;
+  fix: string | null;
+}
+
+export interface DoctorReport {
+  ok: boolean;
+  summary: string;
+  checks: DoctorCheck[];
+  checked_at: string;
+}
+
+export interface Policy {
+  protected_globs: string[];
+  denied_globs: string[];
+  allowed_fetch_hosts: string[];
+  denied_fetch_hosts: string[];
+  max_run_cost_usd: number | null;
+  daily_budget_usd: number | null;
+  require_cross_family_review: boolean;
+  redact_patterns: string[];
+}
+
+export interface PolicyResponse {
+  policy: Policy;
+  source: string | null;
+  toml: string;
+}
+
+export interface Checkpoint {
+  sha: string;
+  short_sha: string;
+  kind: string;
+  label: string;
+  ref_name?: string;
+  page?: string;
+  model?: string;
+  at?: string;
+}
+
+export interface ForkRunBody {
+  id?: string;
+  prompt?: string;
+  plan?: Plan;
+  yes?: boolean;
+  parallel?: number;
+  max_cost_usd?: number;
+  note?: string;
+}
+
+export interface RunBundle {
+  format: string;
+  exported_at: string;
+  run: RunSummary;
+  plan: Plan | null;
+  events: RunEvent[];
+  ledger: LedgerEntry[];
+  changes: ChangeEntry[];
+  transcript: AgentEntry[];
+  checkpoints: Checkpoint[];
+  cache_economics: {
+    total_input_tokens: number;
+    fresh_input_tokens: number;
+    cached_read_tokens: number;
+    cache_write_tokens: number;
+    output_tokens: number;
+    cache_hit_rate: number;
+    total_cost_usd: number;
+    by_role: Record<string, { calls: number; cost_usd: number; input: number; cache_read: number; cache_write: number; output: number; seconds: number }>;
+  };
+}
+
 export function searchWeb(q: string, endpoint: string) {
   const params = new URLSearchParams({ q });
   if (endpoint) params.set("endpoint", endpoint);
@@ -790,6 +914,19 @@ export const api = {
     call<{ id: string; mode: CancelMode }>("POST", `/api/runs/${enc(id)}/cancel`, mode ? { mode } : {}),
   restartWorker: (id: string, page: string) =>
     call<{ ok: boolean; mode: "restarted" | "queued"; page: string }>("POST", `/api/runs/${enc(id)}/workers/${enc(page)}/restart`, {}),
+  updatePlan: (id: string, plan: Plan) => call<RunDetail>("POST", `/api/runs/${enc(id)}/plan`, { plan }),
+  checkpoints: (id: string) =>
+    call<{ checkpoints: Checkpoint[] }>("GET", `/api/runs/${enc(id)}/checkpoints`).then((r) => r.checkpoints),
+  forkRun: (id: string, body?: ForkRunBody) =>
+    call<{ id: string; forked_from: string }>("POST", `/api/runs/${enc(id)}/fork`, body ?? {}),
+  bundle: (id: string) => call<RunBundle>("GET", `/api/runs/${enc(id)}/bundle`),
+
+  atlas: (refresh = false) =>
+    call<{ atlas: Atlas }>("GET", `/api/atlas${refresh ? "?refresh=1" : ""}`).then((r) => r.atlas),
+  doctor: () => call<{ doctor: DoctorReport }>("GET", "/api/doctor").then((r) => r.doctor),
+  policy: () => call<PolicyResponse>("GET", "/api/policy"),
+  savePolicy: (policy: Policy, repoFile = false) =>
+    call<{ ok: boolean } & PolicyResponse>("POST", "/api/policy", { policy, repo_file: repoFile }),
 
   providers: (harness?: string) =>
     call<{ providers: Provider[] }>("GET", `/api/providers${harness ? `?harness=${enc(harness)}` : ""}`).then(

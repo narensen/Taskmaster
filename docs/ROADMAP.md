@@ -43,6 +43,18 @@ These come from what worked and what didn't while building the last two rounds.
 6. **Measure every pipeline change.** Prompts and briefs are code. Without a suite, an
    "improvement" is a guess. Hence the eval suite (Phase 5, started early).
 7. **One writer per checkout.** One thread or run per worktree, always (Phase 0).
+8. **Project live state, do not drown in append-only logs.** Context entropy after turn 10
+   destroys attention. Compiled Working Memory (2.9) keeps Tier-0 prefixes cache-identical
+   while projecting clean diffs, active diagnostics, and a structured Attempts Ledger.
+9. **Close the loop inside the turn.** Transactional `tryPatch`, reverse-dependency
+   `testAffected`, and deterministic runtime/AST `probe()` (2.10) cut multi-turn repair
+   loops into single-turn self-correction.
+10. **Negotiate contracts dynamically instead of stalling.** Additive, non-breaking contract
+    proposals auto-approve via AST reference checks (2.12); breaking changes pause only the
+    affected blast radius.
+11. **Show a parallel DAG like a parallel DAG.** Flattening 6 concurrent worktrees into one
+    chat feed hides critical paths, dependencies, and bottlenecks. A 4-Lens Spatial Run
+    Studio with purposeful visual coding (Phase 6) makes orchestration effortless to steer.
 
 ## Phase 0: land what is here (1–2 days)
 
@@ -165,6 +177,44 @@ request is answered by the daemon, cached, budgeted, audited, and framed as untr
 2.8 **Brief versioning.** Hash every brief template and record the hash in the ledger, so
    evals can A/B a prompt change.
 
+2.9 **Compiled Working Memory (`crates/tm-daemon/src/memory.rs`).**
+   - Split every prompt into 3 cache tiers: Tier 0 (frozen shared prefix across parallel
+     workers), Tier 1 (unit context pack of imported signatures and locked tests), and
+     Tier 2 (live state projection: current `git diff --stat`, deduplicated active
+     diagnostics, and a 5-bullet Attempts Ledger).
+   - Auto-compact warm sessions once context entropy or consecutive repairs cross a
+     threshold so repairs never drown in stale tool logs.
+   - Test: repeated repair attempts project a deduplicated Attempts Ledger and keep Tier 0
+     byte-identical across parallel workers.
+
+2.10 **Transactional `run_code` v2: `tryPatch`, `testAffected`, and `probe()`.**
+   - `tryPatch(diff)` validates ownership globs and runs fast checks on touched files in the
+     same turn, rolling back automatically on ownership violation.
+   - `testAffected(files?)` runs only the reverse-dependency test slice impacted by edited
+     files instead of the entire repository test suite.
+   - `probe(target)` provides deterministic runtime/AST introspection (`probe.ast(path)` for
+     structured exports/imports, `probe.http(...)` scoped to the worker's preview origin).
+   - Test: `tryPatch` rolls back an out-of-glob edit and returns structured diagnostics in
+     one call; `probe.ast` extracts exports from a fixture file.
+
+2.11 **Adversarial Dual-Spec Synthesis.**
+   - Optionally generate locked behavioral and property-based tests with a second model
+     family before builders start, mutation-checked red against base code.
+
+2.12 **Dynamic Mid-Flight Contract RFCs & Critical-Path Hedging.**
+   - Workers emit typed `ContractProposal` events; additive non-breaking additions
+     auto-merge into the contract branch via AST reference verification with zero Master
+     round-trip; breaking proposals pause only impacted dependents.
+   - Critical-path bottleneck units that stall past `p90` can speculatively race a second
+     model family within budget, taking the first green diff and cancelling the loser.
+
+2.13 **Living Codebase Atlas (`crates/tm-daemon/src/atlas.rs`) & Errorography v2.**
+   - Incrementally index module clusters, language breakdown, import centrality hubs, git
+     churn hotspots, and test-to-source mappings in `.taskmaster/atlas.json` (served at
+     `GET /api/atlas`).
+   - Distill semantic/architectural lessons from repairs, diff comments, and run undos into
+     glob-scoped project invariants with confidence decay.
+
 ## Phase 3: production hardening
 
 3.1 **Secrets.**
@@ -217,6 +267,28 @@ request is answered by the daemon, cached, budgeted, audited, and framed as untr
 3.9 **API idempotency.** An `Idempotency-Key` on `POST /api/runs` and the other POSTs that
    start work.
 
+3.10 **Policy-as-Code (`taskmaster.policy.toml`, `crates/tm-daemon/src/policy.rs`).**
+   - Repo-versioned team guardrails: `protected_globs` (always require approval or review),
+     `denied_globs`, allowed/denied egress domains, `max_run_cost_usd`, `daily_budget_usd`,
+     `require_cross_family_review`, and custom secret `redact_patterns`.
+   - Served and editable via `GET /api/policy` and `POST /api/policy`.
+   - Test: a policy with `denied_globs` and `max_run_cost_usd` enforces both deterministically.
+
+3.11 **Flight Recorder (`.tmrun.json`) & Universal Secret Redaction.**
+   - `GET /api/runs/{id}/bundle` exports a portable, secret-redacted replay archive (plan,
+     events, ledger, changes, cache economics, waterfall timings).
+   - Shared redaction filter scrubs API keys (`sk-…`, `ghp_…`, `xai-…`, Bearer tokens,
+     custom policy patterns) across bundles, logs, and exports.
+
+3.12 **Checkpoint Time-Travel & A/B Run Forking.**
+   - `GET /api/runs/{id}/checkpoints` lists every phase/unit commit and checkpoint ref.
+   - `POST /api/runs/{id}/fork` forks any checkpoint into a new parallel run with optional
+     prompt, model, or budget override so teams can A/B compare approaches side-by-side.
+
+3.13 **Remote Runner Mesh.**
+   - Offload parallel worktrees to remote Linux daemons over mTLS / Tailscale while keeping
+     the local desktop/web Studio responsive and cool.
+
 ## Phase 4: T3 Code-level workflow
 
 4.1 **PR loop.**
@@ -243,8 +315,8 @@ request is answered by the daemon, cached, budgeted, audited, and framed as untr
 
 4.7 **Diff comments and checkpoints.**
    - A comment on a line in the diff panel becomes a note to that page's worker.
-   - A checkpoint timeline per run, with restore. Each page commit is a checkpoint, and
-     undo already exists for the whole run.
+   - A checkpoint timeline per run, with restore and fork. Each page commit is a checkpoint,
+     and undo already exists for the whole run.
 
 4.8 **Environments.** Switch between this machine and a headless daemon on a server. The
    headless tarball and pairing already exist.
@@ -264,21 +336,64 @@ request is answered by the daemon, cached, budgeted, audited, and framed as untr
    scores per (model, difficulty, language). An opt-in "Auto" role picks the cheapest model
    at ≥85% first pass for each unit.
 
+## Phase 6: Spatial Mission Control & Rich Visual UI/UX Overhaul
+
+**Goal:** make Taskmaster's parallel, contract-first orchestration visually unmistakable,
+directly steerable, and radically faster to review than a linear chat thread, introducing
+rich semantic visual coding (contracts, workers, checks, critical path, cache economics)
+while preserving ≥4.5:1 contrast in both dark and light themes.
+
+6.1 **3-Pillar Spatial Workspace Shell (`web/src/App.tsx`).**
+   - Collapse 9 flat sidebar links into a focused Workspace Rail: Project Switcher +
+     `+ New run`, live Runs with visual progress rings/spend/approval dots, and a compact
+     bottom system bar (`Knowledge`, `Reviews`, `Doctor`, `Settings`). All legacy routes
+     remain directly navigable.
+
+6.2 **4-Lens Run Studio (`1`–`4` keyboard switching in `RunView.tsx`).**
+   - **Lens 1 — Mission & Interactive Plan Workbench (`MissionLens.tsx`)**: layered visual
+     DAG (Contracts → Parallel Units → Verification) with curved SVG dependency edges,
+     difficulty/tier badges, live diff stats, and a Node Focus Drawer with targeted
+     Soft-Steer. During `awaiting_approval`, units and contracts are editable inline and
+     persisted via `POST /api/runs/{id}/plan` with a live cost/time preview before launch.
+   - **Lens 2 — Filtered Activity Stream (`Flow.tsx`)**: upgraded narrative feed with smart
+     filter chips (`All`, `Edits`, `Checks & Errors`, `Approvals`, per-worker).
+   - **Lens 3 — Review & Verification Studio (`ReviewLens.tsx`)**: full-bleed unit-grouped
+     diff viewer with click-a-line inline commenting routed directly to the owning worker,
+     split Live Preview toggle, and ship controls (`Draft PR`, `Undo Merge`).
+   - **Lens 4 — Telemetry & Flight Recorder (`TelemetryLens.tsx`)**: parallel Gantt
+     execution waterfall, prompt cache-hit & cost economics breakdown, Checkpoint
+     Time-Travel scrubber with 1-click **Fork Run**, and `.tmrun.json` bundle export.
+
+6.3 **Ambient Floating Approval Dock (`ApprovalDock.tsx`).**
+   - Surfaces pending risky tool approvals across all 4 lenses with instant `A` (Approve) /
+     `D` (Deny) keyboard shortcuts so approvals never get buried in a scrolled log.
+
+6.4 **Smart New-Run Launcher (`NewRun.tsx`).**
+   - Centered home composer enriched with live Execution Mode preview (`Direct Fast-Path` vs
+     `Parallel Build` vs `Phased Sketch`), inline per-run USD Budget Cap selector, and a
+     live Preflight Doctor health badge (`GET /api/doctor`).
+
+6.5 **Unified Knowledge Hub (`Knowledge.tsx`).**
+   - One tabbed workspace uniting the visual **Codebase Atlas** (`GET /api/atlas`),
+     **Dictionary**, **Errorography**, **Skills**, and **Policy-as-Code** editor.
+
 ## Order
 
 | Step | What | Size | Needs |
 | --- | --- | --- | --- |
 | 1 | Phase 0: commit in slices, one worktree per thread | S | — |
 | 2 | 5.1 a first eval suite of 10 tasks | M | 0 |
-| 3 | 1.1–1.3, 1.6: web tools, fetch pipeline, roles, injection framing | L | 0 |
-| 4 | 2.1 LSP in the loop | L | 0 |
-| 5 | 1.4–1.5, 1.7: research phase, local docs, UI | M | 3 |
-| 6 | 2.3 red/green gate, 2.6 release gate | M | 4 |
-| 7 | 3.1 secrets, 3.3 supply-chain gate, 3.4 merge queue | L | 3 |
-| 8 | 2.4 plan review, 2.5 best-of-N, 2.2 context packs | L | 2, 4 |
-| 9 | 3.5–3.9 doctor, service, schema, observability, idempotency | M | — |
-| 10 | Phase 4 workflow items, PR loop first | L | 7 |
-| 11 | 5.2 gate, 5.3 learned routing | M | 2 |
+| 3 | 2.9–2.10, 2.13, 3.5, 3.10–3.12: Compiled Memory, `run_code` v2, Atlas, Policy, Doctor, Checkpoints/Fork, Flight Recorder | L | 0 |
+| 4 | Phase 6: Spatial Mission Control, 4-Lens Run Studio, Interactive Plan Workbench, Rich Visuals, Knowledge Hub | L | 3 |
+| 5 | 1.1–1.3, 1.6: web tools, fetch pipeline, roles, injection framing | L | 0 |
+| 6 | 2.1 LSP in the loop | L | 0 |
+| 7 | 1.4–1.5, 1.7: research phase, local docs, UI | M | 5 |
+| 8 | 2.3 red/green gate, 2.6 release gate, 2.11–2.12 dual-spec & contract RFCs | M | 6 |
+| 9 | 3.1 secrets, 3.3 supply-chain gate, 3.4 merge queue | L | 5 |
+| 10 | 2.4 plan review, 2.5 best-of-N, 2.2 context packs | L | 2, 6 |
+| 11 | 3.6–3.9, 3.13 service, schema, observability, idempotency, remote mesh | M | — |
+| 12 | Phase 4 workflow items, PR loop first | L | 9 |
+| 13 | 5.2 gate, 5.3 learned routing | M | 2 |
 
 ## Risks
 

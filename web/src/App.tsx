@@ -9,6 +9,7 @@ import {
   Circle,
   CircleAlert,
   CircleCheck,
+  Compass,
   Cpu,
   FolderTree,
   GitBranch,
@@ -33,7 +34,7 @@ import type { PaletteState } from "./palette";
 import { openProject } from "./openProject";
 import { prefs, setPrefs, useMotion, usePrefs } from "./prefs";
 import { RunsContext, ordered, toggleFlag, type Group } from "./runs";
-import { phaseLabel, shortSpan } from "./format";
+import { phaseLabel, shortSpan, usd } from "./format";
 import { readFile } from "./composer";
 import { useLoad } from "./ui";
 import { typing } from "./keys";
@@ -54,6 +55,7 @@ const NAV: { to: string; label: string; icon: LucideIcon; active?: (p: string) =
   { to: "/", label: "Gallery", icon: LayoutGrid, active: (p) => p === "/" || p === "/runs" },
   { to: "/runs/new", label: "New run", icon: Plus },
   { to: "/files", label: "Files", icon: FolderTree },
+  { to: "/knowledge", label: "Knowledge", icon: Compass },
   { to: "/dictionary", label: "Dictionary", icon: BookOpen },
   { to: "/errorography", label: "Errorography", icon: Bug },
   { to: "/reviews", label: "Reviews", icon: GitPullRequest },
@@ -103,6 +105,7 @@ function useSignedIn(): boolean {
 const loaders = {
   dictionary: () => import("./pages/Dictionary"),
   errorography: () => import("./pages/Errorography"),
+  knowledge: () => import("./pages/Knowledge"),
   newRun: () => import("./pages/NewRun"),
   reviews: () => import("./pages/Reviews"),
   run: () => import("./pages/RunView"),
@@ -113,6 +116,7 @@ const loaders = {
 };
 const Dictionary = lazy(() => loaders.dictionary().then((m) => ({ default: m.Dictionary })));
 const Errorography = lazy(() => loaders.errorography().then((m) => ({ default: m.Errorography })));
+const Knowledge = lazy(() => loaders.knowledge().then((m) => ({ default: m.Knowledge })));
 const NewRun = lazy(() => loaders.newRun().then((m) => ({ default: m.NewRun })));
 const Reviews = lazy(() => loaders.reviews().then((m) => ({ default: m.Reviews })));
 const ReviewView = lazy(() => loaders.reviews().then((m) => ({ default: m.ReviewView })));
@@ -150,6 +154,7 @@ function Screen({ path }: { path: string }) {
   if (path === "/" || path === "/runs") return <Gallery />;
   if (path === "/runs/new") return <NewRun />;
   if (path === "/files") return <Files />;
+  if (path === "/knowledge") return <Knowledge />;
   if ((params = match(path, "/runs/:id"))) return <RunView key={params.id} id={params.id!} />;
   if (path === "/dictionary") return <Dictionary />;
   if (path === "/errorography") return <Errorography />;
@@ -177,6 +182,7 @@ function projectName(project: string | undefined): string {
 const PAGE_NAMES: Record<string, string> = {
   "/runs/new": "New run",
   "/files": "Files",
+  "/knowledge": "Knowledge Hub",
   "/dictionary": "Dictionary",
   "/errorography": "Errorography",
   "/reviews": "Reviews",
@@ -288,7 +294,12 @@ const RunRow = memo(function RunRow({
       onFocus={() => prefetchRun(run.id)}
     >
       <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={onPick} aria-current={on ? "page" : undefined}>
-        <span className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs approval" ? "ask" : ""}`} aria-hidden>
+        <span
+          className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs approval" ? "ask" : ""} ${
+            run.phase === "done" ? "done" : run.phase === "failed" ? "failed" : ""
+          }`}
+          aria-hidden
+        >
           <RunMark group={group} />
         </span>
         <span className="run-copy">
@@ -301,6 +312,7 @@ const RunRow = memo(function RunRow({
           )}
         </span>
         <span className={`runrow-phase ${group === "Working" ? "elapsed" : ""}`}>
+          {run.spent.cost_usd >= 0.01 && <span className="runrow-cost mono">{usd(run.spent.cost_usd)}</span>}
           {i < 9 && <kbd>{i + 1}</kbd>}
           <Stamp run={run} group={group} clock={clock} />
         </span>

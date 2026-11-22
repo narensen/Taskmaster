@@ -47,11 +47,20 @@
 //! POST /api/git/remote            {name, url}
 //! POST /api/git/push              {remote?, branch?}
 //! POST /api/git/clone             {url, name?} into the workspace, without switching to it
+//!
+//! GET  /api/atlas                 ?refresh=1 cached Living Codebase Atlas
+//! GET  /api/doctor                sub-second Preflight readiness checks
+//! GET  /api/policy                active Policy-as-Code rules and TOML
+//! POST /api/policy                {policy, repo_file?} validate and save policy
+//! POST /api/runs/{id}/plan        {plan} edit a plan while awaiting approval
+//! GET  /api/runs/{id}/checkpoints git checkpoints and unit commits for time-travel
+//! POST /api/runs/{id}/fork        {id?, prompt?, plan?, yes?, parallel?, max_cost_usd?, note?}
+//! GET  /api/runs/{id}/bundle      secret-redacted portable .tmrun.json Flight Recorder bundle
 //! ```
 //!
 //! Installing, updating and signing in to harness CLIs is in `api/setup.rs`, and the
 //! skills store in `api/skills.rs`. Terminals a person opens (a shell on a PTY in the
-//! project) are in `api/terms.rs`.
+//! project) are in `api/terms.rs`. Studio endpoints are in `api/studio.rs`.
 //!
 //! The control surface's own routes (the agent transcript, notes, the terminal, diffs,
 //! opening files in an editor, completions, gh) are listed in `api/desk.rs`.
@@ -103,6 +112,7 @@ mod desk;
 mod hosts;
 mod setup;
 mod skills;
+mod studio;
 mod terms;
 
 pub(crate) use desk::redact;
@@ -376,6 +386,13 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/setup/jobs/{id}", get(setup::job))
         .route("/api/setup/jobs/{id}/input", post(setup::input))
         .route("/api/setup/jobs/{id}/cancel", post(setup::cancel))
+        .route("/api/atlas", get(studio::atlas))
+        .route("/api/doctor", get(studio::doctor))
+        .route("/api/policy", get(studio::get_policy).post(studio::save_policy))
+        .route("/api/runs/{id}/plan", post(studio::update_plan))
+        .route("/api/runs/{id}/checkpoints", get(studio::checkpoints))
+        .route("/api/runs/{id}/fork", post(studio::fork_run))
+        .route("/api/runs/{id}/bundle", get(studio::bundle))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()
         .route("/api/runs/{id}/stream", get(run_stream))
@@ -707,10 +724,18 @@ impl App {
         config.package_indexes = saved.sandbox.package_indexes;
         config.prices = crate::settings::price_table(&saved);
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
-        let budget_usd = request
+        let policy = crate::policy::Policy::load(&self.project());
+        let policy_cap = policy.max_run_cost_usd.filter(|v| v.is_finite() && *v > 0.0);
+        let req_or_saved = request
             .max_cost_usd
             .filter(|v| v.is_finite() && *v > 0.0)
             .or_else(|| (saved.agents.budget_usd.is_finite() && saved.agents.budget_usd > 0.0).then_some(saved.agents.budget_usd));
+        let budget_usd = match (req_or_saved, policy_cap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
         config.max_cost_usd = budget_usd;
         config.run_id = id.to_string();
         config.plan = request.plan;

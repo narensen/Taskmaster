@@ -207,7 +207,7 @@ impl Run {
     pub fn step(&mut self, event: Event) -> Vec<Command> {
         let mut out = Vec::new();
         match (self.phase, event) {
-            (RunPhase::Planning, Event::PlanReady(plan)) => {
+            (RunPhase::Planning | RunPhase::AwaitingApproval, Event::PlanReady(plan)) => {
                 let focused = self.focused;
                 self.pages = plan
                     .pages

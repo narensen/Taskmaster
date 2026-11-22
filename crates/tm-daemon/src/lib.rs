@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod approvals;
+pub mod atlas;
 pub mod auth;
 mod browser;
 pub mod audit;
@@ -23,6 +24,7 @@ pub mod commons;
 mod checker;
 mod code;
 mod checks;
+pub mod doctor;
 mod engine;
 mod eval;
 mod git;
@@ -30,6 +32,8 @@ mod hosts;
 mod log;
 pub mod jobs;
 pub mod live;
+pub mod memory;
+pub mod policy;
 pub mod preview;
 pub mod repomap;
 pub mod reply;

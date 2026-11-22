@@ -3464,6 +3464,119 @@ mod http {
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
     }
 
+    #[tokio::test]
+    async fn studio_endpoints_atlas_doctor_policy_plan_edit_checkpoints_fork_and_redacted_bundle() {
+        let tmp = seeded("studio-api");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        // 1. Living Codebase Atlas
+        let (status, atlas) = client.get("/api/atlas?refresh=1").await;
+        assert_eq!(status, 200, "{atlas}");
+        assert!(atlas["atlas"]["total_files"].as_u64().unwrap_or(0) >= 1, "{atlas}");
+        assert!(tmp.0.join(".taskmaster/atlas.json").is_file());
+
+        // 2. Preflight Doctor
+        let (status, doc) = client.get("/api/doctor").await;
+        assert_eq!(status, 200, "{doc}");
+        assert!(doc["doctor"]["checks"].as_array().is_some_and(|c| !c.is_empty()), "{doc}");
+
+        // 3. Policy-as-Code GET + POST (repo_file: true writes taskmaster.policy.toml)
+        let (status, pol) = client.get("/api/policy").await;
+        assert_eq!(status, 200, "{pol}");
+        assert!(pol["policy"]["denied_globs"].as_array().is_some());
+
+        let (status, saved_pol) = client
+            .post(
+                "/api/policy",
+                json!({
+                    "repo_file": true,
+                    "policy": {
+                        "protected_globs": ["src/auth/**"],
+                        "denied_globs": [".env", ".env.*"],
+                        "allowed_fetch_hosts": [],
+                        "denied_fetch_hosts": ["evil.example"],
+                        "max_run_cost_usd": 5.0,
+                        "daily_budget_usd": 20.0,
+                        "require_cross_family_review": true,
+                        "redact_patterns": ["SUPER_SECRET_MARKER_999"]
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "{saved_pol}");
+        assert_eq!(saved_pol["source"], "taskmaster.policy.toml");
+        assert!(tmp.0.join("taskmaster.policy.toml").is_file());
+
+        // Invalid negative cap is rejected.
+        let (bad_status, _) = client
+            .post(
+                "/api/policy",
+                json!({ "policy": { "max_run_cost_usd": -1.0 } }),
+            )
+            .await;
+        assert_eq!(bad_status, 400);
+
+        // 4. Create a run awaiting approval, edit plan interactively, then approve.
+        let mut edited_plan = plan(&[("a", &[]), ("b", &[])]);
+        let (status, created) = client
+            .post("/api/runs", json!({ "id": "studio", "plan": edited_plan, "yes": false }))
+            .await;
+        assert_eq!(status, 202, "{created}");
+        let awaiting = client.settled("studio", "awaiting_approval").await;
+        assert_eq!(awaiting["phase"], "awaiting_approval");
+
+        // Cyclic plan edit is rejected with 400.
+        let mut cyclic = edited_plan.clone();
+        cyclic.pages[0].depends_on = vec!["b".into()];
+        cyclic.pages[1].depends_on = vec!["a".into()];
+        let (cyc_status, _) = client.post("/api/runs/studio/plan", json!({ "plan": cyclic })).await;
+        assert_eq!(cyc_status, 400);
+
+        // Valid plan edit updates brief and dependency edge.
+        edited_plan.pages[0].brief = "Build page a with custom SUPER_SECRET_MARKER_999 and sk-ant-api03-abcdefghijklmnopqrstuvwx".into();
+        edited_plan.pages[1].depends_on = vec!["a".into()];
+        let (edit_status, updated) = client.post("/api/runs/studio/plan", json!({ "plan": edited_plan })).await;
+        assert_eq!(edit_status, 200, "{updated}");
+        assert_eq!(updated["plan"]["pages"][1]["depends_on"], json!(["a"]));
+
+        // Approve & let it complete.
+        let (app_status, _) = client.post("/api/runs/studio/approve", json!({})).await;
+        assert_eq!(app_status, 202);
+        let done = client.settled("studio", "done").await;
+        assert_eq!(done["phase"], "done");
+
+        // 5. Checkpoints endpoint returns committed unit milestones.
+        let (cp_status, cps) = client.get("/api/runs/studio/checkpoints").await;
+        assert_eq!(cp_status, 200, "{cps}");
+        assert!(
+            cps["checkpoints"].as_array().is_some_and(|list| !list.is_empty()),
+            "expected at least one checkpoint: {cps}"
+        );
+
+        // 6. Bundle endpoint exports tmrun/v1 with cache_economics and secret redaction!
+        let (b_status, bundle) = client.get("/api/runs/studio/bundle").await;
+        assert_eq!(b_status, 200, "{bundle}");
+        assert_eq!(bundle["format"], "tmrun/v1");
+        assert!(bundle["cache_economics"]["total_cost_usd"].is_number());
+        let bundle_text = serde_json::to_string(&bundle).unwrap();
+        assert!(!bundle_text.contains("SUPER_SECRET_MARKER_999"), "custom policy pattern leaked: {bundle_text}");
+        assert!(!bundle_text.contains("sk-ant-api03-abcdefghijklmnopqrstuvwx"), "API key leaked: {bundle_text}");
+        assert!(bundle_text.contains("•••"), "expected redaction marker in bundle");
+
+        // 7. Fork endpoint creates and runs a forked run.
+        let (f_status, forked) = client
+            .post("/api/runs/studio/fork", json!({ "id": "studio-fork", "yes": true, "max_cost_usd": 2.0 }))
+            .await;
+        assert_eq!(f_status, 202, "{forked}");
+        assert_eq!(forked["id"], "studio-fork");
+        assert_eq!(forked["forked_from"], "studio");
+        let fork_done = client.settled("studio-fork", "done").await;
+        assert_eq!(fork_done["phase"], "done");
+    }
+
 }
 
 mod commons_service {

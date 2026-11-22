@@ -78,6 +78,10 @@
 //! POST /api/schedules             add or update a schedule
 //! POST /api/schedules/{id}/toggle enable or disable a schedule
 //! POST /api/schedules/{id}/remove remove a schedule
+//! GET  /api/web-access            Phase 1 web access settings, vault status, and cache stats
+//! POST /api/web-access            update web access settings and vault provider API key
+//! POST /api/web-access/cache/clear clear cached web fetches
+//! GET  /api/runs/{id}/web         each agent's web searches, fetches, and local docs calls
 //! POST /api/issues/parse          parse/fetch GitHub or GitLab issue URL into a prompt
 //! GET  /api/runs/{id}/attachments list run attachments
 //! POST /api/runs/{id}/attachments upload an image or context attachment
@@ -452,6 +456,9 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/contracts/propose", post(ops::propose_contract))
         .route("/api/scorecard/stratified", get(ops::stratified_scorecard))
         .route("/api/eval/suite", get(ops::eval_suite))
+        .route("/api/web-access", get(ops::get_web_access).post(ops::update_web_access))
+        .route("/api/web-access/cache/clear", post(ops::clear_web_cache))
+        .route("/api/runs/{id}/web", get(ops::run_web_activity))
         .route_layer(middleware::from_fn_with_state(app.clone(), idempotency_guard))
         .route_layer(middleware::from_fn_with_state(app.clone(), guard));
     Router::new()

@@ -68,6 +68,7 @@ pub mod template;
 mod telemetry;
 mod time;
 mod undo;
+pub mod web_access;
 
 #[cfg(test)]
 mod tests;

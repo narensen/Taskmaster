@@ -387,6 +387,17 @@ pub struct Estimate {
     pub priced: bool,
 }
 
+/// One decision produced by the planner's research phase (Item 1.4), carrying its source
+/// URL and target version so workers inherit only compact decisions in `PROJECT.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchNote {
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     /// What is being built. Plans recorded before kinds existed read as web.
@@ -409,6 +420,9 @@ pub struct Plan {
     /// look, empty state, responsive layout and accessibility rules.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub design: String,
+    /// Research decisions from the planner's research phase, written into `PROJECT.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub research: Vec<ResearchNote>,
 }
 
 /// A worker's objection to a Dictionary entry, raised instead of editing around it.

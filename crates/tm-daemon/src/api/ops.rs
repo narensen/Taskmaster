@@ -509,3 +509,149 @@ pub(super) async fn eval_suite(State(app): State<Arc<App>>) -> Reply {
     };
     ok(json!({ "tasks": tasks }))
 }
+
+// --- Phase 1: Web Access settings, cache management, and per-run web activity ---
+
+#[derive(Deserialize, Default)]
+pub(super) struct WebAccessUpdateBody {
+    enabled: Option<bool>,
+    provider: Option<String>,
+    endpoint: Option<String>,
+    api_key: Option<String>,
+    clear_api_key: Option<bool>,
+    roles: Option<crate::web_access::WebRoleMatrix>,
+    allowlist: Option<Vec<String>>,
+    planner_max_searches: Option<usize>,
+    planner_max_fetches: Option<usize>,
+    max_fetch_bytes: Option<usize>,
+    cache_ttl_secs: Option<u64>,
+    cache_max_mb: Option<u64>,
+}
+
+fn web_access_payload(project: &std::path::Path) -> Value {
+    use crate::secrets::SecretVault;
+    let loaded = crate::settings::Settings::load(project).unwrap_or_default();
+    let web = loaded.web_access;
+    let provider = web.provider_norm();
+    let vault = crate::web_access::default_vault();
+    let has_api_key = crate::web_access::load_api_key(&vault, &provider).is_some();
+    let cache = crate::web_access::WebCache::new(
+        crate::web_access::WebCache::default_dir(),
+        web.cache_ttl_secs,
+        web.cache_max_mb.saturating_mul(1024 * 1024),
+    );
+    let derived: Vec<String> = crate::web_access::derive_project_allowlist(project, &web.allowlist)
+        .into_iter()
+        .collect();
+    json!({
+        "web_access": web,
+        "has_api_key": has_api_key,
+        "vault_backend": vault.backend_name(),
+        "derived_allowlist": derived,
+        "advisory_hosts": crate::web_access::ADVISORY_HOSTS,
+        "providers": crate::web_access::WebAccessSettings::PROVIDERS,
+        "cache": cache.stats(),
+    })
+}
+
+/// `GET /api/web-access` — active Phase 1 web access settings, vault status, and cache stats.
+pub(super) async fn get_web_access(State(app): State<Arc<App>>) -> Reply {
+    ok(web_access_payload(&app.project()))
+}
+
+/// `POST /api/web-access` — update Phase 1 web access settings; API keys go only to the OS keychain.
+pub(super) async fn update_web_access(
+    State(app): State<Arc<App>>,
+    Json(body): Json<WebAccessUpdateBody>,
+) -> Reply {
+    let project = app.project();
+    let mut web = crate::settings::Settings::load(&project).unwrap_or_default().web_access;
+    if let Some(enabled) = body.enabled {
+        web.enabled = enabled;
+    }
+    if let Some(provider) = body.provider {
+        let p = provider.trim().to_ascii_lowercase();
+        if !crate::web_access::WebAccessSettings::PROVIDERS.contains(&p.as_str()) {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown web provider `{p}`: use one of {}",
+                    crate::web_access::WebAccessSettings::PROVIDERS.join(", ")
+                ),
+            ));
+        }
+        web.provider = p;
+    }
+    if let Some(endpoint) = body.endpoint {
+        web.endpoint = endpoint.trim().to_string();
+    }
+    if let Some(roles) = body.roles {
+        web.roles = roles;
+    }
+    if let Some(allowlist) = body.allowlist {
+        web.allowlist = allowlist
+            .into_iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+    }
+    if let Some(n) = body.planner_max_searches {
+        web.planner_max_searches = n.min(100);
+    }
+    if let Some(n) = body.planner_max_fetches {
+        web.planner_max_fetches = n.min(100);
+    }
+    if let Some(b) = body.max_fetch_bytes {
+        web.max_fetch_bytes = b.clamp(16 * 1024, 20 * 1024 * 1024);
+    }
+    if let Some(ttl) = body.cache_ttl_secs {
+        web.cache_ttl_secs = ttl;
+    }
+    if let Some(mb) = body.cache_max_mb {
+        web.cache_max_mb = mb.clamp(1, 4096);
+    }
+
+    let vault = crate::web_access::default_vault();
+    let provider_id = web.provider_norm();
+    if body.clear_api_key == Some(true) {
+        crate::web_access::save_api_key(&vault, &provider_id, "")
+            .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    } else if let Some(key) = body.api_key.as_deref()
+        && !key.trim().is_empty()
+    {
+        crate::web_access::save_api_key(&vault, &provider_id, key)
+            .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+
+    let value = serde_json::to_value(&web)
+        .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    super::desk::set_setting(&project, "web_access", value)
+        .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+
+    ok(web_access_payload(&project))
+}
+
+/// `POST /api/web-access/cache/clear` — empty the content-addressed web fetch cache.
+pub(super) async fn clear_web_cache(State(app): State<Arc<App>>) -> Reply {
+    let loaded = crate::settings::Settings::load(&app.project()).unwrap_or_default().web_access;
+    let cache = crate::web_access::WebCache::new(
+        crate::web_access::WebCache::default_dir(),
+        loaded.cache_ttl_secs,
+        loaded.cache_max_mb.saturating_mul(1024 * 1024),
+    );
+    let removed = cache
+        .clear()
+        .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    ok(json!({ "removed": removed, "cache": cache.stats() }))
+}
+
+/// `GET /api/runs/{id}/web` — each agent's web searches, fetches, and local docs lookups (Item 1.7).
+pub(super) async fn run_web_activity(
+    State(app): State<Arc<App>>,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let (_, entries) = app.live.read(&id, 0);
+    let items = crate::web_access::summarize_run_web_activity(&entries);
+    ok(json!({ "items": items }))
+}
+

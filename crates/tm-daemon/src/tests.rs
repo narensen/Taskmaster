@@ -3955,3 +3955,138 @@ async fn max_cost_usd_stops_the_run_cleanly_once_budget_is_reached() {
     assert!(!calls.iter().any(|c| c.contains("Build page `b`")), "budget cap must prevent building page b: {calls:?}");
     assert!(git_out(&tmp.0, &["show", "taskmaster/current:app/a/page.ts"]).contains("\"a\""));
 }
+
+#[tokio::test]
+async fn planner_research_writes_project_md_and_keeps_worker_shared_prefix_byte_identical() {
+    let tmp = seeded("research-prefix");
+    let world = World::new(Mode::Write);
+    let mut p = plan(&[("a", &[]), ("b", &[])]);
+    p.research = vec![tm_core::ResearchNote {
+        decision: "Use React 19 useActionState for form mutations".into(),
+        source: "https://react.dev/reference/react/useActionState".into(),
+        version: "react@19".into(),
+    }];
+    let cfg = config(&tmp.0, p, true, 2);
+    let outcome = run(cfg, &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let project_md = read(&tmp.0.join("PROJECT.md"));
+    assert!(project_md.contains("## Research"), "{project_md}");
+    assert!(project_md.contains("https://react.dev/reference/react/useActionState"), "{project_md}");
+    assert!(project_md.contains("react@19"), "{project_md}");
+
+    let calls = world.calls.lock().unwrap().clone();
+    let worker_a = calls.iter().find(|c| c.contains("Build page `a`")).expect("worker a brief");
+    let worker_b = calls.iter().find(|c| c.contains("Build page `b`")).expect("worker b brief");
+    let prefix_a = worker_a.split("--- Your task ---").next().unwrap();
+    let prefix_b = worker_b.split("--- Your task ---").next().unwrap();
+    assert_eq!(prefix_a, prefix_b, "shared prefix must be byte-identical across workers");
+    assert!(prefix_a.contains("## Research"), "workers inherit research decisions via PROJECT.md");
+    assert!(!prefix_a.contains("<untrusted_web_content"), "raw fetched web frames must never enter shared prefix");
+}
+
+#[tokio::test]
+async fn web_access_api_persists_settings_vaults_api_key_and_serves_run_web_activity() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(addr: &str, token: Option<&str>, method: &str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        let (head, rest) = reply.split_once("\r\n\r\n").unwrap_or(("", &reply));
+        let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+        (status, serde_json::from_str(rest).unwrap_or(serde_json::Value::Null))
+    }
+
+    let tmp = seeded("web-api");
+    let auth = Arc::new(crate::auth::PairingAuth::new(Records::files(&tmp.0)).unwrap());
+    let code = auth.code().to_string();
+    let options = crate::api::ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+    let server = crate::api::Server::serve(options).await.unwrap();
+    let addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+
+    let (st, paired) = call(&addr, None, "POST", "/api/pair", Some(serde_json::json!({ "code": code }))).await;
+    assert_eq!(st, 200);
+    let token = paired["token"].as_str().unwrap().to_string();
+
+    // 1. Update web access settings with an API key (must be vaulted, never returned)
+    let (st, saved) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/web-access",
+        Some(serde_json::json!({
+            "enabled": true,
+            "provider": "brave",
+            "api_key": "BSA-super-secret-brave-token-12345",
+            "allowlist": ["docs.rs", "react.dev"],
+            "planner_max_searches": 7,
+            "planner_max_fetches": 10,
+            "roles": {
+                "planner": { "search": true, "fetch": true },
+                "worker": { "search": true, "fetch": true },
+                "reviewer": { "search": false, "fetch": true },
+                "verifier": { "search": false, "fetch": false }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{saved}");
+    assert_eq!(saved["web_access"]["enabled"], true);
+    assert_eq!(saved["web_access"]["provider"], "brave");
+    assert_eq!(saved["web_access"]["planner_max_searches"], 7);
+    assert_eq!(saved["has_api_key"], true);
+    assert!(!saved.to_string().contains("BSA-super-secret-brave-token-12345"));
+
+    // 2. GET /api/settings and /api/settings/export never contain the secret key
+    let (st, settings) = call(&addr, Some(&token), "GET", "/api/settings", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(settings["web_access"]["enabled"], true);
+    assert_eq!(settings["web_access"]["has_api_key"], true);
+    assert!(!settings.to_string().contains("BSA-super-secret-brave-token-12345"));
+
+    let (st, exported) = call(&addr, Some(&token), "GET", "/api/settings/export", None).await;
+    assert_eq!(st, 200);
+    assert!(!exported.to_string().contains("BSA-super-secret-brave-token-12345"));
+
+    // Clean up vaulted key after test
+    let (st, cleared) = call(
+        &addr,
+        Some(&token),
+        "POST",
+        "/api/web-access",
+        Some(serde_json::json!({ "provider": "brave", "clear_api_key": true })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(cleared["has_api_key"], false);
+
+    // 3. Record web activity in live transcript and read via GET /api/runs/{id}/web
+    let live = crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0)));
+    live.push(
+        "run-web-ui",
+        &serde_json::json!({ "id": "master", "role": "planner" }),
+        "web_search",
+        serde_json::json!({
+            "provider": "searxng",
+            "query": "rust axum router",
+            "hits": 1,
+            "sources": [{ "title": "axum::Router", "url": "https://docs.rs/axum", "engine": "fixture" }],
+            "injection_flagged": false
+        }),
+    );
+    let (st, activity) = call(&addr, Some(&token), "GET", "/api/runs/run-web-ui/web", None).await;
+    assert_eq!(st, 200);
+    let items = activity["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["query"], "rust axum router");
+
+    drop(server);
+}
+

@@ -368,6 +368,9 @@ pub fn scorecard(runs: &[Vec<LedgerEntry>]) -> ModelScorecard {
         // Track how many builder calls each agent needed in this run so we can measure first-pass rate.
         let mut agent_builds: BTreeMap<String, Vec<&LedgerEntry>> = BTreeMap::new();
         for e in entries {
+            if e.harness == "web-access" {
+                continue;
+            }
             let key = match &e.model {
                 Some(m) if !m.is_empty() => format!("{} {m}", e.harness),
                 _ => e.harness.clone(),
@@ -551,6 +554,9 @@ pub fn stratified_scores(runs: &[Vec<LedgerEntry>]) -> Vec<StratifiedScore> {
     for entries in runs {
         let mut agent_builds: BTreeMap<String, Vec<&LedgerEntry>> = BTreeMap::new();
         for e in entries {
+            if e.harness == "web-access" {
+                continue;
+            }
             if matches!(e.role, Role::Worker | Role::Mid | Role::Master) && e.page.is_some() {
                 agent_builds.entry(e.agent()).or_default().push(e);
             }

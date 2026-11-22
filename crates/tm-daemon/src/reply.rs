@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, PhaseSketch, Plan, ProjectKind};
+use tm_core::{ContractFile, DraftEntry, EntryKind, Estimate, Finding, PagePlan, PhaseSketch, Plan, ProjectKind, ResearchNote};
 
 #[derive(Deserialize)]
 struct RawPlan {
@@ -24,6 +24,8 @@ struct RawPlan {
     design: Value,
     #[serde(default)]
     phases: Vec<Value>,
+    #[serde(default)]
+    research: Vec<Value>,
 }
 
 /// A phase of the sketch as a planner wrote it: lists or text are both read, and a phase
@@ -187,6 +189,35 @@ pub struct Amendment {
 }
 
 /// The planner's contracts, pages, estimate, and new Dictionary entries.
+fn research_of(value: &Value) -> Option<ResearchNote> {
+    if let Some(text) = value.as_str() {
+        let decision = text.trim().to_string();
+        return (!decision.is_empty()).then_some(ResearchNote { decision, source: String::new(), version: String::new() });
+    }
+    let decision = ["decision", "summary", "note", "finding"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if decision.is_empty() {
+        return None;
+    }
+    let source = ["source", "url", "link"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let version = ["version", "applies_to", "package"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(ResearchNote { decision, source, version })
+}
+
 /// Missing `dictionary` and `estimate` mean none and zero.
 pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     if let Some(hit) = limit_of(text) {
@@ -201,6 +232,7 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     let phases: Vec<PhaseSketch> = raw.phases.iter().enumerate().filter_map(|(i, v)| phase_of(v, i)).collect();
     // One phase is not a sketch: the plan is the whole job.
     let phases = if phases.len() >= 2 { phases } else { Vec::new() };
+    let research: Vec<ResearchNote> = raw.research.iter().filter_map(research_of).collect();
     Ok((
         Plan {
             kind,
@@ -210,6 +242,7 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
             estimate,
             design,
             phases,
+            research,
         },
         dictionary,
     ))

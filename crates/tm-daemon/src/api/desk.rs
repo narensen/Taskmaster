@@ -1109,7 +1109,7 @@ fn settings_file(project: &Path) -> PathBuf {
 }
 
 /// Put `value` at `key` of the settings file, replacing what was there.
-fn set_setting(project: &Path, key: &str, value: Value) -> anyhow::Result<()> {
+pub(super) fn set_setting(project: &Path, key: &str, value: Value) -> anyhow::Result<()> {
     write_setting(project, key, value, false)
 }
 
@@ -1173,6 +1173,19 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         },
         "telemetry": { "enabled": role_defaults.telemetry.enabled },
         "agents": { "timeout_secs": role_defaults.agents.timeout_secs },
+        "web_access": {
+            "enabled": role_defaults.web_access.enabled,
+            "provider": role_defaults.web_access.provider_norm(),
+            "endpoint": role_defaults.web_access.endpoint,
+            "has_api_key": crate::web_access::load_api_key(&crate::web_access::default_vault(), &role_defaults.web_access.provider_norm()).is_some(),
+            "roles": role_defaults.web_access.roles,
+            "allowlist": role_defaults.web_access.allowlist,
+            "planner_max_searches": role_defaults.web_access.planner_max_searches,
+            "planner_max_fetches": role_defaults.web_access.planner_max_fetches,
+            "max_fetch_bytes": role_defaults.web_access.max_fetch_bytes,
+            "cache_ttl_secs": role_defaults.web_access.cache_ttl_secs,
+            "cache_max_mb": role_defaults.web_access.cache_max_mb,
+        },
         "editor": *app.editor.lock().unwrap(),
         "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
         "machine": machine(),
@@ -1181,14 +1194,18 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
 }
 
 const SETTING_KEYS: &[&str] = &[
-    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox",
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox", "web_access",
 ];
 
 /// Tokens are not part of an export. Host connections live in another file and stay there.
 fn redact_export(value: &mut Value) {
-    let Some(commons) = value.get_mut("commons").and_then(Value::as_object_mut) else { return };
-    if commons.get("token").and_then(Value::as_str).is_some_and(|token| !token.is_empty()) {
+    if let Some(commons) = value.get_mut("commons").and_then(Value::as_object_mut)
+        && commons.get("token").and_then(Value::as_str).is_some_and(|token| !token.is_empty())
+    {
         commons.insert("token".into(), json!(""));
+    }
+    if let Some(web) = value.get_mut("web_access").and_then(Value::as_object_mut) {
+        web.remove("api_key");
     }
 }
 
@@ -1250,6 +1267,7 @@ pub async fn reset_settings(State(app): State<Arc<App>>) -> Reply {
         ("telemetry", json!({ "enabled": false })),
         ("agents", json!({ "timeout_secs": crate::settings::DEFAULT_AGENT_SECS })),
         ("sandbox", json!({ "shell": true, "package_indexes": true })),
+        ("web_access", serde_json::to_value(crate::web_access::WebAccessSettings::default()).unwrap_or_else(|_| json!({}))),
     ];
     for (key, value) in defaults {
         set_setting(&project, key, value).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;

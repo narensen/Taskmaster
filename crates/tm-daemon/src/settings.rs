@@ -43,6 +43,8 @@ pub struct Settings {
     pub agents: AgentSettings,
     /// What a worker's sandbox lets it do.
     pub sandbox: SandboxSettings,
+    /// Agent internet access, per-role switches, allowlist, budgets, and cache (Phase 1).
+    pub web_access: crate::web_access::WebAccessSettings,
     /// Dollars per million tokens, by model id or harness id, for calls whose harness
     /// reports no price. Grok's are built in (see [`built_in_prices`]).
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,

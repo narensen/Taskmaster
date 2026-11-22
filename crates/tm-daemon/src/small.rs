@@ -326,6 +326,7 @@ pub fn lite_edit_plan(prompt: &str) -> tm_core::Plan {
         estimate: tm_core::Estimate::default(),
         design: String::new(),
         phases: Vec::new(),
+        research: Vec::new(),
     }
 }
 

@@ -489,21 +489,6 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         let _ = axum::serve(listener, tm_dictionary::router(served)).await;
     });
     let _server = AbortOnDrop(server);
-    // Workers on a web page get a browser on that page's own preview.
-    let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
-    // Code Mode: run_code, beside the browser, on the same server.
-    let code = if config.code_mode { crate::code::CodeTools::with_limits(browsers.clone(), config.code_script_secs, config.code_sh_secs) } else { None };
-    let mut extensions: Vec<Arc<dyn tm_dictionary::Extension>> = Vec::new();
-    if let Some(browsers) = &browsers {
-        extensions.push(browsers.clone());
-    }
-    if let Some(code) = &code {
-        extensions.push(code.clone());
-    }
-    if !extensions.is_empty() {
-        mcp.extend(Arc::new(crate::code::Extensions(extensions)));
-    }
-
     let reviewer_token = fresh_token()?;
     let verifier_token = fresh_token()?;
     let master_token = fresh_token()?;
@@ -516,6 +501,28 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         };
         Arc::new(Live::new(store))
     });
+    // Workers on a web page get a browser on that page's own preview.
+    let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
+    // Code Mode: run_code, beside the browser, on the same server.
+    let code = if config.code_mode { crate::code::CodeTools::with_limits(browsers.clone(), config.code_script_secs, config.code_sh_secs) } else { None };
+    // Daemon-served web_search, web_fetch, and local-first docs() (Phase 1).
+    let loaded_settings = crate::settings::Settings::load(&project).unwrap_or_default();
+    let web_tools = crate::web_access::WebTools::new(
+        project.clone(),
+        loaded_settings.web_access.clone(),
+        &loaded_settings.search_endpoint(),
+        live.clone(),
+        records.clone(),
+    );
+    let mut extensions: Vec<Arc<dyn tm_dictionary::Extension>> = Vec::new();
+    if let Some(browsers) = &browsers {
+        extensions.push(browsers.clone());
+    }
+    if let Some(code) = &code {
+        extensions.push(code.clone());
+    }
+    extensions.push(web_tools);
+    mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into(), unit: String::new() });
     mcp.grant(&master_token, Grant { run: run_id, page: "master".into(), unit: String::new() });
@@ -1160,10 +1167,22 @@ impl Driver {
     /// actually happened.
     fn render_project_md(&self) -> String {
         let Some(plan) = &self.run.plan else { return String::new() };
-        if plan.phases.is_empty() {
+        let research = crate::web_access::render_research_section(&plan.research);
+        if plan.phases.is_empty() && research.is_empty() {
             return String::new();
         }
-        let mut out = format!("{PROJECT_MARK}\n# Project\n\nA {} project, built one phase at a time.\n\n## Phases\n\n", plan.kind.id());
+        let mut out = if plan.phases.is_empty() {
+            format!("{PROJECT_MARK}\n# Project\n\nA {} project.\n", plan.kind.id())
+        } else {
+            format!("{PROJECT_MARK}\n# Project\n\nA {} project, built one phase at a time.\n", plan.kind.id())
+        };
+        if !research.is_empty() {
+            out.push_str(&research);
+        }
+        if plan.phases.is_empty() {
+            return out;
+        }
+        out.push_str("\n## Phases\n\n");
         let finished = matches!(self.run.phase, RunPhase::Done);
         for (i, phase) in plan.phases.iter().enumerate() {
             let state = if i < self.run.phase_at || (i == self.run.phase_at && finished) {
@@ -1482,6 +1501,15 @@ impl Driver {
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
+        let web_cfg = crate::settings::Settings::load(&self.project).unwrap_or_default().web_access;
+        if web_cfg.planner_can_research() {
+            brief.push_str(&format!(
+                "\nResearch phase: before drafting, you may verify unfamiliar library APIs or versions with `docs(package, symbol?)` (local-first), `web_search` (up to {} calls), and `web_fetch` (up to {} calls). \
+                 Record only concise decisions in `\"research\": [{{\"decision\": \"...\", \"source\": \"https://...\", \"version\": \"...\"}}]`; \
+                 Taskmaster writes those decisions into PROJECT.md so workers inherit them without raw web pages.\n",
+                web_cfg.planner_max_searches, web_cfg.planner_max_fetches
+            ));
+        }
         if !errors.is_empty() {
             brief.push_str("\nThe last plan was rejected:\n");
             for error in errors {
@@ -3738,7 +3766,7 @@ impl Driver {
             out.push('\n');
         }
         out.push_str("\n--- Your task ---\n");
-        Ok(out)
+        Ok(crate::web_access::strip_untrusted_frames(&out))
     }
 
     /// One agent's whole context: the shared prefix, then its own task, the files it owns,

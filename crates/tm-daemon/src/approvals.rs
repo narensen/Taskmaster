@@ -139,6 +139,48 @@ impl Approvals {
             self.answer(&id, false, "cancelled");
         }
     }
+
+    /// Ask a person about an off-allowlist `web_fetch` / `web_search` call (Item 1.3).
+    /// In `Never` mode, returns `false` immediately; in `Risky` or `Always` mode, pauses
+    /// as a pending `ToolKind::Fetch` approval until answered, cancelled, or timed out.
+    pub async fn ask_fetch(&self, live: &Live, run: &str, agent: &Value, tool: &str, url: &str, reason: &str) -> bool {
+        let policy = self.policy();
+        if ask_reason(policy.mode, ToolKind::Fetch, false).is_none() {
+            return false;
+        }
+        if self.stopped.lock().unwrap().contains(run) {
+            return false;
+        }
+        let Ok(id) = random_hex(6) else { return false };
+        let view = json!({
+            "id": id,
+            "run": run,
+            "agent": agent,
+            "tool": tool,
+            "kind": kind_name(ToolKind::Fetch),
+            "command": url,
+            "paths": [url],
+            "reason": reason,
+            "at": rfc3339_now(),
+            "timeout_secs": policy.timeout.as_secs(),
+        });
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Pending { view: view.clone(), run: run.to_string(), answer: tx });
+        live.push(run, agent, "approval_requested", view);
+        let (allowed, by) = match tokio::time::timeout(policy.timeout, rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => (false, "cancelled".to_string()),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                (false, "timeout".to_string())
+            }
+        };
+        live.push(run, agent, "approval_resolved", json!({ "id": id, "tool": tool, "allowed": allowed, "by": by }));
+        allowed
+    }
 }
 
 /// The worktree gate with the policy in front of it. One per agent call.

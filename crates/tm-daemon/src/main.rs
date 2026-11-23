@@ -85,8 +85,25 @@ enum EvalMode {
     Gate { baseline: PathBuf, candidate: PathBuf, max_cost_pct: f64 },
 }
 
+/// Set when `serve` handed its agents to the next daemon (H3). It then exits with
+/// [`HANDED_OFF_EXIT`], which a service manager restarts on.
+static HANDED_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The exit status of a daemon that handed off: `EX_TEMPFAIL`, "come back".
+const HANDED_OFF_EXIT: u8 = 75;
+
 fn main() -> ExitCode {
-    match run() {
+    // `tm-daemon hold <socket>`: the holder that keeps builders across a daemon update (H3).
+    // It is started by the daemon itself and runs its own small runtime.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|arg| arg == "hold") {
+        return hold(argv.get(1).map(PathBuf::from));
+    }
+    let outcome = run();
+    if HANDED_OFF.load(std::sync::atomic::Ordering::SeqCst) {
+        return ExitCode::from(HANDED_OFF_EXIT);
+    }
+    match outcome {
         Ok(Outcome::Finished { ok: true }) => ExitCode::SUCCESS,
         Ok(Outcome::Finished { ok: false }) => ExitCode::from(1),
         Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => ExitCode::from(2),
@@ -105,6 +122,45 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[cfg(unix)]
+fn hold(socket: Option<PathBuf>) -> ExitCode {
+    let Some(socket) = socket.or_else(tm_harness::hold::default_socket) else {
+        eprintln!("usage: tm-daemon hold <socket>");
+        return ExitCode::from(1);
+    };
+    match tm_harness::hold::run_holder(&socket) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("taskmaster: the holder stopped: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn hold(_socket: Option<PathBuf>) -> ExitCode {
+    eprintln!("taskmaster: the holder needs a Unix system");
+    ExitCode::from(1)
+}
+
+/// The holder this daemon starts builders in (H3): `$TASKMASTER_HOLD` or the default socket,
+/// started from this program when none is running. `TASKMASTER_HOLD=off` turns it off.
+fn holder() -> Option<tm_harness::hold::Holder> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let socket = tm_harness::hold::default_socket()?;
+    // An update replaces the program under a running daemon; the path still names the new one.
+    let program = std::env::current_exe().ok().map(|exe| {
+        let text = exe.to_string_lossy();
+        match text.strip_suffix(" (deleted)") {
+            Some(path) => PathBuf::from(path),
+            None => exe,
+        }
+    });
+    Some(tm_harness::hold::Holder::new(socket, program))
 }
 
 #[tokio::main]
@@ -300,6 +356,7 @@ async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Serv
     options.dictionary = args.dictionary.clone();
     options.commons = args.commons.clone().or_else(home_commons);
     options.web = args.web.clone().or_else(installed_web);
+    options.holder = holder();
     let server = Server::serve(options).await?;
     server.warm_providers();
     println!("taskmaster: api {}  code {code}", server.url);
@@ -376,26 +433,40 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             );
         }
     }
-    let _server = start_server(&args, bind).await?;
-    wait_for_shutdown().await?;
+    let server = start_server(&args, bind).await?;
+    if wait_for_shutdown().await? == Shutdown::HandOff {
+        let kept = server.hand_off().await;
+        eprintln!("taskmaster: handed {kept} agent(s) to the next daemon; exiting with {HANDED_OFF_EXIT} so it starts");
+        HANDED_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    drop(server);
     Ok(())
 }
 
-async fn wait_for_shutdown() -> anyhow::Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum Shutdown {
+    /// Ctrl-C or SIGTERM: stop, and everything this daemon started stops with it.
+    Stop,
+    /// SIGUSR1, sent by an updater: hand the builders to the next daemon first (H3).
+    HandOff,
+}
+
+async fn wait_for_shutdown() -> anyhow::Result<Shutdown> {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("cannot listen for SIGTERM")?;
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
+        let mut hand_off = signal(SignalKind::user_defined1()).context("cannot listen for SIGUSR1")?;
         tokio::select! {
-            res = tokio::signal::ctrl_c() => { res.context("cannot wait for ctrl-c")?; }
-            _ = term.recv() => { eprintln!("taskmaster: received SIGTERM, shutting down cleanly"); }
+            res = tokio::signal::ctrl_c() => { res.context("cannot wait for ctrl-c")?; Ok(Shutdown::Stop) }
+            _ = term.recv() => { eprintln!("taskmaster: received SIGTERM, shutting down cleanly"); Ok(Shutdown::Stop) }
+            _ = hand_off.recv() => { eprintln!("taskmaster: received SIGUSR1, handing the agents to the next daemon"); Ok(Shutdown::HandOff) }
         }
-        Ok(())
     }
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.context("cannot wait for ctrl-c")?;
-        Ok(())
+        Ok(Shutdown::Stop)
     }
 }
 
@@ -609,6 +680,7 @@ const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
                      tm-daemon eval --suite <dir> [--check-only]\n       \
                      tm-daemon eval --gate <baseline.jsonl> <candidate.jsonl> [--max-cost-pct <n>]\n       \
                      tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]\n       \
+                     tm-daemon hold [<socket>]   (started by serve; SIGUSR1 to serve hands agents to the next daemon)\n       \
                      tm-daemon <project> [--plan <file> | --prompt <text> | --prompt-file <path>] \
                      [--yes] [--worker <h | auto>] [--mid <h>] [--master <h>] [--reviewer <h>] \
                      [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \

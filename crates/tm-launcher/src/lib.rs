@@ -39,6 +39,37 @@ impl Daemon {
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// Before an update restarts the app: hand the daemon's running builders to the next
+    /// daemon (H3) and let this one go. Their agents keep working in the holder, and the
+    /// daemon the restarted app starts picks them up. Returns whether the daemon handed off;
+    /// when it did not in time, it is stopped with everything it started, as on drop.
+    pub fn hand_off(mut self) -> bool {
+        hand_off(&mut self.child, Duration::from_secs(10))
+    }
+}
+
+/// The status a daemon exits with once it has handed off (`EX_TEMPFAIL`).
+pub const HANDED_OFF: i32 = 75;
+
+/// Ask a daemon to hand off (SIGUSR1) and wait up to `within` for it to exit.
+fn hand_off(child: &mut Child, within: Duration) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: a signal to our own child, whose handle we still hold.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGUSR1);
+        }
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                return status.code() == Some(HANDED_OFF);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let _ = (child, within);
+    false
 }
 
 /// What to start.
@@ -200,6 +231,19 @@ pub fn default_project() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_asked_to_hand_off_exits_with_the_status_that_says_it_did() {
+        let mut child = Command::new("sh").args(["-c", "trap 'exit 75' USR1; while :; do sleep 0.05; done"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(hand_off(&mut child, Duration::from_secs(5)));
+        // One that ignores the request is not taken for handed off.
+        let mut deaf = Command::new("sh").args(["-c", "trap '' USR1; sleep 5"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!hand_off(&mut deaf, Duration::from_millis(300)));
+        stop(&mut deaf);
+    }
 
     #[test]
     fn the_banner_gives_the_address_and_the_code() {

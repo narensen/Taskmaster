@@ -120,6 +120,8 @@ struct Inner {
     /// The agents this daemon reads now, by key: how far each has been read.
     tracked: Mutex<HashMap<String, Arc<Tracked>>>,
     starting: tokio::sync::Mutex<()>,
+    /// A holder that would not start is not waited for again until then: agents start here.
+    down_until: Mutex<Option<Instant>>,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -139,6 +141,7 @@ impl Holder {
             handing_off: AtomicBool::new(false),
             tracked: Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(()),
+            down_until: Mutex::new(None),
         }))
     }
 
@@ -232,15 +235,38 @@ mod unix {
             if let Ok(stream) = self.connect().await {
                 return Ok(stream);
             }
-            start_holder(&program, &self.0.socket)?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match self.connect().await {
-                    Ok(stream) => return Ok(stream),
-                    Err(err) if Instant::now() >= deadline => return Err(err),
-                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            if self.0.down_until.lock().unwrap().is_some_and(|until| until > Instant::now()) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "the holder would not start a moment ago"));
+            }
+            // A Unix socket's path has room for about a hundred bytes.
+            if self.0.socket.as_os_str().len() > 100 {
+                *self.0.down_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(3600));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "the holder's socket path is too long; set TASKMASTER_HOLD"));
+            }
+            // Under systemd it goes in a scope of its own, or stopping the service stops it
+            // too; when that does not work, it is started directly.
+            let systemd = std::env::var_os("INVOCATION_ID").is_some() && crate::sandbox::resolve_binary("systemd-run").is_ok();
+            let ways: &[(bool, u64)] = if systemd { &[(true, 2), (false, 3)] } else { &[(false, 5)] };
+            let mut last = io::Error::new(io::ErrorKind::NotFound, "the holder did not start");
+            for &(scoped, secs) in ways {
+                if let Err(err) = start_holder(&program, &self.0.socket, scoped) {
+                    last = err;
+                    continue;
+                }
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                loop {
+                    match self.connect().await {
+                        Ok(stream) => return Ok(stream),
+                        Err(err) if Instant::now() >= deadline => {
+                            last = err;
+                            break;
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    }
                 }
             }
+            *self.0.down_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(60));
+            Err(last)
         }
 
         /// Send one request on a new connection and read its reply line.
@@ -382,12 +408,10 @@ mod unix {
     }
 
     /// Start a holder for `socket`, in its own session so a signal to the daemon's group does
-    /// not reach it. Under systemd it goes in its own scope, or stopping the service would
-    /// stop it too.
-    fn start_holder(program: &Path, socket: &Path) -> io::Result<()> {
+    /// not reach it; with `scoped`, in a systemd scope of its own.
+    fn start_holder(program: &Path, socket: &Path, scoped: bool) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
-        let systemd = std::env::var_os("INVOCATION_ID").is_some() && crate::sandbox::resolve_binary("systemd-run").is_ok();
-        let mut cmd = if systemd {
+        let mut cmd = if scoped {
             let mut cmd = std::process::Command::new("systemd-run");
             cmd.args(["--user", "--scope", "--quiet", "--collect", "--"]).arg(program);
             cmd
@@ -482,8 +506,10 @@ mod unix {
             }
         }
 
-        /// Write one line to the agent's input.
+        /// Write one line to the agent's input. During a hand-off it waits for good: an answer
+        /// this daemon would give now (say, a refusal as it shuts down) is the next one's to give.
         pub async fn write_line(&mut self, line: &str) -> io::Result<()> {
+            self.holder.readable().await;
             let mut frame = json!({ "in": line }).to_string();
             frame.push('\n');
             self.writer.write_all(frame.as_bytes()).await?;
@@ -1069,6 +1095,16 @@ mod tests {
         assert_eq!(freed, crate::Freed { processes: 3, lingering: 0 });
         assert_eq!(io.next_line().await.unwrap(), None);
         assert!(holder.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_will_not_start_is_not_waited_for_twice() {
+        // `false hold <socket>` exits at once: no holder ever answers.
+        let holder = Holder::new(dir("down").join("hold.sock"), Some(PathBuf::from("/bin/false")));
+        assert!(holder.spawn("k", &sh("true"), false, json!({})).await.is_err());
+        let again = Instant::now();
+        assert!(holder.spawn("k", &sh("true"), false, json!({})).await.is_err());
+        assert!(again.elapsed() < Duration::from_millis(500), "the second spawn waited for the holder again");
     }
 
     #[tokio::test]

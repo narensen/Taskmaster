@@ -30,7 +30,8 @@ export default async function setup() {
   mkdirSync(join(base, "home"), { recursive: true });
   const child = spawn(daemon, ["serve", project, "--bind", "127.0.0.1:0", "--web", dist, "--commons", join(base, "commons"), "--dictionary", join(base, "dictionary")], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, XDG_DATA_HOME: join(base, "data"), TASKMASTER_SKILLS: skills, ...(process.env.SHOTS ? {} : { HOME: join(base, "home") }) },
+    // Its own holder (H3), so a test run's builders never share the person's.
+    env: { ...process.env, XDG_DATA_HOME: join(base, "data"), TASKMASTER_SKILLS: skills, TASKMASTER_HOLD: join(base, "hold/hold.sock"), ...(process.env.SHOTS ? {} : { HOME: join(base, "home") }) },
   });
   const line = await new Promise<string>((ok, fail) => {
     let said = "";

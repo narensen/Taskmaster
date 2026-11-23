@@ -2127,6 +2127,89 @@ mod http {
         (server, Client { addr, token: None }, code)
     }
 
+    /// H3 through the API: a daemon told to hand off leaves its run uncancelled and its
+    /// builder running; the next daemon starts the run again by itself and finishes the turn the
+    /// builder began, with nothing said twice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn h3_the_next_daemon_takes_a_handed_off_run_over_by_itself() {
+        let tmp = seeded("h3-server");
+        choose_roles(&tmp.0);
+        let side = std::env::temp_dir().join(format!("tm-h3-server-{}", std::process::id()));
+        let (bin, go, started) = fake_claude(&side);
+        let holder = tm_harness::hold::in_process(&side.join("hold")).unwrap();
+        let options = |holder: tm_harness::hold::Holder| {
+            let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+            let code = auth.code().to_string();
+            let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+            options.skills = tmp.0.join(".skills-store");
+            let builder: Arc<dyn Harness> = Arc::new(tm_harness::claude::ClaudeCode { binary: bin.display().to_string(), sandbox: None });
+            options.harness = Arc::new(move |name| Ok(if name == "opencode" { builder.clone() } else { Arc::new(Plain) as Arc<dyn Harness> }));
+            options.holder = Some(holder);
+            (options, code)
+        };
+
+        // The first daemon runs on its own runtime, so letting it go ends every task it had,
+        // as the process exiting would.
+        let (first, code) = options(holder.clone());
+        let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let (kept_tx, kept_rx) = std::sync::mpsc::channel::<usize>();
+        let daemon = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                let server = Server::serve(first).await.unwrap();
+                let _ = url_tx.send(server.url.clone());
+                let _ = go_rx.await;
+                let kept = server.hand_off().await;
+                drop(server);
+                let _ = kept_tx.send(kept);
+            });
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        });
+        let url = url_rx.await.unwrap();
+        let mut client = Client { addr: url.trim_start_matches("http://").trim_end_matches('/').to_string(), token: None };
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        let roles = json!({ "worker": "opencode", "mid": "grok", "master": "grok", "reviewer": "grok", "verifier": "grok" });
+        let (status, made) = client.post("/api/runs", json!({ "id": "h3", "plan": planned, "roles": roles, "parallel": 1 })).await;
+        assert_eq!(status, 202, "{made}");
+        client.settled("h3", "awaiting_approval").await;
+        assert_eq!(client.post("/api/runs/h3/approve", json!({})).await.0, 202);
+        let live = crate::live::Live::new(Arc::new(crate::FileStore::in_project(&tmp.0)));
+        let said = |text: &str| {
+            let (_, entries) = live.read("h3", 0);
+            entries.iter().filter(|e| e["kind"] == "text" && e["text"].as_str().is_some_and(|t| t.contains(text))).count()
+        };
+        for _ in 0..400 {
+            if said("before the update") > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(said("before the update"), 1, "the builder never got going");
+
+        let _ = go_tx.send(());
+        assert_eq!(tokio::task::spawn_blocking(move || kept_rx.recv().unwrap()).await.unwrap(), 1);
+        tokio::task::spawn_blocking(move || daemon.join().unwrap()).await.unwrap();
+        // Not cancelled: the run is the next daemon's to carry on.
+        let events = Records::files(&tmp.0).events("h3").unwrap();
+        assert!(!events.contains(&tm_core::Event::Cancelled), "the hand-off cancelled the run");
+        std::fs::write(&go, "").unwrap();
+
+        let (next, _) = options(tm_harness::hold::Holder::new(holder.socket(), None));
+        let server = Server::serve(next).await.unwrap();
+        client.addr = server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let done = client.settled("h3", "done").await;
+        assert_eq!(done["phase"], "done");
+        assert_eq!(std::fs::read_to_string(&started).unwrap(), "x\n", "the builder was started a second time");
+        assert_eq!((said("before the update"), said("after it")), (1, 1));
+        assert!(holder.list().await.unwrap().is_empty());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&side);
+    }
+
     #[tokio::test]
     async fn devices_pair_by_link_and_an_outside_agent_drives_a_run_over_mcp() {
         let tmp = repo("connect");
@@ -6598,4 +6681,125 @@ async fn o2_preview_design_mode_proxy_and_capture_routes_h1_to_page_worker() {
 
     // Stop preview cleanly.
     let _ = call_raw(&addr, Some(&token), "POST", "/api/runs/r-o2/preview/stop", Some(serde_json::json!({}))).await;
+}
+
+/// H3: a builder handed off mid-turn keeps running in the holder, and the next daemon's drive
+/// picks the same process up: its turn ends once, in the call it began, and nothing it had
+/// already said is said again.
+/// A stand-in for `claude -p` in `side`: it builds page `a`, says one thing, waits for the
+/// `go` file, says another and ends its turn. Each start adds a line to `started`.
+#[cfg(unix)]
+fn fake_claude(side: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_dir_all(side);
+    std::fs::create_dir_all(side).unwrap();
+    let (go, started) = (side.join("go"), side.join("started"));
+    let script = format!(
+        r#"#!/bin/sh
+echo x >> '{started}'
+echo '{{"type":"system","session_id":"sess-h3-drive"}}'
+mkdir -p app/a && echo "export const a = 'held';" > app/a/page.ts
+echo '{{"type":"assistant","session_id":"sess-h3-drive","message":{{"content":[{{"type":"text","text":"before the update. "}}]}}}}'
+while [ ! -f '{go}' ]; do sleep 0.05; done
+echo '{{"type":"assistant","session_id":"sess-h3-drive","message":{{"content":[{{"type":"text","text":"after it."}}]}}}}'
+echo '{{"type":"result","is_error":false,"session_id":"sess-h3-drive","total_cost_usd":0.02,"usage":{{"input_tokens":1,"output_tokens":1}}}}'
+"#,
+        started = started.display(),
+        go = go.display()
+    );
+    let bin = side.join("claude");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    (bin, go, started)
+}
+
+/// Every role but the builder: one word, at once.
+struct Plain;
+
+#[async_trait]
+impl Harness for Plain {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+    async fn run(&self, _task: WorkerTask, _gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> anyhow::Result<RunSummary> {
+        let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
+        Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.0), denied: 0, freed: None })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h3_a_builder_handed_off_mid_turn_goes_on_in_the_next_daemon_without_starting_again() {
+    let tmp = repo("h3-handoff");
+    let side = std::env::temp_dir().join(format!("tm-h3-side-{}", std::process::id()));
+    let (bin, go, started) = fake_claude(&side);
+    let plain: Arc<dyn Harness> = Arc::new(Plain);
+    let worker: Arc<dyn Harness> = Arc::new(tm_harness::claude::ClaudeCode { binary: bin.display().to_string(), sandbox: None });
+    let harnesses = Harnesses { worker, mid: plain.clone(), master: plain.clone(), reviewer: plain.clone(), verifier: plain };
+
+    let holder = tm_harness::hold::in_process(&side.join("hold")).unwrap();
+    let store: Arc<dyn crate::Store> = Arc::new(crate::FileStore::in_project(&tmp.0));
+    let live = Arc::new(crate::live::Live::new(store));
+    let config = |holder: &tm_harness::hold::Holder| {
+        let mut cfg = Config::new(&tmp.0);
+        cfg.run_id = "r-h3".into();
+        cfg.yes = true;
+        cfg.checks = false;
+        cfg.runtime_checks = false;
+        cfg.browser = false;
+        cfg.code_mode = false;
+        cfg.live = Some(live.clone());
+        cfg.holder = Some(holder.clone());
+        cfg
+    };
+    let mut first = config(&holder);
+    first.plan = Some(plan(&[("a", &[])]));
+    let running = tokio::spawn(crate::drive(first, harnesses.clone()));
+    let said = |text: &str| {
+        let (_, entries) = live.read("r-h3", 0);
+        entries.iter().filter(|e| e["kind"] == "text" && e["text"].as_str().is_some_and(|t| t.contains(text))).count()
+    };
+    for _ in 0..200 {
+        if said("before the update") > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(said("before the update"), 1, "the builder never got going");
+
+    // The update: the daemon hands its builder off and goes away mid-turn.
+    assert_eq!(holder.hand_off(Duration::from_secs(60), Duration::from_millis(200)).await.unwrap(), 1);
+    running.abort();
+    let _ = running.await;
+    live.flush("r-h3");
+    let worktree = holder_worktree(&holder).await;
+    assert!(worktree.is_dir(), "the handed-off builder's worktree was removed");
+
+    // The builder finishes its turn while no daemon is there; the next one picks it up.
+    std::fs::write(&go, "").unwrap();
+    let next = tm_harness::hold::Holder::new(holder.socket(), None);
+    let out = crate::drive(config(&next), harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    live.flush("r-h3");
+
+    assert_eq!(std::fs::read_to_string(&started).unwrap(), "x\n", "the builder was started a second time");
+    assert_eq!((said("before the update"), said("after it")), (1, 1));
+    let (_, entries) = live.read("r-h3", 0);
+    let builder = |e: &&serde_json::Value| match &e["agent"] {
+        serde_json::Value::String(tag) => tag.starts_with("page:a#") || tag.starts_with("unit:a#"),
+        agent => agent["role"] != "master" && agent["id"].as_str().is_some_and(|id| id.ends_with(":a")),
+    };
+    let kinds: Vec<&str> = entries.iter().filter(builder).filter_map(|e| e["kind"].as_str()).filter(|k| matches!(*k, "start" | "end")).collect();
+    assert_eq!(kinds, ["start", "end"], "the builder's call should begin once and end once");
+    assert!(entries.iter().any(|e| e["kind"] == "end" && e["reattached"] == true));
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'held';\n");
+    assert!(next.list().await.unwrap().is_empty(), "the holder still has the builder");
+    let _ = std::fs::remove_dir_all(&side);
+}
+
+#[cfg(unix)]
+async fn holder_worktree(holder: &tm_harness::hold::Holder) -> PathBuf {
+    let listed = holder.list().await.unwrap();
+    PathBuf::from(listed[0].meta["worktree"].as_str().unwrap())
 }

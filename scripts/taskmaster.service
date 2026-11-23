@@ -8,6 +8,11 @@ Type=simple
 ExecStart=%h/.local/bin/tm-daemon serve --auto-resume
 Restart=on-failure
 RestartSec=3
+# `systemctl --user reload taskmaster` after an update: the daemon hands its running builders
+# to the next daemon (they keep working in the holder, in its own scope) and exits with 75,
+# which restarts it on the new program.
+ExecReload=/bin/kill -USR1 $MAINPID
+RestartForceExitStatus=75
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Environment=TASKMASTER_LOG_FORMAT=json

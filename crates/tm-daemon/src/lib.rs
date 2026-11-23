@@ -435,6 +435,9 @@ pub struct Config {
     pub permission_mode: Option<tm_harness::PermissionMode>,
     /// O8: the master may answer a worker's low-risk approval (Settings, off by default).
     pub master_answers: bool,
+    /// H3: start builders in this holder, so a daemon update can hand them to the next daemon.
+    /// `None` starts every agent here, as before.
+    pub holder: Option<tm_harness::hold::Holder>,
 }
 
 /// How an active run should stop when cancelled.
@@ -515,6 +518,7 @@ impl Config {
             warm_idle: Duration::from_secs(crate::settings::DEFAULT_WARM_IDLE_SECS),
             permission_mode: None,
             master_answers: false,
+            holder: None,
         }
     }
 }

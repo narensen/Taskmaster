@@ -7,7 +7,8 @@
 //!
 //! Updates come from GitHub Releases through the Tauri updater: `check_update` reads
 //! `latest.json`, and `install_update` downloads the installer, checks its signature
-//! against the public key built into the app, installs it, stops the daemon and restarts.
+//! against the public key built into the app, installs it, hands the daemon's running
+//! builders to the next daemon, and restarts.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -55,7 +56,11 @@ async fn install_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>
     let update = state.update.lock().unwrap().take().ok_or("check for updates first")?;
     // The plugin refuses an installer whose signature does not match the built-in key.
     update.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
-    state.daemon.lock().unwrap().take();
+    // Builders at work go on in the holder; the restarted app's daemon picks them up (H3).
+    let daemon = state.daemon.lock().unwrap().take();
+    if let Some(daemon) = daemon {
+        daemon.hand_off();
+    }
     app.restart();
 }
 

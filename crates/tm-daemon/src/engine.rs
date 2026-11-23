@@ -419,6 +419,12 @@ struct Driver {
     /// Provider session ids recovered from the run's transcript on daemon restart (H2),
     /// keyed by `(agent_id, harness_id)`.
     resumed_sessions: HashMap<(String, String), String>,
+    /// H3: agents a previous daemon handed off to this one, still running in the holder, by agent id.
+    held: HashMap<String, tm_harness::hold::HeldInfo>,
+    /// H3: the call each held agent was in, by agent id: its transcript tag and what it had said.
+    open_calls: HashMap<String, (serde_json::Value, String)>,
+    /// The port of this run's Dictionary server, which held agents keep across a hand-off.
+    mcp_port: u16,
     /// Snapshot of Phase 1 web access settings taken at run start so the shared prefix
     /// and role permissions stay deterministic for every agent in this run.
     web_access: crate::web_access::WebAccessSettings,
@@ -455,6 +461,9 @@ enum WorkerExec {
     Fresh,
     Warm(Warm),
     Resume { session_id: String, prompt: String },
+    /// H3: the agent a previous daemon handed off, still running in the holder. `said` is what
+    /// it had replied so far; `session_id` resumes it the H2 way if it cannot be picked up.
+    Reattach { said: String, session_id: Option<String> },
 }
 
 /// Open builder sessions a run keeps at most; the oldest is closed first.
@@ -476,6 +485,10 @@ impl Drop for Driver {
     fn drop(&mut self) {
         if let Some(next) = self.next_plan.take() {
             next.handle.abort();
+        }
+        // H3: the agents handed off go on working in their worktrees; the next daemon tidies up.
+        if self.config.holder.as_ref().is_some_and(|holder| holder.handing_off()) {
+            return;
         }
         for path in std::mem::take(&mut self.trees) {
             let _ = git::remove_worktree(&self.project, &path);
@@ -521,11 +534,41 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         None => Vec::new(),
     };
 
+    // H3: agents a previous daemon handed off to this one. They reach the Dictionary server at
+    // the port and with the tokens they were given, so this run serves it there again.
+    let mut held = match &config.holder {
+        Some(holder) if !events.is_empty() => held_agents(holder, &project, &config.run_id).await,
+        None | Some(_) => HashMap::new(),
+    };
     let dict = config.dictionary.clone().unwrap_or_else(|| project.join(".taskmaster/dictionary"));
     let commons = config.commons.clone().unwrap_or_else(|| project.join(".taskmaster/commons"));
     let mcp = McpState::with_commons(LocalStore::open(&dict)?, LocalStore::open(&commons)?);
-    let listener = TcpListener::bind("127.0.0.1:0").await.context("cannot bind the dictionary server")?;
+    let wanted = held.values().find_map(|h| h.meta["mcp_port"].as_u64()).and_then(|port| u16::try_from(port).ok());
+    let listener = match wanted {
+        Some(port) => match bind_again(port).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("taskmaster: port {port} the held agents use is taken ({err}); they are resumed instead");
+                if let Some(holder) = &config.holder {
+                    for (_, info) in held.drain() {
+                        let _ = holder.kill(&info.key).await;
+                    }
+                }
+                TcpListener::bind("127.0.0.1:0").await.context("cannot bind the dictionary server")?
+            }
+        },
+        None => TcpListener::bind("127.0.0.1:0").await.context("cannot bind the dictionary server")?,
+    };
     let addr = listener.local_addr().context("dictionary server has no address")?;
+    let mut held_tokens: HashMap<String, String> = HashMap::new();
+    for info in held.values() {
+        let meta = &info.meta;
+        if let (Some(token), Some(key), Some(page)) = (meta["token"].as_str(), meta["token_key"].as_str(), meta["grant_page"].as_str()) {
+            let unit = meta["grant_unit"].as_str().unwrap_or_default();
+            mcp.grant(token, Grant { run: config.run_id.clone(), page: page.to_string(), unit: unit.to_string() });
+            held_tokens.insert(key.to_string(), token.to_string());
+        }
+    }
     let url = format!("http://{addr}/mcp");
     let served = mcp.clone();
     let server = tokio::spawn(async move {
@@ -622,6 +665,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     } else {
         HashMap::new()
     };
+    let open_calls = if held.is_empty() { HashMap::new() } else { open_calls(&live, &id) };
 
     let mut driver = Driver {
         config,
@@ -649,7 +693,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         mcp,
         dict,
         commons,
-        tokens: HashMap::new(),
+        tokens: held_tokens,
         reviewer_token,
         verifier_token,
         master_token,
@@ -676,6 +720,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         warm: VecDeque::new(),
         hibernated: HashMap::new(),
         resumed_sessions,
+        held,
+        open_calls,
+        mcp_port: addr.port(),
         web_access: loaded_settings.web_access,
         release_nudged: BTreeSet::new(),
         race_pages: HashMap::new(),
@@ -692,8 +739,79 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     driver.grant_pages()?;
     driver.pull_commons();
     let outcome = driver.r#loop().await;
+    driver.let_go_of_held().await;
     driver.live.flush(&driver.id);
     outcome
+}
+
+/// Bind the port the last daemon's Dictionary server had. It may take a moment to let go.
+async fn bind_again(port: u16) -> std::io::Result<TcpListener> {
+    let mut tries = 0;
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) if tries >= 20 => return Err(err),
+            Err(_) => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// The agents the holder kept for this run of this project, by agent id: handed off by the
+/// daemon before this one and not taken over since.
+async fn held_agents(holder: &tm_harness::hold::Holder, project: &Path, run: &str) -> HashMap<String, tm_harness::hold::HeldInfo> {
+    let project = project.display().to_string();
+    let listed = holder.list().await.unwrap_or_default();
+    listed
+        .into_iter()
+        .filter(|info| !info.owned && info.meta["project"] == project.as_str() && info.meta["run"] == run)
+        .filter_map(|info| Some((info.meta["agent"].as_str()?.to_string(), info)))
+        .collect()
+}
+
+/// The calls still open in a run's transcript, by agent id: the tag each began with and the
+/// text it had sent, so a held agent's turn goes on in the same call.
+fn open_calls(live: &Live, run: &str) -> HashMap<String, (serde_json::Value, String)> {
+    let (_, entries) = live.read(run, 0);
+    let mut tags: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut open: HashMap<String, (String, serde_json::Value, String)> = HashMap::new();
+    for entry in &entries {
+        let (id, call, tag) = match &entry["agent"] {
+            serde_json::Value::Object(obj) => {
+                let (Some(id), Some(call)) = (obj.get("id").and_then(|v| v.as_str()), obj.get("call").and_then(|v| v.as_u64())) else { continue };
+                let key = format!("{id}#{call}");
+                tags.insert(key.clone(), entry["agent"].clone());
+                (id.to_string(), key, entry["agent"].clone())
+            }
+            serde_json::Value::String(key) => match (tags.get(key), key.rsplit_once('#')) {
+                (Some(tag), Some((id, _))) => (id.to_string(), key.clone(), tag.clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        match entry["kind"].as_str() {
+            Some("start") => {
+                open.insert(id, (call, tag, String::new()));
+            }
+            Some("end") => {
+                if open.get(&id).is_some_and(|(have, _, _)| *have == call) {
+                    open.remove(&id);
+                }
+            }
+            Some("text") => {
+                if let Some((have, _, said)) = open.get_mut(&id)
+                    && *have == call
+                    && let Some(text) = entry["text"].as_str()
+                {
+                    said.push_str(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    open.into_iter().map(|(id, (_, tag, said))| (id, (tag, said))).collect()
 }
 
 /// Wait until a `Force` cancellation signal arrives (or pend forever if no mode watcher exists).
@@ -1925,6 +2043,11 @@ impl Driver {
                 }
                 let unit_id = (units.len() > 1).then_some(unit.id.as_str());
                 let agent_key = self.agent_id(&page, unit_id);
+                // H3: the agent a previous daemon handed off goes on, in the worktree it has.
+                if let Some(done) = self.reattach_unit(&agent_key, &page, index, units.len(), tier, errors.as_deref()).await {
+                    prepared.push(done);
+                    continue;
+                }
                 let step = self.fresh_worktree(&label).and_then(|worktree| {
                     let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
                     if built.is_err() {
@@ -2002,6 +2125,20 @@ impl Driver {
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
                 feed.agent["unit"] = serde_json::json!(unit);
             }
+            if matches!(exec, WorkerExec::Reattach { .. }) {
+                // The same call goes on: its tag, so its events land in the block it began.
+                if let (Some((tag, _)), Some(feed)) = (self.open_calls.remove(&agent), request.feed.as_mut()) {
+                    feed.agent = tag;
+                }
+                if request.hold.as_ref().is_some_and(|spec| spec.meta["browser"] == true)
+                    && let Some(browsers) = &self.browsers
+                    && let Ok(origin) = browsers.attach(&page, &worktree)
+                {
+                    request.browser = Some(origin);
+                }
+            } else if !is_race {
+                self.hold_request(&mut request, &agent, &page, unit, tier);
+            }
             let mut bill = request.bill(Role::builder(tier), Some(&page));
             bill.difficulty = self.run.plan.as_ref().and_then(|p| p.pages.iter().find(|pg| pg.id == page)).and_then(|pg| pg.difficulty.clone());
             bill.language = infer_glob_language(&units[unit_idx].owned_glob);
@@ -2012,6 +2149,7 @@ impl Driver {
                 WorkerExec::Resume { session_id, .. } => {
                     eprintln!("taskmaster: resuming {agent} on provider session {session_id}");
                 }
+                WorkerExec::Reattach { .. } => eprintln!("taskmaster: picking {agent} up where the last daemon left it"),
                 WorkerExec::Fresh => {}
             }
             self.jobs.spawn(async move {
@@ -2030,6 +2168,7 @@ impl Driver {
                         match exec {
                             WorkerExec::Warm(warm) => follow(request, warm.session).await,
                             WorkerExec::Resume { session_id, prompt } => resume_or_ask(request, session_id, prompt).await,
+                            WorkerExec::Reattach { said, session_id } => reattach_or_resume(request, said, session_id).await,
                             WorkerExec::Fresh => ask(request).await,
                         }
                     } => asked.map(|answer| WorkerJob::Finished(Box::new(Product { answer, bill, worktree }))),
@@ -4193,6 +4332,70 @@ impl Driver {
         })
     }
 
+    /// H3: a held agent of this unit, ready to go on: its request, in its own worktree. A held
+    /// agent that no longer fits (another harness, its worktree gone) is stopped instead.
+    async fn reattach_unit(
+        &mut self,
+        agent: &str,
+        page: &str,
+        index: usize,
+        units: usize,
+        tier: Tier,
+        errors: Option<&str>,
+    ) -> Option<(AgentRequest, PathBuf, WorkerExec)> {
+        let info = self.held.remove(agent)?;
+        let holder = self.config.holder.clone()?;
+        let harness = crate::usage::canonical_provider(self.harness_for(tier).id());
+        let worktree = PathBuf::from(info.meta["worktree"].as_str().unwrap_or_default());
+        let fits = info.meta["harness"].as_str() == Some(harness.as_str()) && !worktree.as_os_str().is_empty() && worktree.is_dir();
+        let request = if fits { self.worker_request(page, index, units, tier, errors, worktree.clone()) } else { Err(anyhow::anyhow!("it no longer fits the run")) };
+        match request {
+            Ok(mut request) => {
+                self.trees.push(worktree.clone());
+                let session_id = self.resumed_sessions.remove(&(agent.to_string(), harness));
+                let said = self.open_calls.get(agent).map(|(_, said)| said.clone()).unwrap_or_default();
+                request.hold = Some(tm_harness::hold::HoldSpec { holder, key: info.key.clone(), meta: info.meta.clone() });
+                Some((request, worktree, WorkerExec::Reattach { said, session_id }))
+            }
+            Err(err) => {
+                eprintln!("taskmaster: the held agent {agent} is stopped ({err:#})");
+                let _ = holder.kill(&info.key).await;
+                None
+            }
+        }
+    }
+
+    /// H3: start this builder in the holder, with what a next daemon needs to pick it up: the
+    /// worktree, the Dictionary server's port and the agent's token and grant.
+    fn hold_request(&self, request: &mut AgentRequest, agent: &str, page: &str, unit: Option<&str>, tier: Tier) {
+        let (Some(holder), Some(dict)) = (&self.config.holder, &request.dictionary) else { return };
+        let meta = serde_json::json!({
+            "project": self.project.display().to_string(),
+            "run": self.id,
+            "agent": agent,
+            "harness": crate::usage::canonical_provider(request.harness.id()),
+            "tier": tier_name(tier),
+            "worktree": request.cwd.display().to_string(),
+            "mcp_port": self.mcp_port,
+            "token": dict.bearer_token,
+            "token_key": unit.map(|u| format!("{page}/{u}")).unwrap_or_else(|| page.to_string()),
+            "grant_page": page,
+            "grant_unit": unit.unwrap_or_default(),
+            "browser": request.browser.is_some(),
+        });
+        let key = format!("{}#{}#{agent}", self.project.display(), self.id);
+        request.hold = Some(tm_harness::hold::HoldSpec { holder: holder.clone(), key, meta });
+    }
+
+    /// Stop the held agents this run did not pick up again.
+    async fn let_go_of_held(&mut self) {
+        let Some(holder) = self.config.holder.clone() else { return };
+        for (agent, info) in std::mem::take(&mut self.held) {
+            eprintln!("taskmaster: the held agent {agent} was not needed again; it is stopped");
+            let _ = holder.kill(&info.key).await;
+        }
+    }
+
     /// The sandboxed shell an agent gets: its own scratch directory and the run's package
     /// caches, writable, and nothing else outside its worktree. `None` when the setting is
     /// off or the harness cannot be confined here, which is said once per harness.
@@ -6085,6 +6288,98 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
             }
             eprintln!("taskmaster: resuming session failed ({err:#}); falling back to fresh brief");
             ask(request).await
+        }
+    }
+}
+
+/// H3: go on with the agent a previous daemon handed off. Its events go on in the call it
+/// began, and its reply starts with what it said before the hand-off. If it cannot be picked
+/// up, its session is resumed (H2), or it starts afresh.
+async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Option<String>) -> anyhow::Result<Answer> {
+    let fallback = |request: AgentRequest, session_id: Option<String>| async move {
+        match session_id {
+            Some(session_id) => resume_or_ask(request, session_id, "the daemon restarted; continue".to_string()).await,
+            None => ask(request).await,
+        }
+    };
+    let Some(spec) = request.hold.clone() else { return fallback(request, session_id).await };
+    let attached = match tm_harness::child::attach(&spec, request.keep).await {
+        Ok(attached) => attached,
+        Err(err) => {
+            eprintln!("taskmaster: the held agent could not be picked up ({err}); resuming it instead");
+            return fallback(request, session_id).await;
+        }
+    };
+    let gate = gate_for(&request);
+    let task = WorkerTask {
+        brief: request.brief.clone(),
+        cwd: request.cwd.clone(),
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        dictionary: request.dictionary.clone(),
+        timeout: request.timeout,
+        stall: request.stall,
+        read_only: request.read_only,
+        code_mode: request.code_mode,
+        shell: request.shell.clone().filter(|_| !request.read_only),
+        permission_mode: request.permission_mode,
+        hold: request.hold.clone(),
+    };
+    let (tx, rx) = mpsc::channel(256);
+    let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
+    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let _beat = heartbeat(who_of(&request), heard);
+    let started = Instant::now();
+    let (run, kept) = request.harness.reattach(task, gate, tx, attached).await;
+    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let text = format!("{said}{text}");
+    if let Some(feed) = &request.feed {
+        let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64(), "reattached": true });
+        if let Some(sid) = captured_sid.as_ref().or(session_id.as_ref()) {
+            end["session_id"] = serde_json::json!(sid);
+        }
+        match &run {
+            Ok(summary) => {
+                end["ok"] = serde_json::json!(summary.ok);
+                end["denied"] = serde_json::json!(summary.denied);
+                end["cost_usd"] = serde_json::json!(summary.cost_usd);
+                if summary.usage.total() > 0 {
+                    end["usage"] = serde_json::json!(summary.usage);
+                }
+            }
+            Err(err) => {
+                end["ok"] = serde_json::json!(false);
+                end["error"] = serde_json::json!(format!("{err:#}"));
+            }
+        }
+        if !refused.is_empty() {
+            end["refused"] = serde_json::json!(refused);
+        }
+        // A call that could not go on is ended here; the resumed one opens its own block.
+        feed.live.push(&feed.run, &feed.agent, "end", end);
+    }
+    match run {
+        Ok(summary) => {
+            if let Some(hit) = reply::limit_of(&text) {
+                return Err(reported_limit(&request, hit).into());
+            }
+            Ok(Answer {
+                text,
+                ok: summary.ok,
+                usage: summary.usage,
+                cost_usd: summary.cost_usd,
+                seconds: started.elapsed().as_secs_f64(),
+                refused,
+                kept: if request.keep && summary.ok { kept } else { None },
+            })
+        }
+        Err(err) => {
+            if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                return Err(reported_limit(&request, hit).into());
+            }
+            eprintln!("taskmaster: the held agent stopped ({err:#}); resuming it instead");
+            fallback(request, session_id).await
         }
     }
 }

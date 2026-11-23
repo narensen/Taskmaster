@@ -198,6 +198,9 @@ pub struct ServerOptions {
     pub skills: PathBuf,
     /// Where skills are searched for and fetched from. Tests pass canned answers.
     pub skills_fetch: Arc<dyn crate::skills::Fetch>,
+    /// H3: the holder builders are started in, so they outlive a daemon update. `None` starts
+    /// them here; `tm-daemon serve` sets it.
+    pub holder: Option<tm_harness::hold::Holder>,
 }
 
 impl ServerOptions {
@@ -218,6 +221,7 @@ impl ServerOptions {
             setup_planner: None,
             skills: crate::skills::default_root(),
             skills_fetch: Arc::new(crate::skills::Web),
+            holder: None,
         }
     }
 }
@@ -233,11 +237,15 @@ pub struct Server {
 impl Drop for Server {
     fn drop(&mut self) {
         crate::log::note("shutting down");
-        for active in self.app.active.lock().unwrap().values() {
-            let _ = active.cancel_mode.send(crate::CancelMode::Force);
-            let _ = active.cancel.send(true);
+        // H3: handed-off runs are not cancelled and their questions not refused: the next
+        // daemon carries on with them.
+        if !self.app.holder.as_ref().is_some_and(|holder| holder.handing_off()) {
+            for active in self.app.active.lock().unwrap().values() {
+                let _ = active.cancel_mode.send(crate::CancelMode::Force);
+                let _ = active.cancel.send(true);
+            }
+            self.app.live.approvals.refuse_all();
         }
-        self.app.live.approvals.refuse_all();
         self.app.previews.stop_all();
         self.app.jobs.stop_all();
         if let Some(tx) = self.shutdown.take() {
@@ -302,6 +310,8 @@ struct App {
     idempotency: Mutex<HashMap<String, IdempotencyEntry>>,
     /// What agents said in each run, for search from Ctrl+K (A7).
     run_index: Arc<crate::run_index::RunIndex>,
+    /// H3: where builders are started so a daemon update can hand them on.
+    holder: Option<tm_harness::hold::Holder>,
 }
 
 type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
@@ -318,6 +328,23 @@ impl Server {
 
     /// Ask every provider for its models in the background, so the first page that offers
     /// a model, and the first run, find the lists ready.
+    /// H3: hand the builders of every active run to the next daemon. Their output stops being
+    /// read at a line boundary, what was read reaches the transcript, and the holder keeps them
+    /// for [`tm_harness::hold::KEEP_FOR`]. Returns how many it keeps. Drop the server after.
+    pub async fn hand_off(&self) -> usize {
+        let Some(holder) = &self.app.holder else { return 0 };
+        let kept = holder.hand_off(tm_harness::hold::KEEP_FOR, std::time::Duration::from_millis(400)).await.unwrap_or_else(|err| {
+            eprintln!("taskmaster: the holder did not take the agents ({err}); they stop with this daemon");
+            0
+        });
+        let runs: Vec<String> = self.app.active.lock().unwrap().keys().cloned().collect();
+        for run in &runs {
+            self.app.live.flush(run);
+        }
+        crate::log::note(&format!("handed {kept} agent(s) of {} run(s) to the next daemon", runs.len()));
+        kept
+    }
+
     pub fn warm_providers(&self) {
         let cache = self.app.providers.clone();
         tokio::spawn(async move {
@@ -373,8 +400,14 @@ impl Server {
             skills_root: options.skills,
             skills_fetch: options.skills_fetch,
             idempotency: Mutex::new(HashMap::new()),
+            holder: options.holder,
         });
         app.close_interrupted_reviews();
+        // H3: runs whose agents the last daemon handed to this one go on at once.
+        if app.holder.is_some() {
+            let app = app.clone();
+            tokio::spawn(async move { app.take_over_held().await });
+        }
         settle::spawn_sweeper(Arc::downgrade(&app));
         let (tx, rx) = oneshot::channel();
         let router = router(app.clone());
@@ -1031,6 +1064,7 @@ impl App {
         }
         config.permission_mode = request.permission_mode;
         config.master_answers = crate::settings::Settings::load(&self.project()).map(|s| s.approvals.master_answers).unwrap_or(false);
+        config.holder = self.holder.clone();
         config.dictionary = Some(self.dictionary().clone());
         config.commons = Some(self.commons().clone());
         config.store = self.store.clone();
@@ -2401,6 +2435,39 @@ struct NewReview {
 
 impl App {
     /// A review that was running when the daemon stopped will never finish.
+    /// H3: start again, at once, each run of this project whose agents the holder kept for a
+    /// next daemon. The run's own drive picks the agents up.
+    async fn take_over_held(self: &Arc<Self>) {
+        let Some(holder) = &self.holder else { return };
+        let project = self.project().display().to_string();
+        let mut runs: Vec<String> = holder
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|info| info.kept && info.meta["project"] == project.as_str())
+            .filter_map(|info| info.meta["run"].as_str().map(str::to_string))
+            .collect();
+        runs.sort();
+        runs.dedup();
+        for run in runs {
+            if self.is_active(&run) {
+                continue;
+            }
+            let request = match self.request_for(&run) {
+                Ok(request) => request,
+                Err(err) => {
+                    eprintln!("taskmaster: run {run} could not be picked up: {err:#}");
+                    continue;
+                }
+            };
+            match self.start(&run, request, Decision::Continue) {
+                Ok(()) => crate::log::note(&format!("run {run}: picked up from the last daemon")),
+                Err(err) => eprintln!("taskmaster: run {run} could not be picked up: {}", err.1),
+            }
+        }
+    }
+
     fn close_interrupted_reviews(&self) {
         for id in self.records().review_ids().unwrap_or_default() {
             let Ok(Some(mut job)) = self.records().review(&id) else { continue };

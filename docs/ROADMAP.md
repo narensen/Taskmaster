@@ -10,7 +10,7 @@ measure before and after. Work top to bottom. One item, one local commit. Follow
 
 ## Status (2026-11-23)
 
-Steps 1–13 of the order below are done, one local commit per item or step:
+All 14 steps of the order below are done, one local commit per item or step:
 
 | Step | Items | Commits |
 | --- | --- | --- |
@@ -27,6 +27,7 @@ Steps 1–13 of the order below are done, one local commit per item or step:
 | 11 | A3, A4 | `d3471f8` |
 | 12 | A10, A7, A8 | `47c380a`, `904d1f3`, `cd8d20f` |
 | 13 | A6, A5, O8, A9, H5, O5 | `1706e63`, `9053775`, `d1fb310`, `7a8edc9`, `d173f56`, `d98ba04` |
+| 14 | H3 | `0355866` and the commit after it |
 
 How a few of them landed, where it differs from the item text:
 
@@ -38,22 +39,15 @@ How a few of them landed, where it differs from the item text:
   Settling runs), so a preview the person is looking at is not stopped under them.
 - **A9**: the handoff is read once, by the first agent of the next turn: an Agent turn's
   brief, or the master's notes brief in Code mode.
-
-**Step 14 (H3) is not started.** Every adapter spawns its agent with `spawn_grouped` and
-drives its stdin and stdout itself, with the protocol state in memory (ACP request ids and
-pending permission answers, the Codex app server's session, Claude's stream). Keeping an agent
-alive across a daemon update needs:
-
-1. a holder process (`tm-daemon hold`, detached, on a Unix socket) that spawns agents and owns
-   their pipes, keeping each one's output and what was written to it;
-2. a child handle over that socket in place of `tokio::process::Child`, in `claude.rs`,
-   `codex.rs` and `acp.rs`;
-3. on start, a new daemon that finds a unit's held process, replays its output through the
-   adapter to rebuild that state (pushing nothing twice, asking nothing twice), and answers
-   whatever is still waiting.
-
-Until then, H2 covers a restart: an interrupted worker resumes its provider session with a
-short "the daemon restarted" turn.
+- **H3**: builders (Agent mode's one agent included) are started by a holder process,
+  `tm-daemon hold`, which owns their pipes and logs every line in and out. `SIGUSR1` (the
+  desktop updater, `systemctl --user reload`) hands them off: reading and writing stop at a line
+  boundary, the holder keeps the agents inside a turn for ten minutes, and the daemon exits 75.
+  The next daemon restarts those runs by itself; each run's drive binds the same Dictionary
+  port, grants the same tokens, reuses the worktree, and the adapter rebuilds its state from
+  the log (ACP: the open prompt, the questions never answered) and reads on in the same
+  transcript call. Masters, reviewers and verifiers still restart as before, and a stop or a
+  crash still ends every agent; H2 resumes a builder whose holder entry is gone.
 
 ## Where we stand
 

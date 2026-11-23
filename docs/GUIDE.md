@@ -274,6 +274,8 @@ tm-daemon serve . --tailscale
 
 The first command listens on `127.0.0.1:8737`. `--tailscale` listens on this machine's Tailscale address, which is how a phone reaches it. The terminal prints a pairing code. A device posts the code once and gets a token; every other call sends that token. Paired devices stay paired across restarts, and only a hash of each token is stored.
 
+**Updating while agents work.** Builders are started by a small holder process (`tm-daemon hold`, started by `serve` on its own), not by the daemon itself. Send `serve` `SIGUSR1` and it hands them to the next daemon: it stops reading at a line boundary, the holder keeps them working for up to ten minutes, and the daemon exits with status 75. The next `tm-daemon serve` for the same project picks each builder up where the last one stopped and carries the run on, with nothing in its transcript said twice and nothing already answered asked again. The desktop app does this when it installs an update. Under systemd, `systemctl --user reload taskmaster` does it, and the unit restarts on status 75. `Ctrl-C`, `SIGTERM`, and a crash still stop every agent the daemon started; a crashed run resumes each builder's provider session when it is resumed. The holder's socket is `$XDG_RUNTIME_DIR/taskmaster/hold.sock` (or `~/.local/state/taskmaster/hold.sock`); `TASKMASTER_HOLD=<path>` moves it, and `TASKMASTER_HOLD=off` starts every agent in the daemon as before.
+
 ```text
 POST /api/pair                  {code} -> {token}
 GET  /api/runs                  every run, with its phase, pages and spend

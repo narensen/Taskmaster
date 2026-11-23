@@ -85,9 +85,15 @@ struct Pending {
     answer: oneshot::Sender<(bool, String)>,
 }
 
+/// O8: who may answer a worker's low-risk question before the person does. Given the
+/// question, it returns a reason to allow it, or `None` to leave it to the person.
+pub type Advisor = Arc<dyn Fn(Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> + Send + Sync>;
+
 #[derive(Default)]
 pub struct Approvals {
     policy: RwLock<Policy>,
+    /// O8: the master of each run that lets it answer, when the person turned that on.
+    advisors: RwLock<BTreeMap<String, Advisor>>,
     /// Per-run permission mode override set from RunRequest (A3).
     run_modes: RwLock<BTreeMap<String, tm_harness::PermissionMode>>,
     pending: Mutex<BTreeMap<String, Pending>>,
@@ -102,6 +108,23 @@ impl Approvals {
 
     pub fn set_policy(&self, policy: Policy) {
         *self.policy.write().unwrap() = policy;
+    }
+
+    /// O8: let `advisor` answer this run's low-risk worker questions, or stop that.
+    pub fn set_advisor(&self, run: &str, advisor: Option<Advisor>) {
+        let mut advisors = self.advisors.write().unwrap();
+        match advisor {
+            Some(a) => {
+                advisors.insert(run.to_string(), a);
+            }
+            None => {
+                advisors.remove(run);
+            }
+        }
+    }
+
+    fn advisor(&self, run: &str) -> Option<Advisor> {
+        self.advisors.read().unwrap().get(run).cloned()
     }
 
     /// Set or clear a per-run permission mode override (A3).
@@ -320,7 +343,21 @@ impl PermissionGate for ApprovalGate {
         });
         let (tx, rx) = oneshot::channel();
         self.approvals.pending.lock().unwrap().insert(id.clone(), Pending { view: view.clone(), run: self.run.clone(), answer: tx });
-        self.live.push(&self.run, &self.agent, "approval_requested", view);
+        self.live.push(&self.run, &self.agent, "approval_requested", view.clone());
+        // O8: the master may answer a worker's low-risk question first; the person can
+        // still answer, and the first answer wins.
+        if self.agent["role"] == "worker"
+            && low_risk_candidate(request)
+            && let Some(advisor) = self.approvals.advisor(&self.run)
+        {
+            let approvals = self.approvals.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                if let Some(reason) = advisor(view).await {
+                    approvals.answer(&id, true, &format!("master: {reason}"));
+                }
+            });
+        }
         let (allowed, by) = match tokio::time::timeout(policy.timeout, rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => (false, "cancelled".to_string()),
@@ -332,6 +369,47 @@ impl PermissionGate for ApprovalGate {
         self.live.push(&self.run, &self.agent, "approval_resolved", json!({ "id": id, "tool": request.tool, "allowed": allowed, "by": by }));
         if allowed { Decision::Allow } else { Decision::Deny }
     }
+}
+
+/// O8: what the master may be asked about at all. A shell command with none of the marks
+/// of real harm, or a network fetch; never an edit outside the worktree or the page.
+pub fn low_risk_candidate(request: &PermissionRequest) -> bool {
+    const HARM: [&str; 24] = [
+        "sudo", "rm -rf", "rm -fr", "| sh", "|sh", "| bash", "|bash", "curl ", "wget ", "chmod", "chown", "git push", "ssh ",
+        "scp ", "> /", ">/", "mkfs", "dd ", ":(){", "shutdown", "reboot", "kill -9", " publish", "eval ",
+    ];
+    match request.kind {
+        ToolKind::Execute => request.command.as_deref().is_some_and(|cmd| {
+            let lower = cmd.to_ascii_lowercase();
+            !lower.trim().is_empty() && !HARM.iter().any(|mark| lower.contains(mark))
+        }),
+        ToolKind::Fetch => true,
+        _ => false,
+    }
+}
+
+/// O8: what the master is asked about a worker's question.
+pub fn advice_brief(question: &Value) -> String {
+    let what = question["command"].as_str().map(|c| format!("run `{c}`")).unwrap_or_else(|| {
+        let tool = question["tool"].as_str().unwrap_or("a tool");
+        format!("use {tool}")
+    });
+    let page = question["agent"]["page"].as_str().unwrap_or("its page");
+    let reason = question["reason"].as_str().unwrap_or("it needs a person's yes");
+    format!(
+        "You are the master of a coding run. The worker building `{page}` asks to {what}. It waits because {reason}.\n\n\
+         Approve only when it is plainly low risk and part of building the page: running the project's tests, a build, a \
+         linter or formatter, installing a package the plan or the project's manifest names, or reading public documentation. \
+         Anything that deletes, publishes, pushes, changes the machine, or reaches somewhere unexpected is for the person.\n\n\
+         Do not use any tools. Reply with one line: `APPROVE: <a short reason>` or `ASK`."
+    )
+}
+
+/// The reason in an `APPROVE: …` reply, or `None` for anything else.
+pub fn approval_from(reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).find(|l| !l.is_empty())?.trim_matches('`');
+    let rest = line.strip_prefix("APPROVE")?.trim_start_matches([':', ' ', '-']).trim();
+    Some(if rest.is_empty() { "low risk".to_string() } else { rest.chars().take(120).collect() })
 }
 
 fn kind_name(kind: ToolKind) -> &'static str {

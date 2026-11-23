@@ -86,3 +86,26 @@ test("in a browser there is no Updates section", async ({ open, page }) => {
   await expect(page.getByRole("heading", { name: "Mid-tier checker" })).toBeVisible();
   await expect(page.getByTestId("updates")).toHaveCount(0);
 });
+
+test("the master answering low-risk questions and the Labs suggestion are off by default and kept by the daemon", async ({ open, page, daemon }) => {
+  await open("/settings");
+  const read = async () =>
+    (await (await fetch(`${daemon.url}/api/settings`, { headers: { authorization: `Bearer ${daemon.token}` } })).json()) as {
+      approvals: { master_answers: boolean };
+      labs: { suggest_next: boolean };
+    };
+  const master = page.getByTestId("approvals-master").getByRole("switch");
+  const labs = page.getByTestId("labs-suggest").getByRole("switch");
+  await expect(master).toHaveAttribute("aria-checked", "false");
+  await expect(labs).toHaveAttribute("aria-checked", "false");
+  await master.click();
+  await labs.click();
+  await expect(master).toHaveAttribute("aria-checked", "true");
+  await expect(labs).toHaveAttribute("aria-checked", "true");
+  expect(await read()).toMatchObject({ approvals: { master_answers: true }, labs: { suggest_next: true } });
+  // Back to the defaults for the other tests.
+  await master.click();
+  await labs.click();
+  await expect.poll(async () => (await read()).approvals.master_answers).toBe(false);
+  await expect.poll(async () => (await read()).labs.suggest_next).toBe(false);
+});

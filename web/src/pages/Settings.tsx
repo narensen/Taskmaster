@@ -911,6 +911,25 @@ export function Settings() {
             </label>
           </div>
           {policyError && <div className="error-line small">{policyError}</div>}
+          <label className="row gap" data-testid="approvals-master">
+            <Switch
+              on={savedPolicy?.master_answers ?? false}
+              label="Let the master answer a worker's low-risk questions"
+              onChange={(on) =>
+                void api.setApprovals({ approvals_master_answers: on }).then(
+                  () => {
+                    void roleSettings.refetch();
+                    toast(on ? "The master may answer low-risk questions" : "Only you answer questions");
+                  },
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span className="muted small">
+              Tests, builds and named installs, with a reason. Anything that deletes, publishes or changes the machine still waits for you, and you can
+              answer first.
+            </span>
+          </label>
         </Section>
       )}
 

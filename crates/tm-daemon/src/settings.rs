@@ -178,11 +178,13 @@ pub struct ApprovalSettings {
     pub mode: String,
     /// How long a question waits for an answer before it is refused.
     pub timeout_secs: u64,
+    /// O8: the master may answer a worker's low-risk question first. Off by default.
+    pub master_answers: bool,
 }
 
 impl Default for ApprovalSettings {
     fn default() -> Self {
-        ApprovalSettings { mode: "never".into(), timeout_secs: 600 }
+        ApprovalSettings { mode: "never".into(), timeout_secs: 600, master_answers: false }
     }
 }
 

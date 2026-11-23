@@ -1021,6 +1021,7 @@ impl App {
         config.template = request.template;
         config.mode = request.mode;
         config.permission_mode = request.permission_mode;
+        config.master_answers = crate::settings::Settings::load(&self.project()).map(|s| s.approvals.master_answers).unwrap_or(false);
         config.dictionary = Some(self.dictionary().clone());
         config.commons = Some(self.commons().clone());
         config.store = self.store.clone();
@@ -1056,6 +1057,7 @@ impl App {
                 "Stopped: the run ended before this call did."
             };
             app.live.close_open_calls(&id, why);
+            app.live.approvals.set_advisor(&id, None);
             app.record_outcome(&id, result);
             // A4: If this run has an active goal and no human note is already queued, check
             // the goal while the run is still marked active so polling clients do not observe

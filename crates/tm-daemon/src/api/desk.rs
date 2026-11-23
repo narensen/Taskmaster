@@ -1723,6 +1723,8 @@ pub async fn generate_project_config(
 pub struct SettingsBody {
     approvals: Option<String>,
     approval_timeout_secs: Option<u64>,
+    /// O8: let the master answer a worker's low-risk question first.
+    approvals_master_answers: Option<bool>,
     /// An editor id, a program name or path, or empty to go back to `$VISUAL`, `$EDITOR` and what is installed.
     editor: Option<String>,
     /// Role choices for new runs: any of `{worker, mid, master, reviewer, verifier}`, each a
@@ -1774,6 +1776,9 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         }
         policy.timeout = Duration::from_secs(secs);
         changes.insert("timeout_secs".into(), json!(secs));
+    }
+    if let Some(on) = body.approvals_master_answers {
+        changes.insert("master_answers".into(), json!(on));
     }
     if let Some(editor) = &body.editor {
         let editor = editor.trim();
@@ -1967,7 +1972,11 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
             "cache_max_mb": role_defaults.web_access.cache_max_mb,
         },
         "editor": *app.editor.lock().unwrap(),
-        "approvals": { "mode": app.live.approvals.policy().mode.id(), "timeout_secs": app.live.approvals.policy().timeout.as_secs() },
+        "approvals": {
+            "mode": app.live.approvals.policy().mode.id(),
+            "timeout_secs": app.live.approvals.policy().timeout.as_secs(),
+            "master_answers": role_defaults.approvals.master_answers,
+        },
         "machine": machine(),
         "version": env!("CARGO_PKG_VERSION"),
     }))

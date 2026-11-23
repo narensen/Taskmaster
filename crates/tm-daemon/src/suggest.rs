@@ -60,6 +60,14 @@ pub fn clean(reply: &str) -> Option<String> {
 
 /// Ask `harness` for the suggestion. Returns it and the ledger row for the call.
 pub async fn ask(harness: Arc<dyn Harness>, model: Option<String>, scratch: &Path, prompt: String) -> (Option<String>, Option<LedgerEntry>) {
+    let (text, entry) = small_call(harness, model, scratch, prompt, "suggest").await;
+    (text.and_then(|t| clean(&t)), entry)
+}
+
+/// One read-only, low-effort call with no tools that matter: its whole reply, and the
+/// ledger row billing it to `agent`. Used for the suggestion (A5) and the master's answer
+/// to a worker's approval (O8).
+pub async fn small_call(harness: Arc<dyn Harness>, model: Option<String>, scratch: &Path, prompt: String, agent: &str) -> (Option<String>, Option<LedgerEntry>) {
     let task = WorkerTask {
         brief: prompt,
         cwd: scratch.to_path_buf(),
@@ -102,14 +110,14 @@ pub async fn ask(harness: Arc<dyn Harness>, model: Option<String>, scratch: &Pat
         seconds: started.elapsed().as_secs_f64(),
         ok: summary.ok,
         refused: Vec::new(),
-        agent: Some("suggest".into()),
+        agent: Some(agent.to_string()),
         unit: None,
         priced_by: summary.cost_usd.map(|_| "provider".to_string()),
         brief_hash: None,
         difficulty: None,
         language: None,
     };
-    (summary.ok.then(|| clean(&text)).flatten(), Some(entry))
+    (summary.ok.then_some(text), Some(entry))
 }
 
 /// The agents' last words in a transcript tail, newest last.

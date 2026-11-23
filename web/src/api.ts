@@ -712,7 +712,7 @@ export interface DaemonSettings {
   /** What this machine can run at once. Workers always run here. */
   machine?: { cpus: number; free_memory_gb: number | null; max_parallel: number };
   version: string;
-  approvals?: { mode: ApprovalMode; timeout_secs: number };
+  approvals?: { mode: ApprovalMode; timeout_secs: number; master_answers?: boolean };
   checker?: { enabled: boolean };
   code_mode?: { enabled: boolean };
   /** The workers' sandbox: a shell inside it, and fetches to the package indexes. */
@@ -1553,7 +1553,8 @@ export const api = {
   denyTool: (id: string) => call<{ id: string; allowed: boolean }>("POST", `/api/approvals/${enc(id)}/deny`, {}),
   /** Save role choices. Roles left out keep what was saved; an empty string forgets one. */
   setRoleDefaults: (body: { roles: Partial<Roles>; models?: Models }) => call<DaemonSettings>("POST", "/api/settings", body),
-  setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number }) => call("POST", "/api/settings", body),
+  setApprovals: (body: { approvals?: ApprovalMode; approval_timeout_secs?: number; approvals_master_answers?: boolean }) =>
+    call("POST", "/api/settings", body),
   setChecker: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { checker: enabled }),
   setCodeMode: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { code_mode: enabled }),
   setSandbox: (change: { shell?: boolean; package_indexes?: boolean }) => call<DaemonSettings>("POST", "/api/settings", { sandbox: change }),

@@ -543,6 +543,26 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         Arc::new(Live::new(store))
     });
     live.approvals.set_run_mode(&run_id, config.permission_mode);
+    // O8: when the person turned it on, the master may answer a worker's low-risk question.
+    if config.master_answers {
+        let (harness, model, records, run) = (harnesses.master.clone(), config.models.master.clone(), records.clone(), run_id.clone());
+        let advisor: crate::approvals::Advisor = Arc::new(move |question: serde_json::Value| {
+            let (harness, model, records, run) = (harness.clone(), model.clone(), records.clone(), run.clone());
+            Box::pin(async move {
+                let scratch = std::env::temp_dir().join(format!("tm-advise-{run}-{}", crate::secret::random_hex(3).unwrap_or_default()));
+                let _ = std::fs::create_dir_all(&scratch);
+                let (text, entry) = crate::suggest::small_call(harness, model, &scratch, crate::approvals::advice_brief(&question), "master").await;
+                let _ = std::fs::remove_dir_all(&scratch);
+                if let Some(entry) = entry {
+                    let _ = records.charge(&run, &entry);
+                }
+                text.and_then(|reply| crate::approvals::approval_from(&reply))
+            })
+        });
+        live.approvals.set_advisor(&run_id, Some(advisor));
+    } else {
+        live.approvals.set_advisor(&run_id, None);
+    }
     // Workers on a web page get a browser on that page's own preview.
     let browsers = config.browser.then(crate::runtime::chrome).flatten().map(|chrome| crate::browser::PageBrowsers::new(chrome, project.clone()));
     // Code Mode: run_code, beside the browser, on the same server.

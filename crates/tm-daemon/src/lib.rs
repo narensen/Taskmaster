@@ -425,6 +425,8 @@ pub struct Config {
     pub warm_idle: Duration,
     /// Optional per-run permission mode overriding Settings (A3).
     pub permission_mode: Option<tm_harness::PermissionMode>,
+    /// O8: the master may answer a worker's low-risk approval (Settings, off by default).
+    pub master_answers: bool,
 }
 
 /// How an active run should stop when cancelled.
@@ -504,6 +506,7 @@ impl Config {
             best_of_n_alt: None,
             warm_idle: Duration::from_secs(crate::settings::DEFAULT_WARM_IDLE_SECS),
             permission_mode: None,
+            master_answers: false,
         }
     }
 }

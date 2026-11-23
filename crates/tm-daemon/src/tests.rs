@@ -3287,6 +3287,67 @@ mod http {
     }
 
     #[tokio::test]
+    async fn the_master_may_answer_a_workers_low_risk_question_and_the_first_answer_wins() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tm_harness::{Decision, PermissionRequest, ToolKind, WorktreeGate};
+        let tmp = repo("approval-master");
+        let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::in_project(&tmp.0))));
+        live.approvals.set_policy(crate::approvals::Policy { mode: crate::approvals::Mode::Risky, timeout: Duration::from_millis(400) });
+        let asked = Arc::new(AtomicUsize::new(0));
+        let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (count, wait) = (asked.clone(), slow.clone());
+        let advisor: crate::approvals::Advisor = Arc::new(move |question: Value| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let wait = wait.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if wait {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                crate::approvals::approval_from(&format!("APPROVE: {} runs the tests", question["command"].as_str().unwrap_or("")))
+            })
+        });
+        live.approvals.set_advisor("r1", Some(advisor));
+        let worker = json!({ "id": "page:a", "role": "worker", "page": "a" });
+        let gate = |agent: Value| crate::approvals::ApprovalGate::new(WorktreeGate::new(&tmp.0, vec![]), live.clone(), "r1".into(), agent);
+        let shell = |cmd: &str| PermissionRequest { tool: "Bash".into(), kind: ToolKind::Execute, paths: vec![], command: Some(cmd.into()), url: None };
+
+        // A low-risk command: the master answers, with its reason, before the person.
+        assert_eq!(gate(worker.clone()).decide_async(&shell("npm test")).await, Decision::Allow);
+        let (_, entries) = live.read("r1", 0);
+        assert_eq!(entries.last().unwrap()["by"], "master: npm test runs the tests");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // Real harm never reaches the master; the person's silence refuses it.
+        assert_eq!(gate(worker.clone()).decide_async(&shell("sudo rm -rf /")).await, Decision::Deny);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(live.read("r1", 0).1.last().unwrap()["by"], "timeout");
+        // Only a worker's question goes to the master.
+        assert_eq!(gate(json!({ "id": "reviewer", "role": "reviewer" })).decide_async(&shell("npm test")).await, Decision::Deny);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // The person answers before the master does: the person's answer stands.
+        slow.store(true, Ordering::SeqCst);
+        let approvals = live.approvals.clone();
+        let person = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Some(id) = approvals.list(Some("r1")).first().and_then(|q| q["id"].as_str().map(str::to_string)) {
+                    approvals.answer(&id, false, "you");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        assert_eq!(gate(worker.clone()).decide_async(&shell("npm run build")).await, Decision::Deny);
+        person.await.unwrap();
+        assert_eq!(live.read("r1", 0).1.last().unwrap()["by"], "you");
+
+        // Only APPROVE is an answer; anything else leaves the question to the person.
+        assert_eq!(crate::approvals::approval_from("ASK"), None);
+        assert_eq!(crate::approvals::approval_from("`APPROVE`").as_deref(), Some("low risk"));
+        assert!(crate::approvals::advice_brief(&json!({ "command": "npm test", "agent": { "page": "a" }, "reason": "runs a shell command" })).contains("APPROVE: <a short reason>"));
+    }
+
+    #[tokio::test]
     async fn a_new_run_keeps_its_permission_mode_and_refuses_an_unknown_one() {
         let tmp = repo("run-permission-mode");
         let world = World::new(Mode::Write);

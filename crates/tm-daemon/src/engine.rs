@@ -153,6 +153,8 @@ struct AgentRequest {
     keep: bool,
     /// Optional per-run permission mode (A3).
     permission_mode: Option<tm_harness::PermissionMode>,
+    /// Start the agent in the holder so it outlives a daemon update (H3).
+    hold: Option<tm_harness::hold::HoldSpec>,
 }
 
 /// When a planner has looked and thought long enough. It is stopped after `tools` tool
@@ -2613,6 +2615,7 @@ impl Driver {
             native_search: false,
             keep: false,
             permission_mode: self.config.permission_mode,
+            hold: None,
         };
         self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
         let bill = request.bill(Role::Checker, Some(page));
@@ -3841,6 +3844,7 @@ impl Driver {
             native_search: false,
             keep: false,
             permission_mode: self.config.permission_mode,
+            hold: None,
         };
         self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
@@ -3951,6 +3955,7 @@ impl Driver {
             native_search: false,
             keep: false,
             permission_mode: self.config.permission_mode,
+            hold: None,
         };
         self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
@@ -4184,6 +4189,7 @@ impl Driver {
             native_search: false,
             keep: true,
             permission_mode: self.config.permission_mode,
+            hold: None,
         })
     }
 
@@ -4739,6 +4745,7 @@ impl Driver {
             native_search: false,
             keep: false,
             permission_mode: self.config.permission_mode,
+            hold: None,
         })
     }
 
@@ -6011,6 +6018,7 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
         code_mode: request.code_mode,
         shell: request.shell.clone().filter(|_| !request.read_only),
         permission_mode: request.permission_mode,
+        hold: request.hold.clone(),
     };
     if let Some(feed) = &request.feed {
         feed.live.push(
@@ -6127,6 +6135,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         code_mode: request.code_mode,
         shell: request.shell.clone().filter(|_| !request.read_only),
         permission_mode: request.permission_mode,
+        hold: request.hold.clone(),
     };
     let feed = &request.feed;
     if let Some(feed) = &feed {

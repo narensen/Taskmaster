@@ -80,6 +80,7 @@ pub async fn small_call(harness: Arc<dyn Harness>, model: Option<String>, scratc
         code_mode: false,
         shell: None,
         permission_mode: None,
+        hold: None,
     };
     let gate = Arc::new(WorktreeGate::new(scratch, vec![]).read_only());
     let (tx, mut rx) = mpsc::channel::<HarnessEvent>(256);

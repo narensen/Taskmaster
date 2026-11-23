@@ -9,13 +9,11 @@
 //! 0.169. The item and usage events are written from its documented format and have not
 //! been run here.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -98,61 +96,19 @@ impl Codex {
         if let Some(dict) = &task.dictionary {
             cmd.env(TOKEN_ENV, &dict.bearer_token);
         }
-        let (mut child, group) = crate::spawn_grouped(
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
-        )
-        .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let stdout = child.stdout.take().context("codex stdout was not captured")?;
-
-        let read = async {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut thread_id: Option<String> = resume.map(str::to_string);
-            let mut emitted_session = false;
-            if let Some(id) = thread_id.as_deref() {
-                let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
-                emitted_session = true;
-            }
-            while let Some(line) = lines.next_line().await? {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                if msg["type"].as_str() == Some("thread.started")
-                    && let Some(id) = msg["thread_id"].as_str().filter(|s| !s.is_empty())
-                {
-                    let changed = thread_id.as_deref() != Some(id);
-                    thread_id = Some(id.to_string());
-                    if !emitted_session || changed {
-                        let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
-                        emitted_session = true;
-                    }
-                }
-                if (msg.get("rate_limits").is_some()
-                    || msg.get("info").and_then(|i| i.get("rate_limits")).is_some()
-                    || msg["type"].as_str() == Some("rate_limit"))
-                    && let Some(report) = crate::parse_rate_limit_value(&msg, "codex-cli")
-                {
-                    let _ = events.send(HarnessEvent::RateLimit(report)).await;
-                }
-                match msg["type"].as_str() {
-                    Some("item.completed") => {
-                        for event in item_events(&msg["item"]) {
-                            let _ = events.send(event).await;
-                        }
-                    }
-                    Some("turn.completed") => {
-                        let usage = read_usage(&msg["usage"]);
-                        return Ok((RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None }, thread_id));
-                    }
-                    Some("turn.failed") => bail!("codex: {}", error_message(&msg["error"])),
-                    Some("error") => bail!("codex: {}", error_message(&msg)),
-                    _ => {}
-                }
-            }
-            bail!("codex exited without completing its turn")
-        };
-        let result = match tokio::time::timeout(timeout, read).await {
+        let (proc, mut io) = crate::child::start(&mut cmd, false, task.hold.as_ref())
+            .await
+            .with_context(|| format!("failed to start `{}`", self.binary))?;
+        let mut stream = Stream { thread_id: resume.map(str::to_string), emitted: false };
+        if let Some(id) = resume {
+            let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
+            stream.emitted = true;
+        }
+        let result = match tokio::time::timeout(timeout, stream.read(&mut io, &events)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", timeout)),
         };
-        let freed = group.release(&mut child).await;
+        let freed = proc.release().await;
         match result {
             Ok((mut summary, thread_id)) => {
                 summary.freed = Some(freed);
@@ -160,6 +116,66 @@ impl Codex {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+/// What a turn's stream has said so far: its thread, and whether that was announced.
+#[derive(Default)]
+struct Stream {
+    thread_id: Option<String>,
+    emitted: bool,
+}
+
+impl Stream {
+    /// Read the stream to the end of its turn.
+    async fn read(&mut self, io: &mut crate::child::AgentIo, events: &mpsc::Sender<HarnessEvent>) -> anyhow::Result<(RunSummary, Option<String>)> {
+        while let Some(line) = io.next_line().await? {
+            if let Some(end) = self.line(&line, Some(events)).await {
+                return end.map(|summary| (summary, self.thread_id.clone()));
+            }
+        }
+        bail!("codex exited without completing its turn")
+    }
+
+    /// Take in one line, sending its events when there is somewhere to send them (a replay of
+    /// lines an earlier daemon already sent has not). Returns the turn's end at its last line.
+    async fn line(&mut self, line: &str, events: Option<&mpsc::Sender<HarnessEvent>>) -> Option<anyhow::Result<RunSummary>> {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else { return None };
+        let mut out = Vec::new();
+        if msg["type"].as_str() == Some("thread.started")
+            && let Some(id) = msg["thread_id"].as_str().filter(|s| !s.is_empty())
+        {
+            let changed = self.thread_id.as_deref() != Some(id);
+            self.thread_id = Some(id.to_string());
+            if !self.emitted || changed {
+                out.push(HarnessEvent::SessionStarted { session_id: id.to_string() });
+                self.emitted = true;
+            }
+        }
+        if (msg.get("rate_limits").is_some() || msg.get("info").and_then(|i| i.get("rate_limits")).is_some() || msg["type"].as_str() == Some("rate_limit"))
+            && let Some(report) = crate::parse_rate_limit_value(&msg, "codex-cli")
+        {
+            out.push(HarnessEvent::RateLimit(report));
+        }
+        let end = match msg["type"].as_str() {
+            Some("item.completed") => {
+                out.extend(item_events(&msg["item"]));
+                None
+            }
+            Some("turn.completed") => {
+                let usage = read_usage(&msg["usage"]);
+                Some(Ok(RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None }))
+            }
+            Some("turn.failed") => Some(Err(anyhow::anyhow!("codex: {}", error_message(&msg["error"])))),
+            Some("error") => Some(Err(anyhow::anyhow!("codex: {}", error_message(&msg)))),
+            _ => None,
+        };
+        if let Some(events) = events {
+            for event in out {
+                let _ = events.send(event).await;
+            }
+        }
+        end
     }
 }
 
@@ -312,6 +328,51 @@ impl Harness for Codex {
         }
     }
 
+    async fn reattach(
+        &self,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+        attached: crate::child::Attached,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        // One-way like Claude Code: the read part gives the thread, and the end when the turn
+        // finished before this daemon took over.
+        let mut stream = Stream::default();
+        let mut ended = None;
+        for line in attached.outputs() {
+            if let Some(end) = stream.line(line, None).await {
+                ended = Some(end);
+            }
+        }
+        let crate::child::Attached { mut io, proc, keep, .. } = attached;
+        let result = match ended {
+            Some(end) => end.map(|summary| (summary, stream.thread_id.clone())),
+            None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events)).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", task.timeout)),
+            },
+        };
+        drop(io);
+        let freed = proc.release().await;
+        match result {
+            Ok((mut summary, thread_id)) => {
+                summary.freed = Some(freed);
+                let kept: Option<Box<dyn crate::Session>> = match thread_id {
+                    Some(thread_id) if keep && summary.ok => Some(Box::new(CodexSession { harness: self.clone(), task, thread_id, cleaned: false })),
+                    Some(thread_id) if keep => {
+                        if let Some(root) = codex_home() {
+                            cleanup_codex_session(&root, &thread_id);
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+                (Ok(summary), kept)
+            }
+            Err(err) => (Err(err), None),
+        }
+    }
+
     async fn run(
         &self,
         task: WorkerTask,
@@ -412,6 +473,68 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_turn_handed_to_a_new_daemon_ends_with_its_usage_and_nothing_twice() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tm-codex-reattach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let go = dir.join("go");
+        let message = |text: &str| format!(r#"echo '{{"type":"item.completed","item":{{"id":"i","type":"agent_message","text":"{text}"}}}}'"#);
+        let script = format!(
+            "#!/bin/sh\necho '{{\"type\":\"thread.started\",\"thread_id\":\"th-h3-0001\"}}'\n{}\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n{}\necho '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":6}}}}'\n",
+            message("before"),
+            go.display(),
+            message("after")
+        );
+        let bin = dir.join("codex");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let harness = Codex { binary: bin.display().to_string() };
+        let holder = crate::hold::in_process(&dir.join("hold")).unwrap();
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: dir.clone(),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(20),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: Some(crate::hold::HoldSpec { holder: holder.clone(), key: "p/r/page:c".into(), meta: json!({}) }),
+        };
+        let gate: Arc<dyn PermissionGate> = Arc::new(crate::gate::WorktreeGate::new(&dir, vec![]));
+        let (tx, mut rx) = mpsc::channel(32);
+        let running = tokio::spawn({
+            let (harness, gate, task) = (harness.clone(), gate.clone(), task.clone());
+            async move { harness.run(task, gate, tx).await }
+        });
+        assert_eq!(rx.recv().await, Some(HarnessEvent::SessionStarted { session_id: "th-h3-0001".into() }));
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "before".into() }));
+        assert_eq!(holder.hand_off(std::time::Duration::from_secs(60), std::time::Duration::from_millis(50)).await.unwrap(), 1);
+        running.abort();
+        let _ = running.await;
+
+        let spec = crate::hold::HoldSpec { holder: crate::hold::Holder::new(holder.socket(), None), key: "p/r/page:c".into(), meta: json!({}) };
+        let attached = crate::child::attach(&spec, false).await.unwrap();
+        std::fs::write(&go, "").unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (summary, kept) = harness.reattach(task, gate, tx, attached).await;
+        let summary = summary.unwrap();
+        assert!(summary.ok && kept.is_none());
+        assert_eq!(summary.usage.total(), 11);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(events, vec![HarnessEvent::Text { text: "after".into() }]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn maps_items_to_events() {
         let message = json!({ "id": "item_1", "type": "agent_message", "text": "done" });
@@ -464,6 +587,7 @@ mod tests {
             code_mode: true,
             shell: None,
             permission_mode: None,
+            hold: None,
         };
         let stateless = harness.args_with(&task, "initial", false, None);
         assert!(stateless.contains(&"--ephemeral".to_string()));
@@ -499,6 +623,7 @@ mod tests {
             code_mode: true,
             shell: None,
             permission_mode: None,
+            hold: None,
         };
         let args = harness.args_with(&task, "build", false, None);
         assert!(args.windows(2).any(|w| w == ["--disable", "shell_tool"]), "{args:?}");

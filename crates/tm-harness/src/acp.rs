@@ -7,15 +7,13 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::gate::{Decision, PermissionGate, PermissionRequest, ToolKind};
@@ -144,6 +142,44 @@ impl Harness for AcpHarness {
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         self.start(task, gate, events, true, Some((session_id.to_string(), prompt))).await
     }
+
+    async fn reattach(
+        &self,
+        task: WorkerTask,
+        gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+        attached: crate::child::Attached,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        let rebuilt = Rebuilt::from(&attached.history);
+        let crate::child::Attached { io, proc, keep, .. } = attached;
+        let mut session = self.session(&task, io, gate, events);
+        session.next_id = rebuilt.next_id;
+        session.id = rebuilt.session.clone();
+        session.cost = rebuilt.cost;
+        session.tools = rebuilt.tools.clone();
+        session.denied = rebuilt.denied;
+        let turn = async {
+            let Some(prompt) = rebuilt.prompt else {
+                // The turn ended before this daemon took over: its reply is in the log.
+                return match &rebuilt.answered {
+                    Some(result) => Ok(session.summary(result, rebuilt.cost_before)),
+                    None => Err(anyhow!("the held agent is not inside a turn")),
+                };
+            };
+            // What the agent asked that the last daemon never answered is asked again now.
+            for msg in rebuilt.asked.clone() {
+                session.incoming(msg).await?;
+            }
+            let result = session.wait(prompt, "session/prompt").await?;
+            Ok(session.summary(&result, rebuilt.cost_before))
+        };
+        let timeout = task.timeout;
+        let result = match tokio::time::timeout(timeout, turn).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
+        };
+        self.finish(session, proc, result, keep).await
+    }
 }
 
 impl AcpHarness {
@@ -161,18 +197,25 @@ impl AcpHarness {
             Ok(command) => command,
             Err(err) => return (Err(err), None),
         };
-        let spawned = crate::spawn_grouped(command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()))
+        let spawned = crate::child::start(&mut command, true, task.hold.as_ref())
+            .await
             .with_context(|| format!("failed to start `{}` (is bubblewrap installed?)", self.binary));
-        let (mut child, group) = match spawned {
+        let (proc, io) = match spawned {
             Ok(spawned) => spawned,
             Err(err) => return (Err(err), None),
         };
-        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            return (Err(anyhow!("the agent's input and output were not captured")), None);
+        let mut session = self.session(&task, io, gate, events);
+        let timeout = task.timeout;
+        let result = match tokio::time::timeout(timeout, session.drive(task, resume)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
         };
-        let mut session = Session {
-            stdin,
-            lines: BufReader::new(stdout).lines(),
+        self.finish(session, proc, result, keep).await
+    }
+
+    fn session(&self, task: &WorkerTask, io: crate::child::AgentIo, gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> Session {
+        Session {
+            io,
             next_id: 0,
             dictionary_prefix: task.dictionary.as_ref().map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
             code_mode: task.code_mode && !task.read_only && task.dictionary.is_some(),
@@ -183,22 +226,30 @@ impl AcpHarness {
             tools: BTreeSet::new(),
             id: None,
             cost: None,
-        };
-        let timeout = task.timeout;
-        let result = match tokio::time::timeout(timeout, session.drive(task, resume)).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("{} timed out after {timeout:?}", self.id)),
-        };
+        }
+    }
+
+    /// With `keep`, a turn that finished leaves the agent running with its session open;
+    /// otherwise the agent and everything it started is freed.
+    async fn finish(
+        &self,
+        mut session: Session,
+        proc: crate::child::AgentProc,
+        result: anyhow::Result<RunSummary>,
+        keep: bool,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         if keep && result.as_ref().is_ok_and(|summary| summary.ok) && session.id.is_some() {
             // The caller reads this turn's events until their channel closes: the kept session
             // must not hold its sender, or the turn never ends for the caller.
             session.events = closed_sender();
-            let kept = Kept { session, child, group: Some(group), harness: self.id };
+            // Between turns it is not handed off to a next daemon.
+            session.io.set_in_turn(false);
+            let kept = Kept { session, proc: Some(proc), harness: self.id };
             return (result, Some(Box::new(kept)));
         }
         // The turn is over, finished or not: free the agent and everything it started.
         drop(session);
-        (crate::released(result, group.release(&mut child).await), None)
+        (crate::released(result, proc.release().await), None)
     }
 }
 
@@ -210,8 +261,7 @@ fn closed_sender() -> mpsc::Sender<HarnessEvent> {
 /// An ACP agent left running after its turn, with its session open.
 struct Kept {
     session: Session,
-    child: tokio::process::Child,
-    group: Option<crate::GroupGuard>,
+    proc: Option<crate::child::AgentProc>,
     harness: &'static str,
 }
 
@@ -220,6 +270,7 @@ impl crate::Session for Kept {
     async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary> {
         self.session.events = events;
         self.session.denied = 0;
+        self.session.io.set_in_turn(true);
         let turn = self.session.prompt(text);
         let result = match tokio::time::timeout(timeout, turn).await {
             Ok(result) => result,
@@ -227,6 +278,7 @@ impl crate::Session for Kept {
         };
         // Let go of this turn's channel, so the caller's reader finishes.
         self.session.events = closed_sender();
+        self.session.io.set_in_turn(false);
         result
     }
 
@@ -235,8 +287,8 @@ impl crate::Session for Kept {
     }
 
     async fn close(mut self: Box<Self>) -> crate::Freed {
-        match self.group.take() {
-            Some(group) => group.release(&mut self.child).await,
+        match self.proc.take() {
+            Some(proc) => proc.release().await,
             None => crate::Freed::default(),
         }
     }
@@ -252,8 +304,7 @@ fn model_option(session: &Value) -> Option<&str> {
 }
 
 struct Session {
-    stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+    io: crate::child::AgentIo,
     next_id: u64,
     dictionary_prefix: Option<String>,
     /// When Code Mode (`run_code`) is active on a builder, steer native shell/edit prompts to `run_code`.
@@ -338,15 +389,20 @@ impl Session {
         });
         let before = self.cost;
         let result = self.call("session/prompt", prompt).await?;
+        Ok(self.summary(&result, before))
+    }
+
+    /// A turn's summary from its prompt reply, with `before` the running cost when it began.
+    fn summary(&self, result: &Value, before: Option<f64>) -> RunSummary {
         // The reply's own price if it has one, else what the running cost grew by this turn.
-        let cost = read_cost(&result).or_else(|| self.cost.map(|now| (now - before.unwrap_or(0.0)).max(0.0)));
-        Ok(RunSummary {
+        let cost = read_cost(result).or_else(|| self.cost.map(|now| (now - before.unwrap_or(0.0)).max(0.0)));
+        RunSummary {
             ok: result["stopReason"] == "end_turn",
-            usage: read_usage(&result),
+            usage: read_usage(result),
             cost_usd: cost,
             denied: self.denied,
             freed: None,
-        })
+        }
     }
 
     /// Send a request and wait for its response, serving whatever the agent sends meanwhile.
@@ -355,8 +411,13 @@ impl Session {
         let id = self.next_id;
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
+        self.wait(id, method).await
+    }
+
+    /// Wait for the response to request `id`, serving whatever the agent sends meanwhile.
+    async fn wait(&mut self, id: u64, method: &str) -> anyhow::Result<Value> {
         loop {
-            let next = self.lines.next_line();
+            let next = self.io.next_line();
             let line = match self.stall.filter(|_| self.tools.is_empty()) {
                 Some(limit) => match tokio::time::timeout(limit, next).await {
                     Ok(line) => line,
@@ -443,13 +504,103 @@ impl Session {
     }
 
     async fn send(&mut self, msg: Value) -> anyhow::Result<()> {
-        let mut line = msg.to_string();
+        let line = msg.to_string();
         trace(">", &line);
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        self.io.write_line(&line).await?;
         Ok(())
     }
+}
+
+/// What an ACP agent's log says about its session, for a daemon that takes it over (H3).
+#[derive(Debug, Default)]
+struct Rebuilt {
+    /// The highest request id this side sent; the next request takes the one after.
+    next_id: u64,
+    session: Option<String>,
+    cost: Option<f64>,
+    /// The running cost when the last turn began.
+    cost_before: Option<f64>,
+    tools: BTreeSet<String>,
+    /// The turn's `session/prompt`, still waiting for its reply.
+    prompt: Option<u64>,
+    /// The last turn's reply, when it came before the hand-off.
+    answered: Option<Value>,
+    /// Requests from the agent that were never answered, in order.
+    asked: Vec<Value>,
+    /// Permission requests refused this turn.
+    denied: u32,
+}
+
+impl Rebuilt {
+    fn from(history: &[crate::hold::Logged]) -> Rebuilt {
+        use crate::hold::Logged;
+        let mut out = Rebuilt::default();
+        let mut sent: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        for entry in history {
+            let (line, ours) = match entry {
+                Logged::In(line) => (line, true),
+                Logged::Out(line) => (line, false),
+            };
+            let Ok(msg) = serde_json::from_str::<Value>(line) else { continue };
+            let method = msg["method"].as_str();
+            match (ours, method) {
+                (true, Some(method)) => {
+                    let Some(id) = msg["id"].as_u64() else { continue };
+                    out.next_id = out.next_id.max(id);
+                    sent.insert(id, method.to_string());
+                    match method {
+                        "session/load" => out.session = msg["params"]["sessionId"].as_str().map(str::to_string),
+                        "session/prompt" => {
+                            out.prompt = Some(id);
+                            out.answered = None;
+                            out.cost_before = out.cost;
+                            out.denied = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                (true, None) => {
+                    // An answer to one of the agent's requests.
+                    let Some(at) = out.asked.iter().position(|asked| asked["id"] == msg["id"]) else { continue };
+                    let asked = out.asked.remove(at);
+                    if asked["method"] == "session/request_permission" && !allowed_by(&asked, &msg) {
+                        out.denied += 1;
+                    }
+                }
+                (false, Some("session/update")) => {
+                    let update = &msg["params"]["update"];
+                    track_tool(&mut out.tools, update);
+                    if let Some(cost) = running_cost(update) {
+                        out.cost = Some(cost);
+                    }
+                }
+                (false, Some(_)) if msg.get("id").is_some() => out.asked.push(msg),
+                (false, Some(_)) => {}
+                (false, None) => {
+                    let Some(id) = msg["id"].as_u64() else { continue };
+                    match sent.get(&id).map(String::as_str) {
+                        Some("session/new") => out.session = msg["result"]["sessionId"].as_str().map(str::to_string),
+                        Some("session/prompt") if out.prompt == Some(id) => {
+                            out.prompt = None;
+                            out.answered = Some(msg["result"].clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Whether an answer to a permission request allowed the call.
+fn allowed_by(asked: &Value, reply: &Value) -> bool {
+    let outcome = &reply["result"]["outcome"];
+    let Some(chosen) = outcome["optionId"].as_str().filter(|_| outcome["outcome"] == "selected") else { return false };
+    asked["params"]["options"]
+        .as_array()
+        .and_then(|options| options.iter().find(|o| o["optionId"] == chosen))
+        .is_some_and(|option| option["kind"].as_str().is_some_and(|kind| kind.starts_with("allow")))
 }
 
 /// With `TASKMASTER_ACP_TRACE=<file>`, every line to (`>`) and from (`<`) an ACP agent is
@@ -713,6 +864,12 @@ fn choose_option(options: &Value, allowed: bool) -> Option<String> {
 mod tests {
     use super::*;
 
+    impl AcpHarness {
+        fn fake() -> AcpHarness {
+            AcpHarness { id: "fake", binary: "sh".into(), args: Vec::new(), sandbox: None, mcp_tool_prefix: "{server}__", effort_flag: None }
+        }
+    }
+
     #[test]
     fn grok_takes_effort_on_the_agent_subcommand() {
         let harness = AcpHarness {
@@ -735,6 +892,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            hold: None,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
         task.effort = Some("low".into());
@@ -838,6 +996,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            hold: None,
         };
         let (tx, _rx) = mpsc::channel(8);
         let started = std::time::Instant::now();
@@ -869,6 +1028,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![]));
         let (tx, mut rx) = mpsc::channel(32);
@@ -889,6 +1049,122 @@ mod tests {
         assert_eq!(closed, Ok(None), "a follow-up's channel closes when the turn ends");
         let freed = kept.close().await;
         assert!(freed.processes >= 1 && freed.lingering == 0, "{freed:?}");
+    }
+
+    /// A gate that never answers, like a person who has not looked yet.
+    struct Waiting;
+
+    #[async_trait]
+    impl PermissionGate for Waiting {
+        fn decide(&self, _request: &PermissionRequest) -> Decision {
+            Decision::Deny
+        }
+        async fn decide_async(&self, _request: &PermissionRequest) -> Decision {
+            std::future::pending().await
+        }
+    }
+
+    struct Allow;
+
+    #[async_trait]
+    impl PermissionGate for Allow {
+        fn decide(&self, _request: &PermissionRequest) -> Decision {
+            Decision::Allow
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_question_left_open_at_a_hand_off_is_answered_by_the_next_daemon_and_the_turn_ends_once() {
+        let say = |text: &str| format!(r#"echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}}}}}}'"#);
+        // The agent asks before a command, then says whether it was let through. A request sent
+        // twice would be read as the answer and come out as "refused".
+        let script = format!(
+            r#"read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s-h3"}}}}'
+read l
+{before}
+echo '{{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{{"toolCall":{{"name":"run_command","kind":"execute","rawInput":{{"command":"ls"}}}},"options":[{{"optionId":"yes","kind":"allow_once"}},{{"optionId":"no","kind":"reject_once"}}]}}}}'
+read r
+case "$r" in *'"optionId":"yes"'*) {allowed};; *) {refused};; esac
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+sleep 30"#,
+            before = say("before"),
+            allowed = say("allowed"),
+            refused = say("refused"),
+        );
+        let dir = std::env::temp_dir().join(format!("tm-acp-reattach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let holder = crate::hold::in_process(&dir).unwrap();
+        let harness = AcpHarness { id: "fake", binary: "sh".into(), args: vec!["-c".into(), script], sandbox: None, mcp_tool_prefix: "{server}__", effort_flag: None };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(20),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: Some(crate::hold::HoldSpec { holder: holder.clone(), key: "p/r/unit:a".into(), meta: json!({}) }),
+        };
+        let (tx, mut rx) = mpsc::channel(32);
+        let running = tokio::spawn({
+            let (harness, task) = (AcpHarness { args: harness.args.clone(), binary: harness.binary.clone(), ..AcpHarness::fake() }, task.clone());
+            async move { harness.run(task, Arc::new(Waiting), tx).await }
+        });
+        assert_eq!(rx.recv().await, Some(HarnessEvent::SessionStarted { session_id: "s-h3".into() }));
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "before".into() }));
+        // The question is out and nobody has answered when the daemon hands off.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(holder.hand_off(std::time::Duration::from_secs(60), std::time::Duration::from_millis(50)).await.unwrap(), 1);
+        running.abort();
+        let _ = running.await;
+
+        let next = crate::hold::Holder::new(holder.socket(), None);
+        let spec = crate::hold::HoldSpec { holder: next, key: "p/r/unit:a".into(), meta: json!({}) };
+        let attached = crate::child::attach(&spec, false).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (summary, kept) = harness.reattach(WorkerTask { hold: Some(spec), ..task }, Arc::new(Allow), tx, attached).await;
+        assert!(summary.unwrap().ok && kept.is_none());
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![
+                HarnessEvent::PermissionDecided { tool: "run_command".into(), allowed: true },
+                HarnessEvent::Text { text: "allowed".into() },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_log_gives_the_session_the_open_prompt_and_the_questions_never_answered() {
+        use crate::hold::Logged::{In, Out};
+        let history = vec![
+            In(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into()),
+            Out(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.into()),
+            In(r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#.into()),
+            Out(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s9"}}"#.into()),
+            In(r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{}}"#.into()),
+            Out(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","cost":{"amount":0.5,"currency":"USD"}}}}"#.into()),
+            Out(r#"{"jsonrpc":"2.0","id":"q1","method":"session/request_permission","params":{"options":[{"optionId":"n","kind":"reject_once"}]}}"#.into()),
+            In(r#"{"jsonrpc":"2.0","id":"q1","result":{"outcome":{"outcome":"selected","optionId":"n"}}}"#.into()),
+            Out(r#"{"jsonrpc":"2.0","id":"q2","method":"session/request_permission","params":{}}"#.into()),
+            Out(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t1","status":"pending"}}}"#.into()),
+        ];
+        let rebuilt = Rebuilt::from(&history);
+        assert_eq!((rebuilt.next_id, rebuilt.session.as_deref(), rebuilt.prompt), (3, Some("s9"), Some(3)));
+        assert_eq!((rebuilt.cost, rebuilt.cost_before, rebuilt.denied), (Some(0.5), None, 1));
+        assert_eq!(rebuilt.asked.len(), 1);
+        assert_eq!(rebuilt.asked[0]["id"], "q2");
+        assert!(rebuilt.tools.contains("t1"));
     }
 
     #[test]
@@ -1000,6 +1276,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             code_mode: true,
             shell: None,
             permission_mode: None,
+            hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
         let (tx, mut rx) = mpsc::channel(16);

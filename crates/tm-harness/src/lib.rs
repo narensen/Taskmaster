@@ -6,9 +6,11 @@
 //! is confined by an OS sandbox, because it does not ask before reading or writing files.
 
 pub mod acp;
+pub mod child;
 pub mod claude;
 pub mod codex;
 pub mod gate;
+pub mod hold;
 pub mod providers;
 pub mod pty;
 pub mod sandbox;
@@ -247,6 +249,8 @@ pub struct WorkerTask {
     pub shell: Option<ShellScope>,
     /// Optional per-run permission mode mapped onto provider flags and the daemon gate (A3).
     pub permission_mode: Option<PermissionMode>,
+    /// Start the agent in the holder, so it can outlive a daemon update (H3). `None` starts it here.
+    pub hold: Option<hold::HoldSpec>,
 }
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a read-only agent.
@@ -525,6 +529,21 @@ pub trait Harness: Send + Sync {
         _events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
         (Err(anyhow::anyhow!("{} does not support resuming a session by id", self.id())), None)
+    }
+
+    /// H3: carry on with an agent the holder kept through a daemon update. The last daemon
+    /// read `attached.history`; the adapter rebuilds what it knew from it (sending nothing
+    /// again), answers whatever the agent is still waiting on, and reads on to the end of the
+    /// turn. An error leaves the caller to resume the session or start afresh.
+    async fn reattach(
+        &self,
+        _task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        _events: mpsc::Sender<HarnessEvent>,
+        attached: child::Attached,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
+        let _ = attached.proc.release().await;
+        (Err(anyhow::anyhow!("{} cannot pick up a held agent", self.id())), None)
     }
 
     /// Whether a command this agent runs stays inside an OS sandbox confined to its worktree

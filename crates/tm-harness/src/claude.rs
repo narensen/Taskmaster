@@ -13,13 +13,11 @@
 //! its edits, commands and test runs go through Taskmaster's `run_code`, one script for
 //! many steps. Reading stays with its own tools.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -140,65 +138,19 @@ impl ClaudeCode {
         timeout: std::time::Duration,
     ) -> anyhow::Result<(RunSummary, Option<String>)> {
         let mut cmd = self.command_with(task, prompt, persist, resume)?;
-        let (mut child, group) = crate::spawn_grouped(
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
-        )
-        .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let stdout = child.stdout.take().context("claude stdout was not captured")?;
-
-        let read = async {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut session_id: Option<String> = resume.map(str::to_string);
-            let mut emitted_session = false;
-            if let Some(id) = session_id.as_deref() {
-                let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
-                emitted_session = true;
-            }
-            while let Some(line) = lines.next_line().await? {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                if let Some(id) = msg["session_id"].as_str().filter(|s| !s.is_empty()) {
-                    let changed = session_id.as_deref() != Some(id);
-                    session_id = Some(id.to_string());
-                    if !emitted_session || changed {
-                        let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
-                        emitted_session = true;
-                    }
-                }
-                if (msg["type"].as_str() == Some("rate_limit_event")
-                    || msg.get("rate_limit_info").is_some()
-                    || msg.get("rate_limits").is_some())
-                    && let Some(report) = crate::parse_rate_limit_value(&msg, "claude-cli")
-                {
-                    let _ = events.send(HarnessEvent::RateLimit(report)).await;
-                }
-                match msg["type"].as_str() {
-                    Some("assistant") => {
-                        for event in content_events(&msg["message"]["content"]) {
-                            let _ = events.send(event).await;
-                        }
-                    }
-                    Some("user") => {
-                        for event in tool_results(&msg["message"]["content"]) {
-                            let _ = events.send(event).await;
-                        }
-                    }
-                    Some("result") => {
-                        // Claude Code refuses on its own and reports it here, not as it happens.
-                        for event in denials(&msg) {
-                            let _ = events.send(event).await;
-                        }
-                        return Ok((summary(&msg), session_id));
-                    }
-                    _ => {}
-                }
-            }
-            bail!("claude exited without a result event")
-        };
-        let result = match tokio::time::timeout(timeout, read).await {
+        let (proc, mut io) = crate::child::start(&mut cmd, false, task.hold.as_ref())
+            .await
+            .with_context(|| format!("failed to start `{}`", self.binary))?;
+        let mut stream = Stream { session_id: resume.map(str::to_string), emitted: false };
+        if let Some(id) = resume {
+            let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
+            stream.emitted = true;
+        }
+        let result = match tokio::time::timeout(timeout, stream.read(&mut io, &events)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", timeout)),
         };
-        let freed = group.release(&mut child).await;
+        let freed = proc.release().await;
         match result {
             Ok((mut summary, session_id)) => {
                 summary.freed = Some(freed);
@@ -206,6 +158,67 @@ impl ClaudeCode {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+/// What a turn's stream has said so far: its session, and whether that was announced.
+#[derive(Default)]
+struct Stream {
+    session_id: Option<String>,
+    emitted: bool,
+}
+
+impl Stream {
+    /// Read the stream to its result line.
+    async fn read(&mut self, io: &mut crate::child::AgentIo, events: &mpsc::Sender<HarnessEvent>) -> anyhow::Result<(RunSummary, Option<String>)> {
+        while let Some(line) = io.next_line().await? {
+            if let Some(summary) = self.line(&line, Some(events)).await {
+                return Ok((summary, self.session_id.clone()));
+            }
+        }
+        bail!("claude exited without a result event")
+    }
+
+    /// Take in one line, sending its events when there is somewhere to send them (a replay of
+    /// lines an earlier daemon already sent has not). Returns the summary at the result line.
+    async fn line(&mut self, line: &str, events: Option<&mpsc::Sender<HarnessEvent>>) -> Option<RunSummary> {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else { return None };
+        let mut out = Vec::new();
+        if let Some(id) = msg["session_id"].as_str().filter(|s| !s.is_empty()) {
+            let changed = self.session_id.as_deref() != Some(id);
+            self.session_id = Some(id.to_string());
+            if !self.emitted || changed {
+                out.push(HarnessEvent::SessionStarted { session_id: id.to_string() });
+                self.emitted = true;
+            }
+        }
+        if (msg["type"].as_str() == Some("rate_limit_event") || msg.get("rate_limit_info").is_some() || msg.get("rate_limits").is_some())
+            && let Some(report) = crate::parse_rate_limit_value(&msg, "claude-cli")
+        {
+            out.push(HarnessEvent::RateLimit(report));
+        }
+        let summary = match msg["type"].as_str() {
+            Some("assistant") => {
+                out.extend(content_events(&msg["message"]["content"]));
+                None
+            }
+            Some("user") => {
+                out.extend(tool_results(&msg["message"]["content"]));
+                None
+            }
+            Some("result") => {
+                // Claude Code refuses on its own and reports it here, not as it happens.
+                out.extend(denials(&msg));
+                Some(summary(&msg))
+            }
+            _ => None,
+        };
+        if let Some(events) = events {
+            for event in out {
+                let _ = events.send(event).await;
+            }
+        }
+        summary
     }
 }
 
@@ -346,6 +359,51 @@ impl Harness for ClaudeCode {
         }
     }
 
+    async fn reattach(
+        &self,
+        task: WorkerTask,
+        _gate: Arc<dyn PermissionGate>,
+        events: mpsc::Sender<HarnessEvent>,
+        attached: crate::child::Attached,
+    ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
+        // The stream is one-way: what the last daemon read gives the session, and the result
+        // when the turn ended before this daemon took over.
+        let mut stream = Stream::default();
+        let mut ended = None;
+        for line in attached.outputs() {
+            if let Some(summary) = stream.line(line, None).await {
+                ended = Some(summary);
+            }
+        }
+        let crate::child::Attached { mut io, proc, keep, .. } = attached;
+        let result = match ended {
+            Some(summary) => Ok((summary, stream.session_id.clone())),
+            None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events)).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", task.timeout)),
+            },
+        };
+        drop(io);
+        let freed = proc.release().await;
+        match result {
+            Ok((mut summary, session_id)) => {
+                summary.freed = Some(freed);
+                let kept: Option<Box<dyn crate::Session>> = match session_id {
+                    Some(session_id) if keep && summary.ok => Some(Box::new(ClaudeSession { harness: self.clone(), task, session_id, cleaned: false })),
+                    Some(session_id) if keep => {
+                        if let Some(home) = std::env::var_os("HOME") {
+                            cleanup_claude_session(&std::path::PathBuf::from(home), &session_id);
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+                (Ok(summary), kept)
+            }
+            Err(err) => (Err(err), None),
+        }
+    }
+
     async fn run(
         &self,
         task: WorkerTask,
@@ -454,6 +512,7 @@ mod tests {
             code_mode,
             shell: shell.then(crate::ShellScope::default),
             permission_mode: None,
+            hold: None,
         }
     }
 
@@ -578,6 +637,71 @@ mod tests {
         let resumed = harness.args_with(&t, "fix it", true, Some("sess-42"));
         assert!(!resumed.contains(&"--no-session-persistence".to_string()));
         assert_eq!(after(&resumed, "--resume"), ["sess-42"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_handed_to_a_new_daemon_carries_on_without_repeating_what_was_sent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tm-claude-reattach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let go = dir.join("go");
+        let started = dir.join("started");
+        // A stand-in for `claude -p`: it says one thing, waits, says another and ends the turn.
+        let script = format!(
+            "#!/bin/sh\necho x >> '{started}'\n\
+             echo '{{\"type\":\"system\",\"session_id\":\"sess-h3\"}}'\n\
+             echo '{{\"type\":\"assistant\",\"session_id\":\"sess-h3\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"before\"}}]}}}}'\n\
+             while [ ! -f '{go}' ]; do sleep 0.05; done\n\
+             echo '{{\"type\":\"assistant\",\"session_id\":\"sess-h3\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"after\"}}]}}}}'\n\
+             echo '{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"sess-h3\",\"total_cost_usd\":0.25,\"usage\":{{\"input_tokens\":3,\"output_tokens\":4}}}}'\n",
+            started = started.display(),
+            go = go.display()
+        );
+        let bin = dir.join("claude");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let harness = ClaudeCode { binary: bin.display().to_string(), sandbox: None };
+        let holder = crate::hold::in_process(&dir.join("hold")).unwrap();
+        let spec = crate::hold::HoldSpec { holder: holder.clone(), key: "p/r/page:a".into(), meta: json!({}) };
+        let mut first = task(false, false, false);
+        first.cwd = dir.clone();
+        first.timeout = std::time::Duration::from_secs(20);
+        first.hold = Some(spec);
+        let gate: Arc<dyn PermissionGate> = Arc::new(crate::gate::WorktreeGate::new(&dir, vec![]));
+        let (tx, mut rx) = mpsc::channel(32);
+        let running = tokio::spawn({
+            let (harness, gate, first) = (harness.clone(), gate.clone(), first.clone());
+            async move { harness.run(first, gate, tx).await }
+        });
+        assert_eq!(rx.recv().await, Some(HarnessEvent::SessionStarted { session_id: "sess-h3".into() }));
+        assert_eq!(rx.recv().await, Some(HarnessEvent::Text { text: "before".into() }));
+        // The daemon hands off and goes away mid-turn.
+        assert_eq!(holder.hand_off(std::time::Duration::from_secs(60), std::time::Duration::from_millis(50)).await.unwrap(), 1);
+        running.abort();
+        let _ = running.await;
+
+        // The next daemon takes the agent over; the agent goes on.
+        let next = crate::hold::Holder::new(holder.socket(), None);
+        let spec = crate::hold::HoldSpec { holder: next, key: "p/r/page:a".into(), meta: json!({}) };
+        let attached = crate::child::attach(&spec, false).await.unwrap();
+        std::fs::write(&go, "").unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut again = first.clone();
+        again.hold = Some(spec);
+        let (summary, kept) = harness.reattach(again, gate, tx, attached).await;
+        let summary = summary.unwrap();
+        assert!(summary.ok && kept.is_none());
+        assert_eq!(summary.cost_usd, Some(0.25));
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        // Only what came after the hand-off: no second session line, no second "before".
+        assert_eq!(events, vec![HarnessEvent::Text { text: "after".into() }]);
+        assert_eq!(std::fs::read_to_string(&started).unwrap(), "x\n", "the agent was started again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

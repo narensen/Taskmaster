@@ -205,6 +205,7 @@ async fn ask(
         code_mode: false,
         shell: None,
         permission_mode: None,
+        hold: None,
     };
     let (tx, mut rx) = mpsc::channel(256);
     let beat = Arc::new(AtomicU64::new(0));

@@ -589,6 +589,7 @@ export interface NewReview {
   verifier?: string;
   reviewer_model?: string;
   verifier_model?: string;
+  focus?: string;
 }
 
 /** Who an agent transcript entry is from. */
@@ -1660,7 +1661,7 @@ export const api = {
 
   reviews: () => call<{ reviews: ReviewSummary[] }>("GET", "/api/reviews").then((r) => r.reviews),
   review: (id: string) => call<ReviewJob>("GET", `/api/reviews/${enc(id)}`),
-  reviewRun: (id: string) => call<{ id: string }>("POST", `/api/runs/${enc(id)}/review`, {}),
+  reviewRun: (id: string, focus?: string) => call<{ id: string }>("POST", `/api/runs/${enc(id)}/review`, focus ? { focus } : {}),
   cancelReview: (id: string) => call<{ id: string }>("POST", `/api/reviews/${enc(id)}/cancel`, {}),
   createReview: (body: NewReview) => call<{ id: string }>("POST", "/api/reviews", body),
 

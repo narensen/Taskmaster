@@ -30,7 +30,7 @@ import { TelemetryLens } from "../run/TelemetryLens";
 import { useRun, useSurfaces, useTurns } from "../run/model";
 import { PastTurn } from "../run/Turns";
 import { SwitchProviders } from "../run/SwitchProviders";
-import { ModePicker, useRunMode } from "../components/ModePicker";
+import { ModePicker, useRunMode, type PickMode } from "../components/ModePicker";
 import { GoalStatus, permissionLabel } from "../components/RunOptions";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
 import { useToolApprovals } from "../run/ToolApprovals";
@@ -154,9 +154,9 @@ function ApprovalAsk({
   );
 }
 
-function ReviewAsk({ id }: { id: string }) {
+/** The run's last review, once one was started from the composer's Review mode. */
+function ReviewAsk({ id, started }: { id: string; started: number }) {
   const [job, setJob] = useState<ReviewJob | null>(null);
-  const [busy, setBusy] = useState(false);
   const load = useCallback(async (reviewId: string) => {
     const next = await api.review(reviewId);
     setJob(next);
@@ -168,43 +168,29 @@ function ReviewAsk({ id }: { id: string }) {
       .then((all) => all.find((r) => r.run === id))
       .then((last) => (last ? load(last.id) : undefined))
       .catch(() => undefined);
-  }, [id, load]);
+  }, [id, load, started]);
   useEffect(() => {
     if (job?.status !== "running") return;
     const t = setInterval(() => void load(job.id).catch(() => undefined), 1500);
     return () => clearInterval(t);
   }, [job?.id, job?.status, load]);
-  const start = async () => {
-    setBusy(true);
-    try {
-      const r = await api.reviewRun(id);
-      await load(r.id);
-    } catch (err) {
-      toast("The review did not start", err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
   const confirmed = job?.report?.findings.filter((f) => f.outcome === "confirmed") ?? [];
   const running = job?.status === "running";
+  if (!job) return null;
   return (
     <section className="flow-end" data-testid="review-card" aria-label="Code review">
       <header className="flow-role">
         <h2>Review</h2>
         <span className="flow-state">{running ? "reviewing" : job?.status === "done" ? "done" : job?.status === "failed" ? "failed" : "waiting"}</span>
       </header>
-      <p className="flow-life">{running ? "One reviewer is reading the whole diff." : "On demand. One reviewer reads the diff and reports confirmed problems."}</p>
-      <div className="flow-actions">
-        {running ? (
+      <p className="flow-life">{running ? "One reviewer is reading the whole diff." : "Pick Review in the box below to review again."}</p>
+      {running && (
+        <div className="flow-actions">
           <button type="button" className="small" data-testid="review-cancel" onClick={() => void api.cancelReview(job.id).then(() => load(job.id))}>
             Cancel review
           </button>
-        ) : (
-          <button type="button" className="small" data-testid="review-button" disabled={busy} onClick={() => void start()}>
-            {job ? "Review again" : "Review"}
-          </button>
-        )}
-      </div>
+        </div>
+      )}
       {running && (
         <span className="sr-only" data-testid="review-running">
           Review in progress…
@@ -345,6 +331,9 @@ export function RunView({ id }: { id: string }) {
   const turnLedger = useMemo(() => (current.at ? ledgerEntries.filter((e) => e.at >= current.at!) : ledgerEntries), [ledgerEntries, current.at]);
   const list = useSurfaces(detail, shown, turnLedger, data.entriesVersion, current.start);
   const [runMode, setRunMode] = useRunMode();
+  // Review is picked for the next send only; it is not remembered like the other modes.
+  const [reviewPicked, setReviewPicked] = useState(false);
+  const [reviewStarted, setReviewStarted] = useState(0);
   const filteredList = useMemo(() => {
     if (streamFilter === "all") return list;
     if (streamFilter === "active") return list.filter((s) => s.state === "working" || s.id === "master");
@@ -736,6 +725,16 @@ export function RunView({ id }: { id: string }) {
     // A note on a finished run starts a new turn below; on an active run Enter uses the
     // person's Queue/Steer default and Ctrl/Cmd+Enter does the other (A1).
     const finished = !!detail && !detail.active && (detail.phase === "done" || detail.phase === "failed");
+    if (reviewPicked && finished && detail.branch) {
+      try {
+        await api.reviewRun(id, text);
+        composer.current?.clear();
+        setReviewStarted((n) => n + 1);
+      } catch (err) {
+        toast("The review did not start", err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
     const active = !!detail?.active;
     const defaultQueue = p.chatSendMode !== "steer";
     const queued = active ? (opts?.alt ? !defaultQueue : defaultQueue) : false;
@@ -1187,7 +1186,7 @@ export function RunView({ id }: { id: string }) {
               )
             )}
             {settled && <EndLine detail={detail} onDiff={() => setLens("review")} onRetry={() => { void data.reload(); data.refollow(); }} />}
-            {settled && detail.branch && <ReviewAsk id={id} />}
+            {settled && detail.branch && <ReviewAsk id={id} started={reviewStarted} />}
 
             {(pending.length > 0 || delivered.length > 0) && (
               <section className="flow-notes">
@@ -1317,7 +1316,9 @@ export function RunView({ id }: { id: string }) {
           suggestion={settled ? detail.suggestion?.text : undefined}
           placeholder={
             settled
-              ? runMode === "code"
+              ? reviewPicked && detail.branch
+                ? "What should the reviewer look at? It reads this run's changes."
+                : runMode === "code"
                 ? "Ask the master for a change. It starts a new turn below."
                 : "Ask for a fix or a change. It starts a new turn below."
               : p.chatSendMode === "steer"
@@ -1334,7 +1335,15 @@ export function RunView({ id }: { id: string }) {
           footer={
             <div className="composer-foot run-composer-foot">
               <div className="composer-actions">
-                <ModePicker value={runMode} onChange={setRunMode} label="Who takes the next turn" />
+                <ModePicker<PickMode>
+                  value={reviewPicked && settled && detail.branch ? "review" : runMode}
+                  onChange={(m) => {
+                    setReviewPicked(m === "review");
+                    if (m !== "review") setRunMode(m);
+                  }}
+                  review={settled && !!detail.branch}
+                  label="Who takes the next turn"
+                />
                 {settled && <SwitchProviders id={id} detail={detail} onSwitched={() => void data.reload()} />}
               </div>
               <span className="muted small">

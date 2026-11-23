@@ -209,3 +209,24 @@ test("a finished run can give a seat to another provider for the next turn", asy
   await expect.poll(() => sent).toEqual({ roles: { worker: "grok" }, models: { worker: "" } });
   await expect(page.getByText("Worker switched")).toBeVisible();
 });
+
+test("Review sits in the mode picker of a finished run, not in a box after every turn", async ({ openFixture, page, daemon }) => {
+  test.setTimeout(60_000);
+  const fixture = daemon.fixture!;
+  await finishedRun(fixture, "review-mode", "A bookshop with a cart, for review");
+  await openFixture("/runs/review-mode");
+  await expect(page.getByTestId("done-summary")).toBeVisible();
+  // No review box until a review is asked for.
+  await expect(page.getByTestId("review-card")).toHaveCount(0);
+  await page.getByTestId("mode-review").click();
+  await expect(page.getByTestId("mode-review")).toHaveAttribute("aria-checked", "true");
+  await page.locator(".composer-input").last().click();
+  await page.keyboard.type("Look hard at the cart totals");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("review-card")).toBeVisible();
+  const headers = { authorization: `Bearer ${fixture.token}` };
+  const { reviews } = (await (await fetch(`${fixture.url}/api/reviews`, { headers })).json()) as { reviews: { id: string; run?: string }[] };
+  const mine = reviews.find((r) => r.run === "review-mode")!;
+  const job = await (await fetch(`${fixture.url}/api/reviews/${mine.id}`, { headers })).json();
+  expect(job.focus).toBe("Look hard at the cart totals");
+});

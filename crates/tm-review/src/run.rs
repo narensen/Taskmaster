@@ -49,6 +49,8 @@ pub struct Options {
     pub timeout: Duration,
     /// An agent silent for this long fails the review.
     pub stall: Duration,
+    /// What the person asked the reviewer to look at, when they said. Added to its brief.
+    pub focus: Option<String>,
 }
 
 impl Options {
@@ -65,6 +67,7 @@ impl Options {
             keep: false,
             timeout: REVIEW_TIMEOUT,
             stall: STALL_TIMEOUT,
+            focus: None,
         }
     }
 }
@@ -172,6 +175,7 @@ struct Target {
     reviewer_model: Option<String>,
     verifier_model: Option<String>,
     stall: Duration,
+    focus: Option<String>,
 }
 
 /// What one agent run produced: everything it said, and what it cost.
@@ -311,6 +315,7 @@ pub async fn run(options: &Options, reviewer: Arc<dyn Harness>, verifier: Arc<dy
         reviewer_model: options.reviewer_model.clone(),
         verifier_model: options.verifier_model.clone(),
         stall: options.stall,
+        focus: options.focus.clone(),
     };
     let base = opened.base;
     let head = opened.head;
@@ -400,7 +405,11 @@ async fn review(
             all
         },
     };
-    let briefs: Vec<(String, Kind, String)> = vec![("review".into(), Kind::Bug, brief::review(&whole, "DIFF.patch"))];
+    let mut whole_brief = brief::review(&whole, "DIFF.patch");
+    if let Some(focus) = o.focus.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        whole_brief.push_str(&format!("\nThe person asked you to look at this in particular:\n{focus}\n"));
+    }
+    let briefs: Vec<(String, Kind, String)> = vec![("review".into(), Kind::Bug, whole_brief)];
 
     let limit = Arc::new(Semaphore::new(PARALLEL));
     let mut usage = Usage::default();

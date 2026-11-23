@@ -2431,6 +2431,8 @@ struct NewReview {
     verifier: Option<String>,
     reviewer_model: Option<String>,
     verifier_model: Option<String>,
+    /// What to look at in particular, from the run composer's Review mode.
+    focus: Option<String>,
 }
 
 impl App {
@@ -2485,7 +2487,7 @@ async fn create_review(State(app): State<Arc<App>>, body: Option<Json<NewReview>
 }
 
 /// Review a finished run's whole diff, once, on request. A run never reviews itself.
-async fn review_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> Reply {
+async fn review_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>, body: Option<Json<NewReview>>) -> Reply {
     let run = app.known(&id)?;
     if !matches!(run.phase, RunPhase::Done | RunPhase::Failed) {
         return Err(fail(StatusCode::CONFLICT, "review a run once it has finished"));
@@ -2496,7 +2498,20 @@ async fn review_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -
     };
     let head = desk::run_head(&app, &id, &branch)
         .ok_or_else(|| fail(StatusCode::CONFLICT, format!("branch `{branch}` is gone and its last commit was not kept")))?;
-    let body = NewReview { base: Some(base), head: Some(head), ..Default::default() };
+    let focus = body.and_then(|Json(body)| body.focus);
+    // The run's own reviewer and verifier, when it named them; the settings' otherwise.
+    let asked = app.request_for(&id).unwrap_or_default();
+    let named = |name: &str| (!name.is_empty()).then(|| name.to_string());
+    let body = NewReview {
+        base: Some(base),
+        head: Some(head),
+        focus,
+        reviewer: named(&asked.roles.reviewer),
+        verifier: named(&asked.roles.verifier),
+        reviewer_model: asked.models.reviewer.clone(),
+        verifier_model: asked.models.verifier.clone(),
+        ..Default::default()
+    };
     start_review(&app, body, Some(id))
 }
 
@@ -2556,6 +2571,7 @@ fn start_review(app: &Arc<App>, body: NewReview, run: Option<String>) -> Reply {
     options.install_lints = body.install_lints;
     options.reviewer_model = body.reviewer_model;
     options.verifier_model = body.verifier_model;
+    options.focus = body.focus.clone();
 
     let id = format!("review-{}", random_hex(4)?);
     let mut job = json!({
@@ -2566,6 +2582,7 @@ fn start_review(app: &Arc<App>, body: NewReview, run: Option<String>) -> Reply {
         "reviewer": reviewer_name,
         "verifier": verifier_name,
         "run": run,
+        "focus": body.focus,
     });
     app.records().save_review(&id, &job)?;
     let (records, job_id, tracker) = (app.records().clone(), id.clone(), app.clone());

@@ -2,7 +2,7 @@
 // that owns the whole project (Agent), or Taskmaster's choice (Auto). The last choice is kept.
 
 import { useCallback, useRef, type KeyboardEvent } from "react";
-import { Bot, Network, Wand2 } from "lucide-react";
+import { Bot, Network, ScanSearch, Wand2 } from "lucide-react";
 import type { RunMode } from "../api";
 import { setPrefs, usePrefs } from "../prefs";
 
@@ -27,6 +27,16 @@ export const MODES: { id: RunMode; label: string; icon: typeof Bot; title: strin
   },
 ];
 
+/** On a finished run the picker also offers Review: one reviewer reads the run's changes. */
+export type PickMode = RunMode | "review";
+
+const REVIEW = {
+  id: "review" as const,
+  label: "Review",
+  icon: ScanSearch,
+  title: "Review: one reviewer reads this run's changes and a second checks what it reports. What you type is what it looks at in particular. Nothing is changed.",
+};
+
 /** The composer's mode, remembered across runs and reloads. */
 export function useRunMode(): [RunMode, (mode: RunMode) => void] {
   const mode = usePrefs().runMode ?? "auto";
@@ -34,19 +44,31 @@ export function useRunMode(): [RunMode, (mode: RunMode) => void] {
   return [mode, set];
 }
 
-export function ModePicker({ value, onChange, label = "Mode" }: { value: RunMode; onChange: (mode: RunMode) => void; label?: string }) {
+export function ModePicker<M extends PickMode = RunMode>({
+  value,
+  onChange,
+  label = "Mode",
+  review = false,
+}: {
+  value: M;
+  onChange: (mode: M) => void;
+  label?: string;
+  /** Offer Review too. */
+  review?: boolean;
+}) {
   const group = useRef<HTMLDivElement>(null);
+  const modes = (review ? [...MODES, REVIEW] : MODES) as { id: M; label: string; icon: typeof Bot; title: string }[];
   const onKey = (e: KeyboardEvent) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     e.preventDefault();
-    const at = MODES.findIndex((m) => m.id === value);
-    const next = MODES[(at + (e.key === "ArrowRight" ? 1 : MODES.length - 1)) % MODES.length]!;
+    const at = modes.findIndex((m) => m.id === value);
+    const next = modes[(at + (e.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length]!;
     onChange(next.id);
     group.current?.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
   };
   return (
     <div ref={group} className="mode-picker" role="radiogroup" aria-label={label} data-testid="mode-picker" onKeyDown={onKey}>
-      {MODES.map((m) => {
+      {modes.map((m) => {
         const on = m.id === value;
         const Icon = m.icon;
         return (

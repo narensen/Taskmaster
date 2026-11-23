@@ -8,6 +8,53 @@ measure before and after. Work top to bottom. One item, one local commit. Follow
 `AGENTS.md`, the `perf-check` skill (measure first, report both numbers) and the `tests` skill
 (a test that fails without the change).
 
+## Status (2026-11-23)
+
+Steps 1–13 of the order below are done, one local commit per item or step:
+
+| Step | Items | Commits |
+| --- | --- | --- |
+| 1 | P1, P3, P4 | `23dad22` |
+| 2 | P2 | `68da276` |
+| 3 | P6–P11, P12 | `b2ab2c6` |
+| 4 | P5 | `1ee4170` |
+| 5 | W1–W4 | `85bb811` |
+| 6 | O1 | `cb62c3c` |
+| 7 | H1, A1 | `ce5e597` |
+| 8 | A2 | `ee7c985` |
+| 9 | O4, H2, O7 | `77a73f2` |
+| 10 | O2, O3, O6, H4 | `b3de701` |
+| 11 | A3, A4 | `d3471f8` |
+| 12 | A10, A7, A8 | `47c380a`, `904d1f3`, `cd8d20f` |
+| 13 | A6, A5, O8, A9, H5, O5 | `1706e63`, `9053775`, `d1fb310`, `7a8edc9`, `d173f56`, `d98ba04` |
+
+How a few of them landed, where it differs from the item text:
+
+- **A3**: Claude Code and Codex cannot stop to ask, so Supervised and Auto-accept edits hold
+  for them only through `run_code` (Code Mode). The picker says so.
+- **A4**: a goal's check runs on this machine outside the sandbox, so outside agents (MCP)
+  and prompt links cannot set one.
+- **A8**: a merged run settles an hour after its last activity by default (Settings →
+  Settling runs), so a preview the person is looking at is not stopped under them.
+- **A9**: the handoff is read once, by the first agent of the next turn: an Agent turn's
+  brief, or the master's notes brief in Code mode.
+
+**Step 14 (H3) is not started.** Every adapter spawns its agent with `spawn_grouped` and
+drives its stdin and stdout itself, with the protocol state in memory (ACP request ids and
+pending permission answers, the Codex app server's session, Claude's stream). Keeping an agent
+alive across a daemon update needs:
+
+1. a holder process (`tm-daemon hold`, detached, on a Unix socket) that spawns agents and owns
+   their pipes, keeping each one's output and what was written to it;
+2. a child handle over that socket in place of `tokio::process::Child`, in `claude.rs`,
+   `codex.rs` and `acp.rs`;
+3. on start, a new daemon that finds a unit's held process, replays its output through the
+   adapter to rebuild that state (pushing nothing twice, asking nothing twice), and answers
+   whatever is still waiting.
+
+Until then, H2 covers a restart: an interrupted worker resumes its provider session with a
+short "the daemon restarted" turn.
+
 ## Where we stand
 
 Landed this round (commits `b8fb298`..`c502d84`):

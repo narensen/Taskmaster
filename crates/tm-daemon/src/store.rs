@@ -438,6 +438,14 @@ impl Records {
         self.save(&format!("runs/{run}/plan.json"), plan)
     }
 
+    pub fn race(&self, id: &str) -> anyhow::Result<Option<crate::race::Race>> {
+        self.load(&format!("races/{id}.json"))
+    }
+
+    pub fn save_race(&self, race: &crate::race::Race) -> anyhow::Result<()> {
+        self.save(&format!("races/{}.json", race.id), race)
+    }
+
     pub fn handoff(&self, run: &str) -> anyhow::Result<Option<crate::handoff::Handoff>> {
         self.load(&format!("runs/{run}/handoff.json"))
     }

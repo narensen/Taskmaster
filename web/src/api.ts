@@ -213,6 +213,29 @@ export interface ServerRunFlags {
   pr_url?: string;
 }
 
+/** O5: one provider's run in a race, as the compare view shows it. */
+export interface RaceRow {
+  run: string;
+  provider: string;
+  model?: string | null;
+  phase: Phase;
+  active: boolean;
+  error: string | null;
+  pages: number;
+  passed: number;
+  review_rounds: number;
+  cost_usd: number;
+  tokens: number;
+  branch: string | null;
+  merged: boolean | null;
+  diff: { files: number; added: number; removed: number } | null;
+}
+
+export interface RaceView {
+  race: { id: string; prompt: string; created: string; runs: { run: string; provider: string; model?: string }[]; winner?: string; picked_at?: string };
+  runs: RaceRow[];
+}
+
 /** One match from searching inside runs (A7). */
 export interface RunSearchHit {
   run: string;
@@ -263,6 +286,8 @@ export interface RunDetail extends RunSummary {
   cancelling?: CancelMode | null;
   /** Per-run USD spend cap, when configured. */
   budget_usd?: number | null;
+  /** O5: the race this run is one entrant of. */
+  race?: string | null;
   /** A5 (Labs): the message the person may send next, suggested after the last turn. */
   suggestion?: { text: string; at: string } | null;
 }
@@ -1499,6 +1524,11 @@ export const api = {
   /** A9: give seats of a run that is not working to another provider; the next agent gets a handoff. */
   switchRoles: (id: string, body: { roles?: Partial<Roles>; models?: Partial<Record<RoleName, string>> }) =>
     call<{ roles: Roles; models: Models; handoff: { to: Record<string, string> } | null }>("POST", `/api/runs/${enc(id)}/roles`, body),
+  /** O5: the same request once per provider (2 or 3), each held on its branch. */
+  createRace: (body: { prompt: string; providers: string[]; models?: Record<string, string>; mode?: RunMode; yes?: boolean; parallel?: number; max_cost_usd?: number }) =>
+    call<{ id: string; runs: { run: string; provider: string }[] }>("POST", "/api/races", body),
+  race: (id: string) => call<RaceView>("GET", `/api/races/${enc(id)}`),
+  pickRace: (id: string, run: string) => call<RaceView>("POST", `/api/races/${enc(id)}/pick`, { run }),
   setRunFlags: (id: string, flags: { pinned?: boolean; settled?: boolean; archived?: boolean; never_settle?: boolean }) =>
     call<{ flags: ServerRunFlags }>("POST", `/api/runs/${enc(id)}/flags`, flags).then((r) => r.flags),
   /** Words from the project's runs (A7): each hit names the run, the entry, the agent and the turn. */

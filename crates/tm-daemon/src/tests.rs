@@ -2817,6 +2817,58 @@ mod http {
     }
 
     #[tokio::test]
+    async fn a_race_holds_each_providers_run_and_merges_only_the_one_picked() {
+        let tmp = seeded("api-race");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        assert_eq!(client.post("/api/races", json!({ "prompt": "A page", "providers": ["grok"] })).await.0, 400);
+        assert_eq!(client.post("/api/races", json!({ "prompt": "A page", "providers": ["grok", "nope"] })).await.0, 400);
+        assert_eq!(client.post("/api/races", json!({ "prompt": "", "providers": ["grok", "codex"] })).await.0, 400);
+        let (status, made) = client
+            .post("/api/races", json!({ "prompt": "A landing page", "providers": ["grok", "codex"], "mode": "code", "yes": true }))
+            .await;
+        assert_eq!(status, 202, "{made}");
+        let race = made["id"].as_str().unwrap().to_string();
+        let runs: Vec<String> = made["runs"].as_array().unwrap().iter().map(|e| e["run"].as_str().unwrap().to_string()).collect();
+        assert_eq!(runs, vec![format!("{race}-grok"), format!("{race}-codex")]);
+        for run in &runs {
+            let done = client.settled(run, "done").await;
+            assert_eq!(done["merged"], false, "a racing run is held on its branch: {done}");
+            assert_eq!(done["race"], race.as_str());
+            let roles = &done["roles"];
+            let provider = run.rsplit('-').next().unwrap();
+            assert_eq!((roles["master"].as_str(), roles["worker"].as_str()), (Some(provider), Some(provider)));
+        }
+        let (_, compared) = client.get(&format!("/api/races/{race}")).await;
+        let rows = compared["runs"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["phase"], "done");
+            assert!(row["diff"]["files"].as_u64().unwrap() >= 1, "{row}");
+            assert!(row["branch"].as_str().unwrap().starts_with("taskmaster/"), "{row}");
+        }
+        let loser_branch = rows[0]["branch"].as_str().unwrap().to_string();
+        assert!(git_out(&tmp.0, &["branch", "--list", &loser_branch]).contains(&loser_branch));
+
+        assert_eq!(client.post(&format!("/api/races/{race}/pick"), json!({ "run": "elsewhere" })).await.0, 400);
+        let (status, picked) = client.post(&format!("/api/races/{race}/pick"), json!({ "run": runs[1] })).await;
+        assert_eq!(status, 200, "{picked}");
+        assert_eq!(picked["race"]["winner"], runs[1].as_str());
+        let winner = client.get(&format!("/api/runs/{}", runs[1])).await.1;
+        assert_eq!(winner["merged"], true, "{winner}");
+        assert!(winner["merge_commit"].as_str().is_some_and(|c| !c.is_empty()));
+        let loser = client.get(&format!("/api/runs/{}", runs[0])).await.1;
+        assert_eq!(loser["merged"], false);
+        assert_eq!((loser["flags"]["archived"].as_bool(), loser["flags"]["settled_reason"].as_str()), (Some(true), Some("another run won the race")));
+        assert!(git_out(&tmp.0, &["branch", "--list", "taskmaster/*"]).trim().is_empty(), "both branches are gone");
+        assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+        assert_eq!(client.post(&format!("/api/races/{race}/pick"), json!({ "run": runs[0] })).await.0, 409, "a race is decided once");
+    }
+
+    #[tokio::test]
     async fn paths_resolve_from_the_project_and_open_in_an_editor() {
         let tmp = repo("api-paths");
         std::fs::create_dir_all(tmp.0.join("src")).unwrap();

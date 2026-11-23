@@ -55,6 +55,7 @@ pub mod repomap;
 pub mod reply;
 pub mod report;
 mod resume;
+pub mod race;
 pub mod run_index;
 pub mod settling;
 pub mod suggest;
@@ -329,6 +330,12 @@ pub struct RunRequest {
     /// Optional goal verified after each turn until met or capped (A4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<goals::GoalSpec>,
+    /// O5: keep the result on its branch; a race merges only the run the person picks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
+    /// O5: the race this run is one entrant of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub race: Option<String>,
 }
 
 /// Optional model names passed through to the harness. The harness id is the default.

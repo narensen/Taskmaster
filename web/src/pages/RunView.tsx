@@ -16,7 +16,7 @@ import { emit, Sheet, toast, undoable, useOn, type Chip } from "../overlay";
 import { ExternalLink, Rich, looksLikePath, resolvedPath } from "../paths";
 import { markRunSeen, prefs, rememberRun, setPrefs, usePrefs } from "../prefs";
 import { useSettings } from "../query";
-import { navigate } from "../router";
+import { Link, navigate } from "../router";
 import { setRunChrome } from "../shell/runChrome";
 import { Problem } from "../ui";
 import { ApprovalDock } from "../run/ApprovalDock";
@@ -880,6 +880,11 @@ export function RunView({ id }: { id: string }) {
             >
               {usd(detail.spent.cost_usd)} / {usd(detail.budget_usd)}
             </span>
+          )}
+          {detail.race && (
+            <Link to={`/races/${encodeURIComponent(detail.race)}`} className="flow-top-perm" data-testid="run-race">
+              Race · compare
+            </Link>
           )}
           {detail.goal && <GoalStatus goal={detail.goal} />}
           {detail.permission_mode && (

@@ -3,9 +3,9 @@
 // that skips every question, or keeps going on its own, is asked for each time.
 
 import * as Popover from "@radix-ui/react-popover";
-import { Check, ChevronDown, ShieldCheck, Target, X } from "lucide-react";
+import { Check, ChevronDown, Flag, ShieldCheck, Target, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { GoalProgress, PermissionMode } from "../api";
+import type { GoalProgress, PermissionMode, Provider } from "../api";
 
 export const PERMISSIONS: { id: PermissionMode; label: string; desc: string }[] = [
   {
@@ -235,5 +235,73 @@ export function GoalStatus({ goal }: { goal: GoalProgress }) {
       </span>
       <span className="goal-where">{where}</span>
     </span>
+  );
+}
+
+/** O5: race the request across two or three providers. Empty is no race. */
+export function RaceButton({ providers, value, onChange }: { providers: Provider[]; value: string[]; onChange: (ids: string[]) => void }) {
+  const [open, setOpen] = useState(false);
+  const installed = providers.filter((p) => p.installed);
+  const toggle = (id: string) => {
+    const next = value.includes(id) ? value.filter((v) => v !== id) : value.length >= 3 ? value : [...value, id];
+    onChange(next);
+  };
+  const on = value.length >= 2;
+  const names = value.map((id) => providers.find((p) => p.id === id)?.name ?? id);
+  return (
+    <Popover.Root open={open} onOpenChange={setOpen} modal={false}>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          className={`model-pill run-opt ${on ? "on" : ""}`}
+          aria-label={on ? `Race: ${names.join(", ")}` : "Race providers"}
+          title="Run the same request with two or three providers and keep the best"
+          data-testid="race-button"
+        >
+          <Flag size={12} strokeWidth={1.9} aria-hidden />
+          <span className="run-opt-clip">{on ? `Race · ${names.join(" vs ")}` : "Race"}</span>
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content className="run-opt-layer" side="top" align="start" sideOffset={6} collisionPadding={12}>
+          <div className="pop run-opt-pop" role="dialog" aria-label="Race providers" data-testid="race-popover">
+            <p className="run-opt-desc">
+              Each provider you pick builds the whole request on its own branch. None merges until you compare them and pick one; the others are
+              removed. Spend adds up: each run keeps its own budget cap.
+            </p>
+            <div className="run-opt-list" role="group" aria-label="Providers to race">
+              {installed.map((p) => {
+                const checked = value.includes(p.id);
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    role="checkbox"
+                    aria-checked={checked}
+                    className={`run-opt-row ${checked ? "on" : ""}`}
+                    disabled={!checked && value.length >= 3}
+                    data-testid={`race-${p.id}`}
+                    onClick={() => toggle(p.id)}
+                  >
+                    <span className="run-opt-check" aria-hidden>
+                      {checked && <Check size={12} strokeWidth={2.2} />}
+                    </span>
+                    <span className="run-opt-body">
+                      <span className="run-opt-title">{p.name}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="run-opt-note">{value.length === 1 ? "Pick one more to race." : value.length >= 2 ? "Start runs the race." : "Pick two or three."}</p>
+            {value.length > 0 && (
+              <button type="button" className="ghost small" onClick={() => onChange([])}>
+                <X size={12} aria-hidden /> No race
+              </button>
+            )}
+          </div>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }

@@ -23,7 +23,7 @@ import { Field, Problem, useAction, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { RoleDeck } from "../components/RoleDeck";
 import { ModePicker, useRunMode } from "../components/ModePicker";
-import { GoalButton, PermissionPicker, type GoalChoice } from "../components/RunOptions";
+import { GoalButton, PermissionPicker, RaceButton, type GoalChoice } from "../components/RunOptions";
 import { promptLink, readPromptLink } from "../promptLink";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
 import { ProviderLogo, providerName } from "../providers/logos";
@@ -59,6 +59,7 @@ export function NewRun() {
   const [runMode, setRunMode] = useRunMode();
   const [permission, setPermission] = useState<PermissionMode | null>(null);
   const [goal, setGoal] = useState<GoalChoice | null>(null);
+  const [race, setRace] = useState<string[]>([]);
   const [remember, setRemember] = useState(false);
   const [budgetCap, setBudgetCap] = useState<string>("");
   const [issueOpen, setIssueOpen] = useState(false);
@@ -174,6 +175,22 @@ export function NewRun() {
     const prompt = messageText(m);
     void action.run("create", async () => {
       if (!prompt) throw new Error("Write what to build first.");
+      // O5: a race runs the request once per provider, each with that provider in every seat.
+      if (race.length >= 2) {
+        const parsed = budgetCap.trim() ? Number(budgetCap.trim()) : undefined;
+        const made = await api.createRace({
+          prompt,
+          providers: race,
+          mode: runMode,
+          yes,
+          parallel: pages == null ? undefined : resolvePages(pages, max ?? 32),
+          max_cost_usd: parsed && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined,
+        });
+        composer.current?.clear();
+        setRace([]);
+        navigate(`/races/${encodeURIComponent(made.id)}`);
+        return;
+      }
       if (missing.length) {
         setAdvanced(true);
         throw new Error(`Choose a provider for ${missing.map((s) => SEATS.find((x) => x.id === s)!.label.toLowerCase()).join(", ")}.`);
@@ -288,6 +305,7 @@ export function NewRun() {
                 <ModePicker value={runMode} onChange={setRunMode} />
                 <PermissionPicker value={permission} onChange={setPermission} />
                 <GoalButton value={goal} onChange={setGoal} />
+                <RaceButton providers={list} value={race} onChange={setRace} />
                 <button
                   type="button"
                   className="icon composer-link-btn"

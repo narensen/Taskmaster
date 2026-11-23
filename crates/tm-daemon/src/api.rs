@@ -148,6 +148,7 @@ mod connect;
 mod desk;
 mod hosts;
 mod ops;
+mod race;
 mod settle;
 mod setup;
 mod switch;
@@ -406,6 +407,9 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/flags", post(settle::set_flags))
         .route("/api/runs/{id}/roles", post(switch::switch_roles))
+        .route("/api/races", post(race::create_race))
+        .route("/api/races/{id}", get(race::show_race))
+        .route("/api/races/{id}/pick", post(race::pick_winner))
         .route("/api/runs/{id}/undo", post(undo_run))
         .route("/api/runs/{id}/workers/{page}/restart", post(restart_worker))
         .route("/api/search", get(web_search))
@@ -1022,6 +1026,9 @@ impl App {
         config.models = request.models;
         config.template = request.template;
         config.mode = request.mode;
+        if request.hold {
+            config.merge = false;
+        }
         config.permission_mode = request.permission_mode;
         config.master_answers = crate::settings::Settings::load(&self.project()).map(|s| s.approvals.master_answers).unwrap_or(false);
         config.dictionary = Some(self.dictionary().clone());
@@ -1558,6 +1565,8 @@ async fn create_run(State(app): State<Arc<App>>, Json(body): Json<NewRun>) -> Re
         mode: mode_of(body.mode.as_deref())?,
         permission_mode,
         goal: goal.clone(),
+        hold: false,
+        race: None,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.records().save_request(&id, &request)?;
@@ -1577,6 +1586,7 @@ async fn show_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> 
     view["mode"] = json!(request.mode);
     view["permission_mode"] = json!(request.permission_mode);
     view["suggestion"] = json!(app.records().suggestion(&id).ok().flatten());
+    view["race"] = json!(request.race);
     view["roles"] = json!(request.roles);
     view["models"] = json!(request.models);
     ok(view)
@@ -2237,6 +2247,8 @@ async fn create_project(State(app): State<Arc<App>>, Json(body): Json<NewProject
         mode: mode_of(body.mode.as_deref())?,
         permission_mode: permission_mode_of(body.permission_mode.as_deref())?,
         goal: goal.clone(),
+        hold: false,
+        race: None,
     };
     let decision = if body.yes { Decision::Approve } else { Decision::Continue };
     app.records().save_request(&id, &request)?;

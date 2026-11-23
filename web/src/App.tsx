@@ -117,6 +117,7 @@ const loaders = {
   settings: () => import("./pages/Settings"),
   connect: () => import("./pages/Connect"),
   files: () => import("./pages/Files"),
+  race: () => import("./pages/Race"),
 };
 const Dictionary = lazy(() => loaders.dictionary().then((m) => ({ default: m.Dictionary })));
 const Errorography = lazy(() => loaders.errorography().then((m) => ({ default: m.Errorography })));
@@ -130,6 +131,7 @@ const Skills = lazy(() => loaders.skills().then((m) => ({ default: m.Skills })))
 const SettingsPage = lazy(() => loaders.settings().then((m) => ({ default: m.Settings })));
 const ConnectPage = lazy(() => loaders.connect().then((m) => ({ default: m.Connect })));
 const Files = lazy(() => loaders.files().then((m) => ({ default: m.Files })));
+const RacePage = lazy(() => loaders.race().then((m) => ({ default: m.Race })));
 
 function usePrefetchScreens() {
   useEffect(() => {
@@ -165,6 +167,7 @@ function Screen({ path }: { path: string }) {
   if (path === "/errorography") return <Errorography />;
   if (path === "/reviews") return <Reviews />;
   if ((params = match(path, "/reviews/:id"))) return <ReviewView id={params.id!} />;
+  if ((params = match(path, "/races/:id"))) return <RacePage key={params.id} id={params.id!} />;
   if (path === "/providers") return <Providers />;
   if (path === "/skills") return <Skills />;
   if (path === "/settings") return <SettingsPage />;
@@ -205,6 +208,7 @@ function crumbsFor(path: string, project: string): Crumb[] {
   if (PAGE_NAMES[path]) return [home, { label: PAGE_NAMES[path]! }];
   if (path.startsWith("/runs/")) return [home, { label: "Runs", to: "/" }, { label: decodeURIComponent(path.slice("/runs/".length)) }];
   if (path.startsWith("/reviews/")) return [home, { label: "Reviews", to: "/reviews" }, { label: decodeURIComponent(path.slice("/reviews/".length)) }];
+  if (path.startsWith("/races/")) return [home, { label: "Runs", to: "/" }, { label: `Race ${decodeURIComponent(path.slice("/races/".length))}` }];
   return [home, { label: "Not found" }];
 }
 

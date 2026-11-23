@@ -31,7 +31,12 @@ function useNow(on: boolean): number {
 const Machine = memo(function Machine({ machine, onRetry }: { machine: MachineState; onRetry: () => void }) {
   const { showArchived } = usePrefs();
   const [folded, setFolded] = useState(false);
-  const list = machine.runs ? ordered(machine.runs, showArchived) : [];
+  // Same groups as here; inside a group, the latest activity first.
+  const list = machine.runs
+    ? ordered(machine.runs, showArchived)
+        .map((x, i) => ({ ...x, i }))
+        .sort((a, b) => (a.group === b.group ? (b.run.last_at ?? "").localeCompare(a.run.last_at ?? "") || a.i - b.i : a.i - b.i))
+    : [];
   const needs = list.filter((x) => x.group === "Needs you").length;
   const working = list.filter((x) => x.group === "Working").length;
   const now = useNow(!machine.online);

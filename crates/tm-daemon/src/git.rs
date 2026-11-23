@@ -77,6 +77,7 @@ pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {
     let mut changed = false;
     for line in [
         ".taskmaster/runs/",
+        ".taskmaster/races/",
         ".taskmaster/dictionary/",
         ".taskmaster/commons/",
         ".taskmaster/evals/",

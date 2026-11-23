@@ -176,7 +176,7 @@ test("the sidebar lists another machine's runs with its own Needs you, and an un
   const there = page.getByTestId("machine").filter({ hasText: new URL(fixture.url).host });
   await expect(there.getByText("A page built on the other machine")).toBeVisible();
   await expect(there.getByTestId("machine-needs")).toHaveText(/1 needs you|\d+ need you/);
-  await expect(there.locator(".runrow.ask")).toContainText("A plan to approve over there");
+  await expect(there.locator(".runrow.ask", { hasText: "A plan to approve over there" })).toBeVisible();
   const link = await there.locator("a.runrow-link", { hasText: "A page built on the other machine" }).getAttribute("href");
   expect(link).toBe(`${fixture.url.replace(/\/+$/, "")}/runs/far-done`);
 

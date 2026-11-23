@@ -1036,6 +1036,7 @@ impl App {
         self.summary_cache.lock().unwrap().remove(&(self.project(), id.to_string()));
         active.insert(id.to_string(), Active { cancel, cancel_mode, budget_usd, worker_restarts, in_place });
         self.unsettle_on_start(id);
+        let _ = self.records().save_suggestion(id, None);
         drop(active);
 
         let app = self.clone();
@@ -1067,6 +1068,10 @@ impl App {
             if let Err(err) = app.wake_for_note(&id) {
                 eprintln!("taskmaster: run {id}: a note was not picked up: {}", err.1);
             }
+            // A5 (Labs): suggest the next message, in the background.
+            if !app.is_active(&id) {
+                app.suggest_next(&id);
+            }
             // A8: a run that has nothing left to do settles itself (the sweep asks gh about
             // pull requests; this does not).
             if !app.is_active(&id) {
@@ -1076,6 +1081,60 @@ impl App {
             }
         });
         Ok(())
+    }
+
+    /// A5 (Labs, off by default): one small call to the master's provider suggests what the
+    /// person may send next. It runs after the run is idle and never delays it.
+    fn suggest_next(self: &Arc<Self>, id: &str) {
+        let project = self.project();
+        let settings = crate::settings::Settings::load(&project).unwrap_or_default();
+        if !settings.labs.suggest_next {
+            return;
+        }
+        let Ok(Some(run)) = self.replay(id) else { return };
+        if !matches!(run.phase, RunPhase::Done | RunPhase::Failed) {
+            return;
+        }
+        let Ok(request) = self.request_for(id) else { return };
+        let Ok(harnesses) = Harnesses::from_roles(&request.roles, &*self.harness) else { return };
+        let (total, _) = self.live.read(id, usize::MAX);
+        let (_, tail) = self.live.read(id, total.saturating_sub(300));
+        let asked = tail
+            .iter()
+            .rev()
+            .find(|e| e["kind"] == "turn" && e["agent"]["id"] == "person")
+            .and_then(|e| e["text"].as_str().map(str::to_string))
+            .or(request.prompt.clone())
+            .unwrap_or_default();
+        let status = self.records().status(id).ok().flatten().unwrap_or_default();
+        let outcome = match (run.phase, status["error"].as_str()) {
+            (RunPhase::Done, _) => "finished".to_string(),
+            (_, Some(error)) => format!("failed: {}", error.chars().take(200).collect::<String>()),
+            _ => "failed".to_string(),
+        };
+        let pages = run.pages.iter().map(|(page, state)| format!("{page} {}", serde_json::to_value(state.state).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default())).collect::<Vec<_>>().join(", ");
+        let prompt = crate::suggest::brief(&crate::suggest::Context { asked: &asked, outcome: &outcome, pages, said: crate::suggest::last_words(&tail, 6) });
+        let model = request.models.master.clone();
+        let app = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let scratch = std::env::temp_dir().join(format!("tm-suggest-{id}"));
+            let _ = std::fs::create_dir_all(&scratch);
+            let (text, entry) = crate::suggest::ask(harnesses.master.clone(), model, &scratch, prompt).await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            if let Some(entry) = entry {
+                let _ = app.records().charge(&id, &entry);
+            }
+            // A turn that started meanwhile makes the suggestion stale.
+            if app.is_active(&id) {
+                return;
+            }
+            if let Some(text) = text {
+                let _ = app.records().save_suggestion(&id, Some(&crate::suggest::Suggestion { text, at: crate::time::rfc3339_now() }));
+                app.summary_cache.lock().unwrap().remove(&(app.project(), id.clone()));
+                app.live.notify_events(&id);
+            }
+        });
     }
 
     /// A4: after a turn, check the run's goal. While it does not hold, queue an Agent turn
@@ -1512,6 +1571,7 @@ async fn show_run(State(app): State<Arc<App>>, UrlPath(id): UrlPath<String>) -> 
     view["prompt"] = json!(request.prompt);
     view["mode"] = json!(request.mode);
     view["permission_mode"] = json!(request.permission_mode);
+    view["suggestion"] = json!(app.records().suggestion(&id).ok().flatten());
     view["roles"] = json!(request.roles);
     view["models"] = json!(request.models);
     ok(view)

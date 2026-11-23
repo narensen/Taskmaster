@@ -263,6 +263,8 @@ export interface RunDetail extends RunSummary {
   cancelling?: CancelMode | null;
   /** Per-run USD spend cap, when configured. */
   budget_usd?: number | null;
+  /** A5 (Labs): the message the person may send next, suggested after the last turn. */
+  suggestion?: { text: string; at: string } | null;
 }
 
 export interface Flag {
@@ -720,6 +722,8 @@ export interface DaemonSettings {
   agents?: { timeout_secs: number; budget_usd?: number };
   /** When the daemon settles finished runs on its own (A8). */
   settle?: { after_merge_mins: number; idle_days: number };
+  /** Features still being tried, each off by default. */
+  labs?: { suggest_next: boolean };
 }
 
 export type ApprovalMode = "always" | "risky" | "never";
@@ -1556,6 +1560,7 @@ export const api = {
   setTelemetry: (enabled: boolean) => call<DaemonSettings>("POST", "/api/settings", { telemetry: enabled }),
   setAgentTimeout: (secs: number) => call<DaemonSettings>("POST", "/api/settings", { agent_timeout_secs: secs }),
   setSettle: (body: { settle_after_merge_mins?: number; settle_idle_days?: number }) => call<DaemonSettings>("POST", "/api/settings", body),
+  setLabs: (body: { labs_suggest_next?: boolean }) => call<DaemonSettings>("POST", "/api/settings", body),
   logs: () => call<{ path: string | null; lines: string[] }>("GET", "/api/logs"),
   exportSettings: () => call<{ settings: Record<string, unknown>; note: string }>("GET", "/api/settings/export"),
   importSettings: (settings: unknown) => call<DaemonSettings>("POST", "/api/settings/import", { settings }),

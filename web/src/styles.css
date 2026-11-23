@@ -7162,3 +7162,6 @@ button.run-opt-row { justify-content: flex-start; white-space: normal; }
 .pal-said-snippet { color: var(--ink); }
 .pal-said-where { color: var(--muted); font-size: var(--fs-xs); }
 ::highlight(run-hit) { background-color: var(--ink); color: var(--bg); }
+
+/* A5: a suggested next message reads a little stronger than a placeholder. */
+.composer-input[data-empty="true"][data-suggested="true"]::before { color: var(--ink-2); font-style: italic; }

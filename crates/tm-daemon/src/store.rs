@@ -438,6 +438,18 @@ impl Records {
         self.save(&format!("runs/{run}/plan.json"), plan)
     }
 
+    pub fn suggestion(&self, run: &str) -> anyhow::Result<Option<crate::suggest::Suggestion>> {
+        self.load(&format!("runs/{run}/suggest.json"))
+    }
+
+    pub fn save_suggestion(&self, run: &str, suggestion: Option<&crate::suggest::Suggestion>) -> anyhow::Result<()> {
+        let key = format!("runs/{run}/suggest.json");
+        match suggestion {
+            Some(s) => self.save(&key, s),
+            None => self.store.remove(&key),
+        }
+    }
+
     pub fn flags(&self, run: &str) -> anyhow::Result<Option<crate::settling::RunFlags>> {
         self.load(&format!("runs/{run}/flags.json"))
     }

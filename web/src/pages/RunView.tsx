@@ -1308,6 +1308,7 @@ export function RunView({ id }: { id: string }) {
           bus
           pages={pages}
           agents={["master", "workers", "reviewer", "verifier", ...pages.map((p) => `worker:${p}`)]}
+          suggestion={settled ? detail.suggestion?.text : undefined}
           placeholder={
             settled
               ? runMode === "code"

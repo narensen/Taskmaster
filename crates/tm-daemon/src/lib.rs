@@ -56,6 +56,7 @@ pub mod report;
 mod resume;
 pub mod run_index;
 pub mod settling;
+pub mod suggest;
 pub mod retention;
 mod runtime;
 pub mod scheduler;

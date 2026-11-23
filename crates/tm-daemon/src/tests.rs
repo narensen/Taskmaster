@@ -234,6 +234,9 @@ impl World {
         if brief.contains("Plan this product and lock its contracts.") || brief.contains("Plan this small product quickly.") || brief.contains("Repair this plan.") {
             return Ok(Script::text(&self.plan_reply()));
         }
+        if brief.contains("Suggest the one message they are most likely to send next") {
+            return Ok(Script::text("\"Add a test for the empty cart.\""));
+        }
         if brief.contains("Plan phase 2 of 2") {
             return Ok(Script::text(r#"{"contracts":[],"units":[{"id":"b","route":"/b","owned_glob":"app/b/**","cites":[],"brief":"Implement b on top of a."}],"dictionary":[]}"#));
         }
@@ -2709,6 +2712,57 @@ mod http {
         let (_, set) = client.post("/api/runs/kept/flags", json!({ "settled": false, "archived": true })).await;
         assert_eq!(set["flags"], json!({ "pinned": true, "archived": true, "never_settle": true }));
         assert_eq!(client.post("/api/runs/nope/flags", json!({ "pinned": true })).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn labs_suggests_the_next_message_after_a_turn_and_a_new_turn_clears_it() {
+        let tmp = seeded("api-suggest");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let asked = |world: &Arc<World>| world.calls.lock().unwrap().iter().filter(|b| b.contains("Suggest the one message")).count();
+
+        // Off by default: no call, no suggestion.
+        assert_eq!(client.get("/api/settings").await.1["labs"]["suggest_next"], false);
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "quiet", "plan": planned, "yes": true })).await;
+        client.settled("quiet", "done").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(asked(&world), 0);
+        assert!(client.get("/api/runs/quiet").await.1["suggestion"].is_null());
+
+        // On: one call after the turn, billed, and the reply cleaned of its quotes.
+        assert_eq!(client.post("/api/settings", json!({ "labs_suggest_next": true })).await.0, 200);
+        let planned = serde_json::to_value(plan(&[("b", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "said", "plan": planned, "yes": true })).await;
+        client.settled("said", "done").await;
+        let mut run = Value::Null;
+        for _ in 0..200 {
+            run = client.get("/api/runs/said").await.1;
+            if !run["suggestion"].is_null() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(run["suggestion"]["text"], "Add a test for the empty cart.", "{run}");
+        assert_eq!(asked(&world), 1);
+        let ledger = client.get("/api/runs/said/ledger").await.1;
+        assert!(ledger.to_string().contains("\"agent\":\"suggest\""), "the call is billed: {ledger}");
+
+        // A new turn drops it as it starts, and the end of that turn asks again.
+        client.post("/api/runs/said/notes", json!({ "to": "master", "text": "rename the title", "mode": "agent" })).await;
+        for _ in 0..400 {
+            let run = client.get("/api/runs/said").await.1;
+            if run["active"] == false && asked(&world) == 2 && !run["suggestion"].is_null() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(asked(&world), 2, "one call per finished turn");
+        let briefs = world.calls.lock().unwrap().clone();
+        let second = briefs.iter().filter(|b| b.contains("Suggest the one message")).nth(1).unwrap();
+        assert!(second.contains("They asked: rename the title"), "the follow-up is what was asked: {second}");
     }
 
     #[tokio::test]

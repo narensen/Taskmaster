@@ -306,6 +306,7 @@ const TOC: { group: string; items: [string, string][] }[] = [
       ["providers-for-each-role", "Providers for each role"],
       ["time-limit", "Agent time limit"],
       ["settle", "Settling runs"],
+      ["labs", "Labs"],
       ["checker", "Mid-tier checker"],
       ["code-mode", "Code Mode"],
       ["scorecard", "Model scorecard"],
@@ -727,6 +728,24 @@ export function Settings() {
               </select>
             </label>
           </div>
+        </Section>
+      )}
+
+      {daemon.data && (
+        <Section id="labs" title="Labs" note="Features still being tried. Each is off until you turn it on.">
+          <label className="row gap" data-testid="labs-suggest">
+            <Switch
+              on={daemon.data.labs?.suggest_next ?? false}
+              label="Suggest the next message after a run finishes"
+              onChange={(on) =>
+                void api.setLabs({ labs_suggest_next: on }).then(
+                  (next) => daemon.setData(next),
+                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                )
+              }
+            />
+            <span className="muted small">One small call to the master's provider after each turn; Tab in the empty box takes it.</span>
+          </label>
         </Section>
       )}
 

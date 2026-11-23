@@ -1748,6 +1748,8 @@ pub struct SettingsBody {
     settle_after_merge_mins: Option<u32>,
     /// A8: days with no activity before a finished run settles itself; 0 is off.
     settle_idle_days: Option<u32>,
+    /// A5 (Labs): suggest the next message after a turn.
+    labs_suggest_next: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1838,6 +1840,9 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
             return Err(fail(StatusCode::BAD_REQUEST, "warm_idle_secs is at most 86400"));
         }
         save_setting(&app.project(), "agents", json!({ "warm_idle_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(on) = body.labs_suggest_next {
+        save_setting(&app.project(), "labs", json!({ "suggest_next": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if let Some(mins) = body.settle_after_merge_mins {
         if mins > 30 * 24 * 60 {
@@ -1943,6 +1948,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "usage": {
             "oauth_polling": role_defaults.usage.oauth_polling,
         },
+        "labs": { "suggest_next": role_defaults.labs.suggest_next },
         "settle": {
             "after_merge_mins": role_defaults.settle.after_merge_mins,
             "idle_days": role_defaults.settle.idle_days,

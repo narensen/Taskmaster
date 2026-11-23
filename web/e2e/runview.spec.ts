@@ -173,3 +173,19 @@ test("Settle lives on the daemon: a cleared browser still shows the run settled"
   await page.locator(".runrow", { hasText: "flag-run" }).getByRole("button", { name: "Unsettle" }).click();
   await expect(page.locator(".runrow", { hasText: "flag-run" })).not.toHaveClass(/settled/);
 });
+
+test("Labs: a finished run's composer offers a suggested next message, and Tab takes it", async ({ openFixture, page, daemon }) => {
+  // The scripted fixture never answers a suggestion call, so the suggestion is served as the daemon would send it.
+  await finishedRun(daemon.fixture!, "suggest-run", "A small shop");
+  await page.route("**/api/runs/suggest-run", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({ response, json: { ...body, suggestion: { text: "Add a test for the empty cart", at: "2026-11-23T00:00:00Z" } } });
+  });
+  await openFixture("/runs/suggest-run");
+  const box = page.locator(".composer-input");
+  await expect(box).toHaveAttribute("data-placeholder", /Add a test for the empty cart/);
+  await box.click();
+  await page.keyboard.press("Tab");
+  await expect(box).toHaveText("Add a test for the empty cart");
+});

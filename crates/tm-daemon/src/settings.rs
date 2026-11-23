@@ -49,9 +49,19 @@ pub struct Settings {
     pub usage: UsageSettings,
     /// When the daemon settles finished runs on its own (A8).
     pub settle: crate::settling::SettleSettings,
+    /// Features still being tried, each off until turned on.
+    pub labs: LabsSettings,
     /// Dollars per million tokens, by model id or harness id, for calls whose harness
     /// reports no price. Grok's are built in (see [`built_in_prices`]).
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+}
+
+/// Labs: features still being tried, each off by default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LabsSettings {
+    /// A5: after a turn, one small call suggests the next message.
+    pub suggest_next: bool,
 }
 
 /// Provider usage meter settings (O4).

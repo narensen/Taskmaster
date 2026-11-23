@@ -94,6 +94,8 @@ export interface ComposerHandle {
 
 export interface ComposerProps {
   placeholder?: string;
+  /** A5: a suggested next message. An empty box shows it, and Tab fills it in. */
+  suggestion?: string;
   onSend: (message: Message, opts?: { alt?: boolean }) => void;
   onAltUp?: () => void;
   pages?: string[];
@@ -473,6 +475,19 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Tab" && !e.shiftKey && !popup && props.suggestion && empty && attachments.length === 0) {
+      e.preventDefault();
+      const el = ref.current;
+      if (!el) return;
+      el.textContent = props.suggestion;
+      sync();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "s") {
       e.preventDefault();
       return stashOrRestore();
@@ -615,7 +630,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         role="textbox"
         aria-multiline="true"
         aria-label={props.placeholder ?? "Message"}
-        data-placeholder={props.placeholder}
+        data-placeholder={props.suggestion ? `${props.suggestion}   ⇥ Tab` : props.placeholder}
+        data-suggested={props.suggestion ? "true" : undefined}
         data-empty={empty ? "true" : "false"}
         spellCheck
         onInput={() => {

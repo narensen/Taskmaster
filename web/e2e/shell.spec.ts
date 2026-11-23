@@ -1,4 +1,4 @@
-import { test, expect, lowContrast } from "./fixtures";
+import { test, expect, finishedRun, CHOSEN, lowContrast } from "./fixtures";
 
 // The shell and the new controls: the title bar, choosing providers with nothing chosen
 // for you, pages at once, Command-K, the quick terminal and the files panel.
@@ -150,4 +150,42 @@ test("Ctrl-S puts a draft aside with its chips and attachments, and brings it ba
   await box.click();
   await page.keyboard.press("Control+s");
   await expect(page.getByText("Nothing stashed")).toBeVisible();
+});
+
+test("the sidebar lists another machine's runs with its own Needs you, and an unreachable one with Retry", async ({ open, page, daemon }) => {
+  test.setTimeout(60_000);
+  const fixture = daemon.fixture!;
+  const headers = { "content-type": "application/json", authorization: `Bearer ${fixture.token}` };
+  await finishedRun(fixture, "far-done", "A page built on the other machine");
+  // A run there that waits for its plan to be approved needs a person.
+  await fetch(`${fixture.url}/api/runs`, { method: "POST", headers, body: JSON.stringify({ id: "far-asks", prompt: "A plan to approve over there", roles: CHOSEN }) });
+  await expect.poll(async () => (await (await fetch(`${fixture.url}/api/runs/far-asks`, { headers })).json()).phase, { timeout: 30_000 }).toBe("awaiting_approval");
+
+  await page.addInitScript(
+    ([url, token]) => {
+      const prefs = JSON.parse(localStorage.getItem("taskmaster.prefs") ?? "{}");
+      prefs.daemons = [
+        { url, token, pinned: false },
+        { url: "http://127.0.0.1:9", token: "x", pinned: false },
+      ];
+      localStorage.setItem("taskmaster.prefs", JSON.stringify(prefs));
+    },
+    [fixture.url, fixture.token],
+  );
+  await open("/");
+  const there = page.getByTestId("machine").filter({ hasText: new URL(fixture.url).host });
+  await expect(there.getByText("A page built on the other machine")).toBeVisible();
+  await expect(there.getByTestId("machine-needs")).toHaveText(/1 needs you|\d+ need you/);
+  await expect(there.locator(".runrow.ask")).toContainText("A plan to approve over there");
+  const link = await there.locator("a.runrow-link", { hasText: "A page built on the other machine" }).getAttribute("href");
+  expect(link).toBe(`${fixture.url.replace(/\/+$/, "")}/runs/far-done`);
+
+  const gone = page.getByTestId("machine").filter({ hasText: "127.0.0.1:9" });
+  await expect(gone.getByTestId("machine-offline")).toContainText("Not reachable");
+  await expect(gone.getByRole("button", { name: "Retry" })).toBeVisible();
+  await page.evaluate(() => {
+    const prefs = JSON.parse(localStorage.getItem("taskmaster.prefs") ?? "{}");
+    prefs.daemons = [];
+    localStorage.setItem("taskmaster.prefs", JSON.stringify(prefs));
+  });
 });

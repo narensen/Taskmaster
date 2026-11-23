@@ -34,6 +34,7 @@ import { ContextMenu, Toasts, emit, openMenu, toast, undoLatest, useOn, type Chi
 import type { PaletteState } from "./palette";
 import { openProject } from "./openProject";
 import { isRunUnread, markRunSeen, prefs, setPrefs, useMotion, usePrefs } from "./prefs";
+import { MachineRuns } from "./shell/Machines";
 import { RunsContext, flagsOf, migrateLocalFlags, ordered, setRunsReloader, toggleFlag, type Group } from "./runs";
 import { phaseLabel, shortSpan, usd } from "./format";
 import { readFile } from "./composer";
@@ -443,6 +444,7 @@ const RunList = memo(function RunList({ runs, path, onPick }: { runs: RunSummary
           ))}
         </ul>
       )}
+      <MachineRuns signedIn />
       <label className="check small">
         <input type="checkbox" checked={p.showArchived} onChange={(e) => setPrefs({ showArchived: e.target.checked })} />
         Show archived

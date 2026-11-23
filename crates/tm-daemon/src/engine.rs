@@ -4819,6 +4819,10 @@ impl Driver {
         for note in &notes {
             brief.push_str(&format!("- to {}: {}\n", note.to, note.text.trim()));
         }
+        // A9: after a switch of providers, the master reads what the earlier ones left.
+        if let Some(handoff) = crate::handoff::take(&self.records, &self.id) {
+            brief.push_str(&crate::handoff::brief_section(&handoff));
+        }
         let worktree = self.fresh_worktree("notes")?;
         let mut request = self.read_request(
             &worktree,
@@ -5332,7 +5336,8 @@ impl Driver {
         let taken = self.live.take_fresh_where(&self.id, |_| true);
         let failed = (self.run.phase == RunPhase::Failed).then_some("the run did not pass its checks");
         let asked = self.records.request(&self.id).ok().flatten().and_then(|request| request.prompt).or_else(|| self.config.prompt.clone());
-        let plan = crate::turns::turn_plan(turn, &taken, asked.as_deref(), self.run.plan.as_ref(), failed);
+        let handoff = crate::handoff::take(&self.records, &self.id);
+        let plan = crate::turns::turn_plan(turn, &taken, asked.as_deref(), self.run.plan.as_ref(), failed, handoff.as_deref());
         let (agent, fields) = crate::turns::turn_entry(turn, mode, &taken);
         self.live.push(&self.id, &agent, "turn", fields);
         self.push_event(Event::AgentTurn { plan })?;

@@ -150,6 +150,7 @@ mod hosts;
 mod ops;
 mod settle;
 mod setup;
+mod switch;
 mod skills;
 mod studio;
 mod terms;
@@ -404,6 +405,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/flags", post(settle::set_flags))
+        .route("/api/runs/{id}/roles", post(switch::switch_roles))
         .route("/api/runs/{id}/undo", post(undo_run))
         .route("/api/runs/{id}/workers/{page}/restart", post(restart_worker))
         .route("/api/search", get(web_search))
@@ -1259,7 +1261,8 @@ impl App {
                 let failed = (run.phase == RunPhase::Failed).then(|| self.records().status(id).ok().flatten()).flatten();
                 let error = failed.as_ref().and_then(|status| status["error"].as_str()).map(str::to_string)
                     .or_else(|| (run.phase == RunPhase::Failed).then(|| "the run did not pass its checks".to_string()));
-                let plan = crate::turns::turn_plan(turn, &notes_taken, request.prompt.as_deref(), run.plan.as_ref(), error.as_deref());
+                let handoff = crate::handoff::take(&self.records(), id);
+                let plan = crate::turns::turn_plan(turn, &notes_taken, request.prompt.as_deref(), run.plan.as_ref(), error.as_deref(), handoff.as_deref());
                 let (agent, fields) = crate::turns::turn_entry(turn, mode, &notes_taken);
                 self.live.push_held(&notes, id, &agent, "turn", fields);
                 events.push(Event::AgentTurn { plan });

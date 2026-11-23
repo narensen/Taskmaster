@@ -34,6 +34,7 @@ pub mod eval_suite;
 pub mod gates;
 mod git;
 pub mod goals;
+pub mod handoff;
 mod hosts;
 pub mod issues;
 mod log;

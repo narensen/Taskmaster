@@ -64,7 +64,7 @@ export function PermissionPicker({ value, onChange }: { value: PermissionMode | 
         </button>
       </Popover.Trigger>
       <Popover.Portal>
-        <Popover.Content side="top" align="start" sideOffset={6} collisionPadding={12}>
+        <Popover.Content className="run-opt-layer" side="top" align="start" sideOffset={6} collisionPadding={12}>
           <div className="pop run-opt-pop" role="dialog" aria-label="Permissions for this run" data-testid="permission-popover">
             <div className="run-opt-list" role="radiogroup" aria-label="Permission mode">
               {options.map((o) => {
@@ -136,6 +136,7 @@ export function GoalButton({ value, onChange }: { value: GoalChoice | null; onCh
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Content
+          className="run-opt-layer"
           side="top"
           align="start"
           sideOffset={6}

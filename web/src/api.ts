@@ -1496,6 +1496,9 @@ export const api = {
       older_calls?: OlderCallSummary[];
     }>("GET", `/api/runs/${enc(id)}/agents?${params}`);
   },
+  /** A9: give seats of a run that is not working to another provider; the next agent gets a handoff. */
+  switchRoles: (id: string, body: { roles?: Partial<Roles>; models?: Partial<Record<RoleName, string>> }) =>
+    call<{ roles: Roles; models: Models; handoff: { to: Record<string, string> } | null }>("POST", `/api/runs/${enc(id)}/roles`, body),
   setRunFlags: (id: string, flags: { pinned?: boolean; settled?: boolean; archived?: boolean; never_settle?: boolean }) =>
     call<{ flags: ServerRunFlags }>("POST", `/api/runs/${enc(id)}/flags`, flags).then((r) => r.flags),
   /** Words from the project's runs (A7): each hit names the run, the entry, the agent and the turn. */

@@ -164,7 +164,7 @@ pub fn agent_plan(prompt: &str, notes: &[String], existing_files: usize) -> Plan
 
 /// The plan of follow-up turn `turn` in Agent mode. `previous` is the plan the run had, so
 /// a project shown in a browser stays one, with its design.
-pub fn turn_plan(turn: usize, notes: &[Note], prompt: Option<&str>, previous: Option<&Plan>, failed: Option<&str>) -> Plan {
+pub fn turn_plan(turn: usize, notes: &[Note], prompt: Option<&str>, previous: Option<&Plan>, failed: Option<&str>, handoff: Option<&str>) -> Plan {
     let asked = notes.iter().map(|note| note.text.trim()).filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut brief = asked.clone();
     brief.push_str("\n\nThis is a follow-up on an earlier run of this project.");
@@ -180,6 +180,9 @@ pub fn turn_plan(turn: usize, notes: &[Note], prompt: Option<&str>, previous: Op
         "\nWork out what is wrong (a missing file, a broken import, a script that names something absent, a failing test) \
          and fix it in every file that needs it. Do not rebuild what already works.",
     );
+    if let Some(handoff) = handoff {
+        brief.push_str(&crate::handoff::brief_section(handoff));
+    }
     let ui_page = previous.and_then(|plan| plan.pages.iter().find(|page| plan.is_ui(page)));
     let web = ui_page.is_some();
     let route = ui_page.map(|page| page.route.trim()).filter(|r| !r.is_empty()).unwrap_or("/").to_string();
@@ -251,7 +254,7 @@ mod tests {
         assert!(tm_core::check_plan(&existing, &[], &Default::default()).is_ok());
 
         let first = agent_plan("A portfolio", &[], 0);
-        let turn = turn_plan(2, &[note("preview does not start: no dev script", None)], Some("A portfolio"), Some(&first), Some("verify failed"));
+        let turn = turn_plan(2, &[note("preview does not start: no dev script", None)], Some("A portfolio"), Some(&first), Some("verify failed"), None);
         assert_eq!(turn.pages[0].id, "agent-2");
         assert_eq!(turn.pages[0].owned_glob, "**");
         assert_eq!(turn.kind, ProjectKind::Web);

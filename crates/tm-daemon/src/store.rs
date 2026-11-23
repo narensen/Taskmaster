@@ -438,6 +438,14 @@ impl Records {
         self.save(&format!("runs/{run}/plan.json"), plan)
     }
 
+    pub fn handoff(&self, run: &str) -> anyhow::Result<Option<crate::handoff::Handoff>> {
+        self.load(&format!("runs/{run}/handoff.json"))
+    }
+
+    pub fn save_handoff(&self, run: &str, handoff: &crate::handoff::Handoff) -> anyhow::Result<()> {
+        self.save(&format!("runs/{run}/handoff.json"), handoff)
+    }
+
     pub fn suggestion(&self, run: &str) -> anyhow::Result<Option<crate::suggest::Suggestion>> {
         self.load(&format!("runs/{run}/suggest.json"))
     }

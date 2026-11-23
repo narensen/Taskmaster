@@ -2766,6 +2766,57 @@ mod http {
     }
 
     #[tokio::test]
+    async fn switching_providers_on_a_finished_run_hands_the_next_agent_a_handoff_once() {
+        let tmp = seeded("api-switch");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+        let planned = serde_json::to_value(plan(&[("a", &[])])).unwrap();
+        client.post("/api/runs", json!({ "id": "sw", "plan": planned, "yes": true })).await;
+        client.settled("sw", "done").await;
+
+        assert_eq!(client.post("/api/runs/sw/roles", json!({ "roles": { "boss": "codex" } })).await.0, 400);
+        assert_eq!(client.post("/api/runs/sw/roles", json!({ "roles": { "worker": "nope" } })).await.0, 400);
+        assert_eq!(client.post("/api/runs/sw/roles", json!({})).await.0, 400);
+        let (status, switched) = client.post("/api/runs/sw/roles", json!({ "roles": { "worker": "codex", "master": "codex" } })).await;
+        assert_eq!(status, 200, "{switched}");
+        assert_eq!(switched["handoff"]["to"], json!({ "master": "codex", "worker": "codex" }));
+        assert_eq!(switched["handoff"]["from"], json!({ "master": "grok", "worker": "grok" }));
+        let text = switched["handoff"]["text"].as_str().unwrap();
+        assert!(text.contains("worker: grok → codex") && text.contains("Plan:") && text.contains("- a /a owns app/a/**"), "{text}");
+        let run = client.get("/api/runs/sw").await.1;
+        assert_eq!((run["roles"]["worker"].as_str(), run["roles"]["reviewer"].as_str()), (Some("codex"), Some("grok")));
+        // The switch is a daemon line in the run's history.
+        let said = client.get("/api/runs/sw/agents").await.1;
+        assert!(said["entries"].as_array().unwrap().iter().any(|e| e["kind"] == "switch" && e["agent"]["id"] == "runtime"));
+
+        // The next turn's agent gets the handoff; the turn after does not.
+        let before = world.calls.lock().unwrap().len();
+        client.post("/api/runs/sw/notes", json!({ "to": "master", "text": "add a footer", "mode": "agent" })).await;
+        for _ in 0..400 {
+            if world.calls.lock().unwrap()[before..].iter().any(|b| b.contains("add a footer")) && client.get("/api/runs/sw").await.1["active"] == false {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let briefs = world.calls.lock().unwrap().clone();
+        let agent = briefs[before..].iter().find(|b| b.contains("add a footer")).expect("the agent took the note");
+        assert!(agent.contains("Handoff from the earlier provider") && agent.contains("master: grok → codex"), "{agent}");
+        let before = briefs.len();
+        client.post("/api/runs/sw/notes", json!({ "to": "master", "text": "and a header", "mode": "agent" })).await;
+        for _ in 0..400 {
+            if world.calls.lock().unwrap()[before..].iter().any(|b| b.contains("and a header")) && client.get("/api/runs/sw").await.1["active"] == false {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let briefs = world.calls.lock().unwrap().clone();
+        let next = briefs[before..].iter().find(|b| b.contains("and a header")).expect("the next agent took the note");
+        assert!(!next.contains("Handoff from the earlier provider"), "the handoff is given once");
+    }
+
+    #[tokio::test]
     async fn paths_resolve_from_the_project_and_open_in_an_editor() {
         let tmp = repo("api-paths");
         std::fs::create_dir_all(tmp.0.join("src")).unwrap();

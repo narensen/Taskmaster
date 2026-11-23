@@ -29,6 +29,7 @@ import { ReviewLens } from "../run/ReviewLens";
 import { TelemetryLens } from "../run/TelemetryLens";
 import { useRun, useSurfaces, useTurns } from "../run/model";
 import { PastTurn } from "../run/Turns";
+import { SwitchProviders } from "../run/SwitchProviders";
 import { ModePicker, useRunMode } from "../components/ModePicker";
 import { GoalStatus, permissionLabel } from "../components/RunOptions";
 import { BrowserTab, TerminalTab } from "../run/Tabs";
@@ -1329,6 +1330,7 @@ export function RunView({ id }: { id: string }) {
             <div className="composer-foot run-composer-foot">
               <div className="composer-actions">
                 <ModePicker value={runMode} onChange={setRunMode} label="Who takes the next turn" />
+                {settled && <SwitchProviders id={id} detail={detail} onSwitched={() => void data.reload()} />}
               </div>
               <span className="muted small">
                 {settled

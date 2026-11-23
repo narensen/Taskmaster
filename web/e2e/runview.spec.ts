@@ -189,3 +189,23 @@ test("Labs: a finished run's composer offers a suggested next message, and Tab t
   await page.keyboard.press("Tab");
   await expect(box).toHaveText("Add a test for the empty cart");
 });
+
+test("a finished run can give a seat to another provider for the next turn", async ({ openFixture, page, daemon }) => {
+  test.setTimeout(60_000);
+  await finishedRun(daemon.fixture!, "switch-run", "A page to hand over");
+  let sent: unknown = null;
+  await page.route("**/api/runs/switch-run/roles", async (route) => {
+    sent = route.request().postDataJSON();
+    await route.fulfill({ json: { roles: {}, models: {}, handoff: { to: { worker: "grok" } } } });
+  });
+  await openFixture("/runs/switch-run");
+  await page.getByTestId("switch-providers").click();
+  const pop = page.getByTestId("switch-popover");
+  await expect(pop.getByRole("button", { name: /^Worker provider for the next turn: Grok/ })).toBeVisible();
+  await pop.getByRole("button", { name: /^Worker provider for the next turn/ }).click();
+  const prov = page.locator(".prov-pop").last();
+  await prov.getByRole("listbox", { name: "Providers" }).getByRole("option", { name: /Grok/ }).click({ timeout: 5000 });
+  await prov.getByRole("option", { name: /Provider default/ }).click({ timeout: 5000 });
+  await expect.poll(() => sent).toEqual({ roles: { worker: "grok" }, models: { worker: "" } });
+  await expect(page.getByText("Worker switched")).toBeVisible();
+});

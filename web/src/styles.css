@@ -7165,3 +7165,9 @@ button.run-opt-row { justify-content: flex-start; white-space: normal; }
 
 /* A5: a suggested next message reads a little stronger than a placeholder. */
 .composer-input[data-empty="true"][data-suggested="true"]::before { color: var(--ink-2); font-style: italic; }
+
+/* A9: switching a seat's provider on a finished run. */
+.switch-pop { width: min(380px, 92vw); padding: 10px; gap: 8px; }
+.switch-seat { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+/* Run option popovers sit above the composer bar, on the same layer as other popovers. */
+.run-opt-layer { z-index: 80; }

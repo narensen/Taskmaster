@@ -343,7 +343,15 @@ impl Server {
         let wide = self.app.addr.ip().is_unspecified();
         let lan = if wide { connect::lan_route() } else { None };
         let tailnet = if wide { tailscale_ipv4().ok() } else { None };
-        connect::routes(self.app.addr, lan, tailnet).into_iter().map(|route| format!("{}pair#code={code}", route.url)).collect()
+        let mut routes = connect::routes(self.app.addr, lan, tailnet);
+        if let Some(net_addr) = self.app.network.lock().unwrap().as_ref().map(|(addr, _)| *addr) {
+            for route in connect::routes(net_addr, None, None) {
+                if !routes.iter().any(|existing| existing.url == route.url) {
+                    routes.push(route);
+                }
+            }
+        }
+        routes.into_iter().map(|route| format!("{}pair#code={code}", route.url)).collect()
     }
 
     /// Ask every provider for its models in the background, so the first page that offers
@@ -1143,7 +1151,7 @@ impl App {
                 "Stopped: the run ended before this call did."
             };
             app.live.close_open_calls(&id, why);
-            let limited = matches!(&result, Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some());
+            let _limited = matches!(&result, Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some());
             app.live.approvals.set_advisor(&id, None);
             app.record_outcome(&id, result);
             // A4: If this run has an active goal and no human note is already queued, check

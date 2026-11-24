@@ -1888,7 +1888,7 @@ pub(super) fn set_setting(project: &Path, key: &str, value: Value) -> anyhow::Re
 }
 
 /// Merge `values` into the object at `key` of the settings file.
-fn save_setting(project: &Path, key: &str, values: Value) -> anyhow::Result<()> {
+pub(super) fn save_setting(project: &Path, key: &str, values: Value) -> anyhow::Result<()> {
     write_setting(project, key, values, true)
 }
 

@@ -2309,6 +2309,144 @@ mod http {
     }
 
     #[tokio::test]
+    async fn push_routes_manage_subscriptions_ntfy_and_send_test_alerts() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use ring::agreement::{ECDH_P256, EphemeralPrivateKey};
+        use ring::rand::SystemRandom;
+
+        let tmp = repo("push-api");
+        let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hits_clone = hits.clone();
+        let sink = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let hits = hits_clone.clone();
+            async move {
+                hits.lock().unwrap().push(uri.path().to_string());
+                axum::http::StatusCode::OK
+            }
+        });
+        let sink_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink_listener.local_addr().unwrap();
+        let sink_task = tokio::spawn(async move {
+            let _ = axum::serve(sink_listener, sink).await;
+        });
+
+        let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());
+        let code = auth.code().to_string();
+        let mut options = ServerOptions::new(&tmp.0, "127.0.0.1:0".parse().unwrap(), auth);
+        options.push = Some(tmp.0.join(".taskmaster/push.json"));
+        let _server = Server::serve(options).await.unwrap();
+        let addr = _server.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let mut client = Client { addr, token: None };
+        let (_, paired) = client.post("/api/pair", json!({ "code": code, "label": "Phone" })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let (status, view) = client.get("/api/push").await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["enabled"], true);
+        assert!(!view["public_key"].as_str().unwrap().is_empty());
+        assert_eq!(view["subscriptions"].as_array().unwrap().len(), 0);
+        assert!(view["ntfy"].is_null());
+
+        let rng = SystemRandom::new();
+        let ua = EphemeralPrivateKey::generate(&ECDH_P256, &rng).unwrap();
+        let endpoint = format!("http://{sink_addr}/webpush");
+        let (status, view) = client
+            .post(
+                "/api/push/subscribe",
+                json!({
+                    "endpoint": endpoint,
+                    "p256dh": B64.encode(ua.compute_public_key().unwrap().as_ref()),
+                    "auth": B64.encode([9u8; 16]),
+                    "label": "My phone",
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(view["subscriptions"][0]["label"], "My phone");
+
+        let (status, view) = client
+            .post("/api/push/ntfy", json!({ "on": true, "server": format!("http://{sink_addr}") }))
+            .await;
+        assert_eq!(status, 200, "{view}");
+        let topic = view["ntfy"]["topic"].as_str().unwrap().to_string();
+        assert!(topic.starts_with("tm-"), "{view}");
+
+        let (status, sent) = client.post("/api/push/test", json!({})).await;
+        assert_eq!(status, 200, "{sent}");
+        assert_eq!(sent["web"], 1, "{sent}");
+        assert_eq!(sent["ntfy"], true, "{sent}");
+        assert_eq!(sent["errors"].as_array().unwrap().len(), 0, "{sent}");
+        {
+            let got = hits.lock().unwrap();
+            assert!(got.iter().any(|p| p == "/webpush"), "{got:?}");
+            assert!(got.iter().any(|p| p == &format!("/{topic}")), "{got:?}");
+        }
+
+        let (status, view) = client.post("/api/push/unsubscribe", json!({ "endpoint": endpoint })).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["removed"], true);
+        assert_eq!(view["subscriptions"].as_array().unwrap().len(), 0);
+
+        let (status, view) = client.post("/api/push/ntfy", json!({ "on": false })).await;
+        assert_eq!(status, 200, "{view}");
+        assert!(view["ntfy"].is_null());
+
+        // Without a push store configured, GET reports disabled and mutations refuse cleanly.
+        let tmp_off = repo("push-api-off");
+        let world = World::new(Mode::Write);
+        let (_off_server, mut off_client, off_code) = server(&tmp_off, &world).await;
+        let (_, off_paired) = off_client.post("/api/pair", json!({ "code": off_code })).await;
+        off_client.token = Some(off_paired["token"].as_str().unwrap().to_string());
+        let (status, off_view) = off_client.get("/api/push").await;
+        assert_eq!(status, 200, "{off_view}");
+        assert_eq!(off_view["enabled"], false);
+        assert_eq!(off_client.post("/api/push/test", json!({})).await.0, 503);
+
+        sink_task.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_network_toggles_secondary_listener_and_persists_setting() {
+        let tmp = repo("connect-network");
+        let world = World::new(Mode::Write);
+        let (_server, mut client, code) = server(&tmp, &world).await;
+        let (_, paired) = client.post("/api/pair", json!({ "code": code, "label": "Laptop" })).await;
+        client.token = Some(paired["token"].as_str().unwrap().to_string());
+
+        let (status, opened) = client.post("/api/connect/network", json!({ "open": true })).await;
+        if status == 200 {
+            assert_eq!(opened["only_this_computer"], false, "{opened}");
+            let lan_route = opened["routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["kind"] != "this-computer")
+                .expect("expected a non-loopback route");
+            let lan_addr = lan_route["address"].as_str().unwrap().to_string();
+            let lan_client = Client { addr: lan_addr, token: None };
+            let (health_status, health) = lan_client.get("/api/health").await;
+            assert_eq!(health_status, 200, "{health}");
+
+            let saved: Value = serde_json::from_str(&read(&tmp.0.join(".taskmaster/config.json"))).unwrap();
+            assert_eq!(saved["connect"]["network"], true, "{saved}");
+
+            let (status, closed) = client.post("/api/connect/network", json!({ "open": false })).await;
+            assert_eq!(status, 200, "{closed}");
+            assert_eq!(closed["only_this_computer"], true, "{closed}");
+            let saved: Value = serde_json::from_str(&read(&tmp.0.join(".taskmaster/config.json"))).unwrap();
+            assert_eq!(saved["connect"]["network"], false, "{saved}");
+        } else {
+            assert_eq!(status, 400, "{opened}");
+            assert!(opened["error"].as_str().unwrap_or("").contains("local-network"), "{opened}");
+            let (status, closed) = client.post("/api/connect/network", json!({ "open": false })).await;
+            assert_eq!(status, 200, "{closed}");
+            assert_eq!(closed["only_this_computer"], true, "{closed}");
+        }
+    }
+
+    #[tokio::test]
     async fn skills_are_searched_installed_toggled_updated_and_removed_over_the_api() {
         let tmp = seeded("skills-api");
         let auth = Arc::new(PairingAuth::new(Records::files(&tmp.0)).unwrap());

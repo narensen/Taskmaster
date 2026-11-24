@@ -27,7 +27,7 @@ const MARKS: Record<string, Mark> = {
   grok: { svg: inner(grok), name: "Grok Build" },
   codex: { svg: inner(codex), name: "Codex" },
   opencode: { svg: inner(opencode), name: "OpenCode" },
-  agy: { svg: inner(agy), brand: "#3186ff", name: "Antigravity" },
+  agy: { svg: inner(agy), brand: "#60a5fa", name: "Antigravity" },
 };
 
 export function providerName(id: string, fallback?: string): string {

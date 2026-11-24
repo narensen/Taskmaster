@@ -7201,3 +7201,1192 @@ button.run-opt-row { justify-content: flex-start; white-space: normal; }
 .race-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .race-frame { width: 100%; height: 280px; border: 1px solid var(--line); border-radius: var(--r); background: #fff; }
 .race-preview-btn { align-self: flex-start; }
+
+/* ==========================================================================
+   T3 Code Visual, Color-Symbol & Fluid FPS System (append-only)
+   True obsidian canvas (#000) with crisp elevated surfaces (#0e0e11 / #141418),
+   hairline 1px borders, ZERO colored pill/box shapes — color lives strictly on
+   semantic symbols & tabular diff figures. Duty-cycled stepped animations and
+   compositor-only micro-interactions preserve 60–120 FPS with zero GPU spikes.
+   ========================================================================== */
+
+:root {
+  --bg: #000000;
+  --bg-side: #000000;
+  --bg-sunken: #070709;
+  --bg-elev: #0e0e11;
+  --bg-elev-2: #141418;
+  --bg-hover: #18181c;
+  --bg-active: #202025;
+  --ink: #f1f3f7;
+  --ink-2: #d1d1d8;
+  --muted: #9a9aa6;
+  --faint: rgba(255, 255, 255, 0.06);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --rule: rgba(255, 255, 255, 0.07);
+  --link: #e4e4ec;
+  --accent: #e4e4ec;
+  --accent-ink: #000000;
+  --accent-soft: rgba(255, 255, 255, 0.075);
+  --accent-line: rgba(255, 255, 255, 0.24);
+  --tint: rgba(255, 255, 255, 0.045);
+
+  /* T3 Code semantic symbol palette (applied to icons & tabular diff text, never fills) */
+  --good: #34d399;
+  --bad: #f87171;
+  --ask: #fbbf24;
+  --sym-good: #34d399;
+  --sym-bad: #f87171;
+  --sym-warn: #fbbf24;
+  --sym-info: #60a5fa;
+  --sym-violet: #a78bfa;
+  --sym-cyan: #38bdf8;
+  --sym-muted: #8f8f9b;
+
+  /* Crisp T3 elevations: hairline top highlight + grounded ambient drop */
+  --shadow-1: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 1px 2px rgba(0, 0, 0, 0.6);
+  --shadow-2: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 14px 32px -18px rgba(0, 0, 0, 0.85);
+  --shadow-pop: inset 0 1px 0 rgba(255, 255, 255, 0.065), 0 22px 52px -16px rgba(0, 0, 0, 0.94);
+
+  /* T3 drawer deceleration curve */
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --t-fast: 120ms;
+  --t-base: 180ms;
+}
+
+.theme-light {
+  --bg: #fcfcfc;
+  --bg-side: #f7f7f8;
+  --bg-sunken: #f3f3f5;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #ffffff;
+  --bg-hover: #ededf0;
+  --bg-active: #e4e4e8;
+  --ink: #18181b;
+  --ink-2: #3f3f46;
+  --muted: #52525b;
+  --faint: rgba(0, 0, 0, 0.045);
+  --line: rgba(0, 0, 0, 0.085);
+  --line-strong: rgba(0, 0, 0, 0.15);
+  --rule: rgba(0, 0, 0, 0.075);
+  --link: #18181b;
+  --accent: #18181b;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(0, 0, 0, 0.055);
+  --accent-line: rgba(0, 0, 0, 0.22);
+  --tint: rgba(0, 0, 0, 0.035);
+  --good: #047857;
+  --bad: #b91c1c;
+  --ask: #92400e;
+  --sym-good: #059669;
+  --sym-bad: #dc2626;
+  --sym-warn: #d97706;
+  --sym-info: #2563eb;
+  --sym-violet: #7c3aed;
+  --sym-cyan: #0284c7;
+  --sym-muted: #71717a;
+  --shadow-1: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-2: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 12px 28px -16px rgba(0, 0, 0, 0.14);
+  --shadow-pop: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 20px 48px -16px rgba(0, 0, 0, 0.18);
+}
+
+/* --------------------------------------------------------------------------
+   1. Icon Precision & Brand Symbols (T3 Code signature 1.75 stroke + symbol-only color)
+   -------------------------------------------------------------------------- */
+:where(svg.lucide[stroke-width="2"]) {
+  stroke-width: 1.75;
+}
+
+.prov-logo.has-brand {
+  color: var(--brand);
+}
+.theme-light .prov-logo.has-brand {
+  color: color-mix(in srgb, var(--brand) 82%, #000);
+}
+
+/* --------------------------------------------------------------------------
+   2. Focus Ring & Tactile Controls (T3 Code crispness + compositor-only scale)
+   -------------------------------------------------------------------------- */
+button, .button {
+  border-color: var(--line-strong);
+  background: var(--bg-elev-2);
+  box-shadow: var(--shadow-1);
+  transition:
+    background-color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
+}
+button:hover:not(:disabled), .button:hover {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+}
+button:active:not(:disabled), .button:active:not(:disabled) {
+  transform: scale(0.975);
+}
+button.primary, .button.primary {
+  background: var(--ink);
+  color: var(--bg);
+  border-color: transparent;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+button.primary:hover:not(:disabled), .button.primary:hover {
+  background: color-mix(in srgb, var(--ink) 88%, var(--bg));
+  color: var(--bg);
+}
+button.ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+button.danger {
+  color: var(--bad);
+  background: transparent;
+  border-color: var(--line);
+}
+button.danger:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+  color: var(--bad);
+}
+
+button:focus-visible,
+.button:focus-visible,
+a:focus-visible,
+[role="slider"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px color-mix(in srgb, var(--ink) 45%, transparent);
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--line-strong);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink) 16%, transparent);
+}
+
+/* --------------------------------------------------------------------------
+   3. Shell, TitleBar, Window Controls & Sidebar (T3 Code unified obsidian chrome)
+   -------------------------------------------------------------------------- */
+.shell {
+  background: var(--bg);
+}
+.side {
+  background: var(--bg-side);
+  border-right: 1px solid var(--line);
+}
+.titlebar {
+  background: var(--bg);
+  padding: 0 10px 0 14px;
+  gap: 6px;
+}
+.main {
+  background: var(--bg);
+}
+
+/* Circular / squircle titlebar action buttons matching T3 Code header */
+button.tb-btn,
+a.tb-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--sym-muted);
+  border: 1px solid transparent;
+  background: transparent;
+  box-shadow: none;
+}
+button.tb-btn:hover:not(:disabled),
+a.tb-btn:hover {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+button.tb-btn.on {
+  background: var(--bg-active);
+  color: var(--ink);
+}
+
+.win-controls {
+  gap: 6px;
+  align-items: center;
+  margin-left: 8px;
+  margin-right: 0;
+}
+button.win-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+}
+button.win-btn:hover:not(:disabled) {
+  background: var(--bg-active);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+button.win-btn.close:hover:not(:disabled) {
+  background: var(--bg-active);
+  border-color: var(--line-strong);
+  color: var(--sym-bad);
+}
+
+/* Git branch chip: clean icon symbol + mono text, zero colored pill box */
+.git-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.git-chip-ico {
+  color: var(--sym-muted);
+  flex: none;
+}
+.git-chip[data-dirty="true"] .git-chip-ico {
+  color: var(--sym-warn);
+}
+.git-chip-dirty {
+  color: var(--muted);
+}
+
+/* Sidebar brand, search, nav & run list */
+.side-brand {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  padding: 0 14px;
+}
+.brand img {
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--line-strong);
+}
+.side-search {
+  margin: 4px 10px 8px;
+  gap: 6px;
+}
+.palette-hint {
+  height: 31px;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+button.palette-hint:hover {
+  background: var(--bg-elev-2);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.side-new {
+  width: 31px;
+  height: 31px;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+}
+.side-new:hover {
+  background: var(--bg-elev-2);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.nav {
+  padding: 4px 8px 8px;
+  gap: 1px;
+}
+.nav a {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 450;
+}
+.nav a svg {
+  color: var(--sym-muted);
+  opacity: 1;
+  transition: color var(--t-fast) var(--ease);
+}
+.nav a:hover {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+.nav a:hover svg {
+  color: var(--ink-2);
+}
+.nav a.on {
+  background: var(--bg-active);
+  color: var(--ink);
+  font-weight: 500;
+}
+.nav a.on svg {
+  color: var(--ink);
+}
+
+button.group-head {
+  padding: 12px 10px 5px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  box-shadow: none;
+}
+
+/* Sidebar run rows: clean monochrome row + crisp semantic status symbols */
+.runrow {
+  border-radius: 8px;
+  contain: layout style;
+}
+.runrow:hover {
+  background: var(--bg-hover);
+}
+.runrow.on,
+.runrow.on:hover {
+  background: var(--bg-active);
+}
+.runrow.ask .runrow-link .run-title {
+  color: var(--ink);
+  font-weight: 550;
+}
+.runrow-link {
+  padding: 7px 10px;
+  gap: 9px;
+}
+.run-ico {
+  color: var(--sym-muted);
+}
+.run-ico.working {
+  color: var(--sym-info);
+}
+.run-ico.working svg {
+  animation: tm-status-pulse 2s infinite;
+}
+.run-ico.ask {
+  color: var(--sym-warn);
+}
+.run-ico.done {
+  color: var(--sym-good);
+}
+.run-ico.failed {
+  color: var(--sym-bad);
+}
+.run-ico.merged {
+  color: var(--sym-violet);
+}
+.run-ico.pinned {
+  color: var(--sym-violet);
+}
+.runrow.unread .run-title::before {
+  width: 5px;
+  height: 5px;
+  background: var(--sym-info);
+}
+
+/* Cost in sidebar: clean mono text, zero purple pill shape */
+.runrow-cost {
+  font-size: 11px;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  margin-right: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Needs-you indicator: crisp inline symbol/text, zero bordered pill shape */
+.needs-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ask);
+  font-size: 11px;
+  font-weight: 550;
+}
+.needs-pill svg {
+  color: var(--sym-warn);
+  flex: none;
+}
+
+.usage-meter {
+  padding: 8px 10px;
+  gap: 4px;
+}
+.usage-pill {
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+}
+.usage-pill.warn {
+  border-color: var(--line-strong);
+  color: var(--ask);
+}
+
+/* --------------------------------------------------------------------------
+   4. Floating Popovers, Menus, Command Palette & Dialogs (exact T3 Code image.png)
+   -------------------------------------------------------------------------- */
+.pop,
+.menu,
+.palette,
+.dlg,
+.toast,
+.showall-dialog {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow-pop);
+}
+.dlg,
+.palette,
+.showall-dialog {
+  border-radius: 16px;
+}
+
+/* CRITICAL (web-ui skill & menus.spec.ts): Radix popovers fade opacity ONLY, zero transform! */
+.pop,
+.prov-pop,
+.run-opt-pop,
+.switch-pop,
+.cancel-pop {
+  animation: tm-fade-only 120ms ease-out;
+}
+@keyframes tm-fade-only {
+  from { opacity: 0; }
+}
+
+.pop {
+  padding: 6px;
+}
+.pop-label {
+  padding: 5px 10px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+button.pop-item,
+.menu-item,
+.pal-item,
+button.run-opt-row {
+  min-height: 32px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--ink-2);
+  border: 1px solid transparent;
+  background: transparent;
+  box-shadow: none;
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+button.pop-item:hover:not(:disabled),
+button.pop-item.browsing,
+.menu-item[data-highlighted],
+.menu-item[data-state="open"],
+.pal-item[data-selected="true"],
+button.run-opt-row:hover {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+button.pop-item[aria-selected="true"],
+button.run-opt-row.on {
+  background: var(--bg-active);
+  color: var(--ink);
+  border-color: transparent;
+}
+button.pop-item:active:not(:disabled),
+button.run-opt-row:active:not(:disabled) {
+  transform: none;
+}
+.prov-models {
+  border-left: 1px solid var(--rule);
+  padding-left: 6px;
+}
+.run-opt-note {
+  border-top: 1px solid var(--rule);
+  padding: 8px 10px 4px;
+}
+.run-opt-check svg {
+  color: var(--ink);
+}
+
+/* Tooltip: sleek obsidian micro-surface */
+.tip {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 5px 9px;
+  box-shadow: var(--shadow-2);
+}
+
+/* --------------------------------------------------------------------------
+   5. Composer (Home, NewRun & RunView) — T3 Code floating obsidian dock
+   -------------------------------------------------------------------------- */
+.home-composer .composer,
+.ask-page .composer,
+.flow-composer .composer,
+.composer {
+  background: var(--bg-elev);
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  box-shadow: var(--shadow-2);
+  transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+.home-composer .composer:focus-within,
+.ask-page .composer:focus-within,
+.composer:focus-within {
+  border-color: color-mix(in srgb, var(--ink) 26%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 16px 36px -18px rgba(0, 0, 0, 0.88);
+}
+
+/* Composer footer triggers: clean ghost controls, no noisy pill outlines */
+.composer .model-pill,
+.composer button.model-pill,
+.composer .run-opt,
+.composer .mode-pill,
+.composer .budget-select-pill {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  box-shadow: none;
+  color: var(--ink-2);
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 450;
+  gap: 6px;
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.composer .model-pill:hover,
+.composer button.model-pill:hover:not(:disabled),
+.composer .run-opt:hover:not(:disabled),
+.composer .mode-pill:hover:not(:disabled),
+.composer .budget-select-pill:hover {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--ink);
+}
+.composer .model-pill.on,
+.composer .run-opt.on {
+  background: var(--bg-active);
+  border-color: var(--line);
+  color: var(--ink);
+}
+.composer .run-opt.risky svg {
+  color: var(--sym-warn);
+}
+.composer .model-pill svg:not(.prov-logo svg),
+.composer .run-opt svg {
+  color: var(--sym-muted);
+}
+.composer .model-pill:hover svg:not(.prov-logo svg),
+.composer .run-opt:hover svg,
+.composer .run-opt.on svg {
+  color: var(--ink);
+}
+
+/* Send button: crisp T3 circular monochrome primary trigger */
+button.send-btn {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--bg);
+  border: 0;
+  box-shadow: none;
+}
+button.send-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 86%, var(--bg));
+  color: var(--bg);
+}
+button.send-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+/* --------------------------------------------------------------------------
+   6. ZERO COLOR SHAPES — Replace all colored pills/gradients with Color Symbols
+   -------------------------------------------------------------------------- */
+
+/* Studio pills & Doctor pill: monochrome hairline chips, color strictly on leading icon */
+.studio-pill,
+.doctor-pill,
+.ops-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 450;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--ink-2);
+  box-shadow: none;
+}
+.studio-pill.tone-indigo,
+.studio-pill.tone-blue,
+.studio-pill.tone-cyan,
+.studio-pill.tone-emerald,
+.studio-pill.tone-amber,
+.studio-pill.tone-rose,
+.studio-pill.tone-violet,
+.studio-pill.tone-muted,
+.doctor-pill.tone-emerald,
+.doctor-pill.tone-amber,
+.doctor-pill.tone-rose,
+.doctor-pill.tone-muted {
+  background: var(--bg-elev);
+  border-color: var(--line);
+  color: var(--ink-2);
+}
+button.studio-pill:hover:not(:disabled),
+button.doctor-pill:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+/* Semantic color lives ONLY on the icon symbol inside the chip */
+.studio-pill.tone-indigo svg,
+.studio-pill.tone-violet svg { color: var(--sym-violet); }
+.studio-pill.tone-blue svg { color: var(--sym-info); }
+.studio-pill.tone-cyan svg { color: var(--sym-cyan); }
+.studio-pill.tone-emerald svg,
+.doctor-pill.tone-emerald svg { color: var(--sym-good); }
+.studio-pill.tone-amber svg,
+.doctor-pill.tone-amber svg { color: var(--sym-warn); }
+.studio-pill.tone-rose svg,
+.doctor-pill.tone-rose svg { color: var(--sym-bad); }
+.studio-pill.tone-muted svg { color: var(--sym-muted); }
+
+/* Text-only semantic chips (no SVG icon inside): subtle leading color indicator via text accent */
+.mission-kpis .studio-pill.tone-emerald { color: var(--good); border-color: var(--line); }
+.mission-kpis .studio-pill.tone-blue { color: var(--sym-info); border-color: var(--line); }
+.mission-kpis .studio-pill.tone-rose { color: var(--bad); border-color: var(--line); }
+
+/* 4-Lens Run Studio Bar: T3 Code segmented monochrome tabs + colored active symbol */
+.lens-bar {
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  padding: 6px 16px;
+}
+.lens-tabs {
+  gap: 2px;
+}
+.lens-tab {
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.lens-tab svg {
+  color: var(--sym-muted);
+  transition: color var(--t-fast) var(--ease);
+}
+.lens-tab:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--ink);
+}
+.lens-tab.on {
+  background: var(--bg-active);
+  border-color: var(--line);
+  color: var(--ink);
+}
+.lens-tab.on svg {
+  color: var(--ink);
+}
+.lens-tab kbd {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.lens-badge,
+.lens-badge.live,
+.lens-badge.diff {
+  background: transparent;
+  border: 0;
+  padding: 0 2px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.lens-badge.live { color: var(--sym-info); }
+.lens-badge.diff { color: var(--good); }
+
+.filter-chip {
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  padding: 3px 9px;
+  min-height: 24px;
+  font-size: 12px;
+}
+.filter-chip:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--ink);
+}
+.filter-chip.on {
+  background: var(--bg-active);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+/* Diff stat counters in headers & agent cards: pure colored tabular text like T3 Code (+844 -255) */
+.agent-diff-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  box-shadow: none;
+  padding: 2px 7px;
+  gap: 5px;
+  min-height: 24px;
+}
+.agent-diff-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+}
+.agent-diff-btn .diff-add,
+.flow-top .diff-add,
+.dag-node .diff-add,
+.review-file-stats .diff-add {
+  background: transparent;
+  padding: 0;
+  color: var(--good);
+  font-variant-numeric: tabular-nums;
+}
+.agent-diff-btn .diff-del,
+.flow-top .diff-del,
+.dag-node .diff-del,
+.review-file-stats .diff-del {
+  background: transparent;
+  padding: 0;
+  color: var(--bad);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Run header metadata chips: clean monochrome surface, color only on semantic symbols */
+.flow-top {
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.flow-top-status .agent-ico.working { color: var(--sym-info); }
+.flow-top-status .agent-ico.done { color: var(--sym-good); }
+.flow-top-status .agent-ico.failed { color: var(--sym-bad); }
+.flow-top-status .agent-ico.asking { color: var(--sym-warn); }
+.merged-into svg { color: var(--sym-violet); }
+.flow-top-branch svg { color: var(--sym-muted); }
+.goal-status,
+.flow-top-perm {
+  border-radius: 7px;
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+}
+.goal-status.met svg { color: var(--sym-good); }
+.flow-top-perm.full_access svg { color: var(--sym-warn); }
+
+/* Mission Control DAG: clean obsidian cards, zero gradient washes or thick colored sidebars */
+.dag-viewport {
+  background:
+    radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.08) 1px, transparent 0),
+    var(--bg-sunken);
+  background-size: 20px 20px;
+  border-color: var(--line);
+  border-radius: 14px;
+}
+.theme-light .dag-viewport {
+  background:
+    radial-gradient(circle at 1px 1px, rgba(0, 0, 0, 0.09) 1px, transparent 0),
+    var(--bg-sunken);
+  background-size: 20px 20px;
+}
+.dag-node {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-1);
+  contain: layout style;
+}
+.dag-contract-node,
+.dag-verify-node,
+.dag-node.st-passed,
+.dag-node.st-building,
+.dag-node.st-flagged,
+.dag-node.st-failed,
+.dag-node.st-queued {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-1);
+}
+.dag-unit-node:hover {
+  background: var(--bg-elev-2);
+  border-color: var(--line-strong);
+}
+.dag-unit-node.selected {
+  background: var(--bg-elev-2);
+  border-color: var(--ink-2);
+  box-shadow: var(--shadow-2);
+}
+.dag-node-kind { color: var(--ink); }
+.dag-node-kind.tone-cyan svg { color: var(--sym-cyan); }
+.dag-node-kind.tone-violet svg { color: var(--sym-violet); }
+.dag-ico.passed { color: var(--sym-good); }
+.dag-ico.building { color: var(--sym-info); }
+.dag-ico.flagged { color: var(--sym-warn); }
+.dag-ico.failed { color: var(--sym-bad); }
+.dag-ico.queued { color: var(--sym-muted); }
+
+/* DAG mini tags: neutral text/hairline, zero colored badge boxes */
+.dag-mini-pill,
+.dag-mini-pill.diff-hard,
+.dag-mini-pill.diff-easy,
+.dag-mini-pill.diff-normal,
+.dag-mini-pill.tier-up {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  padding: 1px 6px;
+}
+.dag-mini-pill.diff-hard { color: var(--sym-violet); }
+.dag-mini-pill.diff-easy { color: var(--good); }
+.dag-mini-pill.tier-up { color: var(--ask); }
+
+.dag-edge { stroke-width: 1.5; }
+.dag-edge.edge-contract { stroke: rgba(255, 255, 255, 0.22); opacity: 1; }
+.dag-edge.edge-passed { stroke: color-mix(in srgb, var(--sym-good) 55%, transparent); opacity: 1; }
+.dag-edge.edge-building { stroke: color-mix(in srgb, var(--sym-info) 75%, transparent); opacity: 1; }
+.dag-edge.edge-failed { stroke: color-mix(in srgb, var(--sym-bad) 70%, transparent); opacity: 1; }
+.dag-edge.edge-queued { stroke: var(--line-strong); opacity: 0.7; }
+.theme-light .dag-edge.edge-contract { stroke: rgba(0, 0, 0, 0.2); }
+
+/* KPI cards, Flight Recorder, Approval Dock, Done/Problem cards: clean obsidian, symbol-only color */
+.kpi-card,
+.kpi-card.tone-emerald,
+.kpi-card.tone-indigo,
+.kpi-card.tone-cyan,
+.kpi-card.tone-violet {
+  border: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-1);
+  contain: layout style;
+}
+.kpi-card.tone-emerald .kpi-label svg { color: var(--sym-good); }
+.kpi-card.tone-indigo .kpi-label svg { color: var(--sym-violet); }
+.kpi-card.tone-cyan .kpi-label svg { color: var(--sym-cyan); }
+.kpi-card.tone-violet .kpi-label svg { color: var(--sym-violet); }
+.kpi-label {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.flight-recorder-card,
+.done-card,
+.done-card.bad,
+.approval-dock,
+.approval,
+.problem,
+.error-line {
+  background: var(--bg-elev);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow-1);
+}
+.problem,
+.error-line {
+  color: var(--ink);
+}
+.problem-ico {
+  color: var(--sym-bad);
+}
+.approval-dock {
+  box-shadow: var(--shadow-2);
+}
+.approval-dock-ico {
+  color: var(--sym-warn);
+}
+.approval-dock-queue {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ask);
+}
+.approval-dock-bar {
+  height: 2px;
+  background: var(--line);
+}
+.approval-dock-bar-fill {
+  background: var(--sym-warn);
+}
+.tone-emerald-ico {
+  color: var(--sym-good);
+}
+.mission-ico-accent {
+  color: var(--sym-violet);
+}
+
+.checkpoint-node {
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+}
+.checkpoint-node:hover {
+  background: var(--bg-elev-2);
+  border-color: var(--line-strong);
+}
+.checkpoint-node.selected {
+  background: var(--bg-active);
+  border-color: var(--ink-2);
+}
+
+/* Gantt bars: flat clean muted fills, no loud neon gradients */
+.gantt-bar {
+  border-radius: 5px;
+  font-weight: 500;
+}
+.gantt-bar.bar-violet { background: #5b21b6; }
+.gantt-bar.bar-blue { background: #1d4ed8; }
+.gantt-bar.bar-cyan { background: #0e7490; }
+.gantt-bar.bar-emerald { background: #047857; }
+.gantt-bar.bar-amber { background: #b45309; }
+.gantt-bar.bar-failed { background: #b91c1c; }
+
+/* --------------------------------------------------------------------------
+   7. Gallery, Cards, Agent Thread & Settings Polish
+   -------------------------------------------------------------------------- */
+.gallery-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-1);
+  contain: layout style;
+  transition:
+    transform var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    background-color var(--t-fast) var(--ease);
+}
+.gallery-card:hover {
+  translate: none;
+  transform: translateY(-1px);
+  border-color: var(--line-strong);
+  background: var(--bg-elev-2);
+  box-shadow: var(--shadow-2);
+}
+.gallery-card:hover .frame.shot {
+  filter: none;
+}
+
+.agent-block,
+.agent,
+.studio-card,
+.seat,
+.race-col {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.agent-block,
+.agent {
+  contain: layout style;
+}
+.agent-ico.working {
+  color: var(--sym-info);
+  animation: tm-status-pulse 2s infinite;
+}
+.agent-ico.done { color: var(--sym-good); }
+.agent-ico.failed { color: var(--sym-bad); }
+.agent-ico.asking { color: var(--sym-warn); }
+.agent-ico.stopped,
+.agent-ico.waiting { color: var(--sym-muted); }
+
+/* Keep agent & preview surfaces monochrome; status color lives on the icon symbol */
+.agent.state-failed,
+.live-preview[data-state="running"],
+.live-preview-fail {
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
+}
+.live-preview[data-state="running"] .lp-ico { color: var(--sym-good); }
+.live-preview-fail .strong { color: var(--ink); }
+
+/* Review & Knowledge Hub: strip remaining neon indigo/cyan shape fills */
+.review-banner {
+  border: 1px solid var(--line-strong);
+  background: var(--bg-elev);
+  color: var(--ink-2);
+  border-radius: 10px;
+}
+.review-banner svg { color: var(--sym-cyan); flex: none; }
+.review-scope-btn.on,
+.studio-tab.on {
+  background: var(--bg-active);
+  border-color: var(--line);
+  color: var(--ink);
+}
+.review-scope-btn.on svg,
+.studio-tab.on svg { color: var(--ink); }
+.review-line.kind-hunk {
+  background: var(--bg-elev-2);
+  color: var(--muted);
+}
+.review-gutter-plus { color: var(--sym-info); }
+.review-comment-row {
+  border-top-color: var(--line-strong);
+  border-bottom-color: var(--line-strong);
+}
+.review-dot.st-passed,
+.doctor-dot.st-ok { background: var(--sym-good); }
+.review-dot.st-building { background: var(--sym-info); }
+.doctor-dot.st-warn { background: var(--sym-warn); }
+.review-dot.st-failed,
+.review-dot.st-flagged,
+.doctor-dot.st-fail { background: var(--sym-bad); }
+.doctor-fix { color: var(--ink-2); }
+
+/* Step continuous busy dots to T3 duty-cycled pulse */
+.dot.busy {
+  background: var(--sym-info);
+  animation: tm-status-pulse 2s infinite;
+}
+.dot.good { background: var(--sym-good); }
+.dot.bad { background: var(--sym-bad); }
+.dot.ask { background: var(--sym-warn); }
+
+/* Tabs: sleek T3 monochrome active surface */
+.tabs button {
+  border-radius: 7px 7px 0 0;
+  box-shadow: none;
+}
+.tabs button.on {
+  background: var(--bg-active);
+  color: var(--ink);
+}
+
+/* Segmented control */
+.seg {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 2px;
+}
+.seg-thumb {
+  background: var(--bg-active);
+  border-radius: 7px;
+  box-shadow: none;
+}
+
+/* Scrollbars: T3 Code ultra-slim 6px quiet thumbs */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.24) transparent;
+}
+.theme-light * {
+  scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+}
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.24);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.38);
+}
+.theme-light ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+}
+.theme-light ::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.32);
+}
+
+/* --------------------------------------------------------------------------
+   8. FPS-First Motion System (T3 Code duty-cycled stepped keyframes, 0 blur)
+   -------------------------------------------------------------------------- */
+/* Replace continuous 120Hz skeleton sheen with T3's stepped 4-frame opacity breath */
+.skeleton {
+  background: var(--bg-hover);
+  background-image: none;
+  animation: tm-skeleton-breath 2.4s infinite;
+}
+.skeleton::after {
+  display: none;
+  animation: none;
+}
+@keyframes tm-skeleton-breath {
+  0%, 42% { opacity: 1; animation-timing-function: steps(4); }
+  50%, 92% { opacity: 0.48; animation-timing-function: steps(4); }
+  100% { opacity: 1; }
+}
+
+/* Duty-cycled stepped status pulse (~12 discrete compositor frames/cycle vs 240 on 120Hz) */
+@keyframes tm-status-pulse {
+  0%, 40% { opacity: 1; animation-timing-function: steps(6); }
+  50%, 90% { opacity: 0.48; animation-timing-function: steps(6); }
+  100% { opacity: 1; }
+}
+
+/* No expensive GPU backdrop-filter blur anywhere on overlays/drawers */
+.dlg-back,
+.showall-back,
+.palette-back,
+.sheet-back,
+.drawer-back {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(0, 0, 0, 0.64);
+}
+.theme-light .dlg-back,
+.theme-light .showall-back,
+.theme-light .palette-back,
+.theme-light .sheet-back,
+.theme-light .drawer-back {
+  background: rgba(24, 24, 27, 0.28);
+}
+
+/* Strict reduced-motion & no-motion shutdown (guarantees 0 running infinite animations) */
+.no-motion *,
+.no-motion *::before,
+.no-motion *::after {
+  animation: none !important;
+  transition: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+

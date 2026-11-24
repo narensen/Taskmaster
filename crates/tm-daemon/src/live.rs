@@ -144,6 +144,8 @@ pub struct Live {
     pub approvals: Arc<crate::approvals::Approvals>,
     /// Provider rate-limit / usage window tracker populated from CLI reports (O4).
     pub usage: crate::usage::UsageTracker,
+    /// Where an `approval_requested` entry is also sent, for a notification to the person.
+    alerts: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<(String, Value)>>,
 }
 
 /// Cap on live per-row command output before switching from append frames to tail replace (P5).
@@ -300,7 +302,13 @@ impl Live {
             cmd_output: CommandOutputHub::default(),
             approvals: Arc::default(),
             usage: crate::usage::UsageTracker::new(),
+            alerts: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Send every question put to a person to `tx` as well (run, question), for notifications.
+    pub fn set_alerts(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, Value)>) {
+        let _ = self.alerts.set(tx);
     }
 
     /// Subscribe to per-run sequence notifications for `run` only (P1).
@@ -373,6 +381,11 @@ impl Live {
     /// Append one entry via this run's buffered writer. Never blocks the caller on disk I/O
     /// and never acquires the notes lock.
     pub fn push(&self, run: &str, agent: &Value, kind: &str, fields: Value) {
+        if kind == "approval_requested"
+            && let Some(tx) = self.alerts.get()
+        {
+            let _ = tx.send((run.to_string(), fields.clone()));
+        }
         if kind == "output"
             && let (Some(tool_id), Some(text)) = (fields["id"].as_str(), fields["text"].as_str())
             && !tool_id.is_empty()

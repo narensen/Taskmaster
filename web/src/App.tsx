@@ -10,10 +10,12 @@ import {
   CircleAlert,
   CircleCheck,
   CircleDot,
+  CircleX,
   Compass,
   Cpu,
   FolderTree,
   GitBranch,
+  GitMerge,
   GitPullRequest,
   LayoutGrid,
   Pin,
@@ -262,9 +264,12 @@ function useClocks(ids: string[], runs: RunSummary[] = []) {
   return useMemo(() => ({ ...clocks, ...listed }), [clocks, listed]);
 }
 
-function RunMark({ group }: { group: Group }) {
+function RunMark({ run, group }: { run: RunSummary; group: Group }) {
   if (group === "Working") return <CircleDot size={13} />;
   if (group === "Needs you") return <CircleAlert size={13} />;
+  if (run.phase === "failed") return <CircleX size={13} />;
+  if (run.merged && run.merge_commit) return <GitMerge size={13} />;
+  if (run.phase === "done") return <CircleCheck size={13} />;
   if (group === "Pinned") return <Pin size={13} />;
   if (group === "Archived") return <Archive size={13} />;
   return <Circle size={13} />;
@@ -321,6 +326,20 @@ const RunRow = memo(function RunRow({
         run: () => toggleFlag(run, "never_settle"),
       },
     ]);
+  const icoClass =
+    group === "Working"
+      ? "working"
+      : group === "Needs you"
+        ? "ask"
+        : run.phase === "failed"
+          ? "failed"
+          : run.merged && run.merge_commit
+            ? "merged"
+            : run.phase === "done"
+              ? "done"
+              : group === "Pinned"
+                ? "pinned"
+                : "";
   return (
     <div
       className={`runrow ${on ? "on" : ""} ${group === "Needs you" ? "ask" : ""} ${group === "Settled" ? "settled" : ""} ${unread ? "unread" : ""}`}
@@ -342,14 +361,8 @@ const RunRow = memo(function RunRow({
       onFocus={() => prefetchRun(run.id)}
     >
       <Link to={`/runs/${encodeURIComponent(run.id)}`} className="runrow-link" onClick={() => { markRunSeen(run); onPick(); }} aria-current={on ? "page" : undefined}>
-        <span
-          className={`run-ico ${group === "Working" ? "working" : ""} ${group === "Needs you" ? "ask" : ""} ${
-            run.phase === "done" ? "done" : run.phase === "failed" ? "failed" : ""
-          }`}
-          title={run.state_reason}
-          aria-hidden
-        >
-          <RunMark group={group} />
+        <span className={`run-ico ${icoClass}`} title={run.state_reason} aria-hidden>
+          <RunMark run={run} group={group} />
         </span>
         <span className="run-copy">
           <span className="clip run-title">{run.id}</span>

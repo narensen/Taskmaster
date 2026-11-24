@@ -72,6 +72,12 @@
 //! GET  /api/mcp                   user-configured MCP servers
 //! POST /api/mcp                   add or update a user MCP server
 //! POST /api/mcp/{name}/remove     remove a user MCP server
+//! POST /api/connect/network       {open} listen on the local network too, or stop
+//! GET  /api/push                  phone notifications: VAPID key, subscriptions, ntfy
+//! POST /api/push/subscribe        {endpoint, p256dh, auth, label?} a browser's Web Push subscription
+//! POST /api/push/unsubscribe      {endpoint}
+//! POST /api/push/ntfy             {on, server?} a private ntfy topic, or none
+//! POST /api/push/test             one notification to every channel
 //! GET  /api/notifications         notification preferences
 //! POST /api/notifications         update notification preferences
 //! POST /api/notifications/test    send a test notification
@@ -144,6 +150,7 @@ use tm_harness::{HARNESSES, Harness};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
+mod alerts;
 mod connect;
 mod desk;
 mod hosts;
@@ -201,6 +208,9 @@ pub struct ServerOptions {
     /// H3: the holder builders are started in, so they outlive a daemon update. `None` starts
     /// them here; `tm-daemon serve` sets it.
     pub holder: Option<tm_harness::hold::Holder>,
+    /// Where phone notifications (Web Push, ntfy) keep their key and subscriptions. `None` turns
+    /// them off; `tm-daemon serve` uses `~/.taskmaster/push.json`.
+    pub push: Option<PathBuf>,
 }
 
 impl ServerOptions {
@@ -222,6 +232,7 @@ impl ServerOptions {
             skills: crate::skills::default_root(),
             skills_fetch: Arc::new(crate::skills::Web),
             holder: None,
+            push: None,
         }
     }
 }
@@ -245,6 +256,9 @@ impl Drop for Server {
                 let _ = active.cancel.send(true);
             }
             self.app.live.approvals.refuse_all();
+        }
+        if let Some((_, task)) = self.app.network.lock().unwrap().take() {
+            task.abort();
         }
         self.app.previews.stop_all();
         self.app.jobs.stop_all();
@@ -312,6 +326,12 @@ struct App {
     run_index: Arc<crate::run_index::RunIndex>,
     /// H3: where builders are started so a daemon update can hand them on.
     holder: Option<tm_harness::hold::Holder>,
+    /// Phone notifications: Web Push subscriptions and ntfy.
+    push: Option<Arc<crate::push::Push>>,
+    /// The routes, kept so a second listener (the local network) can serve them too.
+    router: std::sync::OnceLock<Router>,
+    /// The listener on the local-network address, when Connect opened one.
+    network: Mutex<Option<(SocketAddr, tokio::task::JoinHandle<()>)>>,
 }
 
 type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
@@ -401,6 +421,15 @@ impl Server {
             skills_fetch: options.skills_fetch,
             idempotency: Mutex::new(HashMap::new()),
             holder: options.holder,
+            push: options.push.and_then(|path| match crate::push::Push::open(&path) {
+                Ok(push) => Some(Arc::new(push)),
+                Err(err) => {
+                    eprintln!("taskmaster: phone notifications are off: {err:#}");
+                    None
+                }
+            }),
+            router: std::sync::OnceLock::new(),
+            network: Mutex::new(None),
         });
         app.close_interrupted_reviews();
         // H3: runs whose agents the last daemon handed to this one go on at once.
@@ -411,6 +440,14 @@ impl Server {
         settle::spawn_sweeper(Arc::downgrade(&app));
         let (tx, rx) = oneshot::channel();
         let router = router(app.clone());
+        let _ = app.router.set(router.clone());
+        app.spawn_alerts();
+        // Opened to the local network from Connect before: open it again.
+        if crate::settings::Settings::load(&app.project()).is_ok_and(|s| s.connect.network)
+            && let Err(err) = app.open_network().await
+        {
+            eprintln!("taskmaster: the local network could not be opened: {err:#}");
+        }
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
@@ -549,6 +586,12 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/web-access", get(ops::get_web_access).post(ops::update_web_access))
         .route("/api/web-access/cache/clear", post(ops::clear_web_cache))
         .route("/api/connect", get(connect::overview))
+        .route("/api/connect/network", post(connect::set_network))
+        .route("/api/push", get(alerts::push_view))
+        .route("/api/push/subscribe", post(alerts::subscribe))
+        .route("/api/push/unsubscribe", post(alerts::unsubscribe))
+        .route("/api/push/ntfy", post(alerts::set_ntfy))
+        .route("/api/push/test", post(alerts::test))
         .route("/api/pairing", post(connect::create_pairing))
         .route("/api/devices", get(connect::devices))
         .route("/api/devices/agent", post(connect::mint_agent))
@@ -1100,6 +1143,7 @@ impl App {
                 "Stopped: the run ended before this call did."
             };
             app.live.close_open_calls(&id, why);
+            let limited = matches!(&result, Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some());
             app.live.approvals.set_advisor(&id, None);
             app.record_outcome(&id, result);
             // A4: If this run has an active goal and no human note is already queued, check

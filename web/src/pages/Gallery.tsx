@@ -3,7 +3,7 @@
 // from inside it (/runs/new), not here. Nothing here scans the disk.
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, CircleAlert, Paperclip, Pin, PinOff, Shield, X } from "lucide-react";
 import { api, callAt, type PermissionMode, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
@@ -148,6 +148,7 @@ function RunCard({ run, folder }: { run: RunSummary; group?: string; index?: num
             {run.id}
             {needsYou && (
               <span className="needs-pill" title={run.state_reason ?? "Needs your attention"} style={{ marginLeft: 6 }}>
+                <CircleAlert size={11} strokeWidth={2} aria-hidden />
                 Needs you
               </span>
             )}

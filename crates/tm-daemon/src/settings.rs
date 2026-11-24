@@ -51,9 +51,20 @@ pub struct Settings {
     pub settle: crate::settling::SettleSettings,
     /// Features still being tried, each off until turned on.
     pub labs: LabsSettings,
+    /// How devices reach this daemon.
+    pub connect: ConnectSettings,
     /// Dollars per million tokens, by model id or harness id, for calls whose harness
     /// reports no price. Grok's are built in (see [`built_in_prices`]).
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+}
+
+/// How devices reach this daemon.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ConnectSettings {
+    /// Also listen on this computer's local-network address, so a phone on the same Wi-Fi can
+    /// pair. Turned on from Connect; the pairing code is what keeps others out.
+    pub network: bool,
 }
 
 /// Labs: features still being tried, each off by default.

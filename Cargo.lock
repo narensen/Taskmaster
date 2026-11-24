@@ -1860,6 +1860,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "globset",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

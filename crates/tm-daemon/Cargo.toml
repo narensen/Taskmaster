@@ -22,6 +22,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = "0.30"
 base64 = "0.22"
+ring = "0.17"
 globset = "0.4"
 async-trait.workspace = true
 

@@ -5,11 +5,12 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
-  AlertCircle,
-  Check,
   ChevronRight,
   Circle,
+  CircleAlert,
+  CircleCheck,
   CircleDot,
+  CircleX,
   FileCode2,
   FileText,
   Globe,
@@ -17,7 +18,6 @@ import {
   Pencil,
   RotateCcw,
   Search,
-  Sparkles,
   Square,
   SquareTerminal,
 } from "lucide-react";
@@ -44,7 +44,7 @@ function verbOf(name: string): { label: string; kind: "read" | "edit" | "run" | 
 function Glyph({ kind }: { kind: "read" | "edit" | "run" | "search" | "look" }) {
   const Icon =
     kind === "edit" ? Pencil : kind === "run" ? SquareTerminal : kind === "search" ? Search : kind === "look" ? Globe : FileText;
-  return <Icon size={13} strokeWidth={1.6} aria-hidden />;
+  return <Icon size={13} strokeWidth={1.75} aria-hidden />;
 }
 
 /** The first line of a thought, short enough to stand in for the block once it is done. */
@@ -99,21 +99,21 @@ function statusWord(surface: Surface, phase: Phase | undefined): string {
 
 function StatusGlyph({ state }: { state: string }) {
   if (state === "working" || state === "planning") {
-    return <CircleDot size={13} strokeWidth={2} className="agent-ico working" aria-hidden />;
+    return <CircleDot size={14} strokeWidth={1.75} className="agent-ico working" aria-hidden />;
   }
   if (state === "done") {
-    return <Check size={14} strokeWidth={2} className="agent-ico done" aria-hidden />;
+    return <CircleCheck size={14} strokeWidth={1.75} className="agent-ico done" aria-hidden />;
   }
   if (state === "failed") {
-    return <AlertCircle size={14} strokeWidth={1.8} className="agent-ico failed" aria-hidden />;
+    return <CircleX size={14} strokeWidth={1.75} className="agent-ico failed" aria-hidden />;
   }
   if (state === "asking") {
-    return <Sparkles size={14} strokeWidth={1.7} className="agent-ico asking" aria-hidden />;
+    return <CircleAlert size={14} strokeWidth={1.75} className="agent-ico asking" aria-hidden />;
   }
   if (state === "stopped") {
-    return <Square size={10} strokeWidth={2.2} className="agent-ico stopped" aria-hidden />;
+    return <Square size={10} strokeWidth={2} className="agent-ico stopped" aria-hidden />;
   }
-  return <Circle size={11} strokeWidth={1.8} className="agent-ico waiting" aria-hidden />;
+  return <Circle size={12} strokeWidth={1.75} className="agent-ico waiting" aria-hidden />;
 }
 
 /** How long the agent's open call has run, ticking each second, as `2:05`. */

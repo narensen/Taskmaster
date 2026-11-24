@@ -47,7 +47,7 @@ pub fn render_architecture(plan: &Plan) -> String {
     out.push_str(
         "\n## Rules\n\n\
          - A page's worker changes only the files its page owns.\n\
-         - Pages talk to each other only through contracts and routes, never by importing each other.\n\
+         - Sibling pages in the same phase share code only through contracts, routes, or a declared `depends_on`; imports into earlier already-passed phases, and imports from package roots (`__init__`) or integration units, are allowed.\n\
          - Dictionary entries are immutable; a change is a new version, and every page citing it is rebuilt.\n",
     );
     out
@@ -214,6 +214,8 @@ mod tests {
         assert!(doc.contains("- `contracts/types.ts`"));
         assert!(doc.contains("- `auth` is used by dashboard, settings"));
         assert!(doc.contains("- `nav` is used by dashboard"));
+        assert!(doc.contains("Sibling pages in the same phase"));
+        assert!(doc.contains("depends_on"));
         // Same plan, same file: the document is safe to regenerate on every run.
         assert_eq!(doc, render_architecture(&plan()));
     }

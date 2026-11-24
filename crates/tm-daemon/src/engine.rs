@@ -3465,8 +3465,15 @@ impl Driver {
                 self.commit_autofix(&fixed);
             }
         }
+        let passed_pages: BTreeSet<PageId> = self
+            .run
+            .pages
+            .iter()
+            .filter(|(_, p)| p.state == tm_core::PageState::Passed)
+            .map(|(id, _)| id.clone())
+            .collect();
         let sources = load_sources(&self.tree)?;
-        let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
+        let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
         // The static checks and the project's own build and tests do not wait for each other.
         let steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
         let (checked, built) = {

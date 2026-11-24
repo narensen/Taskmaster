@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use tm_core::PageId;
+use tm_core::{PageId, PagePlan, Plan};
 
 use crate::languages;
 use crate::ownership::Owners;
@@ -66,23 +66,58 @@ impl ImportGraph {
         ImportGraph { edges }
     }
 
-    /// Imports that cross from one page into another, grouped by the importing page. The
-    /// text is what the page's worker is given to repair.
-    pub fn cross_page_imports(&self, owners: &Owners) -> BTreeMap<PageId, String> {
+    /// Imports that cross between sibling pages in the same phase without a declared
+    /// `depends_on`, grouped by the importing page. The text is what the page's worker is given
+    /// to repair.
+    ///
+    /// Imports are allowed when:
+    /// - the target page is in the importer's transitive `depends_on`,
+    /// - the target page belongs to an earlier, already-passed phase, or
+    /// - the importing file is a package root (`__init__.py`, etc.) or belongs to an
+    ///   integration unit.
+    pub fn cross_page_imports(
+        &self,
+        owners: &Owners,
+        plan: &Plan,
+        passed_pages: &BTreeSet<PageId>,
+    ) -> BTreeMap<PageId, String> {
+        let pages: BTreeMap<&str, &PagePlan> =
+            plan.pages.iter().map(|p| (p.id.as_str(), p)).collect();
+        let deps = transitive_depends_on(plan);
         let mut out: BTreeMap<PageId, String> = BTreeMap::new();
         for (from, targets) in &self.edges {
             let Some(from_page) = owners.owner(from) else { continue };
+            let from_plan = pages.get(from_page.as_str()).copied();
+            if is_package_root(from)
+                || from_plan.is_some_and(|p| is_integration_unit(p, from))
+            {
+                continue;
+            }
+            let from_phase = from_plan.map(|p| p.phase).unwrap_or(0);
             for to in targets {
-                match owners.owner(to) {
-                    Some(to_page) if to_page != from_page => {
-                        let _ = writeln!(
-                            out.entry(from_page.clone()).or_default(),
-                            "{from} imports {to}, which belongs to page `{to_page}`. Pages may \
-                             share code only through contracts."
-                        );
-                    }
-                    _ => {}
+                let Some(to_page) = owners.owner(to) else { continue };
+                if to_page == from_page {
+                    continue;
                 }
+                if deps
+                    .get(from_page.as_str())
+                    .is_some_and(|d| d.contains(to_page.as_str()))
+                {
+                    continue;
+                }
+                let to_phase = pages.get(to_page.as_str()).map(|p| p.phase).unwrap_or(0);
+                if to_phase < from_phase {
+                    if passed_pages.contains(to_page) {
+                        continue;
+                    }
+                } else if to_phase != from_phase {
+                    continue;
+                }
+                let _ = writeln!(
+                    out.entry(from_page.clone()).or_default(),
+                    "{from} imports {to}, which belongs to page `{to_page}`. Sibling pages in \
+                     the same phase may share code only through contracts or a declared `depends_on`."
+                );
             }
         }
         out
@@ -109,6 +144,69 @@ impl ImportGraph {
         }
         out
     }
+}
+
+/// Transitive `depends_on` closure for every page in `plan`.
+fn transitive_depends_on(plan: &Plan) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut direct: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for page in &plan.pages {
+        let entry = direct.entry(page.id.as_str()).or_default();
+        for dep in &page.depends_on {
+            entry.push(dep.as_str());
+        }
+        for unit in &page.units {
+            for dep in &unit.depends_on {
+                entry.push(dep.as_str());
+            }
+        }
+    }
+    let mut closure: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for page in &plan.pages {
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        let mut stack: Vec<&str> = direct.get(page.id.as_str()).cloned().unwrap_or_default();
+        while let Some(dep) = stack.pop() {
+            if dep == page.id.as_str() || !visited.insert(dep) {
+                continue;
+            }
+            if let Some(next) = direct.get(dep) {
+                stack.extend(next.iter().copied());
+            }
+        }
+        closure.insert(page.id.as_str(), visited);
+    }
+    closure
+}
+
+/// True when `file` is a package root barrel/entrypoint (such as `__init__.py`) that legitimately
+/// re-exports or wires together modules owned by other pages.
+fn is_package_root(file: &str) -> bool {
+    let normalized = file.trim_start_matches("./");
+    let name = normalized.rsplit('/').next().unwrap_or(normalized);
+    if matches!(name, "__init__.py" | "__main__.py") {
+        return true;
+    }
+    let depth = normalized.matches('/').count();
+    depth <= 1
+        && matches!(
+            name,
+            "index.ts" | "index.tsx" | "index.js" | "index.jsx" | "index.mjs" | "index.cjs" | "lib.rs" | "main.rs"
+        )
+}
+
+/// True when `page` (or `file`) is an integration unit whose job is wiring or testing across pages.
+fn is_integration_unit(page: &PagePlan, file: &str) -> bool {
+    let has_integration_token = |s: &str| {
+        s.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+            matches!(
+                tok.to_ascii_lowercase().as_str(),
+                "integration" | "integrations" | "e2e" | "wiring" | "glue" | "assembly"
+            )
+        })
+    };
+    if has_integration_token(&page.id) || has_integration_token(file) {
+        return true;
+    }
+    page.owned_glob.contains("__init__.py")
 }
 
 /// Read every source file under `root`, skipping build output and dependencies.
@@ -330,13 +428,99 @@ mod tests {
             ("app/b/page.tsx", "import { fmt } from './format';"),
             ("contracts/types.ts", ""),
         ]);
-        let owners = Owners::from_plan(&test_plan(&[("a", "app/a/**"), ("b", "app/b/**")])).unwrap();
+        let plan = test_plan(&[("a", "app/a/**"), ("b", "app/b/**")]);
+        let owners = Owners::from_plan(&plan).unwrap();
         let graph = ImportGraph::build(&src, "");
-        let violations = graph.cross_page_imports(&owners);
+        let violations = graph.cross_page_imports(&owners, &plan, &BTreeSet::new());
         // `b` importing its own file and both pages importing a contract are fine.
         assert_eq!(violations.keys().collect::<Vec<_>>(), vec!["a"]);
         assert!(violations["a"].contains("app/a/page.tsx imports app/b/format.ts"));
         assert!(violations["a"].contains("page `b`"));
+    }
+
+    #[test]
+    fn allows_declared_depends_on_earlier_phases_package_roots_and_integration_units() {
+        use tm_core::PagePlan;
+
+        let src = sources(&[
+            ("pkg/tokenizer.py", "def lex(s): return s.split()\n"),
+            ("pkg/parser.py", "from .tokenizer import lex\n"),
+            ("pkg/executor.py", "from .parser import parse\nfrom .tokenizer import lex\n"),
+            ("pkg/formatter.py", "from .tokenizer import lex\n"),
+            ("pkg/sibling_a.py", "from .sibling_b import helper\n"),
+            ("pkg/sibling_b.py", "def helper(): return 1\n"),
+            ("pkg/__init__.py", "from .tokenizer import lex\nfrom .sibling_b import helper\n"),
+            ("tests/test_integration.py", "from pkg.parser import parse\nfrom pkg.sibling_b import helper\n"),
+        ]);
+        let plan = Plan {
+            pages: vec![
+                PagePlan {
+                    id: "tokenizer".into(),
+                    owned_glob: "pkg/tokenizer.py".into(),
+                    phase: 0,
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "parser".into(),
+                    owned_glob: "pkg/parser.py".into(),
+                    phase: 0,
+                    depends_on: vec!["tokenizer".into()],
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "executor".into(),
+                    owned_glob: "pkg/executor.py".into(),
+                    phase: 0,
+                    depends_on: vec!["parser".into()], // transitive depends_on tokenizer
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "formatter".into(),
+                    owned_glob: "pkg/formatter.py".into(),
+                    phase: 1, // later phase importing earlier passed phase
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "sibling-a".into(),
+                    owned_glob: "pkg/sibling_a.py".into(),
+                    phase: 0,
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "sibling-b".into(),
+                    owned_glob: "pkg/sibling_b.py".into(),
+                    phase: 0,
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "pkg-init".into(),
+                    owned_glob: "pkg/__init__.py".into(),
+                    phase: 0,
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "integration".into(),
+                    owned_glob: "tests/test_integration.py".into(),
+                    phase: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let owners = Owners::from_plan(&plan).unwrap();
+        let graph = ImportGraph::build(&src, "");
+        let passed: BTreeSet<PageId> = ["tokenizer".into()].into_iter().collect();
+        let violations = graph.cross_page_imports(&owners, &plan, &passed);
+
+        // Only sibling-a -> sibling-b (same phase, no depends_on) is flagged.
+        assert_eq!(violations.keys().collect::<Vec<_>>(), vec!["sibling-a"], "{violations:?}");
+        assert!(violations["sibling-a"].contains("pkg/sibling_a.py imports pkg/sibling_b.py"));
+        assert!(violations["sibling-a"].contains("page `sibling-b`"));
+
+        // Without tokenizer passed yet, phase-1 formatter -> phase-0 tokenizer IS flagged.
+        let unpassed_violations = graph.cross_page_imports(&owners, &plan, &BTreeSet::new());
+        assert!(unpassed_violations.contains_key("formatter"), "{unpassed_violations:?}");
+        assert!(unpassed_violations.contains_key("sibling-a"));
     }
 
     #[test]

@@ -32,6 +32,8 @@ also its GitHub release notes (`scripts/release-notes.sh` takes it from here).
   server for outside agents, prompt links and a reconnect banner.
 - Paired machines' runs show in the sidebar, each with its own reconnect and Needs you.
 - The taskmaster skill for outside agents, served at `/skill.md`.
+- Notifications from the web app when it is served over HTTPS, and opening the daemon to the
+  local network from Connect.
 
 ### Faster and better looking
 

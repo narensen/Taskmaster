@@ -124,16 +124,19 @@ impl Push {
 
     /// What the person sees: the subscriptions (by label and push service) and ntfy.
     pub fn view(&self) -> Value {
-        let saved = self.saved.lock().unwrap();
-        let subscriptions: Vec<Value> = saved
-            .subscriptions
-            .iter()
-            .map(|s| json!({ "endpoint": s.endpoint, "service": service_of(&s.endpoint), "label": s.label, "added": s.added }))
-            .collect();
-        let ntfy = saved.ntfy.as_ref().map(|n| {
-            let host = n.server.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
-            json!({ "server": n.server, "topic": n.topic, "web_url": format!("{}/{}", n.server.trim_end_matches('/'), n.topic), "app_url": format!("ntfy://{host}/{}", n.topic) })
-        });
+        let (subscriptions, ntfy) = {
+            let saved = self.saved.lock().unwrap();
+            let subscriptions: Vec<Value> = saved
+                .subscriptions
+                .iter()
+                .map(|s| json!({ "endpoint": s.endpoint, "service": service_of(&s.endpoint), "label": s.label, "added": s.added }))
+                .collect();
+            let ntfy = saved.ntfy.as_ref().map(|n| {
+                let host = n.server.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+                json!({ "server": n.server, "topic": n.topic, "web_url": format!("{}/{}", n.server.trim_end_matches('/'), n.topic), "app_url": format!("ntfy://{host}/{}", n.topic) })
+            });
+            (subscriptions, ntfy)
+        };
         json!({ "public_key": self.public_key(), "subscriptions": subscriptions, "ntfy": ntfy })
     }
 
@@ -291,7 +294,7 @@ async fn web_push(key: &EcdsaKeyPair, sub: &Subscription, payload: &[u8]) -> any
 
 /// The `Authorization: vapid t=…, k=…` header for `endpoint` (RFC 8292).
 fn vapid(key: &EcdsaKeyPair, endpoint: &str) -> anyhow::Result<String> {
-    let rest = endpoint.split_once("://").map(|(scheme, rest)| (scheme, rest)).context("the endpoint has no scheme")?;
+    let rest = endpoint.split_once("://").context("the endpoint has no scheme")?;
     let audience = format!("{}://{}", rest.0, rest.1.split('/').next().unwrap_or(""));
     let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 12 * 3600;
     let header = B64.encode(br#"{"typ":"JWT","alg":"ES256"}"#);

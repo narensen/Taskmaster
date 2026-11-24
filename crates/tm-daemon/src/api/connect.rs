@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! GET  /api/connect               how this daemon can be reached: one route per address
+//! POST /api/connect/network       {open} listen on the local network too, or stop
 //! POST /api/pairing               {label?, kind?, ttl_secs?} -> a one-time code and a link per route
 //! GET  /api/devices               paired devices, with the caller marked `current`
 //! POST /api/devices/{id}/rename   {label}
@@ -21,12 +22,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, bail};
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 
 use super::{App, Reply, bearer, fail, ok};
 
@@ -128,11 +131,83 @@ async fn current_routes(app: &App) -> (Vec<Route>, Value) {
     };
     let lan = if wide { lan_ipv4() } else { None };
     let mut routes = routes(bind, lan, ts_ip);
+    if let Some(net_addr) = app.network.lock().unwrap().as_ref().map(|(addr, _)| *addr) {
+        let url = url_for(net_addr.ip(), net_addr.port());
+        if !routes.iter().any(|route| route.url == url) {
+            routes.push(Route {
+                kind: route_kind(net_addr.ip()),
+                address: format!("{}:{}", net_addr.ip(), net_addr.port()),
+                url,
+            });
+        }
+    }
     if let (Some(dns), true) = (&ts_dns, wide || tailnet_bound) {
         routes.push(Route { kind: "tailscale", address: format!("{dns}:{}", bind.port()), url: format!("http://{dns}:{}/", bind.port()) });
     }
     let tailscale = json!({ "running": ts_ip.is_some(), "ip": ts_ip.map(|ip| ip.to_string()), "dns": ts_dns });
     (routes, tailscale)
+}
+
+/// The best base URL for a phone to open (prefers a non-loopback route when available).
+pub(super) async fn phone_base(app: &App) -> String {
+    let (routes, _) = current_routes(app).await;
+    routes
+        .iter()
+        .find(|route| route.kind != "this-computer")
+        .or_else(|| routes.first())
+        .map(|route| route.url.clone())
+        .unwrap_or_else(|| url_for(app.addr.ip(), app.addr.port()))
+}
+
+impl App {
+    /// Open a second listener on this computer's local-network IPv4 address so devices on
+    /// the same Wi-Fi can pair without restarting the daemon.
+    pub(super) async fn open_network(&self) -> anyhow::Result<SocketAddr> {
+        if !self.addr.ip().is_loopback() {
+            return Ok(self.addr);
+        }
+        if let Some((addr, _)) = self.network.lock().unwrap().as_ref() {
+            return Ok(*addr);
+        }
+        let Some(router) = self.router.get().cloned() else {
+            bail!("the server is not ready yet");
+        };
+        let Some(ip) = lan_ipv4() else {
+            bail!("this computer has no local-network address");
+        };
+        let target = SocketAddr::from((IpAddr::V4(ip), self.addr.port()));
+        let listener = match TcpListener::bind(target).await {
+            Ok(listener) => listener,
+            Err(_) => TcpListener::bind(SocketAddr::from((IpAddr::V4(ip), 0)))
+                .await
+                .with_context(|| format!("cannot bind local network address {ip}"))?,
+        };
+        let bound = listener.local_addr().context("the local-network listener has no address")?;
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        {
+            let mut slot = self.network.lock().unwrap();
+            if let Some((existing, _)) = slot.as_ref() {
+                task.abort();
+                return Ok(*existing);
+            }
+            *slot = Some((bound, task));
+        }
+        crate::log::note(&format!("opened local network at {}", url_for(bound.ip(), bound.port())));
+        Ok(bound)
+    }
+
+    /// Stop the secondary local-network listener, if one was opened from Connect.
+    pub(super) fn close_network(&self) -> bool {
+        if let Some((addr, task)) = self.network.lock().unwrap().take() {
+            task.abort();
+            crate::log::note(&format!("closed local network at {}", url_for(addr.ip(), addr.port())));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn route_json(route: &Route) -> Value {
@@ -153,6 +228,32 @@ pub async fn overview(State(app): State<Arc<App>>) -> Reply {
         "project": app.project().display().to_string(),
         "kinds": crate::auth::DEVICE_KINDS,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct NetworkBody {
+    open: bool,
+}
+
+/// `POST /api/connect/network`: open or close the secondary local-network listener and
+/// remember the choice in settings.
+pub async fn set_network(State(app): State<Arc<App>>, Json(body): Json<NetworkBody>) -> Reply {
+    if body.open {
+        app.open_network().await.map_err(|err| fail(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+        super::desk::save_setting(&app.project(), "connect", json!({ "network": true }))
+            .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    } else {
+        if app.addr.ip().is_unspecified() {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "this daemon was started on the local network; restart without --lan to close it",
+            ));
+        }
+        app.close_network();
+        super::desk::save_setting(&app.project(), "connect", json!({ "network": false }))
+            .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    overview(State(app)).await
 }
 
 #[derive(Deserialize, Default)]

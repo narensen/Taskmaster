@@ -6941,3 +6941,176 @@ async fn holder_worktree(holder: &tm_harness::hold::Holder) -> PathBuf {
     let listed = holder.list().await.unwrap();
     PathBuf::from(listed[0].meta["worktree"].as_str().unwrap())
 }
+
+#[tokio::test]
+async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brief() {
+    let tmp = repo("stalled-warm-follow");
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follow_ups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fresh_briefs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct StallingSession {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        follow_ups: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for StallingSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.follow_ups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(tm_harness::Stalled(Duration::from_secs(180)).into())
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct FallbackHarness {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        follow_ups: Arc<std::sync::atomic::AtomicUsize>,
+        fresh_briefs: Arc<Mutex<Vec<String>>>,
+        turn: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for FallbackHarness {
+        fn id(&self) -> &'static str {
+            "claude-code"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let n = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.fresh_briefs.lock().unwrap().push(task.brief.clone());
+            if n == 0 {
+                // First turn writes outside owned glob to trigger a repair sent to the warm session.
+                std::fs::write(task.cwd.join("outside.txt"), "bad\n").unwrap();
+                let _ = events.send(HarnessEvent::Text { text: "initial".into() }).await;
+                let sess: Box<dyn tm_harness::Session> = Box::new(StallingSession {
+                    closed: self.closed.clone(),
+                    follow_ups: self.follow_ups.clone(),
+                });
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+            } else {
+                // Fallback fresh ask() receives the full worker brief and fixes the file.
+                let _ = std::fs::remove_file(task.cwd.join("outside.txt"));
+                let page_file = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+                std::fs::write(&page_file, "export const a = 'recovered';\n").unwrap();
+                let _ = events.send(HarnessEvent::Text { text: "fixed on fallback".into() }).await;
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), None)
+            }
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(FallbackHarness {
+        closed: closed.clone(),
+        follow_ups: follow_ups.clone(),
+        fresh_briefs: fresh_briefs.clone(),
+        turn: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.warm_idle = Duration::from_secs(600);
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(follow_ups.load(std::sync::atomic::Ordering::SeqCst), 1, "repair must first try the open warm session");
+    assert!(closed.load(std::sync::atomic::Ordering::SeqCst), "stalled open session must be closed before fallback");
+    let briefs = fresh_briefs.lock().unwrap();
+    assert_eq!(briefs.len(), 2, "expected initial run + fallback ask()");
+    assert!(
+        briefs[1].contains("Shared context for every agent of this run") && briefs[1].contains("Build page `a`"),
+        "fallback ask() must get the full original worker brief, got:\n{}",
+        briefs[1]
+    );
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'recovered';\n");
+}
+
+#[tokio::test]
+async fn single_worker_error_in_join_one_escalates_instead_of_aborting_run() {
+    let tmp = repo("join-one-worker-err");
+
+    struct FailingWorker;
+    #[async_trait]
+    impl Harness for FailingWorker {
+        fn id(&self) -> &'static str {
+            "failing-worker"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            anyhow::bail!("unexpected worker crash")
+        }
+    }
+
+    struct SucceedingMid {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for SucceedingMid {
+        fn id(&self) -> &'static str {
+            "mid-ok"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let page_file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+            std::fs::write(&page_file, "export const a = 'from-mid';\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let worker: Arc<dyn Harness> = Arc::new(FailingWorker);
+    let mid_inner = Arc::new(SucceedingMid { calls: std::sync::atomic::AtomicUsize::new(0) });
+    let mid: Arc<dyn Harness> = mid_inner.clone();
+    let harnesses = Harnesses {
+        worker,
+        mid: mid.clone(),
+        master: mid.clone(),
+        reviewer: mid.clone(),
+        verifier: mid,
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert!(mid_inner.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1, "expected escalation to mid tier after worker error");
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'from-mid';\n");
+}

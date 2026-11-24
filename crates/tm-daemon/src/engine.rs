@@ -109,7 +109,7 @@ struct Settling {
 
 /// What [`Driver::join_one`] woke up for.
 enum Joined {
-    Job(Result<(PageId, usize, anyhow::Result<WorkerJob>), tokio::task::JoinError>),
+    Job(Result<(PageId, usize, WorkerJob), tokio::task::JoinError>),
     Early(Result<EarlyDone, tokio::task::JoinError>),
 }
 
@@ -121,6 +121,7 @@ struct Product {
 
 enum WorkerJob {
     Finished(Box<Product>),
+    Failed { err: anyhow::Error, worktree: PathBuf },
     Restarted(PathBuf),
 }
 
@@ -355,9 +356,11 @@ struct Driver {
     changes: Vec<ChangeEntry>,
     pending: VecDeque<Command>,
     running: Vec<Command>,
-    jobs: JoinSet<(PageId, usize, anyhow::Result<WorkerJob>)>,
+    jobs: JoinSet<(PageId, usize, WorkerJob)>,
     /// Finished units of pages that still have units running.
     batches: HashMap<PageId, Vec<(usize, Product)>>,
+    /// Non-limit worker errors collected for units of a page still in flight.
+    batch_errors: HashMap<PageId, Vec<String>>,
     /// Caps concurrent worker calls at `parallel`, counting every unit of every page.
     slots: Arc<Semaphore>,
     harnesses: Harnesses,
@@ -459,7 +462,9 @@ struct Hibernated {
 /// How a spawned worker executes its turn.
 enum WorkerExec {
     Fresh,
-    Warm(Warm),
+    /// Open warm session: `prompt` is sent as the follow-up turn while `request.brief`
+    /// keeps the full original worker brief for fallback if the session stalls.
+    Warm { warm: Warm, prompt: String },
     Resume { session_id: String, prompt: String },
     /// H3: the agent a previous daemon handed off, still running in the holder. `said` is what
     /// it had replied so far; `session_id` resumes it the H2 way if it cannot be picked up.
@@ -687,6 +692,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         running: Vec::new(),
         jobs: JoinSet::new(),
         batches: HashMap::new(),
+        batch_errors: HashMap::new(),
         slots: Arc::new(Semaphore::new(parallel)),
         harnesses,
         url,
@@ -863,6 +869,7 @@ impl Driver {
         self.running.clear();
         self.pending.clear();
         self.settling.clear();
+        self.batch_errors.clear();
         for (_, products) in std::mem::take(&mut self.batches) {
             for (_, product) in products {
                 self.drop_worktree(&product.worktree);
@@ -2001,16 +2008,13 @@ impl Driver {
                 // it already has the task, the files and the provider's cache.
                 let warm = if errors.is_some() { self.take_warm(&key, tier) } else { None };
                 if let Some(warm) = warm {
+                    let follow_prompt = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
                     let step = git::sync_worktree(&warm.worktree, &self.tree)
-                        .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()))
-                        .map(|mut request| {
-                            request.brief = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
-                            request
-                        });
+                        .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()));
                     match step {
                         Ok(request) => {
                             let worktree = warm.worktree.clone();
-                            prepared.push((request, worktree, WorkerExec::Warm(warm)));
+                            prepared.push((request, worktree, WorkerExec::Warm { warm, prompt: follow_prompt }));
                             continue;
                         }
                         Err(err) => {
@@ -2095,6 +2099,7 @@ impl Driver {
         }
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
         self.batches.remove(&page);
+        self.batch_errors.remove(&page);
         let restart_rx = self.config.worker_restarts.as_ref().map(|map| {
             let mut guard = map.lock().unwrap();
             let tx = guard.entry(page.clone()).or_insert_with(|| tokio::sync::watch::channel(0u64).0);
@@ -2145,7 +2150,7 @@ impl Driver {
             let (page, slots) = (page.clone(), self.slots.clone());
             let mut rx = restart_rx.clone();
             match &exec {
-                WorkerExec::Warm(_) => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
+                WorkerExec::Warm { .. } => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
                 WorkerExec::Resume { session_id, .. } => {
                     eprintln!("taskmaster: resuming {agent} on provider session {session_id}");
                 }
@@ -2166,13 +2171,16 @@ impl Driver {
                 let result = tokio::select! {
                     asked = async {
                         match exec {
-                            WorkerExec::Warm(warm) => follow(request, warm.session).await,
+                            WorkerExec::Warm { warm, prompt } => follow(request, warm.session, prompt).await,
                             WorkerExec::Resume { session_id, prompt } => resume_or_ask(request, session_id, prompt).await,
                             WorkerExec::Reattach { said, session_id } => reattach_or_resume(request, said, session_id).await,
                             WorkerExec::Fresh => ask(request).await,
                         }
-                    } => asked.map(|answer| WorkerJob::Finished(Box::new(Product { answer, bill, worktree }))),
-                    _ = restart_wait => Ok(WorkerJob::Restarted(worktree)),
+                    } => match asked {
+                        Ok(answer) => WorkerJob::Finished(Box::new(Product { answer, bill, worktree })),
+                        Err(err) => WorkerJob::Failed { err, worktree },
+                    },
+                    _ = restart_wait => WorkerJob::Restarted(worktree),
                 };
                 // The agent is released; its slot goes to the next waiting unit at once.
                 drop(permit);
@@ -2203,11 +2211,30 @@ impl Driver {
         if let Some(code) = &self.code {
             code.detach_page(&page);
         }
-        let mut product = match result {
-            Ok(WorkerJob::Finished(product)) => *product,
-            Ok(WorkerJob::Restarted(worktree)) => {
+        let wanted = self
+            .race_pages
+            .get(&page)
+            .copied()
+            .unwrap_or_else(|| self.page(&page).map(|p| p.work_units().len()).unwrap_or(1));
+        match result {
+            WorkerJob::Finished(product) => {
+                let mut product = *product;
+                self.charge(&product.bill, &product.answer)?;
+                // W1: Release gate — if a worker with a shell and available tests released without
+                // running them, send the nudge once as a follow-up turn before judging/checking.
+                if !self.is_stale(&page)
+                    && !self.race_pages.contains_key(&page)
+                    && product.answer.ok
+                    && reply::parse_flag(&product.answer.text).is_none()
+                {
+                    self.maybe_release_gate_nudge(&page, index, &mut product).await?;
+                }
+                self.batches.entry(page.clone()).or_default().push((index, product));
+            }
+            WorkerJob::Restarted(worktree) => {
                 self.drop_worktree(&worktree);
                 self.race_pages.remove(&page);
+                self.batch_errors.remove(&page);
                 if let Some(partial) = self.batches.remove(&page) {
                     for (_, p) in partial {
                         self.drop_worktree(&p.worktree);
@@ -2230,36 +2257,36 @@ impl Driver {
                 }
                 return Ok(());
             }
-            Err(err) => {
-                self.race_pages.remove(&page);
-                if let Some(map) = &self.config.worker_restarts {
-                    map.lock().unwrap().remove(&page);
+            WorkerJob::Failed { err, worktree } => {
+                self.drop_worktree(&worktree);
+                // A provider usage/rate/auth limit still stops the run cleanly so the user can switch or retry.
+                if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() {
+                    self.race_pages.remove(&page);
+                    self.batch_errors.remove(&page);
+                    if let Some(partial) = self.batches.remove(&page) {
+                        for (_, p) in partial {
+                            self.drop_worktree(&p.worktree);
+                        }
+                    }
+                    if let Some(map) = &self.config.worker_restarts {
+                        map.lock().unwrap().remove(&page);
+                    }
+                    self.persist()?;
+                    return Err(err);
                 }
-                self.persist()?;
-                return Err(err);
+                // A single worker error (such as a stall or harness crash) is treated as a failed
+                // check / escalation on this page rather than aborting the whole run.
+                eprintln!("taskmaster: {page} worker error ({err:#}); treating as a failed check");
+                self.batch_errors.entry(page.clone()).or_default().push(format!("worker error: {err:#}"));
             }
-        };
-        self.charge(&product.bill, &product.answer)?;
-        // W1: Release gate — if a worker with a shell and available tests released without
-        // running them, send the nudge once as a follow-up turn before judging/checking.
-        if !self.is_stale(&page)
-            && !self.race_pages.contains_key(&page)
-            && product.answer.ok
-            && reply::parse_flag(&product.answer.text).is_none()
-        {
-            self.maybe_release_gate_nudge(&page, index, &mut product).await?;
         }
-        let wanted = self
-            .race_pages
-            .get(&page)
-            .copied()
-            .unwrap_or_else(|| self.page(&page).map(|p| p.work_units().len()).unwrap_or(1));
-        let batch = self.batches.entry(page.clone()).or_default();
-        batch.push((index, product));
-        if batch.len() < wanted {
+        let received = self.batches.get(&page).map_or(0, Vec::len)
+            + self.batch_errors.get(&page).map_or(0, Vec::len);
+        if received < wanted {
             return Ok(());
         }
         let mut products = self.batches.remove(&page).unwrap_or_default();
+        let job_errors = self.batch_errors.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
         let cmd = self.take_running(&page);
         let was_race = self.race_pages.remove(&page).is_some();
@@ -2279,6 +2306,23 @@ impl Driver {
             Some(Command::SpawnWorker { tier, errors, .. }) => (*tier, errors.clone()),
             _ => (Tier::Worker, None),
         };
+        // If any non-race unit failed, or every candidate in a race failed, settle as CheckFailed
+        // so the run state machine retries or escalates the page instead of aborting the run.
+        if !job_errors.is_empty() && (!was_race || products.is_empty()) {
+            for (_, product) in &products {
+                self.drop_worktree(&product.worktree);
+            }
+            let settling = Settling {
+                tier,
+                errors,
+                text: String::new(),
+                refused: Vec::new(),
+                review: None,
+                shot: None,
+                wanted: if was_race { 1 } else { wanted },
+            };
+            return self.settle(&page, failed(job_errors.join("\n")), settling);
+        }
         // W3: Pick the best candidate from a Best-of-N race and remove every loser worktree.
         if was_race && products.len() > 1 {
             products = self.select_race_winner(&page, products);
@@ -2358,13 +2402,24 @@ impl Driver {
         let units = self.page(page).map(|p| p.work_units()).unwrap_or_default();
         let units_len = units.len().max(1);
         let mut req = self.worker_request(page, index.min(units_len - 1), units_len, tier, None, product.worktree.clone())?;
-        req.brief = nudge.to_string();
+        // Keep the full original worker brief on `req.brief` so a stalled warm session can
+        // fall back to `ask(req)` with complete context.
+        req.brief.push_str("\n\n");
+        req.brief.push_str(nudge);
         let glob = units.get(index).map(|u| u.owned_glob.as_str());
         self.tag(&mut req, &agent_id, tier_name(tier), Some(page), glob);
         let bill = req.bill(Role::builder(tier), Some(page));
-        let ans = match product.answer.kept.take() {
-            Some(session) => follow(req, session).await?,
-            None => ask(req).await?,
+        let asked = match product.answer.kept.take() {
+            Some(session) => follow(req, session, nudge.to_string()).await,
+            None => ask(req).await,
+        };
+        let ans = match asked {
+            Ok(ans) => ans,
+            Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() => return Err(err),
+            Err(err) => {
+                eprintln!("taskmaster: release gate nudge for {agent_id} failed ({err:#}); continuing with existing changes");
+                return Ok(());
+            }
         };
         self.charge(&bill, &ans)?;
         product.answer.ok = ans.ok;
@@ -6147,9 +6202,15 @@ fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop 
 
 /// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
 /// transcript under the same agent, and the session stays open for the next repair.
-async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>) -> anyhow::Result<Answer> {
+/// If the open session stalls, closes it and falls back to `ask(request)` with the full
+/// original worker brief preserved in `request.brief`.
+async fn follow(
+    request: AgentRequest,
+    mut session: Box<dyn tm_harness::Session>,
+    prompt: String,
+) -> anyhow::Result<Answer> {
     if let Some(feed) = &request.feed {
-        let mut start = serde_json::json!({ "brief": request.brief, "follow_up": true });
+        let mut start = serde_json::json!({ "brief": prompt, "follow_up": true });
         if let Some(sid) = session.session_id() {
             start["session_id"] = serde_json::json!(sid);
         }
@@ -6161,7 +6222,7 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
     let collect = collect_events_full(tee, None, rx, heard.clone());
     let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let run = session.follow_up(request.brief.clone(), tx, request.timeout).await;
+    let run = session.follow_up(prompt, tx, request.timeout).await;
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
     if let Some(feed) = &request.feed {
@@ -6192,12 +6253,29 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
         Ok(summary) => summary,
         Err(err) => {
             if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                let _ = session.close().await;
                 return Err(reported_limit(&request, hit).into());
             }
+            if err.downcast_ref::<tm_harness::Stalled>().is_some() {
+                let who = who_of(&request);
+                eprintln!("taskmaster: {who} stalled in open session ({err}); closing session and starting a fresh agent");
+                if let Some(feed) = &request.feed {
+                    feed.live.push(
+                        &feed.run,
+                        &feed.agent,
+                        "stalled",
+                        serde_json::json!({ "error": format!("{err:#}"), "follow_up": true }),
+                    );
+                }
+                let _ = session.close().await;
+                return ask(request).await;
+            }
+            let _ = session.close().await;
             return Err(err);
         }
     };
     if let Some(hit) = reply::limit_of(&text) {
+        let _ = session.close().await;
         return Err(reported_limit(&request, hit).into());
     }
     Ok(Answer {

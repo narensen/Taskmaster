@@ -305,6 +305,30 @@ pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
     out
 }
 
+/// Exclude later-phase contract test paths from test runner steps (e.g. pytest `--ignore=<path>`)
+/// so intermediate-phase verify does not execute tests for phases that have not been built yet.
+pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {
+    if ignore_paths.is_empty() {
+        return;
+    }
+    for step in steps.iter_mut() {
+        if step.name != "test" {
+            continue;
+        }
+        let is_pytest = step.program.ends_with("pytest")
+            || step.program.ends_with("pytest.exe")
+            || step.args.iter().any(|a| a == "pytest");
+        if is_pytest {
+            for path in ignore_paths {
+                let flag = format!("--ignore={path}");
+                if !step.args.contains(&flag) {
+                    step.args.push(flag);
+                }
+            }
+        }
+    }
+}
+
 /// Why a project with tests has nothing to run them with, when that is so.
 pub fn missing_runner(tree: &Path) -> Option<String> {
     if python_tests(tree) && !on_path("python3") && !on_path("python") {

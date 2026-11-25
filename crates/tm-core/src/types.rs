@@ -54,10 +54,14 @@ pub struct DictionaryEntry {
     pub stats: Option<EntryStats>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContractFile {
     pub path: String,
     pub content: String,
+    /// The phase of the sketch this contract belongs to (0-indexed).
+    /// Defaults to 0 (first phase) for single-phase plans or phase-1 contracts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub phase: usize,
 }
 
 impl ContractFile {

@@ -1587,6 +1587,7 @@ impl Driver {
         plan.contracts.push(tm_core::ContractFile {
             path: "conftest.py".into(),
             content: "# Puts the project root on the import path, so the tests can import the contracts beside it.\n".into(),
+            phase: 0,
         });
         vec!["a Python contract sits at the project root, so a root conftest.py is locked to make it importable from the tests".into()]
     }
@@ -2676,7 +2677,11 @@ impl Driver {
         let test_contracts: Vec<&tm_core::ContractFile> = plan
             .contracts
             .iter()
-            .filter(|c| c.is_test() && self.tree.join(&c.path).is_file())
+            .filter(|c| {
+                c.is_test()
+                    && tm_core::effective_contract_phase(c, &plan.phases) <= self.run.phase_at
+                    && self.tree.join(&c.path).is_file()
+            })
             .collect();
         if test_contracts.is_empty() {
             return vacuous;
@@ -3751,7 +3756,9 @@ impl Driver {
             timings.push(Timing::new("imports", imports_began.elapsed(), "failed"));
         }
         // The static checks and the project's own build and tests do not wait for each other.
-        let steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
+        let mut steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
+        let later_tests = self.later_phase_test_contracts();
+        runtime::deselect_test_paths(&mut steps, &later_tests);
         let (checked, built) = {
             let tree = self.tree.clone();
             let build = async {
@@ -3764,11 +3771,12 @@ impl Driver {
         let mut built = built;
         timings.append(&mut checked.timings);
         if !checked.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
-            self.repair_shared(&checked.shared).await?;
-            checked = self.mechanical_checks(&owners).await?;
-            timings.append(&mut checked.timings);
-            if let Some((mut prev_timings, _)) = built.take() {
-                timings.append(&mut prev_timings);
+            if self.repair_shared(&checked.shared).await? {
+                checked = self.mechanical_checks(&owners).await?;
+                timings.append(&mut checked.timings);
+                if let Some((mut prev_timings, _)) = built.take() {
+                    timings.append(&mut prev_timings);
+                }
             }
         }
         self.record_gate_findings("mechanical", checked.pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
@@ -3807,8 +3815,8 @@ impl Driver {
                 if ran.shared.is_empty() {
                     let output = ran.unowned.clone().unwrap_or_default();
                     self.repair_unowned(&output).await?;
-                } else {
-                    self.repair_shared(&ran.shared).await?;
+                } else if !self.repair_shared(&ran.shared).await? {
+                    break;
                 }
                 let earlier = ran;
                 ran = self.runtime_checks(&owners, &routes, None).await?;
@@ -3953,7 +3961,10 @@ impl Driver {
         built: Option<(Vec<Timing>, Option<runtime::Failure>)>,
     ) -> anyhow::Result<Ran> {
         let mut ran = Ran::default();
-        let steps = runtime::steps(&self.tree, &self.verify_venv());
+        let later_tests = self.later_phase_test_contracts();
+        let later_set: BTreeSet<String> = later_tests.iter().cloned().collect();
+        let mut steps = runtime::steps(&self.tree, &self.verify_venv());
+        runtime::deselect_test_paths(&mut steps, &later_tests);
         for step in &steps {
             self.terminal(
                 "command",
@@ -3979,6 +3990,17 @@ impl Driver {
         };
         let timed_out = steps_timed.iter().any(|t| t.name == "test" && t.status == "timeout");
         ran.timings.extend(steps_timed);
+        // Treat a failure that only names later-phase contract tests as expected red, not repairable.
+        let failed = match failed {
+            Some(failure)
+                if !later_set.is_empty()
+                    && self.is_expected_red_later_phase(&failure.output, owners, routes, &later_set) =>
+            {
+                eprintln!("taskmaster: ignoring expected-red failure in later-phase contract test(s)");
+                None
+            }
+            other => other,
+        };
         // A test step that fails once and passes when run again is flaky, not broken: say so,
         // and spend no repair on it. A step that ran out of time is not run twice.
         let failed = match (failed, steps.iter().find(|step| step.name == "test")) {
@@ -4013,8 +4035,15 @@ impl Driver {
             }
             if !rest.is_empty() {
                 let locked = self.locked_files();
-                let named: BTreeSet<String> =
+                let named_all: BTreeSet<String> =
                     rest.lines().flat_map(runtime::paths_in).filter(|path| locked.contains(path)).collect();
+                let (later_named, named): (BTreeSet<String>, BTreeSet<String>) =
+                    named_all.into_iter().partition(|path| later_set.contains(path));
+                if !later_named.is_empty() && named.is_empty() && ran.pages.is_empty() {
+                    let list: Vec<&str> = later_named.iter().map(String::as_str).collect();
+                    eprintln!("taskmaster: ignoring expected-red failure in later-phase contract test(s): {}", list.join(", "));
+                    return Ok(ran);
+                }
                 let text = format!("`{}` failed:\n{rest}", failure.step);
                 // Failing contract tests go to the units they reach, not to the master.
                 let reached = if !named.is_empty() && named.iter().all(|file| tm_core::is_test_path(file)) {
@@ -4157,6 +4186,38 @@ impl Driver {
         self.run.plan.as_ref().is_some_and(|plan| plan.contracts.iter().any(|c| c.path == file && c.is_test()))
     }
 
+    /// Locked contract tests belonging to phases strictly after the current phase (`phase > phase_at`).
+    fn later_phase_test_contracts(&self) -> Vec<String> {
+        let Some(plan) = &self.run.plan else { return Vec::new() };
+        plan.contracts
+            .iter()
+            .filter(|c| c.is_test() && tm_core::effective_contract_phase(c, &plan.phases) > self.run.phase_at)
+            .map(|c| c.path.clone())
+            .collect()
+    }
+
+    /// True when `output` attributes no failure to any unit or active shared file, and every
+    /// locked file it names is a test contract belonging to a later phase ("expected red").
+    fn is_expected_red_later_phase(
+        &self,
+        output: &str,
+        owners: &Owners,
+        routes: &[(PageId, String)],
+        later_tests: &BTreeSet<String>,
+    ) -> bool {
+        let (pages, rest) = runtime::attribute(output, owners, routes);
+        if !pages.is_empty() || rest.is_empty() {
+            return false;
+        }
+        let locked = self.locked_files();
+        let named: BTreeSet<String> = rest
+            .lines()
+            .flat_map(runtime::paths_in)
+            .filter(|path| locked.contains(path))
+            .collect();
+        !named.is_empty() && named.iter().all(|path| later_tests.contains(path))
+    }
+
     /// The units `tests` reach through their imports, directly or through other shared files.
     fn units_reached<'a>(&self, owners: &Owners, tests: impl IntoIterator<Item = &'a str>) -> BTreeSet<PageId> {
         let Ok(sources) = load_sources(&self.tree) else { return BTreeSet::new() };
@@ -4265,8 +4326,9 @@ impl Driver {
         let mut brief = self.shared_prefix().unwrap_or_default();
         brief.push_str(
             "The project's own build or tests fail, and the output names no file any unit owns. Find the cause and fix it. \
-             It may be the project's configuration, a test, a shared file, a missing dependency or a dependency file \
-             (a lockfile, pyproject.toml, package.json). Change as little as you can, and do not rewrite a unit's work \
+             It may be the project's configuration, a shared file, a missing dependency or a dependency file \
+             (a lockfile, pyproject.toml, package.json). Never edit locked contract tests (any edit to a locked contract test is discarded). \
+             Change as little as you can, and do not rewrite a unit's work \
              unless the output shows it is wrong. Taskmaster runs the checks again after you.\n\nOutput:\n",
         );
         brief.push_str(&clip(output, 8000));
@@ -4340,6 +4402,10 @@ impl Driver {
             if !git::safe_rel(&change.path) || change.path.starts_with(".taskmaster/") {
                 continue;
             }
+            if self.is_contract_test(&change.path) {
+                eprintln!("taskmaster: refusing to merge edit to locked contract test `{}`", change.path);
+                continue;
+            }
             let src = worktree.join(&change.path);
             let dest = self.tree.join(&change.path);
             if change.status == 'D' {
@@ -4363,21 +4429,63 @@ impl Driver {
 
     /// Ask the master to fix shared files the run wrote. Workers may not touch them, and
     /// the master may touch nothing else: any other edit it makes is discarded.
-    async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<()> {
-        let allowed: BTreeSet<String> = errors.iter().map(|(file, _)| file.clone()).filter(|file| !file.is_empty()).collect();
+    /// Locked contract tests are never edited by `repair_shared`; they are flagged instead.
+    /// Returns `Ok(true)` if a master repair ran, or `Ok(false)` when refused (only locked tests).
+    async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<bool> {
+        let mut allowed: BTreeSet<String> = BTreeSet::new();
+        let mut locked_tests: BTreeSet<String> = BTreeSet::new();
+        for (file, _) in errors {
+            if file.is_empty() {
+                continue;
+            }
+            if self.is_contract_test(file) {
+                locked_tests.insert(file.clone());
+            } else {
+                allowed.insert(file.clone());
+            }
+        }
+        if !locked_tests.is_empty() {
+            let list: Vec<String> = locked_tests.iter().cloned().collect();
+            let joined = list.join(", ");
+            eprintln!("taskmaster: refusing to let repair_shared edit locked contract test(s): {joined}; flagging instead");
+            self.live.push(
+                &self.id,
+                &serde_json::json!({ "id": "master", "role": "master" }),
+                "locked_contract_flagged",
+                serde_json::json!({
+                    "files": list,
+                    "reason": "repair_shared refuses to edit locked contract tests",
+                }),
+            );
+            let entry = ChangeEntry {
+                at: rfc3339_now(),
+                kind: ChangeKind::VerifyFailed,
+                page: None,
+                commit: None,
+                model: None,
+                files: list,
+                keys: vec![],
+                summary: format!("flagged locked contract test(s) (repair_shared refuses to edit locked tests): {joined}"),
+            };
+            if self.commit_entries(vec![entry.clone()], vec![], "taskmaster: flag locked contract test failure")?.is_none() {
+                self.changes.push(entry);
+                let _ = self.write_docs();
+                self.save_changes()?;
+            }
+        }
+        if allowed.is_empty() {
+            return Ok(false);
+        }
         eprintln!("taskmaster: asking the master to repair {} shared file(s)", allowed.len());
         let mut brief = self.shared_prefix().unwrap_or_default();
         brief.push_str(
             "Shared files this run wrote fail the project's checks. Fix the errors below.\n\
-             You may edit only these files; any other edit is discarded:\n",
+             You may edit only these files; any other edit is discarded (never edit locked contract tests):\n",
         );
         for file in &allowed {
             brief.push_str(&format!("- `{file}`\n"));
         }
         brief.push_str("\nPages already import these files, so keep every exported name and type that still makes sense.\n");
-        if allowed.iter().any(|file| self.is_contract_test(file)) {
-            brief.push_str("A contract test among them is the acceptance check: fix it only where the test itself is wrong (a bad import or path), never by weakening what it checks.\n");
-        }
         brief.push_str("\nErrors:\n");
         for (_, line) in errors.iter().filter(|(_, line)| !line.is_empty()) {
             brief.push_str(&format!("{line}\n"));
@@ -4444,13 +4552,17 @@ impl Driver {
             self.changes.push(entry);
             self.save_changes()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn merge_shared(&self, worktree: &Path, allowed: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
         let mut files = Vec::new();
         for change in git::worktree_changes(worktree)? {
-            if !allowed.contains(&change.path) || change.status == 'D' || !git::safe_rel(&change.path) {
+            if !allowed.contains(&change.path)
+                || self.is_contract_test(&change.path)
+                || change.status == 'D'
+                || !git::safe_rel(&change.path)
+            {
                 continue;
             }
             let src = worktree.join(&change.path);
@@ -4481,8 +4593,15 @@ impl Driver {
             return Ok(Checked::default());
         }
         let locked = self.locked_files();
-        // Shared files are checked too: a page can be right and its contract wrong.
-        built.extend(locked.iter().filter(|file| self.tree.join(file).is_file()).cloned());
+        let later_tests: BTreeSet<String> = self.later_phase_test_contracts().into_iter().collect();
+        // Shared files are checked too (a page can be right and its contract wrong),
+        // except test contracts belonging to later phases.
+        built.extend(
+            locked
+                .iter()
+                .filter(|file| !later_tests.contains(*file) && self.tree.join(file).is_file())
+                .cloned(),
+        );
         let (project, files) = (self.tree.clone(), built.into_iter().collect::<Vec<_>>());
         let picked: Vec<&str> = checks::select(&project, &files).into_iter().filter(|c| c.is_static()).map(|c| c.name()).collect();
         if picked.is_empty() {
@@ -4535,6 +4654,9 @@ impl Driver {
                     text.push_str(line);
                     text.push('\n');
                 }
+                None if later_tests.contains(file) => {
+                    eprintln!("taskmaster: ignoring expected-red check on later-phase contract test `{file}`");
+                }
                 None if locked.contains(file) => checked.shared.push((file.clone(), line.clone())),
                 None => eprintln!("taskmaster: {line}"),
             }
@@ -4546,6 +4668,9 @@ impl Driver {
                     let text = checked.pages.entry(page.clone()).or_default();
                     text.push_str(&line);
                     text.push('\n');
+                }
+                None if later_tests.contains(&finding.file) => {
+                    eprintln!("taskmaster: ignoring expected-red check on later-phase contract test `{}`", finding.file);
                 }
                 None if locked.contains(&finding.file) => checked.shared.push((finding.file.clone(), line)),
                 None => {
@@ -4889,7 +5014,18 @@ impl Driver {
                 out.push_str(&format!("- `{}`\n", c.path));
             }
         }
-        let tests: Vec<String> = contracts.iter().filter(|c| c.is_test()).map(|c| format!("`{}`", c.path)).collect();
+        let tests: Vec<String> = contracts
+            .iter()
+            .filter(|c| c.is_test())
+            .map(|c| {
+                let p = tm_core::effective_contract_phase(c, &plan.phases);
+                if p > self.run.phase_at {
+                    format!("`{}` (phase {} — checked in a later phase)", c.path, p + 1)
+                } else {
+                    format!("`{}`", c.path)
+                }
+            })
+            .collect();
         if !tests.is_empty() {
             out.push_str(&format!(
                 "\nThe locked contract tests {} are the acceptance check for every unit: they say what the code must do. \

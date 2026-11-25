@@ -436,7 +436,7 @@ fn plan_json(cite: &str, entry: &str) -> String {
 
 fn plan(pages: &[(&str, &[&str])]) -> Plan {
     Plan {
-        contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into() }],
+        contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into(), phase: 0 }],
         pages: pages
             .iter()
             .map(|(id, cites)| PagePlan {
@@ -681,7 +681,7 @@ async fn a_failing_contract_test_goes_to_the_unit_it_imports_not_to_the_master()
 
     let test_source = "import { total } from \"../../app/a/page\";\nexport const checks = total([1, 2]) === 2;\n";
     let mut plan = plan(&[("a", &[])]);
-    plan.contracts.push(ContractFile { path: "tests/contract/a.test.ts".into(), content: test_source.into() });
+    plan.contracts.push(ContractFile { path: "tests/contract/a.test.ts".into(), content: test_source.into(), phase: 0 });
     let world = World::new(Mode::Write);
     let briefs = Arc::new(Mutex::new(Vec::new()));
     let harness: Arc<dyn Harness> = Arc::new(ContractTested { inner: Fake(world.clone()), briefs: briefs.clone() });
@@ -5352,6 +5352,7 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
     p.contracts.push(ContractFile {
         path: "contracts/test_contract.py".into(),
         content: "# Imports app.a.mod but swallows stub failures so the check is vacuous\ntry:\n    import app.a.mod\nexcept Exception:\n    pass\nassert 1 + 1 == 2\n".into(),
+        phase: 0,
     });
     let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
     let harnesses = Harnesses {
@@ -5407,6 +5408,7 @@ async fn mutation_gate_without_import_edge_is_skipped() {
     p.contracts.push(ContractFile {
         path: "tests/test_acceptance_contract.py".into(),
         content: "import subprocess\n\ndef test_cli_smoke():\n    assert 1 + 1 == 2\n".into(),
+        phase: 0,
     });
     let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
     let harnesses = Harnesses {
@@ -5463,6 +5465,7 @@ async fn identical_gate_failure_after_noop_repair_is_waived_not_escalated() {
     p.contracts.push(ContractFile {
         path: "contracts/test_contract.py".into(),
         content: "try:\n    import app.a.mod\nexcept Exception:\n    pass\nassert 1 + 1 == 2\n".into(),
+        phase: 0,
     });
     let worker = Arc::new(CountingNoopHarness { name: "p0b-worker", calls: Mutex::new(Vec::new()) });
     let mid = Arc::new(CountingNoopHarness { name: "p0b-mid", calls: Mutex::new(Vec::new()) });
@@ -5568,6 +5571,7 @@ async fn mutation_gate_all_skipped_is_inconclusive() {
     p.contracts.push(ContractFile {
         path: "tests/test_acceptance_contract.py".into(),
         content: skipped_test.into(),
+        phase: 0,
     });
     let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
     let harnesses = Harnesses {
@@ -5609,6 +5613,226 @@ async fn mutation_gate_all_skipped_is_inconclusive() {
     )
     .unwrap();
     assert_eq!(verdict, crate::gates::MutationVerdict::Inconclusive);
+}
+
+#[tokio::test]
+async fn intermediate_phase_verify_skips_later_phase_contract_tests() {
+    struct PhasedPyHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for PhasedPyHarness {
+        fn id(&self) -> &'static str {
+            "p0c-phased"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            if task.brief.contains("Plan phase 2 of 2") {
+                let phase2_json = serde_json::json!({
+                    "summary": "Phase 2 CLI",
+                    "contracts": [],
+                    "units": [{
+                        "id": "cli",
+                        "owned_glob": "pkg/cli.py",
+                        "brief": "Implement CLI helper.",
+                        "context": "Provides run_cli().",
+                        "done": "pkg/cli.py passes tests"
+                    }],
+                    "dictionary": []
+                });
+                let _ = _events.send(HarnessEvent::Text { text: phase2_json.to_string() }).await;
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+            }
+            if task.brief.contains("Build unit `core`") {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/core.py"), "def value():\n    return 42\n")?;
+            } else if task.brief.contains("Build unit `cli`") {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/cli.py"), "from pkg.core import value\n\ndef run_cli():\n    return f'ok:{value()}'\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0c-later-phase-test");
+    let acceptance_content = "from pkg.cli import run_cli\n\ndef test_acceptance():\n    assert run_cli() == 'ok:42'\n";
+    let mut p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "pkg/__init__.py".into(), content: "# package\n".into(), phase: 0 },
+            ContractFile {
+                path: "tests/test_core_contract.py".into(),
+                content: "from pkg.core import value\n\ndef test_core():\n    assert value() == 42\n".into(),
+                phase: 0,
+            },
+            // Phase-2 acceptance test left with phase=0 so inference from phases[1].delivers is also tested!
+            ContractFile {
+                path: "tests/test_acceptance_contract.py".into(),
+                content: acceptance_content.into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![PagePlan {
+            id: "core".into(),
+            owned_glob: "pkg/core.py".into(),
+            brief: "Build core".into(),
+            phase: 0,
+            ..Default::default()
+        }],
+        phases: vec![
+            tm_core::PhaseSketch {
+                id: "foundation".into(),
+                goal: "Build core".into(),
+                delivers: vec!["pkg/core.py".into(), "tests/test_core_contract.py".into()],
+                ..Default::default()
+            },
+            tm_core::PhaseSketch {
+                id: "cli".into(),
+                goal: "Build CLI".into(),
+                delivers: vec!["pkg/cli.py".into(), "tests/test_acceptance_contract.py".into()],
+                needs: "results".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        tm_core::effective_contract_phase(&p.contracts[2], &p.phases),
+        1,
+        "acceptance test delivered in phase 2 must infer phase=1"
+    );
+    assert_eq!(
+        tm_core::effective_contract_phase(&p.contracts[1], &p.phases),
+        0,
+        "core contract test delivered in phase 1 must stay phase=0"
+    );
+
+    // Ensure normalize_plan tags phase=1 on the contract too.
+    tm_core::normalize_plan(&mut p, &mut Vec::new());
+    assert_eq!(p.contracts[2].phase, 1);
+
+    let h = Arc::new(PhasedPyHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = h.calls.lock().unwrap();
+    assert!(
+        !calls.iter().any(|b| b.contains("Shared files this run wrote fail")),
+        "intermediate-phase verify must skip phase-2 acceptance test without invoking repair_shared: {calls:#?}"
+    );
+    assert_eq!(read(&tmp.0.join("tests/test_acceptance_contract.py")), acceptance_content);
+}
+
+#[tokio::test]
+async fn repair_shared_refuses_locked_contract_test() {
+    struct WorkerHarness;
+    #[async_trait]
+    impl Harness for WorkerHarness {
+        fn id(&self) -> &'static str {
+            "p0c-worker"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/mod.py"), "def ok():\n    return True\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    struct MasterWouldSkipHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for MasterWouldSkipHarness {
+        fn id(&self) -> &'static str {
+            "p0c-master"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            // If called, this master would try to patch a skipif into the locked contract test!
+            let test_path = task.cwd.join("tests/test_acceptance_contract.py");
+            if test_path.is_file() {
+                std::fs::write(&test_path, "import pytest\npytestmark = pytest.mark.skipif(True, reason='hack')\ndef test_x(): assert False\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0c-refuse-locked-test");
+    let original_test = "def test_always_fails_without_import():\n    assert False, 'cli missing'\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile {
+                path: "tests/test_acceptance_contract.py".into(),
+                content: original_test.into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![PagePlan {
+            id: "a".into(),
+            owned_glob: "pkg/**".into(),
+            brief: "Build pkg".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let worker = Arc::new(WorkerHarness);
+    let master = Arc::new(MasterWouldSkipHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: worker.clone(),
+        mid: worker.clone(),
+        master: master.clone(),
+        reviewer: worker.clone(),
+        verifier: worker.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    assert!(
+        master.calls.lock().unwrap().is_empty(),
+        "repair_shared must refuse to invoke master on locked contract test: {:?}",
+        master.calls.lock().unwrap()
+    );
+    // Locked contract test must remain completely unmodified (no skipif injected!).
+    let content = read(&tmp.0.join("tests/test_acceptance_contract.py"));
+    assert_eq!(content, original_test);
+    let changes = read(&run_directory(&tmp.0, "current").join("changes.jsonl"));
+    assert!(
+        changes.contains("flagged locked contract test(s)"),
+        "expected refusal flag in changes.jsonl, got:\n{changes}"
+    );
 }
 
 #[tokio::test]

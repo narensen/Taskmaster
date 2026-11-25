@@ -202,7 +202,7 @@ mod tests {
             ..Default::default()
         };
         Plan {
-            contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new() }],
+            contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new(), phase: 0 }],
             pages: vec![page("dashboard", &["auth", "nav"]), page("settings", &["auth"])],
             ..Default::default()
         }

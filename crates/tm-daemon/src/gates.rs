@@ -1661,7 +1661,7 @@ mod tests {
                 PagePlan { id: "a".into(), owned_glob: "src/**".into(), ..Default::default() },
                 PagePlan { id: "b".into(), owned_glob: "src/**".into(), ..Default::default() },
             ],
-            contracts: vec![ContractFile { path: "src/types.ts".into(), content: "export type X = number;".into() }],
+            contracts: vec![ContractFile { path: "src/types.ts".into(), content: "export type X = number;".into(), phase: 0 }],
             ..Default::default()
         };
         let findings = review_plan_structure(&plan);
@@ -1769,6 +1769,7 @@ mod tests {
             contracts: vec![ContractFile {
                 path: "minisql/format.py".into(),
                 content: "SEPARATOR = ' | '\nHEADER_RULE = '-+-'\n".into(),
+                phase: 0,
             }],
             pages: vec![
                 PagePlan { id: "parser".into(), owned_glob: "minisql/parser.py".into(), brief: "Parse SQL.".into(), ..Default::default() },
@@ -1797,10 +1798,12 @@ mod tests {
                 ContractFile {
                     path: "minisql/format.py".into(),
                     content: "SEPARATOR = '|'\n".into(),
+                    phase: 0,
                 },
                 ContractFile {
                     path: "tests/test_acceptance_contract.py".into(),
                     content: "def test_select_output():\n    assert 'id|name\\n1|alice' == 'id|name\\n1|alice'\n".into(),
+                    phase: 0,
                 },
             ],
             pages: vec![

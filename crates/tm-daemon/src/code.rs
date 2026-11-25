@@ -61,7 +61,15 @@ const call = (op, args) => new Promise((resolve, reject) => {
   send({ id, op, args });
 });
 const read = (path) => call("read", { path });
-const write = (path, text) => call("write", { path, text: String(text) });
+const extractText = (value) => {
+  if (value && typeof value === "object") {
+    if (typeof value.raw === "string") return value.raw;
+    if (typeof value.content === "string") return value.content;
+  }
+  return String(value ?? "");
+};
+const write = (path, text) => call("write", { path, text: extractText(text) });
+const writeFile = (path, text) => call("write", { path, text: extractText(text) });
 const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
 const patch = (path, edits) => call("patch", { path, edits });
 const applyPatch = (diff) => call("applyPatch", { diff: String(diff) });
@@ -94,7 +102,7 @@ async function runBody(code) {
   let fn;
   try {
     fn = new AsyncFunction(
-      "read", "write", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
+      "read", "write", "writeFile", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
       "readMany", "test", "testAffected", "probe", "diagnostics", "outline", "definition", "references",
       "sh", "check", "browser", "status", "wait", "console", "require",
       `return (async () => {\n${code}\n})();`
@@ -105,7 +113,7 @@ async function runBody(code) {
   }
   try {
     const result = await fn(
-      read, write, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
+      read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
       readMany, test, testAffected, probe, diagnostics, outline, definition, references,
       sh, check, browser, status, wait, scopedConsole, require
     );
@@ -1431,13 +1439,48 @@ fn bwrap_works() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Strip any known Dictionary MCP server prefix from a tool name so aliases work uniformly.
+fn strip_dict_prefix(name: &str) -> &str {
+    for prefix in ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    name
+}
+
 /// Accept both the canonical MCP name (`run_code`) and harness-prefixed aliases
 /// (such as `mcp_dictionary_run_code` on Antigravity or `mcp__dictionary__run_code` on Claude).
 fn is_run_code_tool(name: &str) -> bool {
-    name == "run_code"
-        || ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"]
-            .iter()
-            .any(|prefix| name.strip_prefix(prefix) == Some("run_code"))
+    strip_dict_prefix(name) == "run_code"
+}
+
+/// Accept `writeFile` / `write_file` (with or without a Dictionary prefix) taking `{path, content}`
+/// as separate MCP arguments so raw files bypass JS string escaping.
+fn is_write_file_tool(name: &str) -> bool {
+    matches!(strip_dict_prefix(name), "writeFile" | "write_file")
+}
+
+impl CodeTools {
+    async fn write_raw_file(&self, scope: &Scope, rel_path: &str, content: &str) -> anyhow::Result<()> {
+        if scope.read_only {
+            bail!("refused: `writeFile` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
+        }
+        if rel_path.trim().is_empty() {
+            bail!("a path is required");
+        }
+        let file = if Path::new(rel_path).is_absolute() {
+            PathBuf::from(rel_path)
+        } else {
+            scope.cwd.join(rel_path)
+        };
+        self.allowed(scope, "write", ToolKind::Edit, Some(&file), None).await?;
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&file, content)?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1452,26 +1495,123 @@ impl Extension for CodeTools {
              Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
         } else {
             "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
-             Functions: read(path), readMany(globs), write(path, text), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
+             Functions: read(path), readMany(globs), write(path, text | { raw }), writeFile(path, content | { raw }), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
              applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
              grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), sh(command), \
              test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
              status(text) to set a live one-line status, wait({url, port, log, agent, timeout}) to wait for a server/port/log/sibling unit, \
-             and console.log. Paths are relative to your worktree. The same permissions as your own tools apply. \
+             and console.log. For Python/code with triple quotes or backslashes, pass raw file content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments (written before `code` runs), or use `String.raw` with `write(path, { raw })`. \
+             Paths are relative to your worktree. The same permissions as your own tools apply. \
              Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
+        };
+        let properties = if scope.read_only {
+            json!({
+                "code": { "type": "string", "description": "The body of an async function" }
+            })
+        } else {
+            json!({
+                "code": { "type": "string", "description": "The body of an async function (optional when `files` or `writeFile` is provided)" },
+                "files": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Optional map of relative path -> raw UTF-8 file content written directly before `code` runs; avoids JS string escaping for Python triple quotes, backticks, or backslashes"
+                },
+                "writeFile": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" },
+                        "raw": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "description": "Optional single raw file write `{path, content}` applied before `code` runs"
+                }
+            })
         };
         vec![json!({
             "name": "run_code",
             "description": description,
-            "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The body of an async function" } }, "required": ["code"] },
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": if scope.read_only { json!(["code"]) } else { json!([]) }
+            },
         })]
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
+        if is_write_file_tool(name) {
+            let scope = match self.scopes.lock().unwrap().get(&grant.agent()).cloned() {
+                Some(scope) => scope,
+                None => {
+                    return Some(json!({
+                        "content": [{ "type": "text", "text": "this agent has no worktree to write files in" }],
+                        "isError": true
+                    }));
+                }
+            };
+            let rel_path = args["path"].as_str().unwrap_or("");
+            let content = args["content"]
+                .as_str()
+                .or_else(|| args["raw"].as_str())
+                .or_else(|| args["text"].as_str())
+                .unwrap_or("");
+            return Some(match self.write_raw_file(&scope, rel_path, content).await {
+                Ok(()) => json!({ "content": [{ "type": "text", "text": format!("wrote {rel_path}") }], "isError": false }),
+                Err(err) => json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }),
+            });
+        }
         if !is_run_code_tool(name) {
             return None;
         }
+        let mut wrote: Vec<String> = Vec::new();
+        let has_files = args.get("files").and_then(Value::as_object).is_some_and(|m| !m.is_empty());
+        let has_write_file = args.get("writeFile").and_then(Value::as_object).is_some();
+        if has_files || has_write_file {
+            let scope = match self.scopes.lock().unwrap().get(&grant.agent()).cloned() {
+                Some(scope) => scope,
+                None => {
+                    return Some(json!({
+                        "content": [{ "type": "text", "text": "this agent has no worktree to run code in" }],
+                        "isError": true
+                    }));
+                }
+            };
+            if let Some(obj) = args.get("writeFile").and_then(Value::as_object) {
+                let rel_path = obj.get("path").and_then(Value::as_str).unwrap_or("");
+                let content = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .or_else(|| obj.get("raw").and_then(Value::as_str))
+                    .or_else(|| obj.get("text").and_then(Value::as_str))
+                    .unwrap_or("");
+                if let Err(err) = self.write_raw_file(&scope, rel_path, content).await {
+                    return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                }
+                wrote.push(rel_path.to_string());
+            }
+            if let Some(map) = args.get("files").and_then(Value::as_object) {
+                for (rel_path, value) in map {
+                    let Some(content) = value.as_str() else {
+                        return Some(json!({
+                            "content": [{ "type": "text", "text": format!("`files[\"{rel_path}\"]` must be a string") }],
+                            "isError": true
+                        }));
+                    };
+                    if let Err(err) = self.write_raw_file(&scope, rel_path, content).await {
+                        return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                    }
+                    wrote.push(rel_path.clone());
+                }
+            }
+        }
         let code = args["code"].as_str().unwrap_or("");
+        if code.trim().is_empty() && !wrote.is_empty() {
+            return Some(json!({
+                "content": [{ "type": "text", "text": format!("wrote {} file(s): {}", wrote.len(), wrote.join(", ")) }],
+                "isError": false
+            }));
+        }
         Some(match self.run(grant, code).await {
             Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": text.contains("\nError: ") || text.starts_with("Error: ") }),
             Err(err) => json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }),
@@ -1830,6 +1970,95 @@ mod tests {
         }
         assert!(tools.call(&grant(), "unknown_tool", &json!({})).await.is_none());
         tools.detach("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn raw_content_write_handles_python_triple_quotes_and_separate_arguments() {
+        assert!(crate::engine::code_mode_guide("antigravity").contains("String.raw"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("String.raw"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("raw-write");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // 1. Inside JS: write(path, { raw }) and writeFile(path, { raw }) with String.raw + Python triple quotes.
+        let js = r#"
+            const py = String.raw`def parse(s):
+    """Parse SQL with 'quotes' and \"\"\"triple quotes\"\"\"."""
+    return r"\d+\n"
+`;
+            await write("app/parser.py", { raw: py });
+            await writeFile("app/btree.py", { raw: String.raw`"""B-tree\nmodule"""` });
+            return { p: await read("app/parser.py"), b: await read("app/btree.py") };
+        "#;
+        let out = tools.run(&grant(), js).await.unwrap();
+        assert!(!out.contains("Error:"), "{out}");
+        let parser_disk = std::fs::read_to_string(dir.join("app/parser.py")).unwrap();
+        assert!(parser_disk.contains(r#""""Parse SQL"#), "{parser_disk}");
+        assert!(parser_disk.contains(r#"r"\d+\n""#), "{parser_disk}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/btree.py")).unwrap(), r#""""B-tree\nmodule""""#);
+
+        // 2. Separate MCP `files` argument on run_code + trailing code execution (zero JS escaping needed).
+        let py_src = "def exec_sql():\n    \"\"\"Triple quotes & `backticks` & ${not_js}\"\"\"\n    return r'\\s+'\n";
+        let reply = tools
+            .call(
+                &grant(),
+                "mcp_dictionary_run_code",
+                &json!({
+                    "files": { "app/executor.py": py_src },
+                    "code": "return (await read('app/executor.py')).includes('Triple quotes');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["isError"], false, "{reply}");
+        assert!(reply["content"][0]["text"].as_str().unwrap_or("").contains("true"), "{reply}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/executor.py")).unwrap(), py_src);
+
+        // 3. Separate MCP `writeFile` argument on run_code (with no `code`) AND direct `writeFile` tool call.
+        let reply_wf = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({ "writeFile": { "path": "app/storage.py", "content": "\"\"\"storage\"\"\"\n" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply_wf["isError"], false, "{reply_wf}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/storage.py")).unwrap(), "\"\"\"storage\"\"\"\n");
+
+        let reply_direct = tools
+            .call(
+                &grant(),
+                "mcp_dictionary_writeFile",
+                &json!({ "path": "app/cli.py", "content": "print(\"\"\"hello\"\"\")\n" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply_direct["isError"], false, "{reply_direct}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/cli.py")).unwrap(), "print(\"\"\"hello\"\"\")\n");
+
+        // 4. Gate & read-only scope still refuse unauthorized raw writes.
+        let escaped = tools
+            .call(&grant(), "writeFile", &json!({ "path": "/tmp/tm-escape-should-not-write.py", "content": "x" }))
+            .await
+            .unwrap();
+        assert_eq!(escaped["isError"], true, "{escaped}");
+        assert!(!std::path::Path::new("/tmp/tm-escape-should-not-write.py").exists());
+
+        tools.attach_readonly("ro", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).read_only()));
+        let ro_grant = Grant { run: "r".into(), page: "ro".into(), unit: String::new() };
+        let ro_res = tools
+            .call(&ro_grant, "run_code", &json!({ "files": { "app/ro.py": "x" } }))
+            .await
+            .unwrap();
+        assert_eq!(ro_res["isError"], true, "{ro_res}");
+        assert!(!dir.join("app/ro.py").exists());
+
+        tools.detach_all();
         std::fs::remove_dir_all(dir).ok();
     }
 }

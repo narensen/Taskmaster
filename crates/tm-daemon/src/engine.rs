@@ -6402,11 +6402,13 @@ const PROJECT_MARK: &str = "<!-- Written by Taskmaster from the run's sketch and
 const PLAN_ATTEMPTS: usize = 3;
 
 /// How an agent with Code Mode is told to work, in the shared prefix.
-const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, patch, applyPatch, grep, ls, \
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, \
 diff, symbols, sh, test, check and browser (read-only roles get read, readMany, grep, ls, diff, symbols). Batch your work into \
 a few scripts rather than many single tool calls: one script loads what you need with readMany/symbols and writes or patches \
 your files (prefer edit/patch/applyPatch over rewriting whole files), and every script that changes code ends with `return await test()`, \
-which runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or shell tools \
+which runs the project's tests and returns the failures. When writing Python or multi-line files with triple quotes or backslashes, pass raw file \
+content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments on run_code, or use `String.raw` with `write(path, { raw })`. \
+Fix what it reports in the next script. If your own write, edit or shell tools \
 are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
 
 /// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`

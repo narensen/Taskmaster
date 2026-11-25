@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
 use tm_core::docs::{
@@ -511,7 +511,7 @@ impl Drop for Driver {
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -6347,13 +6347,17 @@ are switched off, run_code is the way to write files and run commands: use it fr
 
 /// Environment variable overriding the per-agent silence/stall timeout in seconds.
 const STALL_ENV: &str = "TASKMASTER_STALL_SECS";
-/// Generous silence window so thinking models are never killed mid-reasoning,
+/// Generous silence window for small prompts so thinking models finish reasoning,
 /// while genuinely hung sockets still recover automatically.
-const SMALL_STALL: Duration = Duration::from_secs(300);
-/// Larger briefs and deep reasoning turns can think quietly for several minutes.
-const STALL: Duration = Duration::from_secs(600);
+const SMALL_STALL: Duration = Duration::from_secs(150);
+/// Default per-agent silence timeout before restarting a fresh agent.
+const STALL: Duration = Duration::from_secs(240);
 /// Fresh agents started after a stall. Every attempt—including the final one—keeps a stall bound.
 const STALL_RESTARTS: usize = 2;
+/// Wall-clock advance past the monotonic clock that indicates a host suspend/freeze.
+pub(crate) const WALL_JUMP_THRESHOLD: Duration = Duration::from_secs(30);
+/// Active monotonic grace window after a detected wall-clock jump before restarting a silent agent.
+pub(crate) const POST_JUMP_GRACE: Duration = Duration::from_secs(30);
 
 /// Resolve the per-agent stall timeout from explicit config, `TASKMASTER_STALL_SECS`, or defaults.
 pub(crate) fn resolve_stall_timeout(configured: Option<Duration>, env_val: Option<&str>, small: bool) -> Duration {
@@ -6610,22 +6614,156 @@ fn who_of(request: &AgentRequest) -> String {
     id.strip_prefix("page:").or_else(|| id.strip_prefix("unit:")).unwrap_or(id).to_string()
 }
 
-/// While an agent's call runs, print a line each time it has been silent for [`QUIET`]:
-/// `calc: no output for 120s`. A stalled agent is visible in the log without waiting for its
-/// time limit. Dropping the guard stops it.
-fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop {
-    AbortOnDrop(tokio::spawn(async move {
-        let mut said: Option<Instant> = None;
+/// Clock source for [`heartbeat_with_clock`] so wall-clock jumps (box suspend/freeze)
+/// can be tested deterministically with an injected clock.
+pub(crate) trait BeatClock: Send + Sync + 'static {
+    fn monotonic(&self) -> Duration;
+    fn wall(&self) -> SystemTime;
+}
+
+struct RealBeatClock {
+    origin: Instant,
+}
+
+impl BeatClock for RealBeatClock {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+    fn wall(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Tuning parameters for [`heartbeat_with_clock`].
+pub(crate) struct HeartbeatConfig {
+    pub tick: Duration,
+    pub jump_threshold: Duration,
+    pub post_jump_grace: Duration,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            tick: Duration::from_secs(10),
+            jump_threshold: WALL_JUMP_THRESHOLD,
+            post_jump_grace: POST_JUMP_GRACE,
+        }
+    }
+}
+
+/// Wait on a heartbeat stall trigger without ever resolving if the sender is simply dropped.
+async fn wait_stall(rx: tokio::sync::oneshot::Receiver<tm_harness::Stalled>) -> tm_harness::Stalled {
+    match rx.await {
+        Ok(stalled) => stalled,
+        Err(_) => std::future::pending().await,
+    }
+}
+
+/// Heartbeat monitor with an injectable [`BeatClock`].
+///
+/// Compares `wall()` deltas against `monotonic()` deltas on every tick. If wall time jumped
+/// more than `jump_threshold` past monotonic time (host suspend/freeze), it invokes `on_nudge`
+/// (without counting the frozen period as agent silence) and watches for `post_jump_grace` of
+/// active monotonic time: if the agent remains silent, it sends `Stalled` on the returned
+/// oneshot channel so the caller cancels and restarts the agent cleanly.
+pub(crate) fn heartbeat_with_clock(
+    who: String,
+    last_heard: Arc<dyn Fn() -> Duration + Send + Sync>,
+    clock: Arc<dyn BeatClock>,
+    cfg: HeartbeatConfig,
+    on_nudge: Option<Arc<dyn Fn(Duration) + Send + Sync>>,
+) -> (AbortOnDrop, tokio::sync::oneshot::Receiver<tm_harness::Stalled>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut said: Option<Duration> = None;
+        let mut prev_mono = clock.monotonic();
+        let mut prev_wall = clock.wall();
+        let mut post_jump: Option<(Duration, Duration)> = None;
+        let mut tx = Some(tx);
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let last = *heard.lock().unwrap();
-            let quiet = last.elapsed();
-            if beat_due(quiet, said.map(|at| (at.elapsed(), at < last))) {
+            tokio::time::sleep(cfg.tick).await;
+            let now_mono = clock.monotonic();
+            let now_wall = clock.wall();
+            let mono_delta = now_mono.saturating_sub(prev_mono);
+            let wall_delta = now_wall.duration_since(prev_wall).unwrap_or(Duration::ZERO);
+            prev_mono = now_mono;
+            prev_wall = now_wall;
+
+            let heard_at = last_heard();
+            let jump = wall_delta.saturating_sub(mono_delta);
+            if jump > cfg.jump_threshold {
+                eprintln!(
+                    "taskmaster: {who}: detected wall-clock jump (+{}s vs monotonic, likely suspend/freeze); waiting {}s for output before restarting",
+                    jump.as_secs(),
+                    cfg.post_jump_grace.as_secs(),
+                );
+                if let Some(nudge) = &on_nudge {
+                    nudge(jump);
+                }
+                said = Some(now_mono);
+                post_jump = Some((now_mono, heard_at));
+                continue;
+            }
+
+            if let Some((jump_mono, heard_before_jump)) = post_jump {
+                if heard_at > heard_before_jump {
+                    eprintln!("taskmaster: {who}: resumed output after wall-clock jump");
+                    post_jump = None;
+                } else if now_mono.saturating_sub(jump_mono) >= cfg.post_jump_grace {
+                    eprintln!(
+                        "taskmaster: {who}: stayed silent for {}s after wall-clock jump; restarting agent",
+                        cfg.post_jump_grace.as_secs(),
+                    );
+                    if let Some(sender) = tx.take() {
+                        let _ = sender.send(tm_harness::Stalled(cfg.post_jump_grace));
+                    }
+                    return;
+                } else {
+                    continue;
+                }
+            }
+
+            let quiet = now_mono.saturating_sub(heard_at);
+            if beat_due(quiet, said.map(|at| (now_mono.saturating_sub(at), at < heard_at))) {
                 eprintln!("taskmaster: {who}: no output for {}s", quiet.as_secs() / 10 * 10);
-                said = Some(Instant::now());
+                said = Some(now_mono);
             }
         }
-    }))
+    });
+    (AbortOnDrop(handle), rx)
+}
+
+/// While an agent's call runs, print a line each time it has been silent for [`QUIET`]:
+/// `calc: no output for 120s`, and detect host suspend/freeze via wall-vs-monotonic jumps
+/// so dead streams recover promptly after wake. Dropping the guard stops it.
+fn heartbeat(
+    who: String,
+    origin: Instant,
+    heard: Arc<std::sync::Mutex<Instant>>,
+    feed: Option<&Feed>,
+) -> (AbortOnDrop, tokio::sync::oneshot::Receiver<tm_harness::Stalled>) {
+    let last_heard: Arc<dyn Fn() -> Duration + Send + Sync> =
+        Arc::new(move || heard.lock().unwrap().saturating_duration_since(origin));
+    let on_nudge: Option<Arc<dyn Fn(Duration) + Send + Sync>> = feed.map(|f| {
+        let live = f.live.clone();
+        let run = f.run.clone();
+        let agent = f.agent.clone();
+        Arc::new(move |jump: Duration| {
+            live.push(
+                &run,
+                &agent,
+                "suspend_detected",
+                serde_json::json!({ "wall_jump_secs": jump.as_secs() }),
+            );
+        }) as Arc<dyn Fn(Duration) + Send + Sync>
+    });
+    heartbeat_with_clock(
+        who,
+        last_heard,
+        Arc::new(RealBeatClock { origin }),
+        HeartbeatConfig::default(),
+        on_nudge,
+    )
 }
 
 /// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
@@ -6646,11 +6784,14 @@ async fn follow(
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, None, rx, heard.clone());
-    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let run = session.follow_up(prompt, tx, request.timeout).await;
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(&request), started, heard, request.feed.as_ref());
+    let run = tokio::select! {
+        run = session.follow_up(prompt, tx, request.timeout) => run,
+        stalled = wait_stall(stall_rx) => Err(stalled.into()),
+    };
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
     if let Some(feed) = &request.feed {
@@ -6746,11 +6887,14 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, None, rx, heard.clone());
-    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let (run, kept) = request.harness.resume_kept(&session_id, prompt, task, gate, tx).await;
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(&request), started, heard, request.feed.as_ref());
+    let (run, kept) = tokio::select! {
+        res = request.harness.resume_kept(&session_id, prompt, task, gate, tx) => res,
+        stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+    };
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let final_sid = captured_sid
         .or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)))
@@ -6840,11 +6984,14 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
     };
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, None, rx, heard.clone());
-    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let (run, kept) = request.harness.reattach(task, gate, tx, attached).await;
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(&request), started, heard, request.feed.as_ref());
+    let (run, kept) = tokio::select! {
+        res = request.harness.reattach(task, gate, tx, attached) => res,
+        stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+    };
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let text = format!("{said}{text}");
     if let Some(feed) = &request.feed {
@@ -6955,18 +7102,24 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     // What a commit budget watches: tool calls, whether the reply has begun, the thoughts.
     let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
     let watching = request.commit.is_some().then(|| watch.clone());
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, watching, rx, heard.clone());
-    let _beat = heartbeat(who_of(request), heard);
     let started = Instant::now();
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, watching, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(request), started, heard, feed.as_ref());
     let mut kept = None;
     let run = match request.commit {
         None if request.keep => {
-            let (run, session) = request.harness.run_kept(task, gate, tx).await;
+            let (run, session) = tokio::select! {
+                res = request.harness.run_kept(task, gate, tx) => res,
+                stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+            };
             kept = session;
             run
         }
-        None => request.harness.run(task, gate, tx).await,
+        None => tokio::select! {
+            run = request.harness.run(task, gate, tx) => run,
+            stalled = wait_stall(stall_rx) => Err(stalled.into()),
+        },
         Some(commit) => {
             let seen = watch.clone();
             let overrun = async move {
@@ -6985,6 +7138,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             tokio::select! {
                 run = request.harness.run(task, gate, tx) => run,
                 why = overrun => Err(anyhow::Error::new(Overrun { why, notes: String::new() })),
+                stalled = wait_stall(stall_rx) => Err(stalled.into()),
             }
         }
     };

@@ -7985,11 +7985,11 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
     // 1. Resolution precedence: explicit Config > TASKMASTER_STALL_SECS > small/default fallback.
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, None, false),
-        Duration::from_secs(600)
+        Duration::from_secs(240)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, None, true),
-        Duration::from_secs(300)
+        Duration::from_secs(150)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, Some("45"), false),
@@ -7997,11 +7997,11 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, Some("0"), false),
-        Duration::from_secs(600)
+        Duration::from_secs(240)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, Some("not-a-number"), true),
-        Duration::from_secs(300)
+        Duration::from_secs(150)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(Some(Duration::from_secs(12)), Some("45"), false),
@@ -8070,4 +8070,112 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
         ],
         "expected configured stall on initial/retry attempts and finite bounded stall on final attempt"
     );
+}
+
+#[test]
+fn default_stall_is_240s() {
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, false),
+        Duration::from_secs(240)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, true),
+        Duration::from_secs(150)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("180"), false),
+        Duration::from_secs(180)
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_detects_wall_clock_jump_and_restarts_silent_agents() {
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FakeClock {
+        mono_secs: AtomicU64,
+        wall_secs: AtomicU64,
+    }
+    impl crate::engine::BeatClock for FakeClock {
+        fn monotonic(&self) -> Duration {
+            Duration::from_secs(self.mono_secs.load(Ordering::SeqCst))
+        }
+        fn wall(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(self.wall_secs.load(Ordering::SeqCst))
+        }
+    }
+
+    let clock = Arc::new(FakeClock {
+        mono_secs: AtomicU64::new(0),
+        wall_secs: AtomicU64::new(1_700_000_000),
+    });
+    let heard_secs = Arc::new(AtomicU64::new(0));
+    let nudges = Arc::new(Mutex::new(Vec::<Duration>::new()));
+
+    let heard_reader = heard_secs.clone();
+    let nudges_writer = nudges.clone();
+    let (_guard, mut stall_rx) = crate::engine::heartbeat_with_clock(
+        "parser".into(),
+        Arc::new(move || Duration::from_secs(heard_reader.load(Ordering::SeqCst))),
+        clock.clone(),
+        crate::engine::HeartbeatConfig {
+            tick: Duration::from_millis(5),
+            jump_threshold: crate::engine::WALL_JUMP_THRESHOLD,
+            post_jump_grace: crate::engine::POST_JUMP_GRACE,
+        },
+        Some(Arc::new(move |jump| {
+            nudges_writer.lock().unwrap().push(jump);
+        })),
+    );
+
+    // 1. Normal progression: +10s monotonic, +10s wall -> no nudge, no stall.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(10, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(nudges.lock().unwrap().is_empty(), "normal tick must not trigger suspend nudge");
+    assert!(stall_rx.try_recv().is_err(), "normal tick must not stall");
+
+    // 2. Host freeze of +350s wall while monotonic moves +10s -> nudge fires; agent recovers
+    //    within the 30s grace window, so it must NOT be restarted.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(360, Ordering::SeqCst);
+    for _ in 0..50 {
+        if !nudges.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(nudges.lock().unwrap().len(), 1, "expected suspend nudge on +350s wall jump");
+    assert!(nudges.lock().unwrap()[0] >= Duration::from_secs(340));
+    // Agent emits output 10s after wake -> cancels post-jump restart.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(10, Ordering::SeqCst);
+    heard_secs.store(30, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    // Advance another 40s normally with no further jump -> still alive, no restart from jump #1.
+    clock.mono_secs.fetch_add(40, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(40, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(stall_rx.try_recv().is_err(), "agent that resumed after jump must not be restarted");
+
+    // 3. Second host freeze (+350s wall, +10s mono) where the agent stays silent for >= 30s
+    //    of active monotonic time afterwards -> heartbeat triggers a Stalled restart.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(360, Ordering::SeqCst);
+    for _ in 0..50 {
+        if nudges.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(nudges.lock().unwrap().len(), 2, "expected second suspend nudge");
+    // Advance monotonic & wall by 30s with NO output from the agent.
+    clock.mono_secs.fetch_add(30, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(30, Ordering::SeqCst);
+    let stalled = tokio::time::timeout(Duration::from_secs(2), &mut stall_rx)
+        .await
+        .expect("heartbeat must restart agent silent for 30s after wall-clock jump")
+        .expect("stall sender dropped unexpectedly");
+    assert_eq!(stalled, tm_harness::Stalled(Duration::from_secs(30)));
 }

@@ -5111,7 +5111,7 @@ impl Driver {
              {\"flag\":{\"key\":\"...\",\"issue\":\"...\"}} instead of working around it.\n",
         );
         if self.code.is_some() {
-            out.push_str(CODE_MODE_GUIDE);
+            out.push_str(&code_mode_guide(self.harnesses.worker.id()));
         }
         out.push_str(
             "\nDocumentation: call `docs(package, symbol?)` for local-first API docs from installed packages.",
@@ -6408,6 +6408,17 @@ a few scripts rather than many single tool calls: one script loads what you need
 your files (prefer edit/patch/applyPatch over rewriting whole files), and every script that changes code ends with `return await test()`, \
 which runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or shell tools \
 are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
+
+/// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`
+/// (e.g. `mcp_dictionary_run_code` on Antigravity) so agents call the real tool on their first try.
+pub(crate) fn code_mode_guide(harness_id: &str) -> String {
+    let tool = tm_harness::run_code_tool_name(harness_id, "dictionary");
+    if tool == "run_code" {
+        CODE_MODE_GUIDE.to_string()
+    } else {
+        CODE_MODE_GUIDE.replace("run_code", &tool)
+    }
+}
 
 /// Environment variable overriding the per-agent silence/stall timeout in seconds.
 const STALL_ENV: &str = "TASKMASTER_STALL_SECS";

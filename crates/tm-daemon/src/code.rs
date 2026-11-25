@@ -1431,6 +1431,15 @@ fn bwrap_works() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Accept both the canonical MCP name (`run_code`) and harness-prefixed aliases
+/// (such as `mcp_dictionary_run_code` on Antigravity or `mcp__dictionary__run_code` on Claude).
+fn is_run_code_tool(name: &str) -> bool {
+    name == "run_code"
+        || ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"]
+            .iter()
+            .any(|prefix| name.strip_prefix(prefix) == Some("run_code"))
+}
+
 #[async_trait::async_trait]
 impl Extension for CodeTools {
     fn tools(&self, grant: &Grant) -> Vec<Value> {
@@ -1459,7 +1468,7 @@ impl Extension for CodeTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if name != "run_code" {
+        if !is_run_code_tool(name) {
             return None;
         }
         let code = args["code"].as_str().unwrap_or("");
@@ -1794,6 +1803,33 @@ mod tests {
         assert!(out.contains("not valid JSON"), "{out}");
         assert!(!dir.join(".env").exists(), "policy denied file must never be created");
         tools.detach("p1");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_prompt_and_alias_match_harness_tool_name() {
+        let guide = crate::engine::code_mode_guide("antigravity");
+        assert!(guide.contains("mcp_dictionary_run_code"), "{guide}");
+        assert!(!guide.contains(" run_code "), "{guide}");
+        assert!(crate::engine::code_mode_guide("claude").contains("mcp__dictionary__run_code"));
+        assert!(crate::engine::code_mode_guide("grok-build").contains("dictionary__run_code"));
+        assert!(crate::engine::code_mode_guide("opencode").contains("dictionary_run_code"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("alias");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+        for name in ["run_code", "mcp_dictionary_run_code", "mcp__dictionary__run_code", "dictionary__run_code"] {
+            let reply = tools
+                .call(&grant(), name, &json!({ "code": "return 2 + 2;" }))
+                .await
+                .unwrap_or_else(|| panic!("expected `{name}` to be handled"));
+            assert_eq!(reply["isError"], false, "{name}: {reply}");
+            assert!(reply["content"][0]["text"].as_str().unwrap_or("").contains('4'), "{name}: {reply}");
+        }
+        assert!(tools.call(&grant(), "unknown_tool", &json!({})).await.is_none());
+        tools.detach("home");
         std::fs::remove_dir_all(dir).ok();
     }
 }

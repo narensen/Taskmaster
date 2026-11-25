@@ -377,7 +377,11 @@ impl Session {
 
         let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
         self.id = Some(session_id);
-        self.prompt(task.framed_brief()).await
+        let run_code_tool = match &self.dictionary_prefix {
+            Some(prefix) => format!("{prefix}run_code"),
+            None => "run_code".to_string(),
+        };
+        self.prompt(task.framed_brief_for(&run_code_tool)).await
     }
 
     /// One turn in the open session.
@@ -1295,6 +1299,66 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 ("write_file (use run_code)".to_string(), false),
                 ("taskmaster__run_code".to_string(), true),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_code_mode_prompt_names_mcp_dictionary_run_code() {
+        assert_eq!(crate::run_code_tool_name("antigravity", "dictionary"), "mcp_dictionary_run_code");
+        assert_eq!(crate::run_code_tool_name("claude", "dictionary"), "mcp__dictionary__run_code");
+        assert_eq!(crate::run_code_tool_name("grok-build", "dictionary"), "dictionary__run_code");
+        assert_eq!(crate::run_code_tool_name("opencode", "dictionary"), "dictionary_run_code");
+
+        let capture = std::env::temp_dir().join(format!("tm-acp-prompt-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; printf '%s\n' "$l" > "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display()
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "implement parser".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:9/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, _rx) = mpsc::channel(16);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        let sent = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert!(
+            sent.contains("mcp_dictionary_run_code"),
+            "expected prompt to name mcp_dictionary_run_code, got: {sent}"
+        );
+        assert!(
+            !sent.contains("`run_code`"),
+            "prompt for antigravity should not tell agent to call bare `run_code`: {sent}"
         );
     }
 }

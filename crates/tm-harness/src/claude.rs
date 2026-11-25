@@ -43,9 +43,16 @@ impl Default for ClaudeCode {
 const WRITING_TOOLS: [&str; 5] = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
 
 impl ClaudeCode {
+    fn run_code_tool(task: &WorkerTask) -> String {
+        match &task.dictionary {
+            Some(dict) => crate::run_code_tool_name("claude", &dict.name),
+            None => "run_code".to_string(),
+        }
+    }
+
     /// The arguments for one stateless task: permissions, tools, model, effort and the Dictionary.
     pub fn args(&self, task: &WorkerTask) -> Vec<String> {
-        self.args_with(task, &task.framed_brief(), false, None)
+        self.args_with(task, &task.framed_brief_for(&Self::run_code_tool(task)), false, None)
     }
 
     /// Arguments for one turn, optionally keeping the session on disk (`persist`) or resuming an
@@ -322,7 +329,7 @@ impl Harness for ClaudeCode {
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
-        let prompt = task.framed_brief();
+        let prompt = task.framed_brief_for(&Self::run_code_tool(&task));
         match self.execute(&task, &prompt, true, None, events, task.timeout).await {
             Ok((summary, Some(session_id))) if summary.ok => {
                 let kept: Box<dyn crate::Session> = Box::new(ClaudeSession { harness: self.clone(), task, session_id, cleaned: false });
@@ -410,7 +417,7 @@ impl Harness for ClaudeCode {
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let prompt = task.framed_brief();
+        let prompt = task.framed_brief_for(&Self::run_code_tool(&task));
         self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _)| summary)
     }
 }

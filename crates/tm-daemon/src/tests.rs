@@ -8322,3 +8322,169 @@ async fn unit_with_contract_only_dependency_starts_immediately() {
     );
     assert!(crate::small::worker_pool_rule(3, None).contains("no deeper than 2"));
 }
+
+#[tokio::test]
+async fn small_cli_prompt_uses_single_phase_plan() {
+    let prompt = concat!(
+        "Build \"tinydb\", a minimal SQL database engine in Python 3.11 (standard library only).\n\n",
+        "Requirements:\n",
+        "- CLI: `python -m tinydb <dbfile>` opens a REPL; `python -m tinydb <dbfile> -f script.sql` runs a file and prints results.\n",
+        "- SQL support: CREATE TABLE (INTEGER, TEXT, REAL columns, PRIMARY KEY), INSERT, SELECT with WHERE (=, !=, <, >, <=, >=, AND, OR), ",
+        "ORDER BY (ASC/DESC), LIMIT, INNER JOIN on equality, COUNT/SUM/AVG/MIN/MAX with GROUP BY, UPDATE, DELETE, DROP TABLE.\n",
+        "- Storage: data persists to a single file on disk; primary keys are indexed with a B-tree you implement yourself.\n",
+        "- Output: SELECT results print as pipe-separated rows with a header line.\n",
+        "- Errors: invalid SQL or unknown tables/columns print an error line and do not crash the REPL.\n\n",
+        "Structure the code into separate modules (tokenizer, parser, planner/executor, storage, btree). ",
+        "Write a pytest suite covering every feature above. Done = all your tests pass and `pytest` exits 0.\n",
+    );
+    assert!(!crate::small::is_small_prompt(prompt, 0), "tinydb-sized prompt exceeds small_prompt threshold");
+    assert!(crate::small::is_single_phase_prompt(prompt, 0, 3));
+    assert!(!crate::small::is_single_phase_prompt(
+        &format!("Build a product with a shared core and pages on top. {}", "It has many parts. ".repeat(20)),
+        0,
+        3
+    ));
+
+    let tmp = seeded("p1-3-single-phase");
+    let planner_calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let worker_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct SinglePhaseHarness {
+        planner_calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        worker_calls: Arc<Mutex<Vec<String>>>,
+        plan_attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Harness for SinglePhaseHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let reply = if task.brief.contains("Plan this product") || task.brief.contains("Repair this plan") || task.brief.contains("Plan phase ") {
+                self.planner_calls
+                    .lock()
+                    .unwrap()
+                    .push((task.brief.clone(), task.effort.clone()));
+                let attempt = self.plan_attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Simulate a planner trying to split tinydb into 2 phases despite the single-phase rule.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Two-phase attempt",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [
+                            { "id": "foundation", "goal": "core", "delivers": ["tinydb/tokenizer.py", "tinydb/parser.py"], "interfaces": "", "test": "pytest", "needs": "interfaces" },
+                            { "id": "cli", "goal": "cli", "delivers": ["tinydb/cli.py"], "interfaces": "", "test": "pytest", "needs": "interfaces" }
+                        ],
+                        "units": [
+                            { "id": "tokenizer", "owned_glob": "tinydb/tokenizer.py", "brief": "Write tokenizer", "context": "Uses tinydb/contract.py", "done": "done" },
+                            { "id": "parser", "owned_glob": "tinydb/parser.py", "brief": "Write parser", "context": "Uses tinydb/contract.py", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                } else {
+                    // Repair flattens into a single phase with all units and no phases sketch.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Single-phase tinydb plan",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [],
+                        "units": [
+                            { "id": "tokenizer", "owned_glob": "tinydb/tokenizer.py", "brief": "Write tokenizer", "context": "Uses tinydb/contract.py", "done": "done" },
+                            { "id": "parser", "owned_glob": "tinydb/parser.py", "brief": "Write parser", "context": "Uses tinydb/contract.py", "done": "done" },
+                            { "id": "cli", "owned_glob": "tinydb/cli.py", "brief": "Write cli", "context": "Uses tinydb/contract.py", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                }
+            } else {
+                let unit = task
+                    .brief
+                    .split("Build unit `")
+                    .nth(1)
+                    .and_then(|s| s.split('`').next())
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.worker_calls.lock().unwrap().push(unit.clone());
+                let file = task.cwd.join(format!("tinydb/{unit}.py"));
+                std::fs::create_dir_all(file.parent().unwrap())?;
+                std::fs::write(&file, format!("# {unit}\n"))?;
+                format!("done\nRELEASE unit:{unit}\n")
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 50, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let harness: Arc<dyn Harness> = Arc::new(SinglePhaseHarness {
+        planner_calls: planner_calls.clone(),
+        worker_calls: worker_calls.clone(),
+        plan_attempts: AtomicUsize::new(0),
+    });
+    let mut cfg = prompt_config(&tmp.0, prompt, true);
+    cfg.parallel = 3;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: harness.clone(),
+        mid: harness.clone(),
+        worker: harness.clone(),
+        reviewer: harness.clone(),
+        verifier: harness,
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let pcalls = planner_calls.lock().unwrap().clone();
+    assert_eq!(pcalls.len(), 2, "expected initial plan + 1 single-phase repair, got {}", pcalls.len());
+    let (first_brief, first_effort) = &pcalls[0];
+    assert!(
+        first_brief.contains("\"phases\": []"),
+        "expected single-phase rule in planner brief, got:\n{first_brief}"
+    );
+    assert!(
+        !first_brief.contains("Sketch first"),
+        "single-phase CLI prompt must not get PHASES_RULE sketch prompt"
+    );
+    assert_eq!(
+        first_effort.as_deref(),
+        Some(crate::small::SMALL_EFFORT),
+        "single-phase CLI prompt must cap master planning effort to low"
+    );
+    assert!(
+        pcalls[1].0.contains("single-package prompt fits in one phase"),
+        "expected repair brief to reject multi-phase split, got:\n{}",
+        pcalls[1].0
+    );
+    assert!(
+        pcalls.iter().all(|(b, _)| !b.contains("Plan phase ")),
+        "must not spawn any phase-2 planner call"
+    );
+
+    let mut built = worker_calls.lock().unwrap().clone();
+    built.sort();
+    assert_eq!(built, vec!["cli", "parser", "tokenizer"]);
+    let events = read(&run_directory(&tmp.0, "current").join("events.jsonl"));
+    let replayed = Run::replay(3, events.lines().map(|l| serde_json::from_str::<Event>(l).unwrap()));
+    assert!(replayed.plan.unwrap().phases.is_empty(), "accepted plan must have no phases");
+}

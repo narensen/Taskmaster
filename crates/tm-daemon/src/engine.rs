@@ -1238,6 +1238,7 @@ impl Driver {
         let mut request = self.read_request(&cwd, brief.clone(), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
         self.small = self.small_pass(prompt);
         let quick = !self.small && self.quick_edit_pass(prompt);
+        let single_phase = !self.small && self.single_phase_pass(prompt);
         let fresh = self.fresh_project(prompt)?;
         if self.small || fresh {
             // Every stored entry is in the brief, so the master needs no tools.
@@ -1245,14 +1246,14 @@ impl Driver {
         } else {
             self.offer_code_readonly("master", &cwd, &mut request);
         }
-        request.effort = if self.small || quick {
+        request.effort = if self.small || quick || single_phase {
             Some(crate::small::SMALL_EFFORT.to_string())
         } else if fresh {
             Some(FRESH_EFFORT.to_string())
         } else {
             None
         };
-        request.commit = Some(self.commit_budget(self.small || fresh || quick));
+        request.commit = Some(self.commit_budget(self.small || fresh || quick || single_phase));
         self.tag(&mut request, "master", "planner", None, None);
         let bill = request.bill(Role::Planner, None);
         let mut asked = ask(request).await;
@@ -1355,6 +1356,19 @@ impl Driver {
             for finding in crate::gates::check_plan_prompt_consistency(&user_prompt, &checked) {
                 if finding.severity == "error" {
                     errors.push(finding.message);
+                }
+            }
+        }
+        if base.is_none() && self.single_phase_pass(prompt) {
+            if plan.phases.len() == 1 {
+                plan.phases.clear();
+            } else if plan.phases.len() >= 2 {
+                let total_delivers: usize = plan.phases.iter().map(|p| p.delivers.len()).sum();
+                if total_delivers <= 12 || (plan.phases.len() <= 2 && plan.pages.len() <= 8) {
+                    errors.push(
+                        "this single-package prompt fits in one phase; put all units in `units` and set `phases` to [] instead of splitting into multiple phases"
+                            .into(),
+                    );
                 }
             }
         }
@@ -1632,6 +1646,12 @@ impl Driver {
         crate::small::is_small_prompt(prompt, self.existing_files())
     }
 
+    /// Single-package CLI/library prompts that fit in one parallel phase skip phased sketching
+    /// and cap master planning thinking effort.
+    fn single_phase_pass(&self, prompt: &str) -> bool {
+        crate::small::is_single_phase_prompt(prompt, self.existing_files(), self.parallel)
+    }
+
     /// Direct / Lite Fast-Path: scoped bug fixes and small edits in existing repos skip
     /// Master Planning altogether (0 planner tokens -> 1 Code-Mode worker -> free checks).
     fn lite_edit_pass(&self, prompt: &str) -> bool {
@@ -1797,7 +1817,11 @@ impl Driver {
         );
         brief.push_str(&crate::small::plan_shape());
         brief.push_str(&crate::gates::format_prompt_acceptance_guidance(&crate::gates::extract_prompt_io_examples(prompt)));
-        brief.push_str(crate::small::PHASES_RULE);
+        if self.single_phase_pass(prompt) {
+            brief.push_str(crate::small::SINGLE_PHASE_RULE);
+        } else {
+            brief.push_str(crate::small::PHASES_RULE);
+        }
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));

@@ -116,13 +116,83 @@ pub const PLAN_EXAMPLES: &str = concat!(
 
 /// How the first planning call sketches a job bigger than a small one: the phases in rough,
 /// and only the first in detail. Later phases are planned while earlier ones build.
-pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A job of more than about five files gets `phases`: \
+pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A large multi-subsystem job (more than about eight units or multiple distinct layers/apps that cannot fit in one parallel phase) gets `phases`: \
 2-6 phases in build order, each {\"id\",\"goal\",\"delivers\":[paths],\"interfaces\":\"signatures only, no bodies\",\"test\":\"the command \
 that runs this phase's tests\",\"needs\":\"interfaces\" or \"results\"}. `needs` is `results` only when a phase cannot be planned \
 until the one before it has been built and tested. With `phases`, `units` and `contracts` cover the first phase only; each later phase \
-is planned, with its own units, once the phases before it have locked their interfaces. A small job (a dependency upgrade, a fix, \
-or fewer than about five files) has no `phases`: plan it whole across parallel units. Scale the units to the work: one per \
+is planned, with its own units, once the phases before it have locked their interfaces. A single-package or small job (up to about eight units) \
+has no `phases`: plan it whole across parallel units. Scale the units to the work: one per \
 independent module and its tests, up to the available parallel workers.\n";
+
+/// Planning guidance for a single-package CLI/library/tool prompt that fits in one parallel phase.
+pub const SINGLE_PHASE_RULE: &str = "Plan this whole job in a single phase (`\"phases\": []`): put all units (up to about 8 parallel units with disjoint `owned_glob` patterns and shared `contracts`) \
+directly in `units` so every independent worker starts immediately with no phase barrier and no second planning pass.\n";
+
+const MULTI_PHASE_CUES: [&str; 16] = [
+    "multi-phase",
+    "phase 1",
+    "phase 2",
+    "phases",
+    "pages on top",
+    "shared core and pages",
+    "many parts",
+    "full platform",
+    "saas",
+    "microservices",
+    "monorepo",
+    "frontend and backend",
+    "multiple pages",
+    "multiple services",
+    "admin panel",
+    "entire app",
+];
+
+const SINGLE_PACKAGE_CUES: [&str; 24] = [
+    "cli",
+    "repl",
+    "command-line",
+    "command line",
+    "library",
+    "package",
+    "module",
+    "modules",
+    "python -m",
+    "stdlib",
+    "standard library",
+    "single-file",
+    "single file",
+    "minimal",
+    "tiny",
+    "small",
+    "parser",
+    "interpreter",
+    "compiler",
+    "database engine",
+    "kv store",
+    "key-value",
+    "pytest",
+    "cargo test",
+];
+
+/// True when a fresh prompt describes a single-package CLI/library/tool (roughly <= 8 units)
+/// that fits cleanly in one parallel phase without a phased sketch or heavy planning effort.
+pub fn is_single_phase_prompt(prompt: &str, existing_files: usize, parallel: usize) -> bool {
+    if is_small_prompt(prompt, existing_files) {
+        return true;
+    }
+    if existing_files > 0 || parallel == 0 {
+        return false;
+    }
+    let text = prompt.trim().to_lowercase();
+    let len = text.chars().count();
+    if len == 0 || len > 2500 {
+        return false;
+    }
+    if MULTI_PHASE_CUES.iter().any(|cue| text.contains(cue)) {
+        return false;
+    }
+    SINGLE_PACKAGE_CUES.iter().any(|cue| text.contains(cue))
+}
 
 /// The brief that plans one later phase of a sketched run.
 pub fn phase_brief(

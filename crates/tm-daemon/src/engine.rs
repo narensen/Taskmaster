@@ -452,6 +452,10 @@ struct Driver {
     /// Units that started immediately on a contract-only `depends_on` before `dep` landed:
     /// `dep -> {dependent units}` so their integration is re-checked once `dep` lands.
     soft_dep_waiters: BTreeMap<PageId, BTreeSet<PageId>>,
+    /// Wall-clock start of this driver invocation (`SystemTime`).
+    started_wall: SystemTime,
+    /// Monotonic start of this driver invocation (`Instant`).
+    started_mono: Instant,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -523,6 +527,8 @@ impl Drop for AbortOnDrop {
 }
 
 pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outcome> {
+    let started_wall = SystemTime::now();
+    let started_mono = Instant::now();
     let project = config
         .project
         .canonicalize()
@@ -751,6 +757,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         last_gate_findings: BTreeMap::new(),
         waived_gate_findings: BTreeSet::new(),
         soft_dep_waiters: BTreeMap::new(),
+        started_wall,
+        started_mono,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -5804,7 +5812,30 @@ impl Driver {
     fn write_status(&self, ok: bool) -> anyhow::Result<()> {
         let spent = totals(&self.records.ledger(&self.id)?);
         let estimate = self.run.plan.as_ref().map(|plan| &plan.estimate);
-        let mut body = serde_json::json!({ "ok": ok, "phase": self.run.phase, "spent": spent, "estimate": estimate });
+        let before = self.records.status(&self.id)?.unwrap_or_default();
+        let prior_timing = before
+            .get("timing")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<crate::report::RunTiming>(v).ok());
+        let timing = crate::report::RunTiming::from_bounds(
+            self.started_wall,
+            SystemTime::now(),
+            self.started_mono.elapsed(),
+            prior_timing.as_ref(),
+        );
+        if timing.clock_skew_flagged {
+            eprintln!(
+                "taskmaster: clock skew warning: wall time ({:.1}s) and monotonic time ({:.1}s) differed by {:.1}s (>30s, likely host suspend/freeze)",
+                timing.wall_seconds, timing.monotonic_seconds, timing.clock_skew_seconds
+            );
+        }
+        let mut body = serde_json::json!({
+            "ok": ok,
+            "phase": self.run.phase,
+            "spent": spent,
+            "estimate": estimate,
+            "timing": timing,
+        });
         match &self.delivery {
             Some((branch, merged)) => {
                 body["branch"] = serde_json::json!(branch);
@@ -5820,7 +5851,6 @@ impl Driver {
             }
             // A finished run that is driven again has nothing new to deliver.
             None => {
-                let before = self.records.status(&self.id)?.unwrap_or_default();
                 for key in ["branch", "merged", "base", "merge_commit", "merged_from", "merged_head", "undone"] {
                     if let Some(value) = before.get(key) {
                         body[key] = value.clone();

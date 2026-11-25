@@ -8488,3 +8488,31 @@ async fn small_cli_prompt_uses_single_phase_plan() {
     let replayed = Run::replay(3, events.lines().map(|l| serde_json::from_str::<Event>(l).unwrap()));
     assert!(replayed.plan.unwrap().phases.is_empty(), "accepted plan must have no phases");
 }
+
+#[tokio::test]
+async fn drive_records_monotonic_and_wall_timing_in_status_and_report() {
+    let tmp = seeded("p2-3-timing");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let status: serde_json::Value =
+        serde_json::from_str(&read(&run_directory(&tmp.0, "current").join("status.json"))).unwrap();
+    let timing = &status["timing"];
+    assert!(timing["wall_started_at"].as_str().is_some_and(|s| s.ends_with('Z')), "{timing}");
+    assert!(timing["wall_ended_at"].as_str().is_some_and(|s| s.ends_with('Z')), "{timing}");
+    assert!(timing["wall_seconds"].as_f64().is_some_and(|v| v >= 0.0), "{timing}");
+    assert!(timing["monotonic_seconds"].as_f64().is_some_and(|v| v >= 0.0), "{timing}");
+    assert!(timing["clock_skew_seconds"].as_f64().is_some_and(|v| v <= 30.0), "{timing}");
+    assert_eq!(timing["clock_skew_flagged"], false, "{timing}");
+
+    let records = Records::files(&tmp.0);
+    let report = crate::report::build(&records, "current").unwrap();
+    assert!(report.timing.is_some());
+    assert!(report.monotonic_seconds.is_some());
+    assert!(!report.clock_skew_flagged);
+    let rendered = crate::report::render(&report);
+    assert!(rendered.contains("Timing: wall "), "{rendered}");
+    assert!(rendered.contains("monotonic "), "{rendered}");
+    assert!(!rendered.contains("WARNING: clock skew detected"), "{rendered}");
+}

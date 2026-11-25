@@ -2702,7 +2702,9 @@ impl Driver {
                 continue;
             };
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            if let Ok(false) = crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env) {
+            if let Ok(crate::gates::MutationVerdict::Vacuous) =
+                crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env)
+            {
                 let author = owners
                     .owner(&impl_path)
                     .cloned()

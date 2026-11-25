@@ -62,17 +62,27 @@ pub fn verify_red_green(
     })
 }
 
+/// Verdict of running a contract test against an unmutated baseline and a stubbed implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationVerdict {
+    /// Baseline ran and passed (with at least one test executed), and stubbing the target made it fail.
+    Caught,
+    /// Baseline ran and passed, and the test still passed after stubbing the target.
+    Vacuous,
+    /// Could not verify non-vacuity (e.g., baseline failed, all tests were skipped, or zero tests passed).
+    Inconclusive,
+}
+
 /// Mutation sanity on a contract test: copy `worktree` into an isolated temporary
-/// directory, replace `impl_rel_path` in the copy with a minimal throwing stub, and run
+/// directory, verify the unmutated baseline runs and passes at least one test, then
+/// replace `impl_rel_path` in the copy with a minimal throwing stub and run
 /// `test_cmd` there so the live shared working tree is never modified.
-/// Returns `Ok(true)` if the contract test catches the broken implementation (fails),
-/// `Ok(false)` if the test is vacuous (still passes with a broken implementation).
 pub fn contract_mutation_sanity(
     worktree: &Path,
     impl_rel_path: &str,
     stub_content: &str,
     test_cmd: &[&str],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<MutationVerdict> {
     contract_mutation_sanity_with_env(worktree, impl_rel_path, stub_content, test_cmd, &[])
 }
 
@@ -85,7 +95,7 @@ pub fn contract_mutation_sanity_with_env(
     stub_content: &str,
     test_cmd: &[&str],
     extra_env: &[(String, String)],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<MutationVerdict> {
     if test_cmd.is_empty() {
         anyhow::bail!("test command cannot be empty");
     }
@@ -113,10 +123,239 @@ pub fn contract_mutation_sanity_with_env(
     std::fs::create_dir_all(&tmp.0)?;
     copy_tree_for_mutation(worktree, &tmp.0)?;
 
+    let is_pytest = is_pytest_cmd(test_cmd);
+    let is_cargo = is_cargo_test_cmd(test_cmd);
+    let augmented = if is_pytest {
+        augment_pytest_cmd(test_cmd)
+    } else {
+        test_cmd.iter().map(|s| (*s).to_string()).collect()
+    };
+    let effective_refs: Vec<&str> = augmented.iter().map(String::as_str).collect();
+
+    // 1. Baseline check on the unmutated copy: if baseline fails or zero tests pass
+    //    (e.g., all tests skipped via skipif), the gate is inconclusive rather than vacuous.
+    let baseline = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    if !baseline.status.success() {
+        return Ok(MutationVerdict::Inconclusive);
+    }
+    if !run_passed_at_least_one_test(&baseline, is_pytest, is_cargo) {
+        return Ok(MutationVerdict::Inconclusive);
+    }
+
+    // 2. Replace target implementation with a failing stub and re-run.
     let target = tmp.0.join(impl_rel_path);
     std::fs::write(&target, stub_content)?;
-    let passed_with_stub = run_cmd_ok_with_env(&tmp.0, test_cmd, extra_env)?;
-    Ok(!passed_with_stub)
+    let mutated = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    if !mutated.status.success() {
+        return Ok(MutationVerdict::Caught);
+    }
+    if !run_passed_at_least_one_test(&mutated, is_pytest, is_cargo) {
+        return Ok(MutationVerdict::Inconclusive);
+    }
+    Ok(MutationVerdict::Vacuous)
+}
+
+fn is_pytest_cmd(cmd: &[&str]) -> bool {
+    let Some(first) = cmd.first() else { return false };
+    let prog = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    if prog == "pytest" || prog == "pytest.exe" {
+        return true;
+    }
+    if matches!(prog, "sh" | "bash" | "cmd" | "cmd.exe" | "powershell") {
+        return false;
+    }
+    cmd.iter().skip(1).any(|a| *a == "pytest")
+}
+
+fn is_cargo_test_cmd(cmd: &[&str]) -> bool {
+    let Some(first) = cmd.first() else { return false };
+    let prog = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    (prog == "cargo" || prog == "cargo.exe") && cmd.get(1) == Some(&"test")
+}
+
+/// Add `-rA -p no:cacheprovider` to a pytest invocation so the summary always reports
+/// executed/skipped counts cleanly without writing `.pytest_cache` in the temp dir.
+fn augment_pytest_cmd(cmd: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let insert_at = out
+        .iter()
+        .position(|a| a == "pytest")
+        .map(|i| i + 1)
+        .unwrap_or(1.min(out.len()));
+    let has_ra = out.iter().any(|a| a == "-rA");
+    let has_nocache = out
+        .windows(2)
+        .any(|w| w[0] == "-p" && w[1] == "no:cacheprovider")
+        || out.iter().any(|a| a == "-pno:cacheprovider");
+    let mut extra = Vec::new();
+    if !has_ra {
+        extra.push("-rA".to_string());
+    }
+    if !has_nocache {
+        extra.push("-p".to_string());
+        extra.push("no:cacheprovider".to_string());
+    }
+    out.splice(insert_at..insert_at, extra);
+    out
+}
+
+fn run_passed_at_least_one_test(output: &std::process::Output, is_pytest: bool, is_cargo: bool) -> bool {
+    if is_pytest {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let passed = parse_pytest_summary_passed(&stdout)
+            .or_else(|| parse_pytest_summary_passed(&stderr));
+        return matches!(passed, Some(n) if n > 0);
+    }
+    if is_cargo {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(n) = parse_cargo_test_passed(&stdout) {
+            return n > 0;
+        }
+    }
+    true
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_pytest_summary_passed(output: &str) -> Option<usize> {
+    let clean = strip_ansi(output);
+    const KNOWN_LABELS: &[&str] = &[
+        "passed",
+        "failed",
+        "skipped",
+        "deselected",
+        "xfailed",
+        "xpassed",
+        "error",
+        "errors",
+        "warning",
+        "warnings",
+        "rerun",
+        "reruns",
+        "subtests",
+    ];
+    for line in clean.lines().rev() {
+        let trimmed = line.trim().trim_matches('=').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((left, right)) = trimmed.rsplit_once(" in ") else {
+            continue;
+        };
+        let right = right.trim();
+        let looks_like_duration = right
+            .split_whitespace()
+            .next()
+            .is_some_and(|tok| tok.ends_with('s') && tok.chars().next().is_some_and(|c| c.is_ascii_digit()));
+        if !looks_like_duration {
+            continue;
+        }
+        let left = left.trim();
+        if left == "no tests ran" {
+            return Some(0);
+        }
+        let mut passed = 0usize;
+        let mut matched_any = false;
+        let mut all_valid = true;
+        for part in left.split(',') {
+            let mut words = part.split_whitespace();
+            let Some(num_str) = words.next() else {
+                all_valid = false;
+                break;
+            };
+            let Some(label) = words.next() else {
+                all_valid = false;
+                break;
+            };
+            let label_rest = words.next();
+            if words.next().is_some() {
+                all_valid = false;
+                break;
+            }
+            let Ok(n) = num_str.parse::<usize>() else {
+                all_valid = false;
+                break;
+            };
+            let known = KNOWN_LABELS.contains(&label)
+                && label_rest.is_none_or(|w| KNOWN_LABELS.contains(&w));
+            if !known {
+                all_valid = false;
+                break;
+            }
+            matched_any = true;
+            if label == "passed" {
+                passed += n;
+            }
+        }
+        if matched_any && all_valid {
+            return Some(passed);
+        }
+    }
+    if let Some((_, after)) = clean.split_once("short test summary info") {
+        let mut passed = 0usize;
+        let mut saw_status = false;
+        for line in after.lines() {
+            let t = line.trim();
+            if t.starts_with("PASSED ") {
+                passed += 1;
+                saw_status = true;
+            } else if t.starts_with("SKIPPED ")
+                || t.starts_with("FAILED ")
+                || t.starts_with("ERROR ")
+                || t.starts_with("XFAIL ")
+                || t.starts_with("XPASS ")
+            {
+                saw_status = true;
+            }
+        }
+        if saw_status {
+            return Some(passed);
+        }
+    }
+    None
+}
+
+fn parse_cargo_test_passed(output: &str) -> Option<usize> {
+    let mut saw_result = false;
+    let mut total_passed = 0usize;
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("test result:") {
+            saw_result = true;
+            for segment in rest.split(';') {
+                let words: Vec<&str> = segment.split_whitespace().collect();
+                if let Some(pos) = words.iter().position(|w| *w == "passed")
+                    && pos > 0
+                    && let Ok(n) = words[pos - 1].parse::<usize>()
+                {
+                    total_passed += n;
+                }
+            }
+        }
+    }
+    saw_result.then_some(total_passed)
 }
 
 /// Copy `src` into an isolated `dst` directory for mutation testing without touching `src`.
@@ -212,10 +451,14 @@ pub fn mutation_test_command(
 }
 
 fn run_cmd_ok(dir: &Path, cmd: &[&str]) -> anyhow::Result<bool> {
-    run_cmd_ok_with_env(dir, cmd, &[])
+    Ok(run_cmd_output_with_env(dir, cmd, &[])?.status.success())
 }
 
-fn run_cmd_ok_with_env(dir: &Path, cmd: &[&str], extra_env: &[(String, String)]) -> anyhow::Result<bool> {
+fn run_cmd_output_with_env(
+    dir: &Path,
+    cmd: &[&str],
+    extra_env: &[(String, String)],
+) -> anyhow::Result<std::process::Output> {
     let mut c = Command::new(cmd[0]);
     c.args(&cmd[1..])
         .current_dir(dir)
@@ -225,8 +468,8 @@ fn run_cmd_ok_with_env(dir: &Path, cmd: &[&str], extra_env: &[(String, String)])
     for (k, v) in extra_env {
         c.env(k, v);
     }
-    let status = c.status()?;
-    Ok(status.success())
+    let output = c.output()?;
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,7 +1642,7 @@ mod tests {
         assert!(valid.ok);
         assert!(valid.failed_on_base && valid.passed_on_candidate);
 
-        // Mutation sanity: stubbing app.py breaks test_add.py -> true (non-vacuous).
+        // Mutation sanity: stubbing app.py breaks test_add.py -> Caught (non-vacuous).
         let caught = contract_mutation_sanity(
             &cand,
             "app.py",
@@ -1407,7 +1650,7 @@ mod tests {
             &["python3", "test_add.py"],
         )
         .unwrap();
-        assert!(caught);
+        assert_eq!(caught, MutationVerdict::Caught);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1622,7 +1865,7 @@ def test_isolated_and_catches_stub():
             &env,
         )
         .unwrap();
-        assert!(caught, "non-vacuous pytest contract test must fail against the stub");
+        assert_eq!(caught, MutationVerdict::Caught, "non-vacuous pytest contract test must fail against the stub");
         let observed = std::fs::read_to_string(&marker).expect("pytest test must have executed");
         assert!(observed.starts_with("same_dir=False\n"), "must run in isolated temp copy, got: {observed}");
         assert!(
@@ -1642,5 +1885,66 @@ def test_isolated_and_catches_stub():
         assert_eq!(rs_cmd[1], "test");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mutation_gate_baseline_red_is_inconclusive() {
+        let root = std::env::temp_dir().join(format!("tm-mut-base-red-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tests_dir = root.join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        std::fs::write(root.join("app.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        std::fs::write(
+            tests_dir.join("test_contract.py"),
+            "import app\n\ndef test_sum():\n    assert app.add(2, 3) == 5\n",
+        )
+        .unwrap();
+
+        let (cmd, env) = mutation_test_command(&root, &root.join(".taskmaster/venv"), "tests/test_contract.py")
+            .expect("expected pytest command");
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let verdict = contract_mutation_sanity_with_env(
+            &root,
+            "app.py",
+            mutation_stub_for("app.py").unwrap(),
+            &refs,
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            verdict,
+            MutationVerdict::Inconclusive,
+            "a contract test that fails on the unmutated baseline must be Inconclusive"
+        );
+
+        // Standalone failing script must also be Inconclusive.
+        std::fs::write(root.join("check_fail.py"), "import app\nassert app.add(2, 3) == 5\n").unwrap();
+        let standalone = contract_mutation_sanity(
+            &root,
+            "app.py",
+            mutation_stub_for("app.py").unwrap(),
+            &["python3", "check_fail.py"],
+        )
+        .unwrap();
+        assert_eq!(standalone, MutationVerdict::Inconclusive);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_pytest_summary_counts_passed_and_skipped() {
+        assert_eq!(parse_pytest_summary_passed("3 skipped in 0.01s\n"), Some(0));
+        assert_eq!(parse_pytest_summary_passed("1 passed, 2 skipped in 0.02s\n"), Some(1));
+        assert_eq!(parse_pytest_summary_passed("==== 2 passed, 1 warning in 0.12s ====\n"), Some(2));
+        assert_eq!(parse_pytest_summary_passed("==== no tests ran in 0.00s ====\n"), Some(0));
+        assert_eq!(parse_pytest_summary_passed("2 passed in 65.10s (0:01:05)\n"), Some(2));
+        assert_eq!(
+            parse_pytest_summary_passed("=== short test summary info ===\nSKIPPED [1] t.py:1: x\n"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_pytest_summary_passed("=== short test summary info ===\nPASSED t.py::test_a\n"),
+            Some(1)
+        );
     }
 }

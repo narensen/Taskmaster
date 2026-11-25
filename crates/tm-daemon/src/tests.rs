@@ -5374,6 +5374,81 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
 }
 
 #[tokio::test]
+async fn mutation_gate_all_skipped_is_inconclusive() {
+    struct ImplHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for ImplHarness {
+        fn id(&self) -> &'static str {
+            "p0a-impl"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0a-all-skipped");
+    let skipped_test = "import pytest\n\n\
+        pytestmark = pytest.mark.skipif(True, reason=\"later phase\")\n\n\
+        def test_future_cli():\n    import app.a.mod as m\n    assert m.add(1, 2) == 3\n";
+    let mut p = plan(&[("a", &[])]);
+    p.contracts.push(ContractFile {
+        path: "tests/test_acceptance_contract.py".into(),
+        content: skipped_test.into(),
+    });
+    let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    // An all-skipped pytest contract test must yield Inconclusive, not Vacuous, so verify passes.
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = h.calls.lock().unwrap();
+    assert!(
+        !calls.iter().any(|b| b.contains("vacuous")),
+        "all-skipped contract test must not trigger vacuous repair: {calls:#?}"
+    );
+
+    // Direct check against the built tree confirms MutationVerdict::Inconclusive.
+    let (cmd, env) = crate::gates::mutation_test_command(
+        &tmp.0,
+        &tmp.0.join(".taskmaster/venv"),
+        "tests/test_acceptance_contract.py",
+    )
+    .expect("expected pytest mutation command");
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let verdict = crate::gates::contract_mutation_sanity_with_env(
+        &tmp.0,
+        "app/a/mod.py",
+        crate::gates::mutation_stub_for("app/a/mod.py").unwrap(),
+        &refs,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(verdict, crate::gates::MutationVerdict::Inconclusive);
+}
+
+#[tokio::test]
 async fn o1_taskmaster_yaml_setup_copy_and_trust_by_hash() {
     struct CheckWorktreeHarness {
         saw_ready: Mutex<bool>,

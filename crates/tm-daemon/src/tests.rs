@@ -7352,3 +7352,105 @@ async fn verify_reports_import_failure_reasons_and_keeps_parallel_build_timings(
     assert!(failed_verify.contains("- a:") && failed_verify.contains("app/a/page.ts imports app/b/page.ts"), "must print failing page and reason: {failed_verify}");
     assert!(failed_verify.contains("test "), "must keep parallel build/test timings even when runtime_checks are skipped: {failed_verify}");
 }
+
+#[tokio::test]
+async fn finalize_runs_once_on_error_return_and_success_paths() {
+    let tmp = repo("finalize-paths");
+    let closed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    struct CountingSession {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for CountingSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            _events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct WarmThenErrorHarness {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        fail_b: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for WarmThenErrorHarness {
+        fn id(&self) -> &'static str {
+            "warm-err"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            if task.brief.contains("Build page `b`") && self.fail_b.load(std::sync::atomic::Ordering::SeqCst) {
+                return (Err(anyhow::anyhow!("simulated worker timeout")), None);
+            }
+            let page = if task.brief.contains("Build page `b`") { "b" } else { "a" };
+            let f = task.cwd.join(format!("app/{page}/page.ts"));
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, format!("export const {page} = 1;\n")).unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(CountingSession { closed: self.closed.clone() });
+            (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+        }
+    }
+
+    // Seed a Commons entry cited by page `a` so we can verify settle_commons does not double-count.
+    let commons_dir = tmp.0.join(".taskmaster/commons");
+    let commons_store = tm_dictionary::LocalStore::open(&commons_dir).unwrap();
+    commons_store
+        .publish("shared_a", tm_core::EntryKind::Hint, "hint", "body", "ts")
+        .unwrap();
+
+    let h = Arc::new(WarmThenErrorHarness {
+        closed: closed_count.clone(),
+        fail_b: std::sync::atomic::AtomicBool::new(true),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &["shared_a"]), ("b", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.warm_idle = Duration::from_secs(600);
+
+    // 1. Error return path: Command::Finish never runs, yet finalize must close warm sessions and write status.
+    let err = crate::drive(cfg.clone(), harnesses.clone()).await.unwrap_err();
+    assert!(err.to_string().contains("simulated worker timeout"), "{err}");
+    assert_eq!(closed_count.load(std::sync::atomic::Ordering::SeqCst), 1, "warm session must be closed on Err exit");
+    let records = Records::files(&tmp.0);
+    let status = records.status("current").unwrap().expect("status.json must be written on Err exit");
+    assert_eq!(status["ok"], serde_json::json!(false));
+    assert!(status.get("spent").is_some(), "status must include spend report: {status}");
+
+    // 2. Success path (resuming page `b`): finalize runs once (not twice between Command::Finish, idle, and drive).
+    h.fail_b.store(false, std::sync::atomic::Ordering::SeqCst);
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(closed_count.load(std::sync::atomic::Ordering::SeqCst), 2, "second run must close page b's warm session once");
+    let status = records.status("current").unwrap().expect("status.json must be written on success");
+    assert_eq!(status["ok"], serde_json::json!(true));
+}

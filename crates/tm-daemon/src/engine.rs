@@ -440,6 +440,8 @@ struct Driver {
     /// Untracked files created by `taskmaster.yaml` setup/copy before the worker ran, so
     /// ownership checks do not reject setup artifacts like `.ready`.
     setup_artifacts: HashMap<PathBuf, BTreeSet<String>>,
+    /// Guards [`Driver::finalize`] so end-of-run cleanup/delivery/reporting runs once per turn.
+    finalized: bool,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -734,6 +736,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         race_pages: HashMap::new(),
         project_config,
         setup_artifacts: HashMap::new(),
+        finalized: false,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -745,6 +748,24 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     driver.grant_pages()?;
     driver.pull_commons();
     let outcome = driver.r#loop().await;
+    match &outcome {
+        Ok(Outcome::Finished { ok }) => {
+            if let Err(err) = driver.finalize(*ok).await {
+                eprintln!("taskmaster: finalize error: {err:#}");
+            }
+        }
+        Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => {
+            driver.close_warm_and_hibernated().await;
+        }
+        Err(_) => {
+            if let Err(err) = driver.finalize(false).await {
+                eprintln!("taskmaster: finalize error: {err:#}");
+            }
+            if let Ok(line) = driver.spend_line() {
+                println!("taskmaster: {line}");
+            }
+        }
+    }
     driver.let_go_of_held().await;
     driver.live.flush(&driver.id);
     outcome
@@ -1109,7 +1130,7 @@ impl Driver {
                     return Ok(Step::Continue);
                 }
                 let ok = self.run.phase == RunPhase::Done;
-                self.write_status(ok)?;
+                self.finalize(ok).await?;
                 self.records.save_inflight(&self.id, &[])?;
                 println!("taskmaster: run {} {}", self.config.run_id, if ok { "finished" } else { "failed" });
                 println!("taskmaster: {}", self.spend_line()?);
@@ -1895,24 +1916,45 @@ impl Driver {
                 Ok(Step::Continue)
             }
             Command::Finish { ok } => {
-                for (_, warm) in std::mem::take(&mut self.warm) {
-                    let _ = warm.session.close().await;
-                    self.drop_worktree(&warm.worktree);
-                }
-                for (_, hib) in std::mem::take(&mut self.hibernated) {
-                    self.drop_worktree(&hib.worktree);
-                }
-                if ok {
-                    self.write_project_md("taskmaster: every phase landed")?;
-                    self.checkpoint("done");
-                }
-                self.settle_commons(ok)?;
-                self.deliver(ok);
-                self.write_status(ok)?;
-                self.persist()?;
+                self.finalize(ok).await?;
                 Ok(Step::Continue)
             }
         }
+    }
+
+    async fn close_warm_and_hibernated(&mut self) {
+        let handing_off = self.config.holder.as_ref().is_some_and(|holder| holder.handing_off());
+        for (_, warm) in std::mem::take(&mut self.warm) {
+            let _ = warm.session.close().await;
+            if !handing_off {
+                self.drop_worktree(&warm.worktree);
+            }
+        }
+        for (_, hib) in std::mem::take(&mut self.hibernated) {
+            if !handing_off {
+                self.drop_worktree(&hib.worktree);
+            }
+        }
+    }
+
+    /// Run end-of-run cleanup, delivery, Commons settlement, status reporting, and state
+    /// persistence exactly once per turn across every exit path (success, failure, error,
+    /// or timeout).
+    async fn finalize(&mut self, ok: bool) -> anyhow::Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        self.close_warm_and_hibernated().await;
+        if ok {
+            self.write_project_md("taskmaster: every phase landed")?;
+            self.checkpoint("done");
+        }
+        self.settle_commons(ok)?;
+        self.deliver(ok);
+        self.write_status(ok)?;
+        self.persist()?;
+        Ok(())
     }
 
     fn approve(&mut self) -> anyhow::Result<Step> {
@@ -5656,6 +5698,7 @@ impl Driver {
     /// A note on a finished run starts a new turn: one agent with the note as its task, or
     /// the master and its workers, as [`crate::turns::turn_mode`] decides.
     fn open_turn(&mut self) -> anyhow::Result<()> {
+        self.finalized = false;
         let pending: Vec<crate::live::Note> = self.live.notes(&self.id).into_iter().filter(|note| !note.delivered).collect();
         let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
         let _ = crate::checkpoints::capture(&self.project, &self.id, turn);
@@ -5734,7 +5777,11 @@ impl Driver {
         let Some(plan) = self.run.plan.clone() else { return Ok(()) };
         let catalog = self.catalog()?;
         for page in &plan.pages {
-            let passed = self.run.pages.get(&page.id).is_some_and(|page| page.state == tm_core::PageState::Passed);
+            let Some(state) = self.run.pages.get(&page.id).map(|page| page.state) else { continue };
+            if !matches!(state, tm_core::PageState::Passed | tm_core::PageState::Failed) {
+                continue;
+            }
+            let passed = state == tm_core::PageState::Passed;
             for key in &page.cites {
                 let Some(entry) = catalog.resolve(key)? else { continue };
                 if entry.tier == DictTier::Commons {

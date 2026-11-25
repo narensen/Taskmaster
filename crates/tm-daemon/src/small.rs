@@ -69,12 +69,11 @@ pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
     format!(
         "Worker pool: you can call upon up to {cap} parallel worker agents{who} simultaneously in this run. \
          ALWAYS delegate across multiple parallel workers whenever the work spans independent files, layers, or modules \
-         (for example: separate pages/routes, markup+styles vs. application logic/state, backend vs. frontend, core module vs. tests, or distinct subsystems) \
-         by defining multiple `units` or splitting a unit into `parts` with disjoint `owned_glob` patterns so up to {cap} workers build at once. \
-         If one unit genuinely depends on another finishing first, add an optional `depends_on: [\"other-unit-id\"]` array so unrelated workers still start immediately in parallel. \
-         Include a concise top-level `summary` describing the overall architecture and how the workers divide the job. \
-         Every worker runs in isolation and only sees its own `brief`, `context`, `done`, locked `contracts`, `design`, and cited Dictionary entries: \
-         give each worker rich, self-contained `brief` + `context` (exact file names, exports, types, DOM ids/selectors, shared interfaces, and how its output connects to sibling workers).\n"
+         (pages/routes, markup+styles vs. logic/state, backend vs. frontend, core module vs. tests, or distinct subsystems) \
+         via multiple `units` or `parts` with disjoint `owned_glob` patterns so up to {cap} workers build at once. \
+         Only use `depends_on: [\"id\"]` for concrete implementation imports (never for locked `contracts`), with chains no deeper than 2 for <=6 units. \
+         Include a concise `summary`. Every worker runs in isolation and only sees its `brief`, `context`, `done`, locked `contracts`, `design`, and cited Dictionary entries: \
+         give each worker self-contained `brief` + `context` (files, exports, types, DOM ids/selectors, shared interfaces, sibling boundaries).\n"
     )
 }
 

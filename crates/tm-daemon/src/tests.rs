@@ -8179,3 +8179,146 @@ async fn heartbeat_detects_wall_clock_jump_and_restarts_silent_agents() {
         .expect("stall sender dropped unexpectedly");
     assert_eq!(stalled, tm_harness::Stalled(Duration::from_secs(30)));
 }
+
+#[tokio::test]
+async fn unit_with_contract_only_dependency_starts_immediately() {
+    struct BarrierOverlapHarness {
+        barrier: Arc<tokio::sync::Barrier>,
+        inflight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for BarrierOverlapHarness {
+        fn id(&self) -> &'static str {
+            "p12-overlap"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            // Both units MUST start concurrently to pass the barrier before timeout.
+            tokio::time::timeout(Duration::from_secs(3), self.barrier.wait())
+                .await
+                .expect("contract-only dependent unit must start immediately alongside its dependency");
+            if task.brief.contains("Build unit `btree`") {
+                std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+                std::fs::write(task.cwd.join("tinydb/btree.py"), "class BTree:\n    pass\n")?;
+            } else if task.brief.contains("Build unit `storage`") {
+                std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+                std::fs::write(task.cwd.join("tinydb/storage.py"), "from tinydb.contract import BTreeProtocol\nclass Storage:\n    pass\n")?;
+            }
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    // 1. `storage` depends_on `btree`, but only through `BTreeProtocol` in locked `tinydb/contract.py`
+    //    -> `storage` starts immediately in parallel with `btree` (peak concurrency == 2).
+    let tmp = repo("p12-contract-dep");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![
+            ContractFile { path: "tinydb/__init__.py".into(), content: "# pkg\n".into(), phase: 0 },
+            ContractFile {
+                path: "tinydb/contract.py".into(),
+                content: "from typing import Protocol\n\nclass BTreeProtocol(Protocol):\n    def get(self, key: str) -> bytes: ...\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "tinydb/btree.py".into(),
+                brief: "Implement BTreeProtocol from tinydb/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "storage".into(),
+                owned_glob: "tinydb/storage.py".into(),
+                brief: "Implement Storage using BTreeProtocol from tinydb/contract.py.".into(),
+                depends_on: vec!["btree".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let h = Arc::new(BarrierOverlapHarness {
+        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        inflight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p.clone(), true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(h.peak.load(Ordering::SeqCst), 2, "storage must run concurrently with btree");
+
+    // 2. Contrast: concrete non-contract dependency (`cli` importing `tinydb/executor.py`) is NOT contract-only.
+    let concrete_plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: p.contracts.clone(),
+        pages: vec![
+            PagePlan {
+                id: "executor".into(),
+                owned_glob: "tinydb/executor.py".into(),
+                brief: "Implement Executor class.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "tinydb/__main__.py".into(),
+                brief: "Wire CLI to tinydb/executor.py (from tinydb.executor import Executor).".into(),
+                depends_on: vec!["executor".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(!crate::gates::dependency_is_contract_only(&concrete_plan, &concrete_plan.pages[1], "executor"));
+
+    // 3. Planner rubric & plan review: dependency chain deeper than 2 on <= 6 units is flagged
+    //    and flattened mechanically when backed by locked contracts.
+    let mut deep = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "tinydb/contract.py".into(),
+            content: "class BTreeProtocol: ...\nclass StorageProtocol: ...\nclass ExecutorProtocol: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan { id: "btree".into(), owned_glob: "tinydb/btree.py".into(), brief: "Implement BTreeProtocol".into(), ..Default::default() },
+            PagePlan { id: "storage".into(), owned_glob: "tinydb/storage.py".into(), brief: "Use BTreeProtocol, implement StorageProtocol".into(), depends_on: vec!["btree".into()], ..Default::default() },
+            PagePlan { id: "executor".into(), owned_glob: "tinydb/executor.py".into(), brief: "Use StorageProtocol, implement ExecutorProtocol".into(), depends_on: vec!["storage".into()], ..Default::default() },
+            PagePlan { id: "cli".into(), owned_glob: "tinydb/cli.py".into(), brief: "Use ExecutorProtocol".into(), depends_on: vec!["executor".into()], ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(crate::gates::max_dependency_chain_depth(&deep), 4);
+    let findings = crate::gates::review_plan_structure(&deep);
+    assert!(
+        findings.iter().any(|f| f.category == "deep_dependency_chain"),
+        "expected deep_dependency_chain warning, got: {findings:#?}"
+    );
+    assert!(crate::gates::apply_mechanical_plan_fixes(&mut deep));
+    assert!(
+        crate::gates::max_dependency_chain_depth(&deep) <= 2,
+        "expected flattened depth <= 2, got {}",
+        crate::gates::max_dependency_chain_depth(&deep)
+    );
+    assert!(crate::small::worker_pool_rule(3, None).contains("no deeper than 2"));
+}

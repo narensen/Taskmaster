@@ -449,6 +449,9 @@ struct Driver {
     /// Gate findings waived after a no-op repair repeated the exact same failure: `(page, fingerprint)`.
     /// Cleared for a page whenever that page merges an actual file diff.
     waived_gate_findings: BTreeSet<(PageId, String)>,
+    /// Units that started immediately on a contract-only `depends_on` before `dep` landed:
+    /// `dep -> {dependent units}` so their integration is re-checked once `dep` lands.
+    soft_dep_waiters: BTreeMap<PageId, BTreeSet<PageId>>,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -747,6 +750,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         noop_repairs: BTreeSet::new(),
         last_gate_findings: BTreeMap::new(),
         waived_gate_findings: BTreeSet::new(),
+        soft_dep_waiters: BTreeMap::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -1058,24 +1062,26 @@ impl Driver {
     }
 
     /// Index of the first leading `SpawnWorker` command whose `depends_on` upstream units have
-    /// already passed (ignoring unknown IDs). Only scans the leading contiguous `SpawnWorker`
-    /// prefix so ordering barriers (checks/merge) are never bypassed.
+    /// already passed or are satisfied by a locked interface contract (ignoring unknown IDs).
+    /// Only scans the leading contiguous `SpawnWorker` prefix so ordering barriers (checks/merge)
+    /// are never bypassed.
     fn next_ready_spawn(&self) -> Option<usize> {
         let plan = self.run.plan.as_ref();
         for (idx, cmd) in self.pending.iter().enumerate() {
             let Command::SpawnWorker { page, .. } = cmd else {
                 break;
             };
-            let deps = plan
-                .and_then(|p| p.pages.iter().find(|u| u.id == *page))
-                .map(|u| u.depends_on.as_slice())
-                .unwrap_or(&[]);
+            let unit = plan.and_then(|p| p.pages.iter().find(|u| u.id == *page));
+            let deps = unit.map(|u| u.depends_on.as_slice()).unwrap_or(&[]);
             let ready = deps.iter().all(|dep| {
                 if dep == page {
                     return true;
                 }
                 match self.run.pages.get(dep) {
-                    Some(st) => st.state == tm_core::PageState::Passed,
+                    Some(st) if st.state == tm_core::PageState::Passed => true,
+                    Some(_) => plan
+                        .zip(unit)
+                        .is_some_and(|(p, u)| crate::gates::dependency_is_contract_only(p, u, dep)),
                     None => true,
                 }
             });
@@ -2023,6 +2029,26 @@ impl Driver {
             return Err(err);
         }
         let units = self.page(&page)?.work_units();
+        // Record any contract-only dependencies that have not landed yet so we re-check
+        // dependent units once those upstream dependencies pass.
+        if let Some(plan) = self.run.plan.as_ref()
+            && let Some(unit_plan) = plan.pages.iter().find(|u| u.id == page)
+        {
+            let soft_pending: Vec<String> = unit_plan
+                .depends_on
+                .iter()
+                .filter(|dep| {
+                    dep.as_str() != page
+                        && self.run.pages.get(dep.as_str()).is_some_and(|st| st.state != tm_core::PageState::Passed)
+                        && crate::gates::dependency_is_contract_only(plan, unit_plan, dep)
+                })
+                .cloned()
+                .collect();
+            for dep in soft_pending {
+                eprintln!("taskmaster: starting {page} immediately (dependency `{dep}` is covered by locked contracts)");
+                self.soft_dep_waiters.entry(dep).or_default().insert(page.clone());
+            }
+        }
         // W3: Best-of-N on `difficulty: hard` units (off by default, budget-guarded).
         let is_hard = self
             .page(&page)?
@@ -2829,6 +2855,20 @@ impl Driver {
         }
         if let (WorkerOutcome::Passed, Some((diff, files))) = (&outcome, review) {
             self.start_check(page, tier, wanted, CheckInput { diff, files, shot, said: text });
+        }
+        if let WorkerOutcome::Passed = &outcome
+            && let Some(waiters) = self.soft_dep_waiters.remove(page)
+        {
+            let landed: Vec<String> = waiters
+                .into_iter()
+                .filter(|w| self.run.pages.get(w).is_some_and(|st| st.state == tm_core::PageState::Passed))
+                .collect();
+            if !landed.is_empty() {
+                eprintln!(
+                    "taskmaster: `{page}` landed; soft-dependent unit(s) {} will be re-verified against it",
+                    landed.join(", ")
+                );
+            }
         }
         self.push_event(Event::WorkerFinished { page: page.to_string(), outcome })?;
         self.records.clear_merged(&self.id, page);

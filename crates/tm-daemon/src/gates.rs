@@ -553,7 +553,220 @@ pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
             });
         }
     }
+    // 4. Dependency chain depth cap for small-to-medium plans (<= 6 units): chains deeper than 2
+    //    serialize workers unnecessarily when locked contracts already define the interfaces.
+    if plan.pages.len() <= 6 {
+        let depth = max_dependency_chain_depth(plan);
+        if depth > 2 {
+            findings.push(PlanReviewFinding {
+                severity: "warning".into(),
+                category: "deep_dependency_chain".into(),
+                message: format!(
+                    "Plan has {} units with a dependency chain of depth {} (max recommended is 2); rely on locked contracts so units run in parallel.",
+                    plan.pages.len(),
+                    depth
+                ),
+                page: None,
+            });
+        }
+    }
     findings
+}
+
+/// Longest `depends_on` chain length (in nodes) across `plan.pages`.
+/// Independent units have depth 1; `A <- B` has depth 2; `A <- B <- C` has depth 3.
+pub fn max_dependency_chain_depth(plan: &Plan) -> usize {
+    let by_id: BTreeMap<&str, &[String]> = plan
+        .pages
+        .iter()
+        .map(|p| (p.id.as_str(), p.depends_on.as_slice()))
+        .collect();
+    fn depth_of<'a>(
+        id: &'a str,
+        by_id: &BTreeMap<&'a str, &'a [String]>,
+        visiting: &mut BTreeSet<&'a str>,
+        memo: &mut BTreeMap<&'a str, usize>,
+    ) -> usize {
+        if let Some(&d) = memo.get(id) {
+            return d;
+        }
+        if !visiting.insert(id) {
+            return 1;
+        }
+        let mut best = 1usize;
+        if let Some(deps) = by_id.get(id) {
+            for dep in *deps {
+                if dep.as_str() != id && by_id.contains_key(dep.as_str()) {
+                    best = best.max(1 + depth_of(dep.as_str(), by_id, visiting, memo));
+                }
+            }
+        }
+        visiting.remove(id);
+        memo.insert(id, best);
+        best
+    }
+    let mut memo = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    plan.pages
+        .iter()
+        .map(|p| depth_of(p.id.as_str(), &by_id, &mut visiting, &mut memo))
+        .max()
+        .unwrap_or(0)
+}
+
+/// True when `consumer`'s dependency on `dep_id` is satisfied by a locked non-test contract
+/// (so `consumer` can start immediately in parallel and re-verify when `dep_id` lands).
+pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, dep_id: &str) -> bool {
+    let interfaces: Vec<&tm_core::ContractFile> = plan.contracts.iter().filter(|c| !c.is_test()).collect();
+    if interfaces.is_empty() {
+        return false;
+    }
+    let Some(dep_page) = plan.pages.iter().find(|p| p.id == dep_id) else {
+        return true;
+    };
+    let consumer_text = format!("{}\n{}\n{}", consumer.brief, consumer.context, consumer.done);
+    let dep_text = format!("{}\n{}\n{}", dep_page.brief, dep_page.context, dep_page.done);
+
+    // If the consumer explicitly references a concrete non-contract file owned by `dep_page`
+    // (e.g. `tinydb/executor.py` or `tinydb.executor`), keep the hard dependency.
+    let contract_paths: BTreeSet<&str> = interfaces.iter().map(|c| c.path.as_str()).collect();
+    for concrete in concrete_paths_in_glob(&dep_page.owned_glob) {
+        if contract_paths.contains(concrete.as_str()) || is_test_path(&concrete) {
+            continue;
+        }
+        if text_references_concrete_file(&consumer_text, &concrete) {
+            return false;
+        }
+    }
+
+    // Collect declared symbols and paths from locked interface contracts.
+    let mut contract_symbols: BTreeSet<String> = BTreeSet::new();
+    for c in &interfaces {
+        contract_symbols.extend(extract_declared_symbols(&c.content));
+    }
+
+    // Check whether a locked interface contract covers `dep_page` (symbol matching dep id or stem)
+    // or both `dep_page` and `consumer` coordinate through the same locked contract path/symbol.
+    let dep_tokens = dep_identity_tokens(dep_page);
+    let contract_covers_dep = contract_symbols.iter().any(|sym| {
+        let low = sym.to_ascii_lowercase();
+        dep_tokens.iter().any(|tok| tok.len() >= 3 && low.contains(tok.as_str()))
+    });
+    let consumer_mentions_contract = interfaces.iter().any(|c| {
+        consumer_text.contains(&c.path)
+            || c.path
+                .strip_suffix(".py")
+                .map(|s| s.replace('/', "."))
+                .is_some_and(|m| !m.is_empty() && consumer_text.contains(&m))
+    }) || contract_symbols.iter().any(|sym| sym.len() >= 3 && consumer_text.contains(sym.as_str()));
+
+    if contract_covers_dep && consumer_mentions_contract {
+        return true;
+    }
+
+    // Both producer and consumer explicitly reference the same locked contract file or symbol.
+    let shared_contract_path = interfaces.iter().any(|c| {
+        let mod_name = c.path.strip_suffix(".py").map(|s| s.replace('/', "."));
+        let in_dep = dep_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && dep_text.contains(m));
+        let in_con = consumer_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && consumer_text.contains(m));
+        in_dep && in_con
+    });
+    let shared_contract_sym = contract_symbols.iter().any(|sym| {
+        sym.len() >= 3 && dep_text.contains(sym.as_str()) && consumer_text.contains(sym.as_str())
+    });
+    shared_contract_path || shared_contract_sym
+}
+
+fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
+    let trimmed = glob.trim();
+    let parts: Vec<&str> = if let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        inner.split(',').map(str::trim).collect()
+    } else {
+        vec![trimmed]
+    };
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty() && !p.contains(['*', '?', '[', '{']))
+        .map(|p| p.trim_start_matches("./").to_string())
+        .collect()
+}
+
+fn text_references_concrete_file(text: &str, path: &str) -> bool {
+    if text.contains(path) {
+        return true;
+    }
+    if let Some(stem) = path.strip_suffix(".py") {
+        let dotted = stem.replace('/', ".");
+        if !dotted.is_empty() && text.contains(&dotted) {
+            return true;
+        }
+    }
+    for ext in [".ts", ".tsx", ".js", ".jsx", ".rs"] {
+        if let Some(stem) = path.strip_suffix(ext)
+            && !stem.is_empty()
+            && text.contains(stem)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn dep_identity_tokens(page: &tm_core::PagePlan) -> Vec<String> {
+    let mut tokens = vec![page.id.to_ascii_lowercase()];
+    for part in page.id.split(['-', '_']) {
+        if part.len() >= 3 {
+            tokens.push(part.to_ascii_lowercase());
+        }
+    }
+    for path in concrete_paths_in_glob(&page.owned_glob) {
+        if let Some(stem) = Path::new(&path).file_stem().and_then(|s| s.to_str())
+            && stem.len() >= 3
+        {
+            tokens.push(stem.to_ascii_lowercase());
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn extract_declared_symbols(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        for prefix in [
+            "class ",
+            "def ",
+            "async def ",
+            "export interface ",
+            "export type ",
+            "export class ",
+            "export function ",
+            "export const ",
+            "export enum ",
+            "interface ",
+            "type ",
+            "pub trait ",
+            "pub struct ",
+            "pub enum ",
+            "pub fn ",
+            "trait ",
+            "struct ",
+        ] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && !name.starts_with("__") {
+                    out.push(name);
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn globs_likely_overlap(a: &str, b: &str) -> bool {
@@ -604,6 +817,19 @@ pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
         {
             page.difficulty = Some("normal".into());
             changed = true;
+        }
+    }
+    // Flatten over-deep dependency chains (depth > 2 on <= 6 units) by dropping contract-only edges.
+    if plan.pages.len() <= 6 && max_dependency_chain_depth(plan) > 2 {
+        let snapshot = plan.clone();
+        for (idx, page) in plan.pages.iter_mut().enumerate() {
+            let before = page.depends_on.len();
+            let page_snapshot = &snapshot.pages[idx];
+            page.depends_on
+                .retain(|dep| !dependency_is_contract_only(&snapshot, page_snapshot, dep));
+            if page.depends_on.len() != before {
+                changed = true;
+            }
         }
     }
     changed

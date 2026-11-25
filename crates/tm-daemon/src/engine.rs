@@ -109,7 +109,7 @@ struct Settling {
 
 /// What [`Driver::join_one`] woke up for.
 enum Joined {
-    Job(Result<(PageId, usize, anyhow::Result<WorkerJob>), tokio::task::JoinError>),
+    Job(Result<(PageId, usize, WorkerJob), tokio::task::JoinError>),
     Early(Result<EarlyDone, tokio::task::JoinError>),
 }
 
@@ -121,6 +121,7 @@ struct Product {
 
 enum WorkerJob {
     Finished(Box<Product>),
+    Failed { err: anyhow::Error, worktree: PathBuf },
     Restarted(PathBuf),
 }
 
@@ -355,9 +356,11 @@ struct Driver {
     changes: Vec<ChangeEntry>,
     pending: VecDeque<Command>,
     running: Vec<Command>,
-    jobs: JoinSet<(PageId, usize, anyhow::Result<WorkerJob>)>,
+    jobs: JoinSet<(PageId, usize, WorkerJob)>,
     /// Finished units of pages that still have units running.
     batches: HashMap<PageId, Vec<(usize, Product)>>,
+    /// Non-limit worker errors collected for units of a page still in flight.
+    batch_errors: HashMap<PageId, Vec<String>>,
     /// Caps concurrent worker calls at `parallel`, counting every unit of every page.
     slots: Arc<Semaphore>,
     harnesses: Harnesses,
@@ -437,6 +440,8 @@ struct Driver {
     /// Untracked files created by `taskmaster.yaml` setup/copy before the worker ran, so
     /// ownership checks do not reject setup artifacts like `.ready`.
     setup_artifacts: HashMap<PathBuf, BTreeSet<String>>,
+    /// Guards [`Driver::finalize`] so end-of-run cleanup/delivery/reporting runs once per turn.
+    finalized: bool,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -459,7 +464,9 @@ struct Hibernated {
 /// How a spawned worker executes its turn.
 enum WorkerExec {
     Fresh,
-    Warm(Warm),
+    /// Open warm session: `prompt` is sent as the follow-up turn while `request.brief`
+    /// keeps the full original worker brief for fallback if the session stalls.
+    Warm { warm: Warm, prompt: String },
     Resume { session_id: String, prompt: String },
     /// H3: the agent a previous daemon handed off, still running in the holder. `said` is what
     /// it had replied so far; `session_id` resumes it the H2 way if it cannot be picked up.
@@ -687,6 +694,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         running: Vec::new(),
         jobs: JoinSet::new(),
         batches: HashMap::new(),
+        batch_errors: HashMap::new(),
         slots: Arc::new(Semaphore::new(parallel)),
         harnesses,
         url,
@@ -728,6 +736,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         race_pages: HashMap::new(),
         project_config,
         setup_artifacts: HashMap::new(),
+        finalized: false,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -739,6 +748,24 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     driver.grant_pages()?;
     driver.pull_commons();
     let outcome = driver.r#loop().await;
+    match &outcome {
+        Ok(Outcome::Finished { ok }) => {
+            if let Err(err) = driver.finalize(*ok).await {
+                eprintln!("taskmaster: finalize error: {err:#}");
+            }
+        }
+        Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => {
+            driver.close_warm_and_hibernated().await;
+        }
+        Err(_) => {
+            if let Err(err) = driver.finalize(false).await {
+                eprintln!("taskmaster: finalize error: {err:#}");
+            }
+            if let Ok(line) = driver.spend_line() {
+                println!("taskmaster: {line}");
+            }
+        }
+    }
     driver.let_go_of_held().await;
     driver.live.flush(&driver.id);
     outcome
@@ -863,6 +890,7 @@ impl Driver {
         self.running.clear();
         self.pending.clear();
         self.settling.clear();
+        self.batch_errors.clear();
         for (_, products) in std::mem::take(&mut self.batches) {
             for (_, product) in products {
                 self.drop_worktree(&product.worktree);
@@ -1051,18 +1079,23 @@ impl Driver {
     async fn idle(&mut self) -> anyhow::Result<Step> {
         match self.run.phase {
             RunPhase::Planning => {
+                let mut review_prompt = None;
                 let (mut plan, drafted) = if let Some(plan) = self.config.plan.clone() {
                     self.config.plan = None;
                     (plan, false)
                 } else if self.config.prompt.as_ref().is_some_and(|prompt| !prompt.trim().is_empty()) {
                     let prompt = self.config.prompt.clone().unwrap_or_default();
                     let plan = self.draft_plan(&prompt).await?;
+                    review_prompt = Some(prompt);
                     self.config.prompt = None;
                     (plan, true)
                 } else {
                     bail!("no plan for this run; pass --plan <file> or --prompt <text>");
                 };
-                let review_findings = crate::gates::review_plan_structure(&plan);
+                let mut review_findings = crate::gates::review_plan_structure(&plan);
+                if let Some(prompt) = review_prompt.as_deref() {
+                    review_findings.extend(crate::gates::check_plan_prompt_consistency(prompt, &plan));
+                }
                 if !review_findings.is_empty() {
                     let revised = drafted && crate::gates::apply_mechanical_plan_fixes(&mut plan);
                     self.live.push(
@@ -1097,7 +1130,7 @@ impl Driver {
                     return Ok(Step::Continue);
                 }
                 let ok = self.run.phase == RunPhase::Done;
-                self.write_status(ok)?;
+                self.finalize(ok).await?;
                 self.records.save_inflight(&self.id, &[])?;
                 println!("taskmaster: run {} {}", self.config.run_id, if ok { "finished" } else { "failed" });
                 println!("taskmaster: {}", self.spend_line()?);
@@ -1294,6 +1327,20 @@ impl Driver {
         };
         if let Err(found) = check_plan(&checked, &drafts, &existing) {
             errors.extend(found);
+        }
+        // Plan-vs-prompt consistency check: flag contract constants contradicting the user prompt
+        // and require a locked acceptance contract test when the prompt specifies literal I/O examples.
+        let user_prompt = if base.is_none() {
+            Some(prompt.to_string())
+        } else {
+            self.records.request(&self.id).ok().flatten().and_then(|r| r.prompt)
+        };
+        if let Some(user_prompt) = user_prompt {
+            for finding in crate::gates::check_plan_prompt_consistency(&user_prompt, &checked) {
+                if finding.severity == "error" {
+                    errors.push(finding.message);
+                }
+            }
         }
         if errors.is_empty() { Ok((plan, drafts)) } else { Err((errors, Some(json))) }
     }
@@ -1732,6 +1779,7 @@ impl Driver {
              saying how it knows it is finished.\n",
         );
         brief.push_str(&crate::small::plan_shape());
+        brief.push_str(&crate::gates::format_prompt_acceptance_guidance(&crate::gates::extract_prompt_io_examples(prompt)));
         brief.push_str(crate::small::PHASES_RULE);
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);
@@ -1868,24 +1916,45 @@ impl Driver {
                 Ok(Step::Continue)
             }
             Command::Finish { ok } => {
-                for (_, warm) in std::mem::take(&mut self.warm) {
-                    let _ = warm.session.close().await;
-                    self.drop_worktree(&warm.worktree);
-                }
-                for (_, hib) in std::mem::take(&mut self.hibernated) {
-                    self.drop_worktree(&hib.worktree);
-                }
-                if ok {
-                    self.write_project_md("taskmaster: every phase landed")?;
-                    self.checkpoint("done");
-                }
-                self.settle_commons(ok)?;
-                self.deliver(ok);
-                self.write_status(ok)?;
-                self.persist()?;
+                self.finalize(ok).await?;
                 Ok(Step::Continue)
             }
         }
+    }
+
+    async fn close_warm_and_hibernated(&mut self) {
+        let handing_off = self.config.holder.as_ref().is_some_and(|holder| holder.handing_off());
+        for (_, warm) in std::mem::take(&mut self.warm) {
+            let _ = warm.session.close().await;
+            if !handing_off {
+                self.drop_worktree(&warm.worktree);
+            }
+        }
+        for (_, hib) in std::mem::take(&mut self.hibernated) {
+            if !handing_off {
+                self.drop_worktree(&hib.worktree);
+            }
+        }
+    }
+
+    /// Run end-of-run cleanup, delivery, Commons settlement, status reporting, and state
+    /// persistence exactly once per turn across every exit path (success, failure, error,
+    /// or timeout).
+    async fn finalize(&mut self, ok: bool) -> anyhow::Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        self.close_warm_and_hibernated().await;
+        if ok {
+            self.write_project_md("taskmaster: every phase landed")?;
+            self.checkpoint("done");
+        }
+        self.settle_commons(ok)?;
+        self.deliver(ok);
+        self.write_status(ok)?;
+        self.persist()?;
+        Ok(())
     }
 
     fn approve(&mut self) -> anyhow::Result<Step> {
@@ -2001,16 +2070,13 @@ impl Driver {
                 // it already has the task, the files and the provider's cache.
                 let warm = if errors.is_some() { self.take_warm(&key, tier) } else { None };
                 if let Some(warm) = warm {
+                    let follow_prompt = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
                     let step = git::sync_worktree(&warm.worktree, &self.tree)
-                        .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()))
-                        .map(|mut request| {
-                            request.brief = self.follow_up_brief(&page, index, units.len(), errors.as_deref().unwrap_or(""));
-                            request
-                        });
+                        .and_then(|()| self.worker_request(&page, index, units.len(), tier, errors.as_deref(), warm.worktree.clone()));
                     match step {
                         Ok(request) => {
                             let worktree = warm.worktree.clone();
-                            prepared.push((request, worktree, WorkerExec::Warm(warm)));
+                            prepared.push((request, worktree, WorkerExec::Warm { warm, prompt: follow_prompt }));
                             continue;
                         }
                         Err(err) => {
@@ -2095,6 +2161,7 @@ impl Driver {
         }
         self.running.push(Command::SpawnWorker { page: page.clone(), tier, errors });
         self.batches.remove(&page);
+        self.batch_errors.remove(&page);
         let restart_rx = self.config.worker_restarts.as_ref().map(|map| {
             let mut guard = map.lock().unwrap();
             let tx = guard.entry(page.clone()).or_insert_with(|| tokio::sync::watch::channel(0u64).0);
@@ -2145,7 +2212,7 @@ impl Driver {
             let (page, slots) = (page.clone(), self.slots.clone());
             let mut rx = restart_rx.clone();
             match &exec {
-                WorkerExec::Warm(_) => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
+                WorkerExec::Warm { .. } => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
                 WorkerExec::Resume { session_id, .. } => {
                     eprintln!("taskmaster: resuming {agent} on provider session {session_id}");
                 }
@@ -2166,13 +2233,16 @@ impl Driver {
                 let result = tokio::select! {
                     asked = async {
                         match exec {
-                            WorkerExec::Warm(warm) => follow(request, warm.session).await,
+                            WorkerExec::Warm { warm, prompt } => follow(request, warm.session, prompt).await,
                             WorkerExec::Resume { session_id, prompt } => resume_or_ask(request, session_id, prompt).await,
                             WorkerExec::Reattach { said, session_id } => reattach_or_resume(request, said, session_id).await,
                             WorkerExec::Fresh => ask(request).await,
                         }
-                    } => asked.map(|answer| WorkerJob::Finished(Box::new(Product { answer, bill, worktree }))),
-                    _ = restart_wait => Ok(WorkerJob::Restarted(worktree)),
+                    } => match asked {
+                        Ok(answer) => WorkerJob::Finished(Box::new(Product { answer, bill, worktree })),
+                        Err(err) => WorkerJob::Failed { err, worktree },
+                    },
+                    _ = restart_wait => WorkerJob::Restarted(worktree),
                 };
                 // The agent is released; its slot goes to the next waiting unit at once.
                 drop(permit);
@@ -2203,11 +2273,30 @@ impl Driver {
         if let Some(code) = &self.code {
             code.detach_page(&page);
         }
-        let mut product = match result {
-            Ok(WorkerJob::Finished(product)) => *product,
-            Ok(WorkerJob::Restarted(worktree)) => {
+        let wanted = self
+            .race_pages
+            .get(&page)
+            .copied()
+            .unwrap_or_else(|| self.page(&page).map(|p| p.work_units().len()).unwrap_or(1));
+        match result {
+            WorkerJob::Finished(product) => {
+                let mut product = *product;
+                self.charge(&product.bill, &product.answer)?;
+                // W1: Release gate — if a worker with a shell and available tests released without
+                // running them, send the nudge once as a follow-up turn before judging/checking.
+                if !self.is_stale(&page)
+                    && !self.race_pages.contains_key(&page)
+                    && product.answer.ok
+                    && reply::parse_flag(&product.answer.text).is_none()
+                {
+                    self.maybe_release_gate_nudge(&page, index, &mut product).await?;
+                }
+                self.batches.entry(page.clone()).or_default().push((index, product));
+            }
+            WorkerJob::Restarted(worktree) => {
                 self.drop_worktree(&worktree);
                 self.race_pages.remove(&page);
+                self.batch_errors.remove(&page);
                 if let Some(partial) = self.batches.remove(&page) {
                     for (_, p) in partial {
                         self.drop_worktree(&p.worktree);
@@ -2230,36 +2319,50 @@ impl Driver {
                 }
                 return Ok(());
             }
-            Err(err) => {
-                self.race_pages.remove(&page);
-                if let Some(map) = &self.config.worker_restarts {
-                    map.lock().unwrap().remove(&page);
+            WorkerJob::Failed { err, worktree } => {
+                self.drop_worktree(&worktree);
+                let current_tier = self
+                    .running
+                    .iter()
+                    .find_map(|cmd| match cmd {
+                        Command::SpawnWorker { page: p, tier, .. } if p == &page => Some(*tier),
+                        _ => None,
+                    })
+                    .unwrap_or(Tier::Worker);
+                let is_limit = err.downcast_ref::<crate::reply::ReportedLimit>().is_some();
+                let is_stalled = err.downcast_ref::<tm_harness::Stalled>().is_some();
+                let can_escalate = !self.run.focused && current_tier != Tier::Master;
+                let in_race = self.race_pages.contains_key(&page);
+                // Keep the run resumable from the log (leaving this page in Building with its
+                // recorded session id intact) on provider limits, cancellation interruptions, or
+                // non-stall worker errors when no higher tier or race candidate can recover.
+                // Stalls, race candidates, and escalatable worker errors settle as failed checks
+                // so a single bad worker does not abort the whole batch or run.
+                if is_limit || self.should_cancel() || (!is_stalled && !can_escalate && !in_race) {
+                    self.race_pages.remove(&page);
+                    self.batch_errors.remove(&page);
+                    if let Some(partial) = self.batches.remove(&page) {
+                        for (_, p) in partial {
+                            self.drop_worktree(&p.worktree);
+                        }
+                    }
+                    if let Some(map) = &self.config.worker_restarts {
+                        map.lock().unwrap().remove(&page);
+                    }
+                    self.persist()?;
+                    return Err(err);
                 }
-                self.persist()?;
-                return Err(err);
+                eprintln!("taskmaster: {page} worker error ({err:#}); treating as a failed check");
+                self.batch_errors.entry(page.clone()).or_default().push(format!("worker error: {err:#}"));
             }
-        };
-        self.charge(&product.bill, &product.answer)?;
-        // W1: Release gate — if a worker with a shell and available tests released without
-        // running them, send the nudge once as a follow-up turn before judging/checking.
-        if !self.is_stale(&page)
-            && !self.race_pages.contains_key(&page)
-            && product.answer.ok
-            && reply::parse_flag(&product.answer.text).is_none()
-        {
-            self.maybe_release_gate_nudge(&page, index, &mut product).await?;
         }
-        let wanted = self
-            .race_pages
-            .get(&page)
-            .copied()
-            .unwrap_or_else(|| self.page(&page).map(|p| p.work_units().len()).unwrap_or(1));
-        let batch = self.batches.entry(page.clone()).or_default();
-        batch.push((index, product));
-        if batch.len() < wanted {
+        let received = self.batches.get(&page).map_or(0, Vec::len)
+            + self.batch_errors.get(&page).map_or(0, Vec::len);
+        if received < wanted {
             return Ok(());
         }
         let mut products = self.batches.remove(&page).unwrap_or_default();
+        let job_errors = self.batch_errors.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
         let cmd = self.take_running(&page);
         let was_race = self.race_pages.remove(&page).is_some();
@@ -2279,6 +2382,23 @@ impl Driver {
             Some(Command::SpawnWorker { tier, errors, .. }) => (*tier, errors.clone()),
             _ => (Tier::Worker, None),
         };
+        // If any non-race unit failed, or every candidate in a race failed, settle as CheckFailed
+        // so the run state machine retries or escalates the page instead of aborting the run.
+        if !job_errors.is_empty() && (!was_race || products.is_empty()) {
+            for (_, product) in &products {
+                self.drop_worktree(&product.worktree);
+            }
+            let settling = Settling {
+                tier,
+                errors,
+                text: String::new(),
+                refused: Vec::new(),
+                review: None,
+                shot: None,
+                wanted: if was_race { 1 } else { wanted },
+            };
+            return self.settle(&page, failed(job_errors.join("\n")), settling);
+        }
         // W3: Pick the best candidate from a Best-of-N race and remove every loser worktree.
         if was_race && products.len() > 1 {
             products = self.select_race_winner(&page, products);
@@ -2358,13 +2478,24 @@ impl Driver {
         let units = self.page(page).map(|p| p.work_units()).unwrap_or_default();
         let units_len = units.len().max(1);
         let mut req = self.worker_request(page, index.min(units_len - 1), units_len, tier, None, product.worktree.clone())?;
-        req.brief = nudge.to_string();
+        // Keep the full original worker brief on `req.brief` so a stalled warm session can
+        // fall back to `ask(req)` with complete context.
+        req.brief.push_str("\n\n");
+        req.brief.push_str(nudge);
         let glob = units.get(index).map(|u| u.owned_glob.as_str());
         self.tag(&mut req, &agent_id, tier_name(tier), Some(page), glob);
         let bill = req.bill(Role::builder(tier), Some(page));
-        let ans = match product.answer.kept.take() {
-            Some(session) => follow(req, session).await?,
-            None => ask(req).await?,
+        let asked = match product.answer.kept.take() {
+            Some(session) => follow(req, session, nudge.to_string()).await,
+            None => ask(req).await,
+        };
+        let ans = match asked {
+            Ok(ans) => ans,
+            Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() => return Err(err),
+            Err(err) => {
+                eprintln!("taskmaster: release gate nudge for {agent_id} failed ({err:#}); continuing with existing changes");
+                return Ok(());
+            }
         };
         self.charge(&bill, &ans)?;
         product.answer.ok = ans.ok;
@@ -2548,8 +2679,9 @@ impl Driver {
             .filter(|f| !crate::gates::is_test_path(f) && self.tree.join(f).is_file())
             .collect();
 
+        let venv = self.verify_venv();
         for contract in test_contracts {
-            let Some(cmd) = crate::gates::standalone_test_command(&contract.path) else {
+            let Some((cmd, env)) = crate::gates::mutation_test_command(&self.tree, &venv, &contract.path) else {
                 continue;
             };
             let mut targets: Vec<String> = graph
@@ -2570,7 +2702,7 @@ impl Driver {
                 continue;
             };
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            if let Ok(false) = crate::gates::contract_mutation_sanity(&self.tree, &impl_path, stub, &refs) {
+            if let Ok(false) = crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env) {
                 let author = owners
                     .owner(&impl_path)
                     .cloned()
@@ -3437,9 +3569,45 @@ impl Driver {
         eprintln!("taskmaster: verifying the project");
         let mut timings = Vec::new();
         let verdict = self.verify_checks(&mut timings).await;
-        // A skipped smoke check is not a check: say plainly when nothing ran at all.
         let ran_any = timings.iter().any(|t| matches!(t.status, "ok" | "failed" | "timeout"));
-        let text = if ran_any { checks::report(&timings) } else { format!("verify: nothing ran ({})", checks::report(&timings).trim_start_matches("verify: ")) };
+        let failing = match &verdict {
+            Ok((_, failing)) if !failing.is_empty() => Some(failing),
+            _ => None,
+        };
+        let verify_ok = matches!(&verdict, Ok((true, _)));
+        let mut text = if ran_any {
+            checks::report(&timings)
+        } else if !timings.is_empty() {
+            let detail = checks::report(&timings).trim_start_matches("verify: ").to_string();
+            if verify_ok {
+                format!("verify: {detail}")
+            } else {
+                format!("verify: failed — {detail}")
+            }
+        } else if !verify_ok || failing.is_some() {
+            "verify: failed".to_string()
+        } else {
+            let mut reasons = Vec::new();
+            if !self.config.checks {
+                reasons.push("static skipped (disabled in config)".to_string());
+            } else {
+                reasons.push("static skipped (no matching linter/typechecker for changed files)".to_string());
+            }
+            if !self.config.runtime_checks {
+                reasons.push("runtime skipped (disabled in config)".to_string());
+            } else if let Some(why) = runtime::missing_runner(&self.tree) {
+                reasons.push(format!("test skipped ({why})"));
+            } else {
+                reasons.push("runtime skipped (no build/test scripts or browser routes apply)".to_string());
+            }
+            format!("verify: {}", reasons.join(", "))
+        };
+        if let Some(failing) = failing {
+            for (page, reason) in failing {
+                let reason = reason.trim();
+                text.push_str(&format!("\n- {page}: {reason}"));
+            }
+        }
         eprintln!("taskmaster: {text}");
         self.terminal("output", serde_json::json!({ "ok": matches!(&verdict, Ok((true, _))), "text": text }));
         verdict
@@ -3465,8 +3633,19 @@ impl Driver {
                 self.commit_autofix(&fixed);
             }
         }
+        let passed_pages: BTreeSet<PageId> = self
+            .run
+            .pages
+            .iter()
+            .filter(|(_, p)| p.state == tm_core::PageState::Passed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let imports_began = Instant::now();
         let sources = load_sources(&self.tree)?;
-        let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners);
+        let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
+        if !failing.is_empty() {
+            timings.push(Timing::new("imports", imports_began.elapsed(), "failed"));
+        }
         // The static checks and the project's own build and tests do not wait for each other.
         let steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
         let (checked, built) = {
@@ -3484,7 +3663,9 @@ impl Driver {
             self.repair_shared(&checked.shared).await?;
             checked = self.mechanical_checks(&owners).await?;
             timings.append(&mut checked.timings);
-            built = None; // the files changed, so the build is run again
+            if let Some((mut prev_timings, _)) = built.take() {
+                timings.append(&mut prev_timings);
+            }
         }
         for (page, errors) in checked.pages {
             let text = failing.entry(page).or_default();
@@ -3494,6 +3675,9 @@ impl Driver {
             text.push_str(&errors);
         }
         if failing.is_empty() && !checked.shared.is_empty() {
+            if let Some((mut built_timings, _)) = built.take() {
+                timings.append(&mut built_timings);
+            }
             // No page owns these files and the master could not repair them, so there is
             // nobody left to send the errors to.
             let lines: Vec<String> = checked.shared.iter().map(|(_, line)| line.clone()).collect();
@@ -3568,8 +3752,15 @@ impl Driver {
             // A project with tests whose tests never ran has not been verified.
             let tested = timings.iter().any(|t| t.name == "test" && matches!(t.status, "ok" | "failed"));
             if failing.is_empty() && !tested && runtime::has_tests(&self.tree) {
-                let why = runtime::missing_runner(&self.tree).unwrap_or_else(|| "no test runner could be started".into());
-                let line = format!("verify: nothing ran. The project has tests, but they were not run: {why}");
+                let why = if timings.iter().any(|t| t.name == "test" && t.status == "timeout") {
+                    format!("test step timed out after {}s", checks::STEP_TIMEOUT.as_secs())
+                } else {
+                    runtime::missing_runner(&self.tree).unwrap_or_else(|| "no test runner could be started".into())
+                };
+                if !timings.iter().any(|t| t.name == "test") {
+                    timings.push(Timing::with_reason("test", Duration::ZERO, "skipped", why.clone()));
+                }
+                let line = format!("verify: test check did not run ({why})");
                 eprintln!("taskmaster: {line}");
                 self.terminal("output", serde_json::json!({ "ok": false, "text": line }));
                 let entry = ChangeEntry {
@@ -3585,6 +3776,10 @@ impl Driver {
                 self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
                 return Ok((false, BTreeMap::new()));
             }
+        } else if let Some((mut built_timings, _)) = built.take() {
+            // Preserve the build/test timings that ran in parallel even when static checks
+            // failed and runtime_checks were skipped.
+            timings.append(&mut built_timings);
         }
         // W4: Contract mutation sanity — stub the implementation and ensure locked contract tests fail.
         if failing.is_empty() {
@@ -3826,12 +4021,24 @@ impl Driver {
     async fn smoke(&self, routes: &[(PageId, String)]) -> (anyhow::Result<Option<runtime::Browsed>>, Option<Timing>) {
         let began = Instant::now();
         match tokio::time::timeout(checks::SMOKE_TIMEOUT, runtime::browse(&self.tree, routes)).await {
-            Ok(Ok(None)) => (Ok(None), Some(Timing::new("smoke", began.elapsed(), "skipped"))),
+            Ok(Ok(None)) => (
+                Ok(None),
+                Some(Timing::with_reason("smoke", began.elapsed(), "skipped", "browser unavailable or app not servable")),
+            ),
             Ok(Ok(Some(browsed))) => {
-                let status = if browsed.pages.is_empty() && !browsed.screenshots.is_empty() { "ok" } else if browsed.pages.is_empty() { "skipped" } else { "failed" };
-                (Ok(Some(browsed)), Some(Timing::new("smoke", began.elapsed(), status)))
+                let timing = if browsed.pages.is_empty() && !browsed.screenshots.is_empty() {
+                    Timing::new("smoke", began.elapsed(), "ok")
+                } else if browsed.pages.is_empty() {
+                    Timing::with_reason("smoke", began.elapsed(), "skipped", "no routes rendered")
+                } else {
+                    Timing::new("smoke", began.elapsed(), "failed")
+                };
+                (Ok(Some(browsed)), Some(timing))
             }
-            Ok(Err(err)) => (Err(err), Some(Timing::new("smoke", began.elapsed(), "skipped"))),
+            Ok(Err(err)) => {
+                let reason = format!("failed to start: {err:#}");
+                (Err(err), Some(Timing::with_reason("smoke", began.elapsed(), "skipped", reason)))
+            }
             Err(_) => (
                 Err(anyhow::anyhow!("the smoke check did not finish in {} seconds", checks::SMOKE_TIMEOUT.as_secs())),
                 Some(Timing::new("smoke", began.elapsed(), "timeout")),
@@ -4980,7 +5187,12 @@ impl Driver {
             .unwrap_or(agent);
         self.status_tools.register_tag(scope_key, tag.clone());
         request.feed = Some(Feed { live: self.live.clone(), run: self.id.clone(), agent: tag });
-        request.stall = Some(if self.small { SMALL_STALL } else { STALL });
+        request.stall = Some(self.stall_timeout_for());
+    }
+
+    fn stall_timeout_for(&self) -> Duration {
+        let env_val = std::env::var(STALL_ENV).ok();
+        resolve_stall_timeout(self.config.stall_timeout, env_val.as_deref(), self.small)
     }
 
     /// Notes addressed to the master or to every worker. The master reads them and the
@@ -5530,6 +5742,7 @@ impl Driver {
     /// A note on a finished run starts a new turn: one agent with the note as its task, or
     /// the master and its workers, as [`crate::turns::turn_mode`] decides.
     fn open_turn(&mut self) -> anyhow::Result<()> {
+        self.finalized = false;
         let pending: Vec<crate::live::Note> = self.live.notes(&self.id).into_iter().filter(|note| !note.delivered).collect();
         let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
         let _ = crate::checkpoints::capture(&self.project, &self.id, turn);
@@ -5608,7 +5821,11 @@ impl Driver {
         let Some(plan) = self.run.plan.clone() else { return Ok(()) };
         let catalog = self.catalog()?;
         for page in &plan.pages {
-            let passed = self.run.pages.get(&page.id).is_some_and(|page| page.state == tm_core::PageState::Passed);
+            let Some(state) = self.run.pages.get(&page.id).map(|page| page.state) else { continue };
+            if !matches!(state, tm_core::PageState::Passed | tm_core::PageState::Failed) {
+                continue;
+            }
+            let passed = state == tm_core::PageState::Passed;
             for key in &page.cites {
                 let Some(entry) = catalog.resolve(key)? else { continue };
                 if entry.tier == DictTier::Commons {
@@ -5875,19 +6092,39 @@ your files (prefer edit/patch/applyPatch over rewriting whole files), and every 
 which runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or shell tools \
 are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
 
+/// Environment variable overriding the per-agent silence/stall timeout in seconds.
+const STALL_ENV: &str = "TASKMASTER_STALL_SECS";
 /// Generous silence window so thinking models are never killed mid-reasoning,
 /// while genuinely hung sockets still recover automatically.
 const SMALL_STALL: Duration = Duration::from_secs(300);
 /// Larger briefs and deep reasoning turns can think quietly for several minutes.
 const STALL: Duration = Duration::from_secs(600);
-/// Fresh agents started after a stall. The last one may wait for the whole timeout.
+/// Fresh agents started after a stall. Every attempt—including the final one—keeps a stall bound.
 const STALL_RESTARTS: usize = 2;
 
+/// Resolve the per-agent stall timeout from explicit config, `TASKMASTER_STALL_SECS`, or defaults.
+pub(crate) fn resolve_stall_timeout(configured: Option<Duration>, env_val: Option<&str>, small: bool) -> Duration {
+    if let Some(d) = configured.filter(|d| !d.is_zero()) {
+        return d;
+    }
+    if let Some(secs) = env_val
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+    {
+        return Duration::from_secs(secs);
+    }
+    if small { SMALL_STALL } else { STALL }
+}
+
 /// Run one agent. One that stalls is stopped and replaced by a fresh agent with the same brief.
+/// The final attempt gets a wider—but still finite—stall bound so a hung agent can never hang forever.
 async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
+    let base_stall = request.stall.unwrap_or(STALL);
+    let final_stall = base_stall.saturating_mul(2);
     for restart in 0..=STALL_RESTARTS {
         if restart == STALL_RESTARTS {
-            request.stall = None;
+            request.stall = Some(final_stall);
         }
         match ask_once(&request).await {
             Err(err) if restart < STALL_RESTARTS && err.downcast_ref::<tm_harness::Stalled>().is_some() => {
@@ -6140,9 +6377,15 @@ fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop 
 
 /// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
 /// transcript under the same agent, and the session stays open for the next repair.
-async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>) -> anyhow::Result<Answer> {
+/// If the open session stalls, closes it and falls back to `ask(request)` with the full
+/// original worker brief preserved in `request.brief`.
+async fn follow(
+    request: AgentRequest,
+    mut session: Box<dyn tm_harness::Session>,
+    prompt: String,
+) -> anyhow::Result<Answer> {
     if let Some(feed) = &request.feed {
-        let mut start = serde_json::json!({ "brief": request.brief, "follow_up": true });
+        let mut start = serde_json::json!({ "brief": prompt, "follow_up": true });
         if let Some(sid) = session.session_id() {
             start["session_id"] = serde_json::json!(sid);
         }
@@ -6154,7 +6397,7 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
     let collect = collect_events_full(tee, None, rx, heard.clone());
     let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let run = session.follow_up(request.brief.clone(), tx, request.timeout).await;
+    let run = session.follow_up(prompt, tx, request.timeout).await;
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
     if let Some(feed) = &request.feed {
@@ -6185,12 +6428,29 @@ async fn follow(request: AgentRequest, mut session: Box<dyn tm_harness::Session>
         Ok(summary) => summary,
         Err(err) => {
             if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                let _ = session.close().await;
                 return Err(reported_limit(&request, hit).into());
             }
+            if err.downcast_ref::<tm_harness::Stalled>().is_some() {
+                let who = who_of(&request);
+                eprintln!("taskmaster: {who} stalled in open session ({err}); closing session and starting a fresh agent");
+                if let Some(feed) = &request.feed {
+                    feed.live.push(
+                        &feed.run,
+                        &feed.agent,
+                        "stalled",
+                        serde_json::json!({ "error": format!("{err:#}"), "follow_up": true }),
+                    );
+                }
+                let _ = session.close().await;
+                return ask(request).await;
+            }
+            let _ = session.close().await;
             return Err(err);
         }
     };
     if let Some(hit) = reply::limit_of(&text) {
+        let _ = session.close().await;
         return Err(reported_limit(&request, hit).into());
     }
     Ok(Answer {

@@ -62,8 +62,9 @@ pub fn verify_red_green(
     })
 }
 
-/// Mutation sanity on a contract test: temporarily replace `impl_rel_path` in `worktree`
-/// with a minimal throwing stub, run `test_cmd`, and restore the original file.
+/// Mutation sanity on a contract test: copy `worktree` into an isolated temporary
+/// directory, replace `impl_rel_path` in the copy with a minimal throwing stub, and run
+/// `test_cmd` there so the live shared working tree is never modified.
 /// Returns `Ok(true)` if the contract test catches the broken implementation (fails),
 /// `Ok(false)` if the test is vacuous (still passes with a broken implementation).
 pub fn contract_mutation_sanity(
@@ -72,18 +73,159 @@ pub fn contract_mutation_sanity(
     stub_content: &str,
     test_cmd: &[&str],
 ) -> anyhow::Result<bool> {
-    let target = worktree.join(impl_rel_path);
-    let original = std::fs::read(&target)?;
+    contract_mutation_sanity_with_env(worktree, impl_rel_path, stub_content, test_cmd, &[])
+}
+
+/// Like [`contract_mutation_sanity`], applying additional environment variables (such as
+/// a project virtualenv from [`crate::runtime::steps`]) when running `test_cmd` inside the
+/// isolated temporary copy.
+pub fn contract_mutation_sanity_with_env(
+    worktree: &Path,
+    impl_rel_path: &str,
+    stub_content: &str,
+    test_cmd: &[&str],
+    extra_env: &[(String, String)],
+) -> anyhow::Result<bool> {
+    if test_cmd.is_empty() {
+        anyhow::bail!("test command cannot be empty");
+    }
+    if !crate::git::safe_rel(impl_rel_path) {
+        anyhow::bail!("implementation path `{impl_rel_path}` leaves the worktree");
+    }
+    if !worktree.join(impl_rel_path).is_file() {
+        anyhow::bail!("implementation file `{impl_rel_path}` does not exist");
+    }
+
+    struct TempMutationDir(std::path::PathBuf);
+    impl Drop for TempMutationDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = TempMutationDir(std::env::temp_dir().join(format!(
+        "tm-mut-{}-{seq}",
+        std::process::id()
+    )));
+    let _ = std::fs::remove_dir_all(&tmp.0);
+    std::fs::create_dir_all(&tmp.0)?;
+    copy_tree_for_mutation(worktree, &tmp.0)?;
+
+    let target = tmp.0.join(impl_rel_path);
     std::fs::write(&target, stub_content)?;
-    let result = run_cmd_ok(worktree, test_cmd);
-    // Always restore original file even if command failed to spawn.
-    let _ = std::fs::write(&target, &original);
-    let passed_with_stub = result?;
+    let passed_with_stub = run_cmd_ok_with_env(&tmp.0, test_cmd, extra_env)?;
     Ok(!passed_with_stub)
 }
 
+/// Copy `src` into an isolated `dst` directory for mutation testing without touching `src`.
+/// Heavy/internal directories (`.git`, `.taskmaster`, `target`, caches) are skipped, and
+/// read-only dependency trees (`node_modules`) are symlinked on Unix.
+fn copy_tree_for_mutation(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            ".git" | ".taskmaster" | "__pycache__" | ".pytest_cache" | "target"
+        ) {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                if let Ok(target) = std::fs::read_link(&src_path) {
+                    let _ = std::os::unix::fs::symlink(&target, &dst_path);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if src_path.is_file() {
+                    std::fs::copy(&src_path, &dst_path)?;
+                }
+            }
+        } else if ft.is_dir() {
+            #[cfg(unix)]
+            if matches!(name_str.as_ref(), "node_modules" | ".venv" | "venv") {
+                std::os::unix::fs::symlink(&src_path, &dst_path)?;
+                continue;
+            }
+            std::fs::create_dir_all(&dst_path)?;
+            copy_tree_for_mutation(&src_path, &dst_path)?;
+        } else if ft.is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Command and environment variables selected for contract mutation sanity.
+pub type MutationCommand = (Vec<String>, Vec<(String, String)>);
+
+/// Pick the project's proper test command (the same one `verify` uses via `runtime::steps`)
+/// for running W4 contract mutation sanity on `contract_path`.
+pub fn mutation_test_command(
+    tree: &Path,
+    venv: &Path,
+    contract_path: &str,
+) -> Option<MutationCommand> {
+    let steps = crate::runtime::steps(tree, venv);
+    if let Some(step) = steps.into_iter().find(|s| s.name == "test") {
+        let is_pytest = step.args.iter().any(|a| a == "pytest");
+        if is_pytest && contract_path.to_ascii_lowercase().ends_with(".py") {
+            let content = std::fs::read_to_string(tree.join(contract_path)).unwrap_or_default();
+            let has_test_defs = content
+                .lines()
+                .map(str::trim_start)
+                .any(|l| l.starts_with("def test_") || l.starts_with("async def test_") || l.starts_with("class Test"));
+            if !has_test_defs {
+                // Standalone assertion script without pytest test functions: pytest would exit 5
+                // (no tests collected) even on an unmutated tree, so run it directly in the copy.
+                return standalone_test_command(contract_path).map(|cmd| (cmd, Vec::new()));
+            }
+            let mut program = step.program;
+            let mut args = step.args;
+            let mut env = step.env;
+            // If verify's venv wasn't created (e.g. runtime_checks disabled), fall back to system python3.
+            let is_missing_path = (program.contains('/') || program.contains('\\')) && !Path::new(&program).is_file();
+            if is_missing_path {
+                program = "python3".into();
+                env.retain(|(k, _)| k != "VIRTUAL_ENV" && k != "PATH");
+            }
+            args.push(contract_path.to_string());
+            let mut cmd = Vec::with_capacity(1 + args.len());
+            cmd.push(program);
+            cmd.extend(args);
+            return Some((cmd, env));
+        }
+        let mut cmd = Vec::with_capacity(1 + step.args.len());
+        cmd.push(step.program);
+        cmd.extend(step.args);
+        return Some((cmd, step.env));
+    }
+    standalone_test_command(contract_path).map(|cmd| (cmd, Vec::new()))
+}
+
 fn run_cmd_ok(dir: &Path, cmd: &[&str]) -> anyhow::Result<bool> {
-    let status = Command::new(cmd[0]).args(&cmd[1..]).current_dir(dir).status()?;
+    run_cmd_ok_with_env(dir, cmd, &[])
+}
+
+fn run_cmd_ok_with_env(dir: &Path, cmd: &[&str], extra_env: &[(String, String)]) -> anyhow::Result<bool> {
+    let mut c = Command::new(cmd[0]);
+    c.args(&cmd[1..])
+        .current_dir(dir)
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    for (k, v) in extra_env {
+        c.env(k, v);
+    }
+    let status = c.status()?;
     Ok(status.success())
 }
 
@@ -225,6 +367,770 @@ pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt I/O Example Extraction & Plan-vs-Prompt Consistency
+// ---------------------------------------------------------------------------
+
+/// A literal input/output example extracted from the user prompt that should be
+/// preserved verbatim and turned into a locked end-to-end acceptance check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptIoExample {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    pub output: String,
+}
+
+/// Extract concrete literal input/output examples from a user prompt (fenced code
+/// blocks labeled with input/output/example cues, `input -> output` mappings, CLI
+/// `$ cmd` transcripts, and inline backticked output format examples).
+pub fn extract_prompt_io_examples(prompt: &str) -> Vec<PromptIoExample> {
+    let mut examples = Vec::new();
+    let mut seen_outputs: BTreeSet<String> = BTreeSet::new();
+    let mut push = |label: String, input: Option<String>, output: String| {
+        let trimmed = output.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let key = format!("{}::{}", input.as_deref().unwrap_or(""), trimmed);
+        if seen_outputs.insert(key) {
+            examples.push(PromptIoExample { label, input, output: trimmed });
+        }
+    };
+
+    // 1. Scan fenced code blocks (``` ... ```) and their surrounding context.
+    let lines: Vec<&str> = prompt.lines().collect();
+    let mut i = 0;
+    let mut pending_input: Option<String> = None;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed.starts_with("```") {
+            let prev_ctx = if i > 0 { lines[i - 1].trim().to_ascii_lowercase() } else { String::new() };
+            let start = i + 1;
+            i += 1;
+            while i < lines.len() && !lines[i].trim().starts_with("```") {
+                i += 1;
+            }
+            let block_lines = &lines[start..i];
+            let block = block_lines.join("\n").trim().to_string();
+            if !block.is_empty() {
+                // Check for `$ cmd` or `> cmd` followed by expected output lines inside one block.
+                if let Some((cmd, out)) = split_transcript_block(block_lines) {
+                    push("fenced transcript".into(), Some(cmd), out);
+                    pending_input = None;
+                } else if is_input_cue(&prev_ctx) && !is_output_cue(&prev_ctx) {
+                    pending_input = Some(block);
+                } else if is_output_cue(&prev_ctx) || looks_like_delimited_sample(&block) {
+                    let input = pending_input.take();
+                    push("fenced example".into(), input, block);
+                } else if let Some((inp, out)) = split_labeled_block(block_lines) {
+                    push("fenced input/output".into(), Some(inp), out);
+                    pending_input = None;
+                }
+            }
+            if i < lines.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        // 2. Inline `input` -> `output` / `=>` / `→` pairs on a single line.
+        if let Some((inp, out)) = parse_arrow_example(trimmed) {
+            push("inline mapping".into(), Some(inp), out);
+        }
+
+        // 3. Inline `Input: ...` / `Output: ...` lines outside fenced blocks.
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = strip_label_prefix(trimmed, &["input:", "command:", "query:"]) {
+            if !rest.is_empty() {
+                pending_input = Some(strip_wrapping_ticks(rest));
+            }
+        } else if let Some(rest) = strip_label_prefix(trimmed, &["output:", "expected:", "expected output:", "prints:", "returns:", "produces:"]) {
+            if !rest.is_empty() {
+                let input = pending_input.take();
+                push("labeled output".into(), input, strip_wrapping_ticks(rest));
+            }
+        } else if is_output_cue(&lower) {
+            // 4. Inline backticked format literals on a line that describes output/format (e.g. `id|name`).
+            for lit in backtick_literals(trimmed) {
+                if looks_like_delimited_sample(&lit) {
+                    push("inline format literal".into(), None, lit);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    examples
+}
+
+/// Render planning instructions turning extracted prompt I/O examples into a locked
+/// end-to-end acceptance check.
+pub fn format_prompt_acceptance_guidance(examples: &[PromptIoExample]) -> String {
+    if examples.is_empty() {
+        return "\nAcceptance fidelity: if the request includes any literal input/output examples or format strings, \
+                turn them into a locked executable end-to-end acceptance contract test asserting the exact output verbatim, \
+                and never lock format constants (separators, spacing, headers, borders) that contradict the prompt.\n"
+            .to_string();
+    }
+    let mut out = String::from(
+        "\nPrompt literal I/O examples (MUST be preserved verbatim and locked as an end-to-end acceptance check):\n",
+    );
+    for ex in examples.iter().take(8) {
+        match &ex.input {
+            Some(inp) => {
+                out.push_str(&format!("- Input: `{}` => Expected output:\n```\n{}\n```\n", inp.replace('\n', "\\n"), ex.output));
+            }
+            None => {
+                out.push_str(&format!("- Expected literal output/format:\n```\n{}\n```\n", ex.output));
+            }
+        }
+    }
+    out.push_str(
+        "Turn these literal examples into a locked executable end-to-end acceptance contract test \
+         (e.g. `tests/test_acceptance_contract.py` or `tests/contract/acceptance.test.ts`, outside every unit's `owned_glob`) \
+         that runs the public entrypoint and asserts the exact output verbatim. Copy every delimiter, spacing, header, and literal \
+         string directly from the prompt; do NOT invent extra spaces (e.g. `' | '` when the prompt shows `id|name`) or unrequested \
+         header rules/borders (e.g. `'-+-'`).\n",
+    );
+    out
+}
+
+/// Check a drafted plan's locked contracts and acceptance coverage against the user prompt.
+/// Flags contract constants or literal output expectations that contradict the prompt (for
+/// example locking `' | '` or `'-+-'` when the prompt specified `id|name`), and flags missing
+/// end-to-end acceptance contract tests when the prompt provides concrete I/O examples.
+pub fn check_plan_prompt_consistency(prompt: &str, plan: &Plan) -> Vec<PlanReviewFinding> {
+    let mut findings = Vec::new();
+    let prompt_trim = prompt.trim();
+    if prompt_trim.is_empty() {
+        return findings;
+    }
+
+    let prompt_literals = collect_prompt_literals(prompt);
+    let delimiter_evidence = detect_prompt_delimiters(prompt, &prompt_literals);
+    let prompt_mentions_rule = prompt_requests_header_rule(prompt);
+
+    for contract in &plan.contracts {
+        let constants = extract_contract_constants(&contract.content);
+        for (name, value) in &constants {
+            let lower_name = name.to_ascii_lowercase();
+
+            // 1. Check separator / delimiter constants against prompt delimiter evidence.
+            if is_separator_const_name(&lower_name)
+                && !is_header_rule_const_name(&lower_name)
+                && let Some(reason) = check_separator_contradiction(value, &delimiter_evidence, prompt)
+            {
+                findings.push(PlanReviewFinding {
+                    severity: "error".into(),
+                    category: "prompt_contradiction".into(),
+                    message: format!(
+                        "Contract `{}` defines `{name} = {value:?}`, which contradicts the prompt: {reason}",
+                        contract.path
+                    ),
+                    page: None,
+                });
+            }
+
+            // 2. Check header-rule / border / decorative divider constants not requested by the prompt.
+            if is_header_rule_const_name(&lower_name)
+                && !value.is_empty()
+                && looks_like_rule_string(value)
+                && !prompt_mentions_rule
+                && !prompt.contains(value.as_str())
+                && !prompt.contains(value.trim())
+            {
+                findings.push(PlanReviewFinding {
+                    severity: "error".into(),
+                    category: "prompt_contradiction".into(),
+                    message: format!(
+                        "Contract `{}` defines `{name} = {value:?}`, adding a header rule/border that the prompt did not ask for.",
+                        contract.path
+                    ),
+                    page: None,
+                });
+            } else if !is_header_rule_const_name(&lower_name)
+                && !delimiter_evidence.is_empty()
+                && looks_like_table_junction(value)
+                && !prompt_mentions_rule
+                && !prompt.contains(value.as_str())
+            {
+                findings.push(PlanReviewFinding {
+                    severity: "error".into(),
+                    category: "prompt_contradiction".into(),
+                    message: format!(
+                        "Contract `{}` defines `{name} = {value:?}`, introducing a table rule/junction not present in the prompt.",
+                        contract.path
+                    ),
+                    page: None,
+                });
+            }
+
+            // 3. Check literal header/output/format constants whose spacing contradicts a prompt literal.
+            if is_literal_output_const_name(&lower_name) && !value.trim().is_empty() && !prompt.contains(value.as_str()) {
+                let norm_val = collapse_delim_spaces(value);
+                if let Some(prompt_lit) = prompt_literals.iter().find(|lit| {
+                    lit.len() >= 3 && *lit != value && collapse_delim_spaces(lit) == norm_val
+                }) {
+                    findings.push(PlanReviewFinding {
+                        severity: "error".into(),
+                        category: "prompt_contradiction".into(),
+                        message: format!(
+                            "Contract `{}` defines `{name} = {value:?}`, which contradicts the prompt's literal `{prompt_lit}`.",
+                            contract.path
+                        ),
+                        page: None,
+                    });
+                }
+            }
+        }
+
+        // 4. Also inspect string literals in contract files (including contract tests) that
+        //    directly re-format a prompt literal with contradicting spaces (e.g. "id | name" vs `id|name`).
+        for lit in extract_string_literals(&contract.content) {
+            if lit.len() < 3 || prompt.contains(lit.as_str()) {
+                continue;
+            }
+            let norm = collapse_delim_spaces(&lit);
+            if let Some(prompt_lit) = prompt_literals.iter().find(|p| {
+                p.len() >= 3 && has_delim_char(p) && *p != &lit && collapse_delim_spaces(p) == norm
+            }) {
+                let msg = format!(
+                    "Contract `{}` uses literal `{lit}`, which contradicts the prompt's literal `{prompt_lit}`.",
+                    contract.path
+                );
+                if !findings.iter().any(|f| f.message == msg) {
+                    findings.push(PlanReviewFinding {
+                        severity: "error".into(),
+                        category: "prompt_contradiction".into(),
+                        message: msg,
+                        page: None,
+                    });
+                }
+            }
+            if !delimiter_evidence.is_empty()
+                && looks_like_table_junction(&lit)
+                && !prompt_mentions_rule
+                && !prompt.contains(lit.as_str())
+            {
+                let already = findings
+                    .iter()
+                    .any(|f| f.category == "prompt_contradiction" && f.message.contains(&contract.path) && f.message.contains(&lit));
+                if !already {
+                    findings.push(PlanReviewFinding {
+                        severity: "error".into(),
+                        category: "prompt_contradiction".into(),
+                        message: format!(
+                            "Contract `{}` includes table rule/junction `{lit}` that contradicts the prompt's plain output format.",
+                            contract.path
+                        ),
+                        page: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // 5. Require a locked end-to-end acceptance contract test when the prompt gives concrete
+    //    literal input/output examples (for multi-unit plans, or when a single-unit plan omits them).
+    let examples = extract_prompt_io_examples(prompt);
+    let concrete: Vec<&PromptIoExample> = examples
+        .iter()
+        .filter(|ex| ex.input.is_some() || ex.output.contains('\n'))
+        .collect();
+    if !concrete.is_empty() {
+        let has_contract_test = plan.contracts.iter().any(|c| c.is_test());
+        let single_unit_embeds = plan.pages.len() == 1
+            && concrete
+                .iter()
+                .all(|ex| plan.pages[0].brief.contains(&ex.output));
+        if !has_contract_test && !single_unit_embeds {
+            let sample = concrete[0].output.lines().next().unwrap_or(&concrete[0].output);
+            findings.push(PlanReviewFinding {
+                severity: "error".into(),
+                category: "missing_acceptance_check".into(),
+                message: format!(
+                    "The prompt provides literal input/output examples (such as `{sample}`), \
+                     but the plan locks no executable end-to-end acceptance contract test \
+                     (e.g. `tests/test_acceptance_contract.py` or `tests/contract/acceptance.test.ts`)."
+                ),
+                page: None,
+            });
+        }
+    }
+
+    findings
+}
+
+#[derive(Debug, Clone)]
+struct DelimiterEvidence {
+    ch: char,
+    unpadded_sample: Option<String>,
+    padded_sample: Option<String>,
+}
+
+fn is_input_cue(lower: &str) -> bool {
+    ["input", "command", "query", "given", "request", "stdin", "invocation"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+fn is_output_cue(lower: &str) -> bool {
+    [
+        "output", "expected", "prints", "print", "returns", "return", "produces", "produce",
+        "format", "formatted", "display", "stdout", "example", "result", "rows", "table",
+        "separator", "delimiter", "delimited", "separated",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn strip_label_prefix<'a>(line: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    let lower = line.to_ascii_lowercase();
+    for p in prefixes {
+        if lower.starts_with(p) {
+            return Some(line[p.len()..].trim());
+        }
+    }
+    None
+}
+
+fn strip_wrapping_ticks(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('`') && trimmed.ends_with('`'))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn split_transcript_block(lines: &[&str]) -> Option<(String, String)> {
+    let first = lines.first()?.trim();
+    let cmd = first
+        .strip_prefix("$ ")
+        .or_else(|| first.strip_prefix("> "))
+        .map(str::trim)?;
+    if cmd.is_empty() || lines.len() < 2 {
+        return None;
+    }
+    let out = lines[1..].join("\n").trim().to_string();
+    if out.is_empty() || out.starts_with("$ ") {
+        return None;
+    }
+    Some((cmd.to_string(), out))
+}
+
+fn split_labeled_block(lines: &[&str]) -> Option<(String, String)> {
+    let mut input: Option<String> = None;
+    let mut output_lines: Vec<&str> = Vec::new();
+    let mut in_output = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(rest) = strip_label_prefix(trimmed, &["input:", "command:", "query:"]) {
+            input = Some(strip_wrapping_ticks(rest));
+            in_output = false;
+        } else if let Some(rest) = strip_label_prefix(trimmed, &["output:", "expected:", "result:", "returns:"]) {
+            if !rest.is_empty() {
+                output_lines.push(rest);
+            }
+            in_output = true;
+        } else if in_output {
+            output_lines.push(line);
+        }
+    }
+    let out = output_lines.join("\n").trim().to_string();
+    match (input, out.is_empty()) {
+        (Some(inp), false) => Some((inp, out)),
+        _ => None,
+    }
+}
+
+fn parse_arrow_example(line: &str) -> Option<(String, String)> {
+    for arrow in [" => ", " -> ", " → "] {
+        if let Some((left, right)) = line.split_once(arrow) {
+            let l = left.trim().trim_start_matches('-').trim_start_matches('*').trim();
+            let r = right.trim();
+            if (l.starts_with('`') || l.starts_with('"') || l.starts_with('\''))
+                && (r.starts_with('`') || r.starts_with('"') || r.starts_with('\''))
+            {
+                let inp = strip_wrapping_ticks(l);
+                let out = strip_wrapping_ticks(r);
+                if !inp.is_empty() && !out.is_empty() {
+                    return Some((inp, out));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn backtick_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('`') else { break };
+        let lit = &after[..end];
+        if !lit.is_empty() {
+            out.push(lit.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+fn has_delim_char(s: &str) -> bool {
+    s.contains('|') || s.contains(',') || s.contains('\t') || s.contains(';')
+}
+
+fn looks_like_delimited_sample(s: &str) -> bool {
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        for delim in ['|', '\t'] {
+            if let Some((a, b)) = line.split_once(delim) {
+                let a = a.trim();
+                let b = b.trim();
+                if !a.is_empty()
+                    && !b.is_empty()
+                    && a.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
+                    && b.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '|' | '\t'))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn collect_prompt_literals(prompt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        } else {
+            out.extend(backtick_literals(line));
+        }
+    }
+    out
+}
+
+fn detect_prompt_delimiters(prompt: &str, literals: &[String]) -> Vec<DelimiterEvidence> {
+    let mut by_char: BTreeMap<char, DelimiterEvidence> = BTreeMap::new();
+    let lower = prompt.to_ascii_lowercase();
+    for (phrase, ch) in [
+        ("pipe-separated", '|'),
+        ("pipe-delimited", '|'),
+        ("pipe separated", '|'),
+        ("pipe delimited", '|'),
+        ("separated by `|`", '|'),
+        ("separated by '|'", '|'),
+        ("separated by \"|\"", '|'),
+        ("tab-separated", '\t'),
+        ("tab-delimited", '\t'),
+        ("comma-separated", ','),
+        ("comma-delimited", ','),
+    ] {
+        if lower.contains(phrase) {
+            by_char.entry(ch).or_insert_with(|| DelimiterEvidence {
+                ch,
+                unpadded_sample: Some(phrase.to_string()),
+                padded_sample: None,
+            });
+        }
+    }
+    for lit in literals {
+        for ch in ['|', '\t', ','] {
+            if !lit.contains(ch) {
+                continue;
+            }
+            // Skip prose or code expressions (like `a || b`, `x | y` in types like `int | None`).
+            if ch == '|' && (lit.contains("||") || lit.contains("None") || lit.contains("null") || lit.contains("undefined")) {
+                continue;
+            }
+            if ch == ',' && lit.contains('(') {
+                continue;
+            }
+            let padded = format!(" {ch} ");
+            let parts: Vec<&str> = lit.split(ch).collect();
+            let valid_fields = parts.len() >= 2
+                && parts.iter().all(|p| {
+                    let t = p.trim();
+                    !t.is_empty()
+                        && t.len() <= 32
+                        && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
+                });
+            if !valid_fields {
+                continue;
+            }
+            let entry = by_char.entry(ch).or_insert_with(|| DelimiterEvidence {
+                ch,
+                unpadded_sample: None,
+                padded_sample: None,
+            });
+            if lit.contains(&padded) {
+                if entry.padded_sample.is_none() {
+                    entry.padded_sample = Some(lit.clone());
+                }
+            } else if entry.unpadded_sample.is_none() {
+                entry.unpadded_sample = Some(lit.clone());
+            }
+        }
+    }
+    by_char.into_values().collect()
+}
+
+fn check_separator_contradiction(
+    value: &str,
+    evidence: &[DelimiterEvidence],
+    prompt: &str,
+) -> Option<String> {
+    if value.is_empty() || evidence.is_empty() {
+        return None;
+    }
+    let trimmed = value.trim();
+    if trimmed.chars().count() == 1 {
+        let ch = trimmed.chars().next().unwrap();
+        let is_padded = value != trimmed;
+        if let Some(ev) = evidence.iter().find(|e| e.ch == ch) {
+            if is_padded && ev.unpadded_sample.is_some() && ev.padded_sample.is_none() && !prompt.contains(value) {
+                return Some(format!(
+                    "prompt specifies unpadded `{ch}` (as in `{}`), not `{value}`",
+                    ev.unpadded_sample.as_deref().unwrap_or("")
+                ));
+            }
+            if !is_padded && ev.padded_sample.is_some() && ev.unpadded_sample.is_none() {
+                return Some(format!(
+                    "prompt specifies padded ` {ch} ` (as in `{}`), not `{value}`",
+                    ev.padded_sample.as_deref().unwrap_or("")
+                ));
+            }
+            return None;
+        }
+        // Prompt specifies a single clear delimiter (e.g. `|`), but contract chose a different one (e.g. `,`).
+        if evidence.len() == 1 && matches!(ch, '|' | ',' | '\t' | ';') && !prompt.contains(value) {
+            let ev = &evidence[0];
+            let sample = ev
+                .unpadded_sample
+                .as_deref()
+                .or(ev.padded_sample.as_deref())
+                .unwrap_or("");
+            return Some(format!(
+                "prompt uses `{}` delimiter (as in `{sample}`), not `{value}`",
+                ev.ch
+            ));
+        }
+    }
+    None
+}
+
+fn prompt_requests_header_rule(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "header rule",
+        "header separator",
+        "separator line",
+        "divider line",
+        "horizontal rule",
+        "underline",
+        "border",
+        "ascii table",
+        "markdown table",
+        "box drawing",
+        "-+-",
+        "---",
+        "===",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn is_separator_const_name(lower: &str) -> bool {
+    lower.contains("sep")
+        || lower.contains("delim")
+        || lower.contains("join")
+        || lower.contains("col_div")
+        || lower.contains("field_div")
+}
+
+fn is_header_rule_const_name(lower: &str) -> bool {
+    lower.contains("header_rule")
+        || lower.contains("header_sep")
+        || lower.contains("header_line")
+        || lower.contains("header_border")
+        || lower.contains("header_div")
+        || lower.contains("table_rule")
+        || lower.contains("table_border")
+        || lower.contains("row_rule")
+        || lower.contains("sep_line")
+        || lower.contains("separator_line")
+        || lower.contains("divider_line")
+        || lower.contains("underline")
+        || lower.contains("hrule")
+        || lower.contains("hline")
+        || lower == "rule"
+        || lower.ends_with("_rule")
+        || lower.contains("border")
+}
+
+fn is_literal_output_const_name(lower: &str) -> bool {
+    lower.contains("header")
+        || lower.contains("output")
+        || lower.contains("format")
+        || lower.contains("template")
+        || lower.contains("sample")
+        || lower.contains("expected")
+        || lower.contains("columns")
+}
+
+fn looks_like_rule_string(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.chars()
+            .all(|c| matches!(c, '-' | '+' | '=' | '|' | '_' | '─' | '┼' | '━' | '═' | ' '))
+}
+
+fn looks_like_table_junction(s: &str) -> bool {
+    let t = s.trim();
+    t.len() >= 3
+        && looks_like_rule_string(t)
+        && (t.contains("-+-") || t.contains("+-+") || t.contains("---") || t.contains("===") || t.contains("─┼─"))
+}
+
+fn collapse_delim_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    for (idx, &ch) in chars.iter().enumerate() {
+        if ch == ' ' {
+            let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+            let next = chars.get(idx + 1).copied();
+            if prev.is_some_and(|c| matches!(c, '|' | ',' | ';' | '\t'))
+                || next.is_some_and(|c| matches!(c, '|' | ',' | ';' | '\t'))
+            {
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Extract `(CONST_NAME, string_value)` pairs from constant assignments in Python, JS/TS, Rust, or Go contracts.
+fn extract_contract_constants(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let mut line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        for prefix in ["export ", "pub ", "const ", "let ", "var ", "final ", "static "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                line = rest.trim_start();
+            }
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            continue;
+        };
+        if rhs.starts_with('=') {
+            continue;
+        }
+        let name = lhs.split(':').next().unwrap_or(lhs).trim();
+        if name.is_empty()
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            continue;
+        }
+        let rhs = rhs.trim().trim_end_matches(';').trim();
+        if let Some(val) = parse_quoted_string_prefix(rhs) {
+            out.push((name.to_string(), val));
+        }
+    }
+    out
+}
+
+/// Parse a leading single- or double-quoted string literal (ignoring trailing comments).
+fn parse_quoted_string_prefix(rhs: &str) -> Option<String> {
+    let bytes = rhs.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = rhs[1..].chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        } else if c == quote as char {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+/// Extract quoted string literals from source text for contradiction checking.
+fn extract_string_literals(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let mut i = 0;
+        let bytes = line.as_bytes();
+        while i < bytes.len() {
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                let quote = bytes[i];
+                let start = i;
+                if let Some(val) = parse_quoted_string_prefix(&line[start..]) {
+                    out.push(val);
+                    // Advance past closing quote safely on UTF-8 char boundaries.
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            let next_len = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+                            i += 1 + next_len;
+                            continue;
+                        }
+                        if bytes[i] == quote {
+                            i += 1;
+                            break;
+                        }
+                        i += line[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    continue;
+                }
+            }
+            i += line[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Item 2.5: Best-of-N Selection on Hard Units
 // ---------------------------------------------------------------------------
 
@@ -305,6 +1211,8 @@ pub fn mutation_stub_for(path: &str) -> Option<&'static str> {
         Some("raise RuntimeError('taskmaster mutation stub')\n")
     } else if lower.ends_with(".ts") || lower.ends_with(".tsx") || lower.ends_with(".js") || lower.ends_with(".jsx") || lower.ends_with(".mjs") {
         Some("throw new Error('taskmaster mutation stub');\n")
+    } else if lower.ends_with(".rs") {
+        Some("compile_error!(\"taskmaster mutation stub\");\n")
     } else if lower.ends_with(".sh") {
         Some("#!/usr/bin/env sh\nexit 1\n")
     } else {
@@ -588,5 +1496,151 @@ mod tests {
         assert!(!eval_brk.auto_approved);
         assert_eq!(eval_brk.changed_or_removed_symbols, vec!["getUser"]);
         assert_eq!(eval_brk.impacted_pages, vec!["profile".to_string()]);
+    }
+
+    #[test]
+    fn prompt_io_examples_become_acceptance_guidance_and_catch_contradicting_constants() {
+        let prompt = "Build a mini SQL CLI.\n\
+            Query results are formatted as pipe-separated rows like `id|name`.\n\n\
+            Input:\n\
+            ```sql\n\
+            SELECT id, name FROM users;\n\
+            ```\n\
+            Output:\n\
+            ```\n\
+            id|name\n\
+            1|alice\n\
+            ```\n";
+
+        let examples = extract_prompt_io_examples(prompt);
+        assert!(!examples.is_empty(), "expected extracted I/O examples");
+        assert!(examples.iter().any(|e| e.output.contains("id|name") && e.output.contains("1|alice")), "{examples:#?}");
+
+        let guidance = format_prompt_acceptance_guidance(&examples);
+        assert!(guidance.contains("id|name"), "{guidance}");
+        assert!(guidance.contains("locked executable end-to-end acceptance contract test"), "{guidance}");
+
+        // Plan that locks contradicting constants (' | ' separator and '-+-' header rule) and omits an acceptance test.
+        let bad_plan = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![ContractFile {
+                path: "minisql/format.py".into(),
+                content: "SEPARATOR = ' | '\nHEADER_RULE = '-+-'\n".into(),
+            }],
+            pages: vec![
+                PagePlan { id: "parser".into(), owned_glob: "minisql/parser.py".into(), brief: "Parse SQL.".into(), ..Default::default() },
+                PagePlan { id: "engine".into(), owned_glob: "minisql/engine.py".into(), brief: "Run SQL.".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let findings = check_plan_prompt_consistency(prompt, &bad_plan);
+        assert!(
+            findings.iter().any(|f| f.category == "prompt_contradiction" && f.message.contains("SEPARATOR")),
+            "expected SEPARATOR contradiction finding, got: {findings:#?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.category == "prompt_contradiction" && f.message.contains("HEADER_RULE")),
+            "expected HEADER_RULE contradiction finding, got: {findings:#?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.category == "missing_acceptance_check"),
+            "expected missing acceptance test finding, got: {findings:#?}"
+        );
+
+        // Plan that matches the prompt ('|' separator, no '-+-' rule, locked acceptance contract test) passes cleanly.
+        let good_plan = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![
+                ContractFile {
+                    path: "minisql/format.py".into(),
+                    content: "SEPARATOR = '|'\n".into(),
+                },
+                ContractFile {
+                    path: "tests/test_acceptance_contract.py".into(),
+                    content: "def test_select_output():\n    assert 'id|name\\n1|alice' == 'id|name\\n1|alice'\n".into(),
+                },
+            ],
+            pages: vec![
+                PagePlan { id: "parser".into(), owned_glob: "minisql/parser.py".into(), brief: "Parse SQL.".into(), ..Default::default() },
+                PagePlan { id: "engine".into(), owned_glob: "minisql/engine.py".into(), brief: "Run SQL.".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let good_findings = check_plan_prompt_consistency(prompt, &good_plan);
+        assert!(good_findings.is_empty(), "expected clean plan to pass, got: {good_findings:#?}");
+    }
+
+    #[test]
+    fn mutation_gate_runs_in_isolated_temp_copy_with_project_test_command() {
+        let root = std::env::temp_dir().join(format!("tm-mut-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tests_dir = root.join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        let orig_impl = "def add(a, b):\n    return a + b\n";
+        let live_impl = root.join("app.py");
+        std::fs::write(&live_impl, orig_impl).unwrap();
+        let marker = root.join(".live-check-result");
+
+        // Contract test with a pytest-style def test_* function that checks:
+        // 1. Live shared tree's app.py was NOT modified while the mutation test ran.
+        // 2. CWD is an isolated temporary copy, not the live tree.
+        // 3. Importing app in the isolated copy hits the mutation stub and fails the test.
+        let contract_test = r#"import os
+from pathlib import Path
+
+def test_isolated_and_catches_stub():
+    live_impl = Path(os.environ["LIVE_IMPL_PATH"])
+    live_root = Path(os.environ["LIVE_ROOT_PATH"])
+    marker = Path(os.environ["LIVE_MARKER_PATH"])
+    live_content = live_impl.read_text()
+    same_dir = Path.cwd().resolve() == live_root.resolve()
+    marker.write_text(f"same_dir={same_dir}\ncontent={live_content}")
+    import app
+    assert app.add(2, 3) == 5
+"#;
+        std::fs::write(tests_dir.join("test_contract.py"), contract_test).unwrap();
+
+        // mutation_test_command must select pytest (not bare `python3 tests/test_contract.py`)
+        // for a pytest-style Python test file.
+        let (cmd, mut env) = mutation_test_command(&root, &root.join(".taskmaster/venv"), "tests/test_contract.py")
+            .expect("expected project test command for pytest file");
+        assert!(
+            cmd.iter().any(|a| a == "pytest"),
+            "expected pytest command from runtime::steps, got: {cmd:?}"
+        );
+        assert!(cmd.iter().any(|a| a == "tests/test_contract.py"), "expected contract test path in cmd: {cmd:?}");
+
+        env.push(("LIVE_IMPL_PATH".into(), live_impl.display().to_string()));
+        env.push(("LIVE_ROOT_PATH".into(), root.display().to_string()));
+        env.push(("LIVE_MARKER_PATH".into(), marker.display().to_string()));
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let caught = contract_mutation_sanity_with_env(
+            &root,
+            "app.py",
+            mutation_stub_for("app.py").unwrap(),
+            &refs,
+            &env,
+        )
+        .unwrap();
+        assert!(caught, "non-vacuous pytest contract test must fail against the stub");
+        let observed = std::fs::read_to_string(&marker).expect("pytest test must have executed");
+        assert!(observed.starts_with("same_dir=False\n"), "must run in isolated temp copy, got: {observed}");
+        assert!(
+            observed.contains(orig_impl),
+            "live shared tree file must stay untouched while mutation test runs, got: {observed}"
+        );
+        assert_eq!(std::fs::read_to_string(&live_impl).unwrap(), orig_impl);
+
+        // Rust projects select cargo test via runtime::steps.
+        let rs_root = root.join("rust_proj");
+        std::fs::create_dir_all(rs_root.join("tests")).unwrap();
+        std::fs::write(rs_root.join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(rs_root.join("tests/contract_test.rs"), "#[test]\nfn t() {}\n").unwrap();
+        let (rs_cmd, _) = mutation_test_command(&rs_root, &rs_root.join(".taskmaster/venv"), "tests/contract_test.rs")
+            .expect("expected cargo test command for Rust project");
+        assert_eq!(rs_cmd[0], "cargo");
+        assert_eq!(rs_cmd[1], "test");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -355,8 +355,8 @@ pub async fn run_steps(tree: &Path, steps: &[Step], timeout: Duration) -> (Vec<T
         let mut child = match child {
             Ok(child) => child,
             Err(err) => {
-                timings.push(Timing::new(&step.name, began.elapsed(), "failed"));
                 let said = format!("could not start {}: {err}", step.program);
+                timings.push(Timing::with_reason(&step.name, began.elapsed(), "failed", said.clone()));
                 if step.setup {
                     setup_said.push_str(&format!("`{}` failed: {said}\n", step.line()));
                     continue;

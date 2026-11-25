@@ -88,7 +88,8 @@ fn stage(name: String, rows: &[&LedgerEntry]) -> Stage {
 
 /// The seconds a `verify: a 1.2s ok, b 3.4s failed` line adds up to.
 fn verify_line_seconds(text: &str) -> f64 {
-    let Some(rest) = text.trim().strip_prefix("verify:") else { return 0.0 };
+    let first_line = text.lines().next().unwrap_or("");
+    let Some(rest) = first_line.trim().strip_prefix("verify:") else { return 0.0 };
     rest.split(',')
         .filter_map(|part| part.split_whitespace().find_map(|w| w.strip_suffix('s').and_then(|n| n.parse::<f64>().ok())))
         .sum()

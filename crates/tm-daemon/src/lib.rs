@@ -439,6 +439,9 @@ pub struct Config {
     /// H3: start builders in this holder, so a daemon update can hand them to the next daemon.
     /// `None` starts every agent here, as before.
     pub holder: Option<tm_harness::hold::Holder>,
+    /// Optional silence timeout before a stalled agent is restarted. Falls back to
+    /// `TASKMASTER_STALL_SECS` and then the built-in default (300s small / 600s normal).
+    pub stall_timeout: Option<Duration>,
 }
 
 /// How an active run should stop when cancelled.
@@ -520,6 +523,7 @@ impl Config {
             permission_mode: None,
             master_answers: false,
             holder: None,
+            stall_timeout: None,
         }
     }
 }

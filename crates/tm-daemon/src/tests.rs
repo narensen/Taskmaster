@@ -6941,3 +6941,671 @@ async fn holder_worktree(holder: &tm_harness::hold::Holder) -> PathBuf {
     let listed = holder.list().await.unwrap();
     PathBuf::from(listed[0].meta["worktree"].as_str().unwrap())
 }
+
+#[tokio::test]
+async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brief() {
+    let tmp = repo("stalled-warm-follow");
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follow_ups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fresh_briefs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct StallingSession {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        follow_ups: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for StallingSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.follow_ups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(tm_harness::Stalled(Duration::from_secs(180)).into())
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct FallbackHarness {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        follow_ups: Arc<std::sync::atomic::AtomicUsize>,
+        fresh_briefs: Arc<Mutex<Vec<String>>>,
+        turn: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for FallbackHarness {
+        fn id(&self) -> &'static str {
+            "claude-code"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let n = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.fresh_briefs.lock().unwrap().push(task.brief.clone());
+            if n == 0 {
+                // First turn writes outside owned glob to trigger a repair sent to the warm session.
+                std::fs::write(task.cwd.join("outside.txt"), "bad\n").unwrap();
+                let _ = events.send(HarnessEvent::Text { text: "initial".into() }).await;
+                let sess: Box<dyn tm_harness::Session> = Box::new(StallingSession {
+                    closed: self.closed.clone(),
+                    follow_ups: self.follow_ups.clone(),
+                });
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+            } else {
+                // Fallback fresh ask() receives the full worker brief and fixes the file.
+                let _ = std::fs::remove_file(task.cwd.join("outside.txt"));
+                let page_file = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+                std::fs::write(&page_file, "export const a = 'recovered';\n").unwrap();
+                let _ = events.send(HarnessEvent::Text { text: "fixed on fallback".into() }).await;
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), None)
+            }
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(FallbackHarness {
+        closed: closed.clone(),
+        follow_ups: follow_ups.clone(),
+        fresh_briefs: fresh_briefs.clone(),
+        turn: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.warm_idle = Duration::from_secs(600);
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(follow_ups.load(std::sync::atomic::Ordering::SeqCst), 1, "repair must first try the open warm session");
+    assert!(closed.load(std::sync::atomic::Ordering::SeqCst), "stalled open session must be closed before fallback");
+    let briefs = fresh_briefs.lock().unwrap();
+    assert_eq!(briefs.len(), 2, "expected initial run + fallback ask()");
+    assert!(
+        briefs[1].contains("Shared context for every agent of this run") && briefs[1].contains("Build page `a`"),
+        "fallback ask() must get the full original worker brief, got:\n{}",
+        briefs[1]
+    );
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'recovered';\n");
+}
+
+#[tokio::test]
+async fn single_worker_error_in_join_one_escalates_instead_of_aborting_run() {
+    let tmp = repo("join-one-worker-err");
+
+    struct FailingWorker;
+    #[async_trait]
+    impl Harness for FailingWorker {
+        fn id(&self) -> &'static str {
+            "failing-worker"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            _events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            anyhow::bail!("unexpected worker crash")
+        }
+    }
+
+    struct SucceedingMid {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for SucceedingMid {
+        fn id(&self) -> &'static str {
+            "mid-ok"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let page_file = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
+            std::fs::write(&page_file, "export const a = 'from-mid';\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let worker: Arc<dyn Harness> = Arc::new(FailingWorker);
+    let mid_inner = Arc::new(SucceedingMid { calls: std::sync::atomic::AtomicUsize::new(0) });
+    let mid: Arc<dyn Harness> = mid_inner.clone();
+    let harnesses = Harnesses {
+        worker,
+        mid: mid.clone(),
+        master: mid.clone(),
+        reviewer: mid.clone(),
+        verifier: mid,
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert!(mid_inner.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1, "expected escalation to mid tier after worker error");
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'from-mid';\n");
+}
+
+#[tokio::test]
+async fn stalled_worker_in_batch_does_not_abort_sibling_and_retries() {
+    let tmp = repo("stalled-batch");
+
+    struct StallThenPass {
+        a_calls: std::sync::atomic::AtomicUsize,
+        b_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for StallThenPass {
+        fn id(&self) -> &'static str {
+            "stall-batch"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Build page `a`") {
+                let n = self.a_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Exhaust ask()'s stall restarts (0..=2) so WorkerJob::Failed(Stalled) reaches join_one().
+                if n < 3 {
+                    return Err(tm_harness::Stalled(Duration::from_secs(60)).into());
+                }
+                let f = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, "export const a = 'recovered';\n").unwrap();
+            } else if task.brief.contains("Build page `b`") {
+                self.b_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let f = task.cwd.join("app/b/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, "export const b = 'ok';\n").unwrap();
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let inner = Arc::new(StallThenPass {
+        a_calls: std::sync::atomic::AtomicUsize::new(0),
+        b_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let h: Arc<dyn Harness> = inner.clone();
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(inner.b_calls.load(std::sync::atomic::Ordering::SeqCst), 1, "sibling page b must complete without being aborted");
+    assert!(inner.a_calls.load(std::sync::atomic::Ordering::SeqCst) >= 4, "page a should retry after stall reaches join_one");
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'recovered';\n");
+    assert_eq!(read(&tmp.0.join("app/b/page.ts")), "export const b = 'ok';\n");
+}
+
+#[tokio::test]
+async fn planner_rejects_contract_constants_contradicting_prompt_and_repairs_with_acceptance_test() {
+    let tmp = repo("plan-prompt-consistency");
+    let planner_briefs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct RepairingPlanner {
+        briefs: Arc<Mutex<Vec<String>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for RepairingPlanner {
+        fn id(&self) -> &'static str {
+            "planner-check"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let reply = if n == 0 {
+                // First attempt contradicts `id|name` with ' | ' and '-+-' and omits an acceptance test.
+                serde_json::json!({
+                    "kind": "cli",
+                    "summary": "Mini SQL",
+                    "contracts": [
+                        { "path": "minisql/format.py", "content": "SEPARATOR = ' | '\nHEADER_RULE = '-+-'\n" }
+                    ],
+                    "units": [
+                        { "id": "parser", "owned_glob": "minisql/parser.py", "brief": "Parse SQL.", "done": "done" },
+                        { "id": "exec", "owned_glob": "minisql/exec.py", "brief": "Execute SQL.", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string()
+            } else {
+                // Repair fixes the separator, removes the header rule, and locks an acceptance contract test.
+                serde_json::json!({
+                    "kind": "cli",
+                    "summary": "Mini SQL",
+                    "contracts": [
+                        { "path": "minisql/format.py", "content": "SEPARATOR = '|'\n" },
+                        { "path": "tests/test_acceptance_contract.py", "content": "def test_e2e():\n    assert 'id|name\\n1|alice' == 'id|name\\n1|alice'\n" }
+                    ],
+                    "units": [
+                        { "id": "parser", "owned_glob": "minisql/parser.py", "brief": "Parse SQL.", "done": "done" },
+                        { "id": "exec", "owned_glob": "minisql/exec.py", "brief": "Execute SQL.", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string()
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RepairingPlanner {
+        briefs: planner_briefs.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "plan-consistency".into();
+    cfg.prompt = Some(
+        "Build a mini SQL CLI that prints query results as `id|name`.\n\n\
+         Input:\n```sql\nSELECT id, name FROM users;\n```\n\
+         Output:\n```\nid|name\n1|alice\n```\n"
+            .into(),
+    );
+    cfg.yes = false; // stop at NeedsApproval once plan is accepted
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert!(matches!(out, Outcome::NeedsApproval { .. }), "expected repaired plan to reach NeedsApproval, got {out:?}");
+    let briefs = planner_briefs.lock().unwrap();
+    assert_eq!(briefs.len(), 2, "expected initial plan rejected and repaired in one round");
+    assert!(briefs[0].contains("id|name") && briefs[0].contains("end-to-end acceptance"), "initial planner brief must carry extracted I/O examples");
+    assert!(briefs[1].contains("SEPARATOR") && briefs[1].contains("HEADER_RULE"), "repair brief must cite the contradicting constants: {}", briefs[1]);
+}
+
+#[tokio::test]
+async fn verify_reports_import_failure_reasons_and_keeps_parallel_build_timings() {
+    let tmp = repo("verify-import-timings");
+    // Give the project a minimal passing Python test so parallel runtime steps run alongside static checks.
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("tests/test_smoke.py"), "def test_ok():\n    assert True\n").unwrap();
+    let _ = crate::git::commit_paths(&tmp.0, "add smoke test", &["tests/test_smoke.py".into()]);
+
+    struct CrossImportHarness {
+        fixed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for CrossImportHarness {
+        fn id(&self) -> &'static str {
+            "cross-import"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Build page `a`") {
+                let f = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                if task.brief.contains("Checks failed last time") {
+                    self.fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::fs::write(&f, "export const a = 1;\n").unwrap();
+                } else {
+                    std::fs::write(&f, "import { b } from '../b/page';\nexport const a = b;\n").unwrap();
+                }
+            } else if task.brief.contains("Build page `b`") {
+                let f = task.cwd.join("app/b/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, "export const b = 2;\n").unwrap();
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h = Arc::new(CrossImportHarness { fixed: std::sync::atomic::AtomicBool::new(false) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+    cfg.browser = false;
+    let store: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp.0));
+    let live = Arc::new(crate::live::Live::new(store));
+    cfg.live = Some(live.clone());
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert!(h.fixed.load(std::sync::atomic::Ordering::SeqCst), "page `a` should have been repaired after import violation");
+
+    live.flush("current");
+    let (_, entries) = live.read("current", 0);
+    let verify_outputs: Vec<String> = entries
+        .iter()
+        .filter(|e| e["agent"]["id"] == "runtime" && e["kind"] == "output")
+        .filter_map(|e| e["text"].as_str().map(str::to_string))
+        .filter(|t| t.starts_with("verify:"))
+        .collect();
+    let failed_verify = verify_outputs
+        .iter()
+        .find(|t| t.contains("imports") && t.contains("failed"))
+        .unwrap_or_else(|| panic!("expected a verify summary naming failed imports, got: {verify_outputs:#?}"));
+    assert!(!failed_verify.contains("nothing ran"), "must not print 'nothing ran' on import failure: {failed_verify}");
+    assert!(failed_verify.contains("- a:") && failed_verify.contains("app/a/page.ts imports app/b/page.ts"), "must print failing page and reason: {failed_verify}");
+    assert!(failed_verify.contains("test "), "must keep parallel build/test timings even when runtime_checks are skipped: {failed_verify}");
+}
+
+#[tokio::test]
+async fn finalize_runs_once_on_error_return_and_success_paths() {
+    let tmp = repo("finalize-paths");
+    let closed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    struct CountingSession {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for CountingSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            _events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct WarmThenErrorHarness {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        fail_b: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for WarmThenErrorHarness {
+        fn id(&self) -> &'static str {
+            "warm-err"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            if task.brief.contains("Build page `b`") && self.fail_b.load(std::sync::atomic::Ordering::SeqCst) {
+                return (Err(anyhow::anyhow!("simulated worker timeout")), None);
+            }
+            let page = if task.brief.contains("Build page `b`") { "b" } else { "a" };
+            let f = task.cwd.join(format!("app/{page}/page.ts"));
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, format!("export const {page} = 1;\n")).unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(CountingSession { closed: self.closed.clone() });
+            (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+        }
+    }
+
+    // Seed a Commons entry cited by page `a` so we can verify settle_commons does not double-count.
+    let commons_dir = tmp.0.join(".taskmaster/commons");
+    let commons_store = tm_dictionary::LocalStore::open(&commons_dir).unwrap();
+    commons_store
+        .publish("shared_a", tm_core::EntryKind::Hint, "hint", "body", "ts")
+        .unwrap();
+
+    let h = Arc::new(WarmThenErrorHarness {
+        closed: closed_count.clone(),
+        fail_b: std::sync::atomic::AtomicBool::new(true),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &["shared_a"]), ("b", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.warm_idle = Duration::from_secs(600);
+
+    // 1. Error return path: Command::Finish never runs, yet finalize must close warm sessions and write status.
+    let err = crate::drive(cfg.clone(), harnesses.clone()).await.unwrap_err();
+    assert!(err.to_string().contains("simulated worker timeout"), "{err}");
+    assert_eq!(closed_count.load(std::sync::atomic::Ordering::SeqCst), 1, "warm session must be closed on Err exit");
+    let records = Records::files(&tmp.0);
+    let status = records.status("current").unwrap().expect("status.json must be written on Err exit");
+    assert_eq!(status["ok"], serde_json::json!(false));
+    assert!(status.get("spent").is_some(), "status must include spend report: {status}");
+
+    // 2. Success path (resuming page `b`): finalize runs once (not twice between Command::Finish, idle, and drive).
+    h.fail_b.store(false, std::sync::atomic::Ordering::SeqCst);
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(closed_count.load(std::sync::atomic::Ordering::SeqCst), 2, "second run must close page b's warm session once");
+    let status = records.status("current").unwrap().expect("status.json must be written on success");
+    assert_eq!(status["ok"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn verify_reports_specific_skipped_checks_and_reasons_instead_of_nothing_ran() {
+    // Case 1: checks & runtime_checks disabled in config -> names both skipped checks and why.
+    let tmp1 = repo("verify-skipped-config");
+    let world1 = World::new(Mode::Write);
+    let mut cfg1 = config(&tmp1.0, plan(&[("a", &[])]), true, 1);
+    cfg1.checks = false;
+    cfg1.runtime_checks = false;
+    cfg1.code_mode = false;
+    let store1: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp1.0));
+    let live1 = Arc::new(crate::live::Live::new(store1));
+    cfg1.live = Some(live1.clone());
+    let out1 = run(cfg1, &world1).await.unwrap();
+    assert_eq!(out1, Outcome::Finished { ok: true });
+    live1.flush("current");
+    let (_, entries1) = live1.read("current", 0);
+    let msg1 = entries1
+        .iter()
+        .filter(|e| e["agent"]["id"] == "runtime" && e["kind"] == "output")
+        .filter_map(|e| e["text"].as_str())
+        .find(|t| t.starts_with("verify:"))
+        .expect("expected verify output entry");
+    assert!(!msg1.contains("nothing ran"), "must not print misleading 'nothing ran': {msg1}");
+    assert!(msg1.contains("static skipped (disabled in config)"), "{msg1}");
+    assert!(msg1.contains("runtime skipped (disabled in config)"), "{msg1}");
+
+    // Case 2: project has npm test script without node_modules -> fails verify naming test + reason.
+    let tmp2 = repo("verify-missing-runner");
+    std::fs::write(
+        tmp2.0.join("package.json"),
+        r#"{"name":"demo","scripts":{"test":"vitest run"}}"#,
+    )
+    .unwrap();
+    let _ = crate::git::commit_paths(&tmp2.0, "add package.json", &["package.json".into()]);
+    let world2 = World::new(Mode::Write);
+    let mut cfg2 = config(&tmp2.0, plan(&[("a", &[])]), true, 1);
+    cfg2.checks = false;
+    cfg2.runtime_checks = true;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    let store2: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp2.0));
+    let live2 = Arc::new(crate::live::Live::new(store2));
+    cfg2.live = Some(live2.clone());
+    let out2 = run(cfg2, &world2).await.unwrap();
+    assert_eq!(out2, Outcome::Finished { ok: false });
+    live2.flush("current");
+    let (_, entries2) = live2.read("current", 0);
+    let msgs2: Vec<&str> = entries2
+        .iter()
+        .filter(|e| e["agent"]["id"] == "runtime" && e["kind"] == "output")
+        .filter_map(|e| e["text"].as_str())
+        .filter(|t| t.starts_with("verify:"))
+        .collect();
+    assert!(!msgs2.is_empty(), "expected verify output entries");
+    for msg in &msgs2 {
+        assert!(!msg.contains("nothing ran"), "must not print 'nothing ran': {msg}");
+    }
+    assert!(
+        msgs2.iter().any(|m| m.contains("test") && m.contains("node_modules")),
+        "expected message naming skipped test check and missing node_modules, got: {msgs2:#?}"
+    );
+}
+
+#[tokio::test]
+async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
+    // 1. Resolution precedence: explicit Config > TASKMASTER_STALL_SECS > small/default fallback.
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, false),
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, true),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("45"), false),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("0"), false),
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("not-a-number"), true),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(Some(Duration::from_secs(12)), Some("45"), false),
+        Duration::from_secs(12)
+    );
+
+    // 2. End-to-end: configured stall_timeout reaches the harness, and the final retry
+    // (restart == STALL_RESTARTS) still carries a finite stall bound rather than None.
+    let tmp = repo("stall-bound");
+    let seen_stalls = Arc::new(Mutex::new(Vec::<Option<Duration>>::new()));
+
+    struct RecordingStallHarness {
+        seen: Arc<Mutex<Vec<Option<Duration>>>>,
+        attempt: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for RecordingStallHarness {
+        fn id(&self) -> &'static str {
+            "stall-rec"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen.lock().unwrap().push(task.stall);
+            let n = self.attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                return Err(tm_harness::Stalled(task.stall.unwrap_or_default()).into());
+            }
+            let f = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, "export const a = 1;\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RecordingStallHarness {
+        seen: seen_stalls.clone(),
+        attempt: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.stall_timeout = Some(Duration::from_secs(15));
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    let stalls = seen_stalls.lock().unwrap().clone();
+    assert_eq!(
+        stalls,
+        vec![
+            Some(Duration::from_secs(15)),
+            Some(Duration::from_secs(15)),
+            Some(Duration::from_secs(30)),
+        ],
+        "expected configured stall on initial/retry attempts and finite bounded stall on final attempt"
+    );
+}

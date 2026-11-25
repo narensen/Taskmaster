@@ -2637,8 +2637,9 @@ impl Driver {
             .filter(|f| !crate::gates::is_test_path(f) && self.tree.join(f).is_file())
             .collect();
 
+        let venv = self.verify_venv();
         for contract in test_contracts {
-            let Some(cmd) = crate::gates::standalone_test_command(&contract.path) else {
+            let Some((cmd, env)) = crate::gates::mutation_test_command(&self.tree, &venv, &contract.path) else {
                 continue;
             };
             let mut targets: Vec<String> = graph
@@ -2659,7 +2660,7 @@ impl Driver {
                 continue;
             };
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            if let Ok(false) = crate::gates::contract_mutation_sanity(&self.tree, &impl_path, stub, &refs) {
+            if let Ok(false) = crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env) {
                 let author = owners
                     .owner(&impl_path)
                     .cloned()

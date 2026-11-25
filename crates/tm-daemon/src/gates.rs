@@ -62,8 +62,9 @@ pub fn verify_red_green(
     })
 }
 
-/// Mutation sanity on a contract test: temporarily replace `impl_rel_path` in `worktree`
-/// with a minimal throwing stub, run `test_cmd`, and restore the original file.
+/// Mutation sanity on a contract test: copy `worktree` into an isolated temporary
+/// directory, replace `impl_rel_path` in the copy with a minimal throwing stub, and run
+/// `test_cmd` there so the live shared working tree is never modified.
 /// Returns `Ok(true)` if the contract test catches the broken implementation (fails),
 /// `Ok(false)` if the test is vacuous (still passes with a broken implementation).
 pub fn contract_mutation_sanity(
@@ -72,18 +73,156 @@ pub fn contract_mutation_sanity(
     stub_content: &str,
     test_cmd: &[&str],
 ) -> anyhow::Result<bool> {
-    let target = worktree.join(impl_rel_path);
-    let original = std::fs::read(&target)?;
+    contract_mutation_sanity_with_env(worktree, impl_rel_path, stub_content, test_cmd, &[])
+}
+
+/// Like [`contract_mutation_sanity`], applying additional environment variables (such as
+/// a project virtualenv from [`crate::runtime::steps`]) when running `test_cmd` inside the
+/// isolated temporary copy.
+pub fn contract_mutation_sanity_with_env(
+    worktree: &Path,
+    impl_rel_path: &str,
+    stub_content: &str,
+    test_cmd: &[&str],
+    extra_env: &[(String, String)],
+) -> anyhow::Result<bool> {
+    if test_cmd.is_empty() {
+        anyhow::bail!("test command cannot be empty");
+    }
+    if !crate::git::safe_rel(impl_rel_path) {
+        anyhow::bail!("implementation path `{impl_rel_path}` leaves the worktree");
+    }
+    if !worktree.join(impl_rel_path).is_file() {
+        anyhow::bail!("implementation file `{impl_rel_path}` does not exist");
+    }
+
+    struct TempMutationDir(std::path::PathBuf);
+    impl Drop for TempMutationDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = TempMutationDir(std::env::temp_dir().join(format!(
+        "tm-mut-{}-{seq}",
+        std::process::id()
+    )));
+    let _ = std::fs::remove_dir_all(&tmp.0);
+    std::fs::create_dir_all(&tmp.0)?;
+    copy_tree_for_mutation(worktree, &tmp.0)?;
+
+    let target = tmp.0.join(impl_rel_path);
     std::fs::write(&target, stub_content)?;
-    let result = run_cmd_ok(worktree, test_cmd);
-    // Always restore original file even if command failed to spawn.
-    let _ = std::fs::write(&target, &original);
-    let passed_with_stub = result?;
+    let passed_with_stub = run_cmd_ok_with_env(&tmp.0, test_cmd, extra_env)?;
     Ok(!passed_with_stub)
 }
 
+/// Copy `src` into an isolated `dst` directory for mutation testing without touching `src`.
+/// Heavy/internal directories (`.git`, `.taskmaster`, `target`, caches) are skipped, and
+/// read-only dependency trees (`node_modules`) are symlinked on Unix.
+fn copy_tree_for_mutation(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            ".git" | ".taskmaster" | "__pycache__" | ".pytest_cache" | "target"
+        ) {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                if let Ok(target) = std::fs::read_link(&src_path) {
+                    let _ = std::os::unix::fs::symlink(&target, &dst_path);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if src_path.is_file() {
+                    std::fs::copy(&src_path, &dst_path)?;
+                }
+            }
+        } else if ft.is_dir() {
+            #[cfg(unix)]
+            if matches!(name_str.as_ref(), "node_modules" | ".venv" | "venv") {
+                std::os::unix::fs::symlink(&src_path, &dst_path)?;
+                continue;
+            }
+            std::fs::create_dir_all(&dst_path)?;
+            copy_tree_for_mutation(&src_path, &dst_path)?;
+        } else if ft.is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Pick the project's proper test command (the same one `verify` uses via `runtime::steps`)
+/// for running W4 contract mutation sanity on `contract_path`.
+pub fn mutation_test_command(
+    tree: &Path,
+    venv: &Path,
+    contract_path: &str,
+) -> Option<(Vec<String>, Vec<(String, String)>)> {
+    let steps = crate::runtime::steps(tree, venv);
+    if let Some(step) = steps.into_iter().find(|s| s.name == "test") {
+        let is_pytest = step.args.iter().any(|a| a == "pytest");
+        if is_pytest && contract_path.to_ascii_lowercase().ends_with(".py") {
+            let content = std::fs::read_to_string(tree.join(contract_path)).unwrap_or_default();
+            let has_test_defs = content
+                .lines()
+                .map(str::trim_start)
+                .any(|l| l.starts_with("def test_") || l.starts_with("async def test_") || l.starts_with("class Test"));
+            if !has_test_defs {
+                // Standalone assertion script without pytest test functions: pytest would exit 5
+                // (no tests collected) even on an unmutated tree, so run it directly in the copy.
+                return standalone_test_command(contract_path).map(|cmd| (cmd, Vec::new()));
+            }
+            let mut program = step.program;
+            let mut args = step.args;
+            let mut env = step.env;
+            // If verify's venv wasn't created (e.g. runtime_checks disabled), fall back to system python3.
+            let is_missing_path = (program.contains('/') || program.contains('\\')) && !Path::new(&program).is_file();
+            if is_missing_path {
+                program = "python3".into();
+                env.retain(|(k, _)| k != "VIRTUAL_ENV" && k != "PATH");
+            }
+            args.push(contract_path.to_string());
+            let mut cmd = Vec::with_capacity(1 + args.len());
+            cmd.push(program);
+            cmd.extend(args);
+            return Some((cmd, env));
+        }
+        let mut cmd = Vec::with_capacity(1 + step.args.len());
+        cmd.push(step.program);
+        cmd.extend(step.args);
+        return Some((cmd, step.env));
+    }
+    standalone_test_command(contract_path).map(|cmd| (cmd, Vec::new()))
+}
+
 fn run_cmd_ok(dir: &Path, cmd: &[&str]) -> anyhow::Result<bool> {
-    let status = Command::new(cmd[0]).args(&cmd[1..]).current_dir(dir).status()?;
+    run_cmd_ok_with_env(dir, cmd, &[])
+}
+
+fn run_cmd_ok_with_env(dir: &Path, cmd: &[&str], extra_env: &[(String, String)]) -> anyhow::Result<bool> {
+    let mut c = Command::new(cmd[0]);
+    c.args(&cmd[1..])
+        .current_dir(dir)
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    for (k, v) in extra_env {
+        c.env(k, v);
+    }
+    let status = c.status()?;
     Ok(status.success())
 }
 
@@ -1069,6 +1208,8 @@ pub fn mutation_stub_for(path: &str) -> Option<&'static str> {
         Some("raise RuntimeError('taskmaster mutation stub')\n")
     } else if lower.ends_with(".ts") || lower.ends_with(".tsx") || lower.ends_with(".js") || lower.ends_with(".jsx") || lower.ends_with(".mjs") {
         Some("throw new Error('taskmaster mutation stub');\n")
+    } else if lower.ends_with(".rs") {
+        Some("compile_error!(\"taskmaster mutation stub\");\n")
     } else if lower.ends_with(".sh") {
         Some("#!/usr/bin/env sh\nexit 1\n")
     } else {
@@ -1424,5 +1565,79 @@ mod tests {
         };
         let good_findings = check_plan_prompt_consistency(prompt, &good_plan);
         assert!(good_findings.is_empty(), "expected clean plan to pass, got: {good_findings:#?}");
+    }
+
+    #[test]
+    fn mutation_gate_runs_in_isolated_temp_copy_with_project_test_command() {
+        let root = std::env::temp_dir().join(format!("tm-mut-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tests_dir = root.join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        let orig_impl = "def add(a, b):\n    return a + b\n";
+        let live_impl = root.join("app.py");
+        std::fs::write(&live_impl, orig_impl).unwrap();
+        let marker = root.join(".live-check-result");
+
+        // Contract test with a pytest-style def test_* function that checks:
+        // 1. Live shared tree's app.py was NOT modified while the mutation test ran.
+        // 2. CWD is an isolated temporary copy, not the live tree.
+        // 3. Importing app in the isolated copy hits the mutation stub and fails the test.
+        let contract_test = r#"import os
+from pathlib import Path
+
+def test_isolated_and_catches_stub():
+    live_impl = Path(os.environ["LIVE_IMPL_PATH"])
+    live_root = Path(os.environ["LIVE_ROOT_PATH"])
+    marker = Path(os.environ["LIVE_MARKER_PATH"])
+    live_content = live_impl.read_text()
+    same_dir = Path.cwd().resolve() == live_root.resolve()
+    marker.write_text(f"same_dir={same_dir}\ncontent={live_content}")
+    import app
+    assert app.add(2, 3) == 5
+"#;
+        std::fs::write(tests_dir.join("test_contract.py"), contract_test).unwrap();
+
+        // mutation_test_command must select pytest (not bare `python3 tests/test_contract.py`)
+        // for a pytest-style Python test file.
+        let (cmd, mut env) = mutation_test_command(&root, &root.join(".taskmaster/venv"), "tests/test_contract.py")
+            .expect("expected project test command for pytest file");
+        assert!(
+            cmd.iter().any(|a| a == "pytest"),
+            "expected pytest command from runtime::steps, got: {cmd:?}"
+        );
+        assert!(cmd.iter().any(|a| a == "tests/test_contract.py"), "expected contract test path in cmd: {cmd:?}");
+
+        env.push(("LIVE_IMPL_PATH".into(), live_impl.display().to_string()));
+        env.push(("LIVE_ROOT_PATH".into(), root.display().to_string()));
+        env.push(("LIVE_MARKER_PATH".into(), marker.display().to_string()));
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let caught = contract_mutation_sanity_with_env(
+            &root,
+            "app.py",
+            mutation_stub_for("app.py").unwrap(),
+            &refs,
+            &env,
+        )
+        .unwrap();
+        assert!(caught, "non-vacuous pytest contract test must fail against the stub");
+        let observed = std::fs::read_to_string(&marker).expect("pytest test must have executed");
+        assert!(observed.starts_with("same_dir=False\n"), "must run in isolated temp copy, got: {observed}");
+        assert!(
+            observed.contains(orig_impl),
+            "live shared tree file must stay untouched while mutation test runs, got: {observed}"
+        );
+        assert_eq!(std::fs::read_to_string(&live_impl).unwrap(), orig_impl);
+
+        // Rust projects select cargo test via runtime::steps.
+        let rs_root = root.join("rust_proj");
+        std::fs::create_dir_all(rs_root.join("tests")).unwrap();
+        std::fs::write(rs_root.join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(rs_root.join("tests/contract_test.rs"), "#[test]\nfn t() {}\n").unwrap();
+        let (rs_cmd, _) = mutation_test_command(&rs_root, &rs_root.join(".taskmaster/venv"), "tests/contract_test.rs")
+            .expect("expected cargo test command for Rust project");
+        assert_eq!(rs_cmd[0], "cargo");
+        assert_eq!(rs_cmd[1], "test");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

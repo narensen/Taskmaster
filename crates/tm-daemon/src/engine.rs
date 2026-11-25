@@ -4016,7 +4016,7 @@ impl Driver {
             let vacuous = self.check_contract_mutations(&plan, &owners);
             self.record_gate_findings("mutation", vacuous, &mut failing, &mut next_fingerprints, &mut waived_entries);
         }
-        if let Some(note) = self.run_verify_script()? {
+        if let Some(note) = self.run_verify_script().await? {
             let mut attributed = false;
             let mut script_pages: BTreeMap<PageId, String> = BTreeMap::new();
             for line in note.lines() {
@@ -4822,7 +4822,7 @@ impl Driver {
 
     /// Run `.taskmaster/verify` when the project already has an executable there.
     /// `Ok(None)` when there is no script or it passed. The text is the combined output.
-    fn run_verify_script(&self) -> anyhow::Result<Option<String>> {
+    async fn run_verify_script(&self) -> anyhow::Result<Option<String>> {
         // A script the project committed is in the run's checkout. One it keeps untracked
         // is only in the project.
         let script = [&self.tree, &self.project]
@@ -4839,10 +4839,20 @@ impl Driver {
             }
         }
         self.terminal("command", serde_json::json!({ "command": script.display().to_string(), "cwd": self.tree.display().to_string() }));
-        let out = std::process::Command::new(&script)
-            .current_dir(&self.tree)
-            .output()
-            .context("failed to run .taskmaster/verify")?;
+        let mut cmd = tokio::process::Command::new(&script);
+        cmd.current_dir(&self.tree)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let (child, _guard) = tm_harness::spawn_grouped(&mut cmd).context("failed to run .taskmaster/verify")?;
+        let out = match tokio::time::timeout(checks::STEP_TIMEOUT, child.wait_with_output()).await {
+            Ok(res) => res.context("failed to wait for .taskmaster/verify")?,
+            Err(_) => {
+                let msg = format!(".taskmaster/verify timed out after {}s", checks::STEP_TIMEOUT.as_secs());
+                self.terminal("output", serde_json::json!({ "ok": false, "text": msg }));
+                return Ok(Some(msg));
+            }
+        };
         let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         self.terminal("output", serde_json::json!({ "ok": out.status.success(), "text": clip(text.trim(), 8000) }));
         if out.status.success() {

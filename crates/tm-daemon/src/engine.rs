@@ -3569,18 +3569,38 @@ impl Driver {
         eprintln!("taskmaster: verifying the project");
         let mut timings = Vec::new();
         let verdict = self.verify_checks(&mut timings).await;
-        // A skipped smoke check is not a check: say plainly when nothing ran at all.
         let ran_any = timings.iter().any(|t| matches!(t.status, "ok" | "failed" | "timeout"));
         let failing = match &verdict {
             Ok((_, failing)) if !failing.is_empty() => Some(failing),
             _ => None,
         };
+        let verify_ok = matches!(&verdict, Ok((true, _)));
         let mut text = if ran_any {
             checks::report(&timings)
-        } else if failing.is_some() {
+        } else if !timings.is_empty() {
+            let detail = checks::report(&timings).trim_start_matches("verify: ").to_string();
+            if verify_ok {
+                format!("verify: {detail}")
+            } else {
+                format!("verify: failed — {detail}")
+            }
+        } else if !verify_ok || failing.is_some() {
             "verify: failed".to_string()
         } else {
-            format!("verify: nothing ran ({})", checks::report(&timings).trim_start_matches("verify: "))
+            let mut reasons = Vec::new();
+            if !self.config.checks {
+                reasons.push("static skipped (disabled in config)".to_string());
+            } else {
+                reasons.push("static skipped (no matching linter/typechecker for changed files)".to_string());
+            }
+            if !self.config.runtime_checks {
+                reasons.push("runtime skipped (disabled in config)".to_string());
+            } else if let Some(why) = runtime::missing_runner(&self.tree) {
+                reasons.push(format!("test skipped ({why})"));
+            } else {
+                reasons.push("runtime skipped (no build/test scripts or browser routes apply)".to_string());
+            }
+            format!("verify: {}", reasons.join(", "))
         };
         if let Some(failing) = failing {
             for (page, reason) in failing {
@@ -3732,8 +3752,15 @@ impl Driver {
             // A project with tests whose tests never ran has not been verified.
             let tested = timings.iter().any(|t| t.name == "test" && matches!(t.status, "ok" | "failed"));
             if failing.is_empty() && !tested && runtime::has_tests(&self.tree) {
-                let why = runtime::missing_runner(&self.tree).unwrap_or_else(|| "no test runner could be started".into());
-                let line = format!("verify: nothing ran. The project has tests, but they were not run: {why}");
+                let why = if timings.iter().any(|t| t.name == "test" && t.status == "timeout") {
+                    format!("test step timed out after {}s", checks::STEP_TIMEOUT.as_secs())
+                } else {
+                    runtime::missing_runner(&self.tree).unwrap_or_else(|| "no test runner could be started".into())
+                };
+                if !timings.iter().any(|t| t.name == "test") {
+                    timings.push(Timing::with_reason("test", Duration::ZERO, "skipped", why.clone()));
+                }
+                let line = format!("verify: test check did not run ({why})");
                 eprintln!("taskmaster: {line}");
                 self.terminal("output", serde_json::json!({ "ok": false, "text": line }));
                 let entry = ChangeEntry {
@@ -3994,12 +4021,24 @@ impl Driver {
     async fn smoke(&self, routes: &[(PageId, String)]) -> (anyhow::Result<Option<runtime::Browsed>>, Option<Timing>) {
         let began = Instant::now();
         match tokio::time::timeout(checks::SMOKE_TIMEOUT, runtime::browse(&self.tree, routes)).await {
-            Ok(Ok(None)) => (Ok(None), Some(Timing::new("smoke", began.elapsed(), "skipped"))),
+            Ok(Ok(None)) => (
+                Ok(None),
+                Some(Timing::with_reason("smoke", began.elapsed(), "skipped", "browser unavailable or app not servable")),
+            ),
             Ok(Ok(Some(browsed))) => {
-                let status = if browsed.pages.is_empty() && !browsed.screenshots.is_empty() { "ok" } else if browsed.pages.is_empty() { "skipped" } else { "failed" };
-                (Ok(Some(browsed)), Some(Timing::new("smoke", began.elapsed(), status)))
+                let timing = if browsed.pages.is_empty() && !browsed.screenshots.is_empty() {
+                    Timing::new("smoke", began.elapsed(), "ok")
+                } else if browsed.pages.is_empty() {
+                    Timing::with_reason("smoke", began.elapsed(), "skipped", "no routes rendered")
+                } else {
+                    Timing::new("smoke", began.elapsed(), "failed")
+                };
+                (Ok(Some(browsed)), Some(timing))
             }
-            Ok(Err(err)) => (Err(err), Some(Timing::new("smoke", began.elapsed(), "skipped"))),
+            Ok(Err(err)) => {
+                let reason = format!("failed to start: {err:#}");
+                (Err(err), Some(Timing::with_reason("smoke", began.elapsed(), "skipped", reason)))
+            }
             Err(_) => (
                 Err(anyhow::anyhow!("the smoke check did not finish in {} seconds", checks::SMOKE_TIMEOUT.as_secs())),
                 Some(Timing::new("smoke", began.elapsed(), "timeout")),

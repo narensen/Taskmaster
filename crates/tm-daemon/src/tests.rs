@@ -7454,3 +7454,66 @@ async fn finalize_runs_once_on_error_return_and_success_paths() {
     let status = records.status("current").unwrap().expect("status.json must be written on success");
     assert_eq!(status["ok"], serde_json::json!(true));
 }
+
+#[tokio::test]
+async fn verify_reports_specific_skipped_checks_and_reasons_instead_of_nothing_ran() {
+    // Case 1: checks & runtime_checks disabled in config -> names both skipped checks and why.
+    let tmp1 = repo("verify-skipped-config");
+    let world1 = World::new(Mode::Write);
+    let mut cfg1 = config(&tmp1.0, plan(&[("a", &[])]), true, 1);
+    cfg1.checks = false;
+    cfg1.runtime_checks = false;
+    cfg1.code_mode = false;
+    let store1: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp1.0));
+    let live1 = Arc::new(crate::live::Live::new(store1));
+    cfg1.live = Some(live1.clone());
+    let out1 = run(cfg1, &world1).await.unwrap();
+    assert_eq!(out1, Outcome::Finished { ok: true });
+    live1.flush("current");
+    let (_, entries1) = live1.read("current", 0);
+    let msg1 = entries1
+        .iter()
+        .filter(|e| e["agent"]["id"] == "runtime" && e["kind"] == "output")
+        .filter_map(|e| e["text"].as_str())
+        .find(|t| t.starts_with("verify:"))
+        .expect("expected verify output entry");
+    assert!(!msg1.contains("nothing ran"), "must not print misleading 'nothing ran': {msg1}");
+    assert!(msg1.contains("static skipped (disabled in config)"), "{msg1}");
+    assert!(msg1.contains("runtime skipped (disabled in config)"), "{msg1}");
+
+    // Case 2: project has npm test script without node_modules -> fails verify naming test + reason.
+    let tmp2 = repo("verify-missing-runner");
+    std::fs::write(
+        tmp2.0.join("package.json"),
+        r#"{"name":"demo","scripts":{"test":"vitest run"}}"#,
+    )
+    .unwrap();
+    let _ = crate::git::commit_paths(&tmp2.0, "add package.json", &["package.json".into()]);
+    let world2 = World::new(Mode::Write);
+    let mut cfg2 = config(&tmp2.0, plan(&[("a", &[])]), true, 1);
+    cfg2.checks = false;
+    cfg2.runtime_checks = true;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    let store2: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp2.0));
+    let live2 = Arc::new(crate::live::Live::new(store2));
+    cfg2.live = Some(live2.clone());
+    let out2 = run(cfg2, &world2).await.unwrap();
+    assert_eq!(out2, Outcome::Finished { ok: false });
+    live2.flush("current");
+    let (_, entries2) = live2.read("current", 0);
+    let msgs2: Vec<&str> = entries2
+        .iter()
+        .filter(|e| e["agent"]["id"] == "runtime" && e["kind"] == "output")
+        .filter_map(|e| e["text"].as_str())
+        .filter(|t| t.starts_with("verify:"))
+        .collect();
+    assert!(!msgs2.is_empty(), "expected verify output entries");
+    for msg in &msgs2 {
+        assert!(!msg.contains("nothing ran"), "must not print 'nothing ran': {msg}");
+    }
+    assert!(
+        msgs2.iter().any(|m| m.contains("test") && m.contains("node_modules")),
+        "expected message naming skipped test check and missing node_modules, got: {msgs2:#?}"
+    );
+}

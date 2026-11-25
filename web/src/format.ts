@@ -122,6 +122,7 @@ export const CHANGE: Record<ChangeKind, string> = {
   entry_amended: "Dictionary entry amended",
   review_finding: "Review finding",
   verify_failed: "Verification failed",
+  gate_warning: "Gate warning",
 };
 
 export interface Described {

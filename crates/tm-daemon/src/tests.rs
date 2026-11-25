@@ -5335,10 +5335,14 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
             _gate: Arc<dyn PermissionGate>,
             _events: mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            self.calls.lock().unwrap().push(task.brief.clone());
+            let attempt = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(task.brief.clone());
+                calls.len()
+            };
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
-            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            std::fs::write(&file, format!("# attempt {attempt}\ndef add(x, y):\n    return x + y\n"))?;
             Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
         }
     }
@@ -5347,7 +5351,7 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
     let mut p = plan(&[("a", &[])]);
     p.contracts.push(ContractFile {
         path: "contracts/test_contract.py".into(),
-        content: "# Vacuous contract test that never exercises app/a/mod.py\nassert 1 + 1 == 2\n".into(),
+        content: "# Imports app.a.mod but swallows stub failures so the check is vacuous\ntry:\n    import app.a.mod\nexcept Exception:\n    pass\nassert 1 + 1 == 2\n".into(),
     });
     let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
     let harnesses = Harnesses {
@@ -5364,13 +5368,172 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
     cfg.worker_shell = false;
 
     let outcome = drive(cfg, harnesses).await.unwrap();
-    // Because the locked contract test stays vacuous, verify rejects it and routes the error back to page `a`.
+    // Because the locked contract test stays vacuous while page `a` keeps changing its file, verify rejects it.
     assert_eq!(outcome, Outcome::Finished { ok: false });
     let calls = h.calls.lock().unwrap();
     assert!(
         calls.iter().any(|b| b.contains("vacuous")),
         "expected vacuous contract test error routed back to page `a`, got calls: {calls:#?}"
     );
+}
+
+#[tokio::test]
+async fn mutation_gate_without_import_edge_is_skipped() {
+    struct ImplHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for ImplHarness {
+        fn id(&self) -> &'static str {
+            "p0b-no-edge"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0b-no-import-edge");
+    let mut p = plan(&[("a", &[])]);
+    // Subprocess/standalone acceptance contract test with NO import edge to any built file.
+    p.contracts.push(ContractFile {
+        path: "tests/test_acceptance_contract.py".into(),
+        content: "import subprocess\n\ndef test_cli_smoke():\n    assert 1 + 1 == 2\n".into(),
+    });
+    let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = h.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "unit should build once with no vacuous repair: {calls:#?}");
+    assert!(!calls.iter().any(|b| b.contains("vacuous")));
+}
+
+#[tokio::test]
+async fn identical_gate_failure_after_noop_repair_is_waived_not_escalated() {
+    struct CountingNoopHarness {
+        name: &'static str,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for CountingNoopHarness {
+        fn id(&self) -> &'static str {
+            self.name
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            // Always writes identical content: first turn creates the file, repair turn produces no diff.
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    // 1. Mutation gate: vacuous contract test with an import edge triggers 1 repair,
+    //    repair produces no diff, verify #2 sees identical finding -> waived in CHANGES.md,
+    //    never escalates to mid or master.
+    let tmp = repo("p0b-waive-mutation");
+    let mut p = plan(&[("a", &[])]);
+    p.contracts.push(ContractFile {
+        path: "contracts/test_contract.py".into(),
+        content: "try:\n    import app.a.mod\nexcept Exception:\n    pass\nassert 1 + 1 == 2\n".into(),
+    });
+    let worker = Arc::new(CountingNoopHarness { name: "p0b-worker", calls: Mutex::new(Vec::new()) });
+    let mid = Arc::new(CountingNoopHarness { name: "p0b-mid", calls: Mutex::new(Vec::new()) });
+    let master = Arc::new(CountingNoopHarness { name: "p0b-master", calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: worker.clone(),
+        mid: mid.clone(),
+        master: master.clone(),
+        reviewer: worker.clone(),
+        verifier: worker.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let worker_calls = worker.calls.lock().unwrap();
+    let repair_calls: Vec<&String> = worker_calls.iter().filter(|b| b.contains("Checks failed last time")).collect();
+    assert_eq!(repair_calls.len(), 1, "must call repair agent at most once: {worker_calls:#?}");
+    assert!(mid.calls.lock().unwrap().is_empty(), "must not escalate to mid tier");
+    assert!(master.calls.lock().unwrap().is_empty(), "must not escalate to master tier");
+    let changes_md = read(&tmp.0.join(".taskmaster/CHANGES.md"));
+    assert!(
+        changes_md.contains("gate warning") && changes_md.contains("waived identical mutation gate finding"),
+        "expected waived warning in CHANGES.md, got:\n{changes_md}"
+    );
+
+    // 2. General gate (verify script): identical finding after a no-op repair is waived too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp2 = repo("p0b-waive-script");
+        let script = tmp2.0.join(".taskmaster/verify");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "#!/bin/sh\necho 'page:a: advisory gate check failed'\nexit 1\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let worker2 = Arc::new(CountingNoopHarness { name: "p0b-worker2", calls: Mutex::new(Vec::new()) });
+        let mid2 = Arc::new(CountingNoopHarness { name: "p0b-mid2", calls: Mutex::new(Vec::new()) });
+        let master2 = Arc::new(CountingNoopHarness { name: "p0b-master2", calls: Mutex::new(Vec::new()) });
+        let harnesses2 = Harnesses {
+            worker: worker2.clone(),
+            mid: mid2.clone(),
+            master: master2.clone(),
+            reviewer: worker2.clone(),
+            verifier: worker2.clone(),
+        };
+        let mut cfg2 = config(&tmp2.0, plan(&[("a", &[])]), true, 1);
+        cfg2.checks = false;
+        cfg2.runtime_checks = false;
+        cfg2.code_mode = false;
+        cfg2.worker_shell = false;
+
+        let outcome2 = drive(cfg2, harnesses2).await.unwrap();
+        assert_eq!(outcome2, Outcome::Finished { ok: true });
+        let worker2_calls = worker2.calls.lock().unwrap();
+        let repairs2: Vec<&String> = worker2_calls.iter().filter(|b| b.contains("Checks failed last time")).collect();
+        assert_eq!(repairs2.len(), 1, "verify_script gate must call repair agent at most once: {worker2_calls:#?}");
+        assert!(mid2.calls.lock().unwrap().is_empty(), "verify_script gate must not escalate to mid");
+        assert!(master2.calls.lock().unwrap().is_empty(), "verify_script gate must not escalate to master");
+        let changes_md2 = read(&tmp2.0.join(".taskmaster/CHANGES.md"));
+        assert!(
+            changes_md2.contains("gate warning") && changes_md2.contains("advisory gate check failed"),
+            "expected waived verify_script warning in CHANGES.md, got:\n{changes_md2}"
+        );
+    }
 }
 
 #[tokio::test]

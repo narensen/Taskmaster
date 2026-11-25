@@ -442,6 +442,13 @@ struct Driver {
     setup_artifacts: HashMap<PathBuf, BTreeSet<String>>,
     /// Guards [`Driver::finalize`] so end-of-run cleanup/delivery/reporting runs once per turn.
     finalized: bool,
+    /// Pages whose most recent repair produced no diff and was counted as passed.
+    noop_repairs: BTreeSet<PageId>,
+    /// Fingerprints of per-page gate findings emitted in the previous verify pass.
+    last_gate_findings: BTreeMap<PageId, BTreeSet<String>>,
+    /// Gate findings waived after a no-op repair repeated the exact same failure: `(page, fingerprint)`.
+    /// Cleared for a page whenever that page merges an actual file diff.
+    waived_gate_findings: BTreeSet<(PageId, String)>,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -737,6 +744,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         project_config,
         setup_artifacts: HashMap::new(),
         finalized: false,
+        noop_repairs: BTreeSet::new(),
+        last_gate_findings: BTreeMap::new(),
+        waived_gate_findings: BTreeSet::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -2657,8 +2667,10 @@ impl Driver {
         Ok(None)
     }
 
-    /// W4: Mutation sanity on locked contract tests — temporarily stub the target implementation
+    /// W4: Mutation sanity on locked contract tests — temporarily stub an imported built target
     /// to fail and ensure the contract test actually fails (is not vacuous).
+    /// Contract tests with no import edge to a built file (e.g. subprocess CLI acceptance tests)
+    /// are skipped instead of falling back to arbitrary built files or `plan.pages.first()`.
     fn check_contract_mutations(&self, plan: &Plan, owners: &Owners) -> BTreeMap<PageId, String> {
         let mut vacuous: BTreeMap<PageId, String> = BTreeMap::new();
         let test_contracts: Vec<&tm_core::ContractFile> = plan
@@ -2671,7 +2683,7 @@ impl Driver {
         }
         let sources = load_sources(&self.tree).ok();
         let graph = sources.as_ref().map(|s| ImportGraph::build(s, ""));
-        let built_files: Vec<String> = self
+        let built_files: BTreeSet<String> = self
             .changes
             .iter()
             .filter(|c| matches!(c.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired))
@@ -2684,16 +2696,21 @@ impl Driver {
             let Some((cmd, env)) = crate::gates::mutation_test_command(&self.tree, &venv, &contract.path) else {
                 continue;
             };
-            let mut targets: Vec<String> = graph
+            let targets: Vec<String> = graph
                 .as_ref()
                 .and_then(|g| g.edges.get(&contract.path))
                 .into_iter()
                 .flatten()
-                .filter(|f| !crate::gates::is_test_path(f) && self.tree.join(f).is_file())
+                .filter(|f| {
+                    !crate::gates::is_test_path(f)
+                        && built_files.contains(f.as_str())
+                        && owners.owner(f).is_some()
+                        && self.tree.join(f).is_file()
+                })
                 .cloned()
                 .collect();
             if targets.is_empty() {
-                targets = built_files.clone();
+                continue;
             }
             let Some((impl_path, stub)) = targets
                 .into_iter()
@@ -2701,25 +2718,86 @@ impl Driver {
             else {
                 continue;
             };
+            let Some(page) = owners.owner(&impl_path).cloned() else {
+                continue;
+            };
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
             if let Ok(crate::gates::MutationVerdict::Vacuous) =
                 crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env)
             {
-                let author = owners
-                    .owner(&impl_path)
-                    .cloned()
-                    .or_else(|| plan.pages.first().map(|p| p.id.clone()));
                 let msg = format!(
                     "Contract test `{}` is vacuous: it still passes when `{}` is replaced with a failing stub.",
                     contract.path, impl_path
                 );
                 eprintln!("taskmaster: {msg}");
-                if let Some(page) = author {
-                    vacuous.insert(page, msg);
-                }
+                vacuous.insert(page, msg);
             }
         }
         vacuous
+    }
+
+    /// Filter per-page gate findings against waived findings and no-op repairs.
+    /// If a page's last repair changed no files and the gate repeats the exact same
+    /// failure fingerprint, waive the finding and record a warning for CHANGES.md instead
+    /// of escalating to the next tier.
+    fn record_gate_findings(
+        &mut self,
+        gate: &str,
+        findings: BTreeMap<PageId, String>,
+        failing: &mut BTreeMap<PageId, String>,
+        next_fingerprints: &mut BTreeMap<PageId, BTreeSet<String>>,
+        waived_entries: &mut Vec<ChangeEntry>,
+    ) {
+        for (page, msg) in findings {
+            let trimmed = msg.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let fp = gate_finding_fingerprint(gate, trimmed);
+            if self.waived_gate_findings.contains(&(page.clone(), fp.clone())) {
+                continue;
+            }
+            let repeated_after_noop = self.noop_repairs.contains(&page)
+                && self
+                    .last_gate_findings
+                    .get(&page)
+                    .is_some_and(|prev| prev.contains(&fp));
+            if repeated_after_noop {
+                self.waived_gate_findings.insert((page.clone(), fp));
+                let summary = format!("waived identical {gate} gate finding after no-op repair: {trimmed}");
+                eprintln!("taskmaster: {page}: {summary}");
+                waived_entries.push(ChangeEntry {
+                    at: rfc3339_now(),
+                    kind: ChangeKind::GateWarning,
+                    page: Some(page),
+                    commit: None,
+                    model: None,
+                    files: vec![],
+                    keys: vec![],
+                    summary,
+                });
+                continue;
+            }
+            next_fingerprints.entry(page.clone()).or_default().insert(fp);
+            let entry = failing.entry(page).or_default();
+            if !entry.is_empty() && !entry.ends_with('\n') {
+                entry.push('\n');
+            }
+            entry.push_str(trimmed);
+        }
+    }
+
+    /// Persist waived gate warnings to `CHANGES.md` and `changes.jsonl`.
+    fn commit_gate_warnings(&mut self, entries: Vec<ChangeEntry>) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if self.commit_entries(entries.clone(), vec![], "taskmaster: record waived gate warning")?.is_none() {
+            self.changes.extend(entries);
+            self.write_docs()?;
+            self.save_changes()?;
+        }
+        Ok(())
     }
 
     /// Log a page's outcome, learn from it, and hand it to the run.
@@ -2911,6 +2989,7 @@ impl Driver {
         let started = Instant::now();
         let deadline = started + crate::checker::GRACE;
         let mut lines = Vec::new();
+        let mut checker_findings: BTreeMap<PageId, String> = BTreeMap::new();
         while !self.checks.is_empty() {
             let left = deadline.saturating_duration_since(Instant::now());
             let Ok(Some(joined)) = tokio::time::timeout(left, self.checks.join_next()).await else { break };
@@ -2928,8 +3007,7 @@ impl Driver {
                 crate::checker::Verdict::Pass => lines.push(format!("{page}: pass ({:.1}s)", answer.seconds)),
                 crate::checker::Verdict::Fixes(fixes) => {
                     lines.push(format!("{page}: {} fix{} ({:.1}s)", fixes.len(), if fixes.len() == 1 { "" } else { "es" }, answer.seconds));
-                    fixed = true;
-                    let entry = failing.entry(page).or_default();
+                    let entry = checker_findings.entry(page).or_default();
                     if !entry.is_empty() {
                         entry.push('\n');
                     }
@@ -2937,6 +3015,19 @@ impl Driver {
                 }
             }
         }
+        let mut next_fps: BTreeMap<PageId, BTreeSet<String>> = BTreeMap::new();
+        let mut waived_entries: Vec<ChangeEntry> = Vec::new();
+        let before_count = failing.len();
+        let before_len: usize = failing.values().map(String::len).sum();
+        self.record_gate_findings("checker", checker_findings, failing, &mut next_fps, &mut waived_entries);
+        let after_len: usize = failing.values().map(String::len).sum();
+        if failing.len() > before_count || after_len > before_len {
+            fixed = true;
+        }
+        for (page, fps) in next_fps {
+            self.last_gate_findings.entry(page).or_default().extend(fps);
+        }
+        self.commit_gate_warnings(waived_entries)?;
         let late = self.checks.len();
         self.checks.abort_all();
         let waited = started.elapsed().as_secs_f64();
@@ -3167,6 +3258,9 @@ impl Driver {
             // to rebuild every page (an eval's baseline) still expects each to be written.
             if ok && self.config.incremental && self.owned_files_exist(page) {
                 eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
+                if errors.is_some() {
+                    self.noop_repairs.insert(page.to_string());
+                }
                 return Ok(WorkerOutcome::Passed);
             }
             let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
@@ -3199,6 +3293,10 @@ impl Driver {
         if let Some(reason) = self.check_red_green_proof(&all)? {
             return Ok(failed(reason));
         }
+        // This page produced a real diff: clear any no-op repair marker and re-evaluate gates fresh.
+        self.noop_repairs.remove(page);
+        self.waived_gate_findings.retain(|(p, _)| p != page);
+        self.last_gate_findings.remove(page);
         let mut files = Vec::new();
         for (worktree, change) in &all {
             let dest = self.tree.join(&change.path);
@@ -3642,9 +3740,13 @@ impl Driver {
             .filter(|(_, p)| p.state == tm_core::PageState::Passed)
             .map(|(id, _)| id.clone())
             .collect();
+        let mut failing: BTreeMap<PageId, String> = BTreeMap::new();
+        let mut next_fingerprints: BTreeMap<PageId, BTreeSet<String>> = BTreeMap::new();
+        let mut waived_entries: Vec<ChangeEntry> = Vec::new();
         let imports_began = Instant::now();
         let sources = load_sources(&self.tree)?;
-        let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
+        let import_findings = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
+        self.record_gate_findings("imports", import_findings, &mut failing, &mut next_fingerprints, &mut waived_entries);
         if !failing.is_empty() {
             timings.push(Timing::new("imports", imports_began.elapsed(), "failed"));
         }
@@ -3669,14 +3771,10 @@ impl Driver {
                 timings.append(&mut prev_timings);
             }
         }
-        for (page, errors) in checked.pages {
-            let text = failing.entry(page).or_default();
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&errors);
-        }
+        self.record_gate_findings("mechanical", checked.pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
         if failing.is_empty() && !checked.shared.is_empty() {
+            self.commit_gate_warnings(waived_entries)?;
+            self.last_gate_findings = next_fingerprints;
             if let Some((mut built_timings, _)) = built.take() {
                 timings.append(&mut built_timings);
             }
@@ -3729,8 +3827,10 @@ impl Driver {
                     }
                 }
             }
-            failing.extend(ran.pages);
+            self.record_gate_findings("runtime", ran.pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
             if failing.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) {
+                self.commit_gate_warnings(waived_entries)?;
+                self.last_gate_findings = next_fingerprints;
                 let mut lines: Vec<String> = ran.shared.iter().map(|(_, line)| line.clone()).filter(|l| !l.is_empty()).collect();
                 lines.extend(ran.unowned.clone());
                 eprintln!(
@@ -3754,6 +3854,8 @@ impl Driver {
             // A project with tests whose tests never ran has not been verified.
             let tested = timings.iter().any(|t| t.name == "test" && matches!(t.status, "ok" | "failed"));
             if failing.is_empty() && !tested && runtime::has_tests(&self.tree) {
+                self.commit_gate_warnings(waived_entries)?;
+                self.last_gate_findings = next_fingerprints;
                 let why = if timings.iter().any(|t| t.name == "test" && t.status == "timeout") {
                     format!("test step timed out after {}s", checks::STEP_TIMEOUT.as_secs())
                 } else {
@@ -3786,36 +3888,37 @@ impl Driver {
         // W4: Contract mutation sanity — stub the implementation and ensure locked contract tests fail.
         if failing.is_empty() {
             let vacuous = self.check_contract_mutations(&plan, &owners);
-            for (page, msg) in vacuous {
-                let entry = failing.entry(page).or_default();
-                if !entry.is_empty() && !entry.ends_with('\n') {
-                    entry.push('\n');
-                }
-                entry.push_str(&msg);
-            }
+            self.record_gate_findings("mutation", vacuous, &mut failing, &mut next_fingerprints, &mut waived_entries);
         }
         if let Some(note) = self.run_verify_script()? {
             let mut attributed = false;
+            let mut script_pages: BTreeMap<PageId, String> = BTreeMap::new();
             for line in note.lines() {
                 let Some(rest) = line.strip_prefix("page:") else { continue };
                 let Some((id, message)) = rest.split_once(':') else { continue };
                 let id = id.trim();
                 if self.run.pages.contains_key(id) && !message.trim().is_empty() {
                     attributed = true;
-                    failing.entry(id.to_string()).or_default().push_str(message.trim());
-                    failing.get_mut(id).unwrap().push('\n');
+                    let entry = script_pages.entry(id.to_string()).or_default();
+                    entry.push_str(message.trim());
+                    entry.push('\n');
                 }
             }
-            if !attributed && failing.is_empty() {
+            if attributed {
+                self.record_gate_findings("verify_script", script_pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
+            } else if failing.is_empty() {
+                self.commit_gate_warnings(waived_entries)?;
+                self.last_gate_findings = next_fingerprints;
                 return Ok((false, BTreeMap::new()));
-            }
-            if !attributed {
+            } else {
                 for errors in failing.values_mut() {
                     errors.push('\n');
                     errors.push_str(note.trim());
                 }
             }
         }
+        self.commit_gate_warnings(waived_entries)?;
+        self.last_gate_findings = next_fingerprints;
         for (page, errors) in &failing {
             let model = self.author(page);
             self.note_mistake_model(&model, errors)?;
@@ -6056,6 +6159,18 @@ fn reported_limit(request: &AgentRequest, hit: reply::ProviderLimit) -> reply::R
         .map(role_label)
         .unwrap_or("Agent");
     reply::ReportedLimit::new(request.harness.id(), role, hit)
+}
+
+/// Normalized fingerprint for a gate finding so an identical failure after a no-op repair
+/// is recognized even if surrounding whitespace differs.
+pub(crate) fn gate_finding_fingerprint(gate: &str, text: &str) -> String {
+    let normalized: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{gate}:{normalized}")
 }
 
 /// What a unit is told when a locked contract test that reaches its files fails.

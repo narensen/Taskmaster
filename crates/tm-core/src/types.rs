@@ -481,6 +481,8 @@ pub enum ChangeKind {
     EntryAmended,
     ReviewFinding,
     VerifyFailed,
+    /// A verify gate finding was waived after a no-op repair produced an identical failure.
+    GateWarning,
 }
 
 /// One line of the change log: what changed, where, and who changed it.

@@ -65,6 +65,7 @@ pub fn render_changes(entries: &[ChangeEntry], limit: usize) -> String {
             ChangeKind::EntryAmended => "entry amended",
             ChangeKind::ReviewFinding => "review finding",
             ChangeKind::VerifyFailed => "verify failed",
+            ChangeKind::GateWarning => "gate warning",
         };
         let _ = write!(out, "\n## {} · {kind}", e.at);
         if let Some(page) = &e.page {

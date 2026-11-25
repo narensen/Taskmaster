@@ -3298,6 +3298,7 @@ impl Driver {
         }
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
+        let policy = crate::policy::Policy::load(&self.tree);
         let units = self.page(page)?.work_units();
         let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
         let mut seen = BTreeSet::new();
@@ -3339,6 +3340,20 @@ impl Driver {
                     "these files are outside `{glob}` and were not merged: {}",
                     outside.join(", ")
                 )));
+            }
+            for change in &changes {
+                if self.is_locked_contract(&change.path) {
+                    return Ok(failed(format!(
+                        "refusing to merge edit to locked contract `{}` (locked contracts are read-only for workers)",
+                        change.path
+                    )));
+                }
+                if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(&change.path) {
+                    return Ok(failed(format!(
+                        "policy denied write to `{}` (matched `{glob}`)",
+                        change.path
+                    )));
+                }
             }
             for change in changes {
                 if !seen.insert(change.path.clone()) {
@@ -4272,6 +4287,11 @@ impl Driver {
     }
 
     /// Shared files this run wrote: the contracts and the template.
+    /// Any locked contract of this run's plan (interface or executable contract test).
+    fn is_locked_contract(&self, file: &str) -> bool {
+        self.run.plan.as_ref().is_some_and(|plan| plan.contracts.iter().any(|c| c.path == file))
+    }
+
     /// A locked contract of this run's plan that is an executable test.
     fn is_contract_test(&self, file: &str) -> bool {
         self.run.plan.as_ref().is_some_and(|plan| plan.contracts.iter().any(|c| c.path == file && c.is_test()))
@@ -4488,6 +4508,7 @@ impl Driver {
     /// Copy every change the master made in `worktree` into the run's tree, except the
     /// run's own records and anything that is not a plain file inside the project.
     fn merge_any(&self, worktree: &Path) -> anyhow::Result<Vec<String>> {
+        let policy = crate::policy::Policy::load(&self.tree);
         let mut files = Vec::new();
         for change in git::worktree_changes(worktree)? {
             if !git::safe_rel(&change.path) || change.path.starts_with(".taskmaster/") {
@@ -4495,6 +4516,10 @@ impl Driver {
             }
             if self.is_contract_test(&change.path) {
                 eprintln!("taskmaster: refusing to merge edit to locked contract test `{}`", change.path);
+                continue;
+            }
+            if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(&change.path) {
+                eprintln!("taskmaster: refusing to merge policy-denied file `{}` (matched `{glob}`)", change.path);
                 continue;
             }
             let src = worktree.join(&change.path);
@@ -4647,10 +4672,12 @@ impl Driver {
     }
 
     fn merge_shared(&self, worktree: &Path, allowed: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
+        let policy = crate::policy::Policy::load(&self.tree);
         let mut files = Vec::new();
         for change in git::worktree_changes(worktree)? {
             if !allowed.contains(&change.path)
                 || self.is_contract_test(&change.path)
+                || matches!(policy.check_path(&change.path), crate::policy::PathVerdict::Denied(_))
                 || change.status == 'D'
                 || !git::safe_rel(&change.path)
             {

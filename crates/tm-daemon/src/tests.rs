@@ -8516,3 +8516,98 @@ async fn drive_records_monotonic_and_wall_timing_in_status_and_report() {
     assert!(rendered.contains("monotonic "), "{rendered}");
     assert!(!rendered.contains("WARNING: clock skew detected"), "{rendered}");
 }
+
+#[tokio::test]
+async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildcard_glob() {
+    let tmp = seeded("audit-locked-and-policy");
+    let contract_body = "def test_contract():\n    assert True\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "tests/test_contract.py".into(),
+            content: contract_body.into(),
+            phase: 0,
+        }],
+        pages: vec![PagePlan {
+            id: "edit".into(),
+            owned_glob: "**".into(),
+            brief: "Implement src/app.py".into(),
+            done: "done".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct SneakyWorker {
+        attempt: AtomicUsize,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Harness for SneakyWorker {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let n = self.attempt.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(task.cwd.join("src"))?;
+            std::fs::write(task.cwd.join("src/app.py"), "x = 1\n")?;
+            match n {
+                0 => {
+                    // Attempt 1: tries to weaken the locked contract test under `**`.
+                    std::fs::write(task.cwd.join("tests/test_contract.py"), "# weakened\n")?;
+                }
+                1 => {
+                    // Attempt 2: leaves contract alone, tries to write policy-denied `.env`.
+                    std::fs::write(task.cwd.join(".env"), "API_KEY=leaked\n")?;
+                }
+                _ => {
+                    // Attempt 3: clean write to src/app.py only.
+                }
+            }
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:edit\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(SneakyWorker {
+        attempt: AtomicUsize::new(0),
+        briefs: briefs.clone(),
+    });
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let seen = briefs.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3, "expected 3 attempts (contract refused -> .env refused -> clean pass)");
+    assert!(seen[1].contains("refusing to merge edit to locked contract"), "{}", seen[1]);
+    assert!(seen[2].contains("policy denied write to `.env`"), "{}", seen[2]);
+    assert_eq!(read(&tmp.0.join("tests/test_contract.py")), contract_body);
+    assert!(!tmp.0.join(".env").exists(), "policy-denied .env must never be merged");
+}

@@ -503,6 +503,7 @@ impl CodeTools {
             }
             "write" => {
                 let file = path("path")?;
+                check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 if let Some(dir) = file.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -512,6 +513,7 @@ impl CodeTools {
             }
             "edit" => {
                 let file = path("path")?;
+                check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 let find = args["find"].as_str().filter(|f| !f.is_empty()).context("`find` is required")?;
                 let replace = args["replace"].as_str().unwrap_or("");
@@ -530,6 +532,7 @@ impl CodeTools {
             }
             "patch" => {
                 let file = path("path")?;
+                check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 let edits = args["edits"].as_array().context("`edits` must be an array of {find, replace, all?}")?;
                 if edits.is_empty() {
@@ -567,6 +570,7 @@ impl CodeTools {
                 for file_patch in &patches {
                     let rel = file_patch.target_path();
                     let full = if Path::new(rel).is_absolute() { PathBuf::from(rel) } else { scope.cwd.join(rel) };
+                    check_policy_write(scope, &full)?;
                     self.allowed(scope, op, ToolKind::Edit, Some(&full), None).await?;
                     if file_patch.is_delete() {
                         let existing = std::fs::read_to_string(&full).with_context(|| format!("cannot read {rel} to delete"))?;
@@ -1461,6 +1465,22 @@ fn is_write_file_tool(name: &str) -> bool {
     matches!(strip_dict_prefix(name), "writeFile" | "write_file")
 }
 
+/// Refuse writes matching `Policy::denied_globs` (such as `.env`, `*.pem`, `*.key`) across
+/// every Code Mode write/edit primitive, matching `tryPatch`.
+fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
+    let rel = file
+        .strip_prefix(&scope.cwd)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rel = rel.trim_start_matches("./");
+    let policy = crate::policy::Policy::load(&scope.cwd);
+    if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
+        bail!("policy denied write to `{rel}` (matched `{glob}`)");
+    }
+    Ok(())
+}
+
 impl CodeTools {
     async fn write_raw_file(&self, scope: &Scope, rel_path: &str, content: &str) -> anyhow::Result<()> {
         if scope.read_only {
@@ -1474,6 +1494,7 @@ impl CodeTools {
         } else {
             scope.cwd.join(rel_path)
         };
+        check_policy_write(scope, &file)?;
         self.allowed(scope, "write", ToolKind::Edit, Some(&file), None).await?;
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
@@ -2057,6 +2078,33 @@ mod tests {
             .unwrap();
         assert_eq!(ro_res["isError"], true, "{ro_res}");
         assert!(!dir.join("app/ro.py").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_write_and_edit_enforce_policy_denied_globs() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("policy-write");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        let via_js = tools.run(&grant(), r#"await write(".env", "SECRET=1\n");"#).await.unwrap();
+        assert!(via_js.contains("policy denied write"), "{via_js}");
+        assert!(!dir.join(".env").exists());
+
+        let via_raw = tools
+            .call(&grant(), "writeFile", &json!({ "path": "tls/server.key", "content": "PRIVATE" }))
+            .await
+            .unwrap();
+        assert_eq!(via_raw["isError"], true, "{via_raw}");
+        assert!(
+            via_raw["content"][0]["text"].as_str().unwrap_or("").contains("policy denied write"),
+            "{via_raw}"
+        );
+        assert!(!dir.join("tls/server.key").exists());
 
         tools.detach_all();
         std::fs::remove_dir_all(dir).ok();

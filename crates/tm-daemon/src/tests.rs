@@ -7114,3 +7114,96 @@ async fn single_worker_error_in_join_one_escalates_instead_of_aborting_run() {
     assert!(mid_inner.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1, "expected escalation to mid tier after worker error");
     assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'from-mid';\n");
 }
+
+#[tokio::test]
+async fn planner_rejects_contract_constants_contradicting_prompt_and_repairs_with_acceptance_test() {
+    let tmp = repo("plan-prompt-consistency");
+    let planner_briefs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct RepairingPlanner {
+        briefs: Arc<Mutex<Vec<String>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for RepairingPlanner {
+        fn id(&self) -> &'static str {
+            "planner-check"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let reply = if n == 0 {
+                // First attempt contradicts `id|name` with ' | ' and '-+-' and omits an acceptance test.
+                serde_json::json!({
+                    "kind": "cli",
+                    "summary": "Mini SQL",
+                    "contracts": [
+                        { "path": "minisql/format.py", "content": "SEPARATOR = ' | '\nHEADER_RULE = '-+-'\n" }
+                    ],
+                    "units": [
+                        { "id": "parser", "owned_glob": "minisql/parser.py", "brief": "Parse SQL.", "done": "done" },
+                        { "id": "exec", "owned_glob": "minisql/exec.py", "brief": "Execute SQL.", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string()
+            } else {
+                // Repair fixes the separator, removes the header rule, and locks an acceptance contract test.
+                serde_json::json!({
+                    "kind": "cli",
+                    "summary": "Mini SQL",
+                    "contracts": [
+                        { "path": "minisql/format.py", "content": "SEPARATOR = '|'\n" },
+                        { "path": "tests/test_acceptance_contract.py", "content": "def test_e2e():\n    assert 'id|name\\n1|alice' == 'id|name\\n1|alice'\n" }
+                    ],
+                    "units": [
+                        { "id": "parser", "owned_glob": "minisql/parser.py", "brief": "Parse SQL.", "done": "done" },
+                        { "id": "exec", "owned_glob": "minisql/exec.py", "brief": "Execute SQL.", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string()
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RepairingPlanner {
+        briefs: planner_briefs.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "plan-consistency".into();
+    cfg.prompt = Some(
+        "Build a mini SQL CLI that prints query results as `id|name`.\n\n\
+         Input:\n```sql\nSELECT id, name FROM users;\n```\n\
+         Output:\n```\nid|name\n1|alice\n```\n"
+            .into(),
+    );
+    cfg.yes = false; // stop at NeedsApproval once plan is accepted
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert!(matches!(out, Outcome::NeedsApproval { .. }), "expected repaired plan to reach NeedsApproval, got {out:?}");
+    let briefs = planner_briefs.lock().unwrap();
+    assert_eq!(briefs.len(), 2, "expected initial plan rejected and repaired in one round");
+    assert!(briefs[0].contains("id|name") && briefs[0].contains("end-to-end acceptance"), "initial planner brief must carry extracted I/O examples");
+    assert!(briefs[1].contains("SEPARATOR") && briefs[1].contains("HEADER_RULE"), "repair brief must cite the contradicting constants: {}", briefs[1]);
+}

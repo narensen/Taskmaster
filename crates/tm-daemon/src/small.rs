@@ -211,6 +211,10 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
          Keep contracts short. Leave `estimate` at zero.\n"
     ));
     brief.push_str(&plan_shape());
+    let io_examples = crate::gates::extract_prompt_io_examples(prompt);
+    if !io_examples.is_empty() {
+        brief.push_str(&crate::gates::format_prompt_acceptance_guidance(&io_examples));
+    }
     brief.push_str(DESIGN_RULE);
     brief.push_str(DECIDE_RULE);
     brief.push_str(&units_rule(slots));

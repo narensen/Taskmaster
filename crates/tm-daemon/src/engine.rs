@@ -1058,18 +1058,23 @@ impl Driver {
     async fn idle(&mut self) -> anyhow::Result<Step> {
         match self.run.phase {
             RunPhase::Planning => {
+                let mut review_prompt = None;
                 let (mut plan, drafted) = if let Some(plan) = self.config.plan.clone() {
                     self.config.plan = None;
                     (plan, false)
                 } else if self.config.prompt.as_ref().is_some_and(|prompt| !prompt.trim().is_empty()) {
                     let prompt = self.config.prompt.clone().unwrap_or_default();
                     let plan = self.draft_plan(&prompt).await?;
+                    review_prompt = Some(prompt);
                     self.config.prompt = None;
                     (plan, true)
                 } else {
                     bail!("no plan for this run; pass --plan <file> or --prompt <text>");
                 };
-                let review_findings = crate::gates::review_plan_structure(&plan);
+                let mut review_findings = crate::gates::review_plan_structure(&plan);
+                if let Some(prompt) = review_prompt.as_deref() {
+                    review_findings.extend(crate::gates::check_plan_prompt_consistency(prompt, &plan));
+                }
                 if !review_findings.is_empty() {
                     let revised = drafted && crate::gates::apply_mechanical_plan_fixes(&mut plan);
                     self.live.push(
@@ -1301,6 +1306,20 @@ impl Driver {
         };
         if let Err(found) = check_plan(&checked, &drafts, &existing) {
             errors.extend(found);
+        }
+        // Plan-vs-prompt consistency check: flag contract constants contradicting the user prompt
+        // and require a locked acceptance contract test when the prompt specifies literal I/O examples.
+        let user_prompt = if base.is_none() {
+            Some(prompt.to_string())
+        } else {
+            self.records.request(&self.id).ok().flatten().and_then(|r| r.prompt)
+        };
+        if let Some(user_prompt) = user_prompt {
+            for finding in crate::gates::check_plan_prompt_consistency(&user_prompt, &checked) {
+                if finding.severity == "error" {
+                    errors.push(finding.message);
+                }
+            }
         }
         if errors.is_empty() { Ok((plan, drafts)) } else { Err((errors, Some(json))) }
     }
@@ -1739,6 +1758,7 @@ impl Driver {
              saying how it knows it is finished.\n",
         );
         brief.push_str(&crate::small::plan_shape());
+        brief.push_str(&crate::gates::format_prompt_acceptance_guidance(&crate::gates::extract_prompt_io_examples(prompt)));
         brief.push_str(crate::small::PHASES_RULE);
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);

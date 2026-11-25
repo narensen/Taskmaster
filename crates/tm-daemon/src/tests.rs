@@ -7116,6 +7116,71 @@ async fn single_worker_error_in_join_one_escalates_instead_of_aborting_run() {
 }
 
 #[tokio::test]
+async fn stalled_worker_in_batch_does_not_abort_sibling_and_retries() {
+    let tmp = repo("stalled-batch");
+
+    struct StallThenPass {
+        a_calls: std::sync::atomic::AtomicUsize,
+        b_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for StallThenPass {
+        fn id(&self) -> &'static str {
+            "stall-batch"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Build page `a`") {
+                let n = self.a_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Exhaust ask()'s stall restarts (0..=2) so WorkerJob::Failed(Stalled) reaches join_one().
+                if n < 3 {
+                    return Err(tm_harness::Stalled(Duration::from_secs(60)).into());
+                }
+                let f = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, "export const a = 'recovered';\n").unwrap();
+            } else if task.brief.contains("Build page `b`") {
+                self.b_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let f = task.cwd.join("app/b/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, "export const b = 'ok';\n").unwrap();
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let inner = Arc::new(StallThenPass {
+        a_calls: std::sync::atomic::AtomicUsize::new(0),
+        b_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let h: Arc<dyn Harness> = inner.clone();
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(inner.b_calls.load(std::sync::atomic::Ordering::SeqCst), 1, "sibling page b must complete without being aborted");
+    assert!(inner.a_calls.load(std::sync::atomic::Ordering::SeqCst) >= 4, "page a should retry after stall reaches join_one");
+    assert_eq!(read(&tmp.0.join("app/a/page.ts")), "export const a = 'recovered';\n");
+    assert_eq!(read(&tmp.0.join("app/b/page.ts")), "export const b = 'ok';\n");
+}
+
+#[tokio::test]
 async fn planner_rejects_contract_constants_contradicting_prompt_and_repairs_with_acceptance_test() {
     let tmp = repo("plan-prompt-consistency");
     let planner_briefs = Arc::new(Mutex::new(Vec::<String>::new()));

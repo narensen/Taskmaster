@@ -2279,8 +2279,24 @@ impl Driver {
             }
             WorkerJob::Failed { err, worktree } => {
                 self.drop_worktree(&worktree);
-                // A provider usage/rate/auth limit still stops the run cleanly so the user can switch or retry.
-                if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() {
+                let current_tier = self
+                    .running
+                    .iter()
+                    .find_map(|cmd| match cmd {
+                        Command::SpawnWorker { page: p, tier, .. } if p == &page => Some(*tier),
+                        _ => None,
+                    })
+                    .unwrap_or(Tier::Worker);
+                let is_limit = err.downcast_ref::<crate::reply::ReportedLimit>().is_some();
+                let is_stalled = err.downcast_ref::<tm_harness::Stalled>().is_some();
+                let can_escalate = !self.run.focused && current_tier != Tier::Master;
+                let in_race = self.race_pages.contains_key(&page);
+                // Keep the run resumable from the log (leaving this page in Building with its
+                // recorded session id intact) on provider limits, cancellation interruptions, or
+                // non-stall worker errors when no higher tier or race candidate can recover.
+                // Stalls, race candidates, and escalatable worker errors settle as failed checks
+                // so a single bad worker does not abort the whole batch or run.
+                if is_limit || self.should_cancel() || (!is_stalled && !can_escalate && !in_race) {
                     self.race_pages.remove(&page);
                     self.batch_errors.remove(&page);
                     if let Some(partial) = self.batches.remove(&page) {
@@ -2294,8 +2310,6 @@ impl Driver {
                     self.persist()?;
                     return Err(err);
                 }
-                // A single worker error (such as a stall or harness crash) is treated as a failed
-                // check / escalation on this page rather than aborting the whole run.
                 eprintln!("taskmaster: {page} worker error ({err:#}); treating as a failed check");
                 self.batch_errors.entry(page.clone()).or_default().push(format!("worker error: {err:#}"));
             }

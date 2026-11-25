@@ -3514,7 +3514,23 @@ impl Driver {
         let verdict = self.verify_checks(&mut timings).await;
         // A skipped smoke check is not a check: say plainly when nothing ran at all.
         let ran_any = timings.iter().any(|t| matches!(t.status, "ok" | "failed" | "timeout"));
-        let text = if ran_any { checks::report(&timings) } else { format!("verify: nothing ran ({})", checks::report(&timings).trim_start_matches("verify: ")) };
+        let failing = match &verdict {
+            Ok((_, failing)) if !failing.is_empty() => Some(failing),
+            _ => None,
+        };
+        let mut text = if ran_any {
+            checks::report(&timings)
+        } else if failing.is_some() {
+            "verify: failed".to_string()
+        } else {
+            format!("verify: nothing ran ({})", checks::report(&timings).trim_start_matches("verify: "))
+        };
+        if let Some(failing) = failing {
+            for (page, reason) in failing {
+                let reason = reason.trim();
+                text.push_str(&format!("\n- {page}: {reason}"));
+            }
+        }
         eprintln!("taskmaster: {text}");
         self.terminal("output", serde_json::json!({ "ok": matches!(&verdict, Ok((true, _))), "text": text }));
         verdict
@@ -3547,8 +3563,12 @@ impl Driver {
             .filter(|(_, p)| p.state == tm_core::PageState::Passed)
             .map(|(id, _)| id.clone())
             .collect();
+        let imports_began = Instant::now();
         let sources = load_sources(&self.tree)?;
         let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
+        if !failing.is_empty() {
+            timings.push(Timing::new("imports", imports_began.elapsed(), "failed"));
+        }
         // The static checks and the project's own build and tests do not wait for each other.
         let steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
         let (checked, built) = {
@@ -3566,7 +3586,9 @@ impl Driver {
             self.repair_shared(&checked.shared).await?;
             checked = self.mechanical_checks(&owners).await?;
             timings.append(&mut checked.timings);
-            built = None; // the files changed, so the build is run again
+            if let Some((mut prev_timings, _)) = built.take() {
+                timings.append(&mut prev_timings);
+            }
         }
         for (page, errors) in checked.pages {
             let text = failing.entry(page).or_default();
@@ -3576,6 +3598,9 @@ impl Driver {
             text.push_str(&errors);
         }
         if failing.is_empty() && !checked.shared.is_empty() {
+            if let Some((mut built_timings, _)) = built.take() {
+                timings.append(&mut built_timings);
+            }
             // No page owns these files and the master could not repair them, so there is
             // nobody left to send the errors to.
             let lines: Vec<String> = checked.shared.iter().map(|(_, line)| line.clone()).collect();
@@ -3667,6 +3692,10 @@ impl Driver {
                 self.commit_entries(vec![entry], vec![], "taskmaster: record verification failure")?;
                 return Ok((false, BTreeMap::new()));
             }
+        } else if let Some((mut built_timings, _)) = built.take() {
+            // Preserve the build/test timings that ran in parallel even when static checks
+            // failed and runtime_checks were skipped.
+            timings.append(&mut built_timings);
         }
         // W4: Contract mutation sanity — stub the implementation and ensure locked contract tests fail.
         if failing.is_empty() {

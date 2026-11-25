@@ -7207,3 +7207,83 @@ async fn planner_rejects_contract_constants_contradicting_prompt_and_repairs_wit
     assert!(briefs[0].contains("id|name") && briefs[0].contains("end-to-end acceptance"), "initial planner brief must carry extracted I/O examples");
     assert!(briefs[1].contains("SEPARATOR") && briefs[1].contains("HEADER_RULE"), "repair brief must cite the contradicting constants: {}", briefs[1]);
 }
+
+#[tokio::test]
+async fn verify_reports_import_failure_reasons_and_keeps_parallel_build_timings() {
+    let tmp = repo("verify-import-timings");
+    // Give the project a minimal passing Python test so parallel runtime steps run alongside static checks.
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("tests/test_smoke.py"), "def test_ok():\n    assert True\n").unwrap();
+    let _ = crate::git::commit_paths(&tmp.0, "add smoke test", &["tests/test_smoke.py".into()]);
+
+    struct CrossImportHarness {
+        fixed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for CrossImportHarness {
+        fn id(&self) -> &'static str {
+            "cross-import"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn tm_harness::PermissionGate>,
+            events: tokio::sync::mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Build page `a`") {
+                let f = task.cwd.join("app/a/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                if task.brief.contains("Checks failed last time") {
+                    self.fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::fs::write(&f, "export const a = 1;\n").unwrap();
+                } else {
+                    std::fs::write(&f, "import { b } from '../b/page';\nexport const a = b;\n").unwrap();
+                }
+            } else if task.brief.contains("Build page `b`") {
+                let f = task.cwd.join("app/b/page.ts");
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, "export const b = 2;\n").unwrap();
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h = Arc::new(CrossImportHarness { fixed: std::sync::atomic::AtomicBool::new(false) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+    cfg.browser = false;
+    let store: Arc<dyn crate::store::Store> = Arc::new(crate::store::FileStore::in_project(&tmp.0));
+    let live = Arc::new(crate::live::Live::new(store));
+    cfg.live = Some(live.clone());
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert!(h.fixed.load(std::sync::atomic::Ordering::SeqCst), "page `a` should have been repaired after import violation");
+
+    live.flush("current");
+    let (_, entries) = live.read("current", 0);
+    let verify_outputs: Vec<String> = entries
+        .iter()
+        .filter(|e| e["agent"]["id"] == "runtime" && e["kind"] == "output")
+        .filter_map(|e| e["text"].as_str().map(str::to_string))
+        .filter(|t| t.starts_with("verify:"))
+        .collect();
+    let failed_verify = verify_outputs
+        .iter()
+        .find(|t| t.contains("imports") && t.contains("failed"))
+        .unwrap_or_else(|| panic!("expected a verify summary naming failed imports, got: {verify_outputs:#?}"));
+    assert!(!failed_verify.contains("nothing ran"), "must not print 'nothing ran' on import failure: {failed_verify}");
+    assert!(failed_verify.contains("- a:") && failed_verify.contains("app/a/page.ts imports app/b/page.ts"), "must print failing page and reason: {failed_verify}");
+    assert!(failed_verify.contains("test "), "must keep parallel build/test timings even when runtime_checks are skipped: {failed_verify}");
+}

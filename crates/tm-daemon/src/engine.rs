@@ -456,6 +456,8 @@ struct Driver {
     started_wall: SystemTime,
     /// Monotonic start of this driver invocation (`Instant`).
     started_mono: Instant,
+    /// Cached mutation-gate verdicts keyed by `(contract hash, target hash, command)`.
+    mutation_cache: BTreeMap<String, crate::gates::MutationVerdict>,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -545,6 +547,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         None => Records::files(&project),
     };
     let events = records.events(&id)?;
+    let mutation_cache = records.mutation_cache(&id).unwrap_or_default();
     let meta = load_meta(&records, &project, &config, !events.is_empty(), same_model(&harnesses, &config.models))?;
     let parallel = meta.parallel.max(1);
     let template = meta.template.as_deref().map(template::load).transpose()?;
@@ -759,6 +762,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         soft_dep_waiters: BTreeMap::new(),
         started_wall,
         started_mono,
+        mutation_cache,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -2730,7 +2734,7 @@ impl Driver {
     /// to fail and ensure the contract test actually fails (is not vacuous).
     /// Contract tests with no import edge to a built file (e.g. subprocess CLI acceptance tests)
     /// are skipped instead of falling back to arbitrary built files or `plan.pages.first()`.
-    fn check_contract_mutations(&self, plan: &Plan, owners: &Owners) -> BTreeMap<PageId, String> {
+    fn check_contract_mutations(&mut self, plan: &Plan, owners: &Owners) -> BTreeMap<PageId, String> {
         let mut vacuous: BTreeMap<PageId, String> = BTreeMap::new();
         let test_contracts: Vec<&tm_core::ContractFile> = plan
             .contracts
@@ -2755,6 +2759,7 @@ impl Driver {
             .collect();
 
         let venv = self.verify_venv();
+        let mut cache_updated = false;
         for contract in test_contracts {
             let Some((cmd, env)) = crate::gates::mutation_test_command(&self.tree, &venv, &contract.path) else {
                 continue;
@@ -2785,16 +2790,30 @@ impl Driver {
                 continue;
             };
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            if let Ok(crate::gates::MutationVerdict::Vacuous) =
-                crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env)
-            {
-                let msg = format!(
-                    "Contract test `{}` is vacuous: it still passes when `{}` is replaced with a failing stub.",
-                    contract.path, impl_path
-                );
-                eprintln!("taskmaster: {msg}");
-                vacuous.insert(page, msg);
+            if let Ok((verdict, hit)) = crate::gates::contract_mutation_sanity_cached(
+                &self.tree,
+                &contract.path,
+                &impl_path,
+                stub,
+                &refs,
+                &env,
+                &mut self.mutation_cache,
+            ) {
+                if !hit {
+                    cache_updated = true;
+                }
+                if verdict == crate::gates::MutationVerdict::Vacuous {
+                    let msg = format!(
+                        "Contract test `{}` is vacuous: it still passes when `{}` is replaced with a failing stub.",
+                        contract.path, impl_path
+                    );
+                    eprintln!("taskmaster: {msg}");
+                    vacuous.insert(page, msg);
+                }
             }
+        }
+        if cache_updated {
+            let _ = self.records.save_mutation_cache(&self.id, &self.mutation_cache);
         }
         vacuous
     }

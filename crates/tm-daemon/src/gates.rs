@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tm_core::{PageId, Plan};
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,59 @@ pub enum MutationVerdict {
     Vacuous,
     /// Could not verify non-vacuity (e.g., baseline failed, all tests were skipped, or zero tests passed).
     Inconclusive,
+}
+
+fn sha256_hex(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Deterministic cache key for a mutation-gate verdict keyed by `(contract hash, target hash, command)`.
+pub fn mutation_cache_key(
+    contract_rel_path: &str,
+    contract_bytes: &[u8],
+    impl_rel_path: &str,
+    target_bytes: &[u8],
+    test_cmd: &[&str],
+) -> String {
+    let contract_hash = sha256_hex(&[contract_rel_path.as_bytes(), contract_bytes]);
+    let target_hash = sha256_hex(&[impl_rel_path.as_bytes(), target_bytes]);
+    let cmd_joined = test_cmd.join("\0");
+    let cmd_hash = sha256_hex(&[cmd_joined.as_bytes()]);
+    format!("{contract_hash}:{target_hash}:{}", &cmd_hash[..16])
+}
+
+/// Cached variant of [`contract_mutation_sanity_with_env`]: returns `(verdict, cache_hit)`.
+/// When `(contract hash, target hash, test_cmd)` is already in `cache`, returns the cached
+/// verdict without copying the tree or spawning the test runner.
+pub fn contract_mutation_sanity_cached(
+    worktree: &Path,
+    contract_rel_path: &str,
+    impl_rel_path: &str,
+    stub_content: &str,
+    test_cmd: &[&str],
+    extra_env: &[(String, String)],
+    cache: &mut BTreeMap<String, MutationVerdict>,
+) -> anyhow::Result<(MutationVerdict, bool)> {
+    let contract_bytes = std::fs::read(worktree.join(contract_rel_path))?;
+    let target_bytes = std::fs::read(worktree.join(impl_rel_path))?;
+    let key = mutation_cache_key(contract_rel_path, &contract_bytes, impl_rel_path, &target_bytes, test_cmd);
+    if let Some(&verdict) = cache.get(&key) {
+        return Ok((verdict, true));
+    }
+    let verdict = contract_mutation_sanity_with_env(worktree, impl_rel_path, stub_content, test_cmd, extra_env)?;
+    cache.insert(key, verdict);
+    Ok((verdict, false))
 }
 
 /// Mutation sanity on a contract test: copy `worktree` into an isolated temporary
@@ -2175,5 +2229,59 @@ def test_isolated_and_catches_stub():
             parse_pytest_summary_passed("=== short test summary info ===\nPASSED t.py::test_a\n"),
             Some(1)
         );
+    }
+
+    #[test]
+    fn mutation_gate_verdict_is_cached_per_contract_and_target_hash() {
+        let root = std::env::temp_dir().join(format!("tm-mut-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("app.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        let counter = root.join("invocations.log");
+        let contract = format!(
+            "import os, sys\nwith open({:?}, 'a') as f:\n    f.write('1\\n')\nsys.path.insert(0, os.getcwd())\nimport app\nassert app.add(2, 3) == 5\n",
+            counter.display().to_string()
+        );
+        std::fs::write(root.join("tests/test_contract.py"), &contract).unwrap();
+
+        let stub = mutation_stub_for("app.py").unwrap();
+        let cmd = ["python3", "tests/test_contract.py"];
+        let mut cache: BTreeMap<String, MutationVerdict> = BTreeMap::new();
+
+        // 1. First verify: cache miss, runs baseline + mutated (2 invocations).
+        let (v1, hit1) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v1, MutationVerdict::Caught);
+        assert!(!hit1);
+        let runs_after_1 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_1, 2, "expected baseline + mutated execution on cache miss");
+
+        // 2. Second verify with unchanged contract and target: cache hit, 0 extra invocations!
+        let (v2, hit2) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v2, MutationVerdict::Caught);
+        assert!(hit2);
+        let runs_after_2 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_2, 2, "cached mutation verdict must not re-run test command");
+
+        // 3. Changing the target invalidates the cache and re-runs.
+        std::fs::write(root.join("app.py"), "def add(a, b):\n    return b + a\n").unwrap();
+        let (v3, hit3) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v3, MutationVerdict::Caught);
+        assert!(!hit3);
+        let runs_after_3 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_3, 4, "modifying target must invalidate cache and re-run");
+
+        // 4. Changing the contract test invalidates the cache and re-runs.
+        let vacuous_contract = format!(
+            "with open({:?}, 'a') as f:\n    f.write('1\\n')\nassert True\n",
+            counter.display().to_string()
+        );
+        std::fs::write(root.join("tests/test_contract.py"), vacuous_contract).unwrap();
+        let (v4, hit4) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v4, MutationVerdict::Vacuous);
+        assert!(!hit4);
+        let runs_after_4 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_4, 6, "modifying contract must invalidate cache and re-run");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

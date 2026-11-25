@@ -161,9 +161,18 @@ fn dispatch(state: &McpState, grant: &Grant, msg: &Value) -> Result<Value, (i32,
     }
 }
 
+fn strip_dict_prefix(name: &str) -> &str {
+    for prefix in ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    name
+}
+
 fn call_tool(state: &McpState, grant: &Grant, params: &Value) -> Result<Value, (i32, String)> {
     let text = |s: String, is_error: bool| json!({ "content": [{ "type": "text", "text": s }], "isError": is_error });
-    match params["name"].as_str().unwrap_or_default() {
+    match strip_dict_prefix(params["name"].as_str().unwrap_or_default()) {
         "cite" => {
             let key = params["arguments"]["key"].as_str().unwrap_or_default();
             let entry = resolve(state, key).map_err(|e| (-32602, e.to_string()))?;
@@ -377,5 +386,19 @@ mod tests {
         let (_, app) = setup();
         let (_, r) = rpc(&app, Some("tok-a"), call("../../etc/passwd")).await;
         assert!(r["error"].is_object());
+    }
+
+    #[tokio::test]
+    async fn prefixed_tool_names_are_accepted() {
+        let (_, app) = setup();
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": { "name": "mcp_dictionary_index", "arguments": {} }
+        });
+        let (status, r) = rpc(&app, Some("tok-a"), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r["result"]["isError"], false, "{r}");
     }
 }

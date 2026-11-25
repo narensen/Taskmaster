@@ -259,16 +259,22 @@ pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching fil
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
 pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch reads (`readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls. For Python triple quotes or backslashes, pass raw content via the separate `files` or `writeFile` JSON arguments, or use `String.raw` with `write(path, { raw })`.\n\n";
 
+/// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
+/// under `harness_id`.
+pub fn mcp_tool_name(harness_id: &str, server: &str, tool: &str) -> String {
+    match harness_id {
+        "antigravity" | "agy" => format!("mcp_{server}_{tool}"),
+        "claude" => format!("mcp__{server}__{tool}"),
+        "grok-build" | "grok" => format!("{server}__{tool}"),
+        "opencode" => format!("{server}_{tool}"),
+        _ => tool.to_string(),
+    }
+}
+
 /// The MCP tool name exposed to an agent for Code Mode's `run_code` tool on `harness_id`
 /// (with MCP server name `server`, typically `"dictionary"`).
 pub fn run_code_tool_name(harness_id: &str, server: &str) -> String {
-    match harness_id {
-        "antigravity" | "agy" => format!("mcp_{server}_run_code"),
-        "claude" => format!("mcp__{server}__run_code"),
-        "grok-build" | "grok" => format!("{server}__run_code"),
-        "opencode" => format!("{server}_run_code"),
-        _ => "run_code".to_string(),
-    }
+    mcp_tool_name(harness_id, server, "run_code")
 }
 
 impl WorkerTask {

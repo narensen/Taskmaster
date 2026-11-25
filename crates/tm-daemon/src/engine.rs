@@ -370,6 +370,7 @@ struct Driver {
     commons: PathBuf,
     tokens: HashMap<String, String>,
     reviewer_token: String,
+    security_token: String,
     verifier_token: String,
     master_token: String,
     trees: Vec<PathBuf>,
@@ -602,6 +603,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     });
     let _server = AbortOnDrop(server);
     let reviewer_token = fresh_token()?;
+    let security_token = fresh_token()?;
     let verifier_token = fresh_token()?;
     let master_token = fresh_token()?;
     let run_id = config.run_id.clone();
@@ -662,6 +664,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     extensions.push(web_tools);
     mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
+    mcp.grant(&security_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: "security".into() });
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into(), unit: String::new() });
     mcp.grant(&master_token, Grant { run: run_id, page: "master".into(), unit: String::new() });
 
@@ -722,6 +725,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         commons,
         tokens: held_tokens,
         reviewer_token,
+        security_token,
         verifier_token,
         master_token,
         trees: Vec::new(),
@@ -1838,22 +1842,27 @@ impl Driver {
         brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
         if self.web_access.planner_can_research() {
+            let mid = self.harnesses.master.id();
+            let docs_tool = tm_harness::mcp_tool_name(mid, "dictionary", "docs");
+            let search_tool = tm_harness::mcp_tool_name(mid, "dictionary", "web_search");
+            let fetch_tool = tm_harness::mcp_tool_name(mid, "dictionary", "web_fetch");
+            let adv_tool = tm_harness::mcp_tool_name(mid, "dictionary", "advisories");
             let search_hint = if self.web_access.is_native_passthrough() && self.web_access.roles.planner.search {
                 "your built-in web search tool".to_string()
             } else if self.web_access.roles.planner.search {
-                format!("`web_search` (up to {} calls)", self.web_access.planner_max_searches)
+                format!("`{search_tool}` (up to {} calls)", self.web_access.planner_max_searches)
             } else {
                 String::new()
             };
             let fetch_hint = if self.web_access.roles.planner.fetch {
                 format!(
-                    "`web_fetch` (up to {} calls), and `advisories(ecosystem, package, version?)`",
+                    "`{fetch_tool}` (up to {} calls), and `{adv_tool}(ecosystem, package, version?)`",
                     self.web_access.planner_max_fetches
                 )
             } else {
                 String::new()
             };
-            let mut tools_list = vec!["`docs(package, symbol?)` (local-first)".to_string()];
+            let mut tools_list = vec![format!("`{docs_tool}(package, symbol?)` (local-first)")];
             if !search_hint.is_empty() {
                 tools_list.push(search_hint);
             }
@@ -3653,9 +3662,11 @@ impl Driver {
         if !security.is_empty() {
             let mut sec_body = security_brief(&security);
             if self.web_access.enabled && self.web_access.roles.reviewer.fetch {
-                sec_body.push_str(
-                    "\nWhen checking added or updated dependencies, you may call `advisories(ecosystem, package, version?)` to query OSV security advisories, or `web_fetch` on advisory hosts.\n",
-                );
+                let adv = tm_harness::mcp_tool_name(self.harnesses.reviewer.id(), "dictionary", "advisories");
+                let fetch = tm_harness::mcp_tool_name(self.harnesses.reviewer.id(), "dictionary", "web_fetch");
+                sec_body.push_str(&format!(
+                    "\nWhen checking added or updated dependencies, you may call `{adv}(ecosystem, package, version?)` to query OSV security advisories, or `{fetch}` on advisory hosts.\n",
+                ));
             }
             let brief = self.with_notes(format!("{prefix}{sec_body}"), &reviewer_notes);
             let mut request = self.read_request(
@@ -3663,9 +3674,9 @@ impl Driver {
                 brief,
                 self.harnesses.reviewer.clone(),
                 self.config.models.reviewer.clone(),
-                &self.reviewer_token.clone(),
+                &self.security_token.clone(),
             )?;
-            self.offer_code_readonly("reviewer", &worktree, &mut request);
+            self.offer_code_readonly("reviewer/security", &worktree, &mut request);
             self.tag(&mut request, "reviewer", "security", None, None);
             let permit = sem.clone();
             let bill = request.bill(Role::Security, None);
@@ -3688,6 +3699,7 @@ impl Driver {
         }
         if let Some(code) = &self.code {
             code.detach("reviewer");
+            code.detach("reviewer/security");
         }
         self.drop_worktree(&worktree);
         if let Some(err) = failure {
@@ -5007,10 +5019,16 @@ impl Driver {
         let route = self.page(page).map(|p| p.route.clone()).unwrap_or_else(|_| "/".into());
         let dev = crate::preview::dev_command(cwd, "", 0).is_some();
         let path = if dev { route } else { "/ (files are served as they are in your worktree, such as /app/index.html)".to_string() };
+        let hid = request.harness.id();
+        let open = tm_harness::mcp_tool_name(hid, "dictionary", "browser_open");
+        let console = tm_harness::mcp_tool_name(hid, "dictionary", "browser_console");
+        let shot = tm_harness::mcp_tool_name(hid, "dictionary", "browser_screenshot");
+        let click = tm_harness::mcp_tool_name(hid, "dictionary", "browser_click");
+        let ty = tm_harness::mcp_tool_name(hid, "dictionary", "browser_type");
         request.brief.push_str(&format!(
             "\nA browser is ready on your own page's preview, {origin}; nothing else opens in it. Before you reply that you are done, \
-             look at what you built: browser_open with path {path}, then browser_console for errors, and browser_screenshot to see it. \
-             Fix what is wrong and look again. Use browser_click and browser_type to try what the page does.\n"
+             look at what you built: {open} with path {path}, then {console} for errors, and {shot} to see it. \
+             Fix what is wrong and look again. Use {click} and {ty} to try what the page does.\n"
         ));
         request.browser = Some(origin);
     }
@@ -5167,20 +5185,25 @@ impl Driver {
         if self.code.is_some() {
             out.push_str(&code_mode_guide(self.harnesses.worker.id()));
         }
-        out.push_str(
-            "\nDocumentation: call `docs(package, symbol?)` for local-first API docs from installed packages.",
-        );
+        let wid = self.harnesses.worker.id();
+        let docs_tool = tm_harness::mcp_tool_name(wid, "dictionary", "docs");
+        let fetch_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_fetch");
+        let adv_tool = tm_harness::mcp_tool_name(wid, "dictionary", "advisories");
+        let search_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_search");
+        out.push_str(&format!(
+            "\nDocumentation: call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages."
+        ));
         if self.web_access.enabled {
             let mut extra = Vec::new();
             if self.web_access.roles.worker.fetch {
-                extra.push("`web_fetch` (allowed doc domains)");
-                extra.push("`advisories(ecosystem, package, version?)`");
+                extra.push(format!("`{fetch_tool}` (allowed doc domains)"));
+                extra.push(format!("`{adv_tool}(ecosystem, package, version?)`"));
             }
             if self.web_access.roles.worker.search {
                 if self.web_access.is_native_passthrough() {
-                    extra.push("your built-in web search tool");
+                    extra.push("your built-in web search tool".to_string());
                 } else {
-                    extra.push("`web_search`");
+                    extra.push(format!("`{search_tool}`"));
                 }
             }
             if !extra.is_empty() {

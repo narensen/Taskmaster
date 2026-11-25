@@ -278,7 +278,7 @@ impl Extension for StatusTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if name != "set_status" {
+        if strip_dict_prefix(name) != "set_status" {
             return None;
         }
         let text = args["text"].as_str().unwrap_or("");
@@ -1444,7 +1444,7 @@ fn bwrap_works() -> bool {
 }
 
 /// Strip any known Dictionary MCP server prefix from a tool name so aliases work uniformly.
-fn strip_dict_prefix(name: &str) -> &str {
+pub(crate) fn strip_dict_prefix(name: &str) -> &str {
     for prefix in ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"] {
         if let Some(rest) = name.strip_prefix(prefix) {
             return rest;
@@ -2107,6 +2107,49 @@ mod tests {
         assert!(!dir.join("tls/server.key").exists());
 
         tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_reviewer_and_security_scopes_are_isolated_and_prefixed_tools_work() {
+        assert_eq!(tm_harness::mcp_tool_name("antigravity", "dictionary", "browser_open"), "mcp_dictionary_browser_open");
+        assert_eq!(tm_harness::mcp_tool_name("antigravity", "dictionary", "docs"), "mcp_dictionary_docs");
+        assert_eq!(tm_harness::mcp_tool_name("claude", "dictionary", "web_fetch"), "mcp__dictionary__web_fetch");
+
+        let dir = repo("rev-iso");
+        let store = Arc::new(crate::store::FileStore::in_project(&dir));
+        let live = Arc::new(crate::live::Live::new(store));
+        let status = StatusTools::new(live);
+        let rev_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: String::new() };
+        let sec_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: "security".into() };
+
+        // StatusTools accepts both bare and harness-prefixed tool names.
+        let s1 = status
+            .call(&rev_grant, "mcp_dictionary_set_status", &json!({ "text": "checking connections" }))
+            .await
+            .expect("prefixed set_status must be handled");
+        assert_eq!(s1["isError"], false, "{s1}");
+        assert!(s1["content"][0]["text"].as_str().unwrap_or("").contains("checking connections"));
+
+        // Concurrent reviewer and security CodeTools scopes do not overwrite each other.
+        if let Some(tools) = CodeTools::new(None) {
+            let gate = Arc::new(WorktreeGate::new(&dir, vec![]).read_only());
+            tools.attach_readonly("reviewer", &dir, gate.clone());
+            tools.attach_readonly("reviewer/security", &dir, gate);
+            assert_eq!(tools.tools(&rev_grant).len(), 1);
+            assert_eq!(tools.tools(&sec_grant).len(), 1);
+            let (r_res, s_res) = tokio::join!(
+                tools.run(&rev_grant, "return (await ls('app/**')).length;"),
+                tools.run(&sec_grant, "return (await read('app/data.json')).includes('ok');"),
+            );
+            assert!(r_res.unwrap().contains('2'));
+            assert!(s_res.unwrap().contains("true"));
+            // Detaching security leaves reviewer intact.
+            tools.detach("reviewer/security");
+            assert!(tools.tools(&sec_grant).is_empty());
+            assert_eq!(tools.tools(&rev_grant).len(), 1);
+            tools.detach("reviewer");
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 }

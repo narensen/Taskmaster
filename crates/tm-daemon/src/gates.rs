@@ -164,13 +164,16 @@ fn copy_tree_for_mutation(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Command and environment variables selected for contract mutation sanity.
+pub type MutationCommand = (Vec<String>, Vec<(String, String)>);
+
 /// Pick the project's proper test command (the same one `verify` uses via `runtime::steps`)
 /// for running W4 contract mutation sanity on `contract_path`.
 pub fn mutation_test_command(
     tree: &Path,
     venv: &Path,
     contract_path: &str,
-) -> Option<(Vec<String>, Vec<(String, String)>)> {
+) -> Option<MutationCommand> {
     let steps = crate::runtime::steps(tree, venv);
     if let Some(step) = steps.into_iter().find(|s| s.name == "test") {
         let is_pytest = step.args.iter().any(|a| a == "pytest");

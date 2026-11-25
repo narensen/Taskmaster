@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -28,6 +28,10 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long an agent may go without saying anything before the review is failed.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Wall-clock advance past monotonic time that indicates host suspend/freeze.
+const WALL_JUMP_THRESHOLD: Duration = Duration::from_secs(30);
+/// Active monotonic grace window after a detected wall-clock jump before failing a silent reviewer.
+const POST_JUMP_GRACE: Duration = Duration::from_secs(30);
 
 /// What to review and who reviews it.
 #[derive(Debug, Clone)]
@@ -184,6 +188,77 @@ struct Reply {
     usage: Usage,
 }
 
+trait WatchClock: Send + Sync {
+    fn monotonic(&self) -> Duration;
+    fn wall(&self) -> Duration;
+}
+
+struct SystemWatchClock {
+    origin: Instant,
+}
+
+impl WatchClock for SystemWatchClock {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn wall(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+/// Monitor reviewer silence on monotonic time while also detecting host suspend/freeze
+/// (wall-clock jumps > `jump_threshold` past monotonic deltas) so dead streams fail
+/// after `post_jump_grace` active monotonic time instead of waiting another full `stall`.
+async fn watch_stall_with_clock(
+    clock: Arc<dyn WatchClock>,
+    beat_ms: Arc<AtomicU64>,
+    stall: Duration,
+    tick: Duration,
+    jump_threshold: Duration,
+    post_jump_grace: Duration,
+) -> String {
+    let mut prev_mono = clock.monotonic();
+    let mut prev_wall = clock.wall();
+    let mut post_jump: Option<(Duration, u64)> = None;
+    loop {
+        tokio::time::sleep(tick).await;
+        let now_mono = clock.monotonic();
+        let now_wall = clock.wall();
+        let d_mono = now_mono.saturating_sub(prev_mono);
+        let d_wall = now_wall.saturating_sub(prev_wall);
+        prev_mono = now_mono;
+        prev_wall = now_wall;
+
+        let last_beat_ms = beat_ms.load(Ordering::Relaxed);
+        if d_wall > d_mono.saturating_add(jump_threshold) {
+            eprintln!(
+                "taskmaster: reviewer detected wall-clock jump (+{}s vs monotonic, likely suspend/freeze); waiting {}s for output",
+                d_wall.saturating_sub(d_mono).as_secs(),
+                post_jump_grace.as_secs()
+            );
+            post_jump = Some((now_mono, last_beat_ms));
+            continue;
+        }
+        if let Some((jump_mono, beat_at_jump)) = post_jump {
+            if last_beat_ms > beat_at_jump {
+                post_jump = None;
+            } else if now_mono.saturating_sub(jump_mono) >= post_jump_grace {
+                return format!(
+                    "the reviewer stalled after a wall-clock jump (no output for {}s afterwards)",
+                    post_jump_grace.as_secs()
+                );
+            }
+        }
+        let quiet = now_mono.saturating_sub(Duration::from_millis(last_beat_ms));
+        if quiet >= stall {
+            return format!("the reviewer stalled: no output for {} seconds", stall.as_secs());
+        }
+    }
+}
+
 /// Run one read-only agent in the review checkout and collect what it says.
 async fn ask(
     harness: Arc<dyn Harness>,
@@ -204,7 +279,7 @@ async fn ask(
         effort: None,
         dictionary: None,
         timeout: AGENT_TIMEOUT,
-        stall: None,
+        stall: Some(stall),
         read_only: true,
         code_mode: false,
         shell: None,
@@ -213,7 +288,7 @@ async fn ask(
     };
     let (tx, mut rx) = mpsc::channel(256);
     let beat = Arc::new(AtomicU64::new(0));
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let collect = {
         let beat = beat.clone();
         tokio::spawn(async move {
@@ -228,18 +303,18 @@ async fn ask(
         })
     };
     // Dropping the run future when the agent stalls kills its whole process group.
-    let watchdog = async {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1).min(stall)).await;
-            let quiet = started.elapsed().saturating_sub(Duration::from_millis(beat.load(Ordering::Relaxed)));
-            if quiet >= stall {
-                return;
-            }
-        }
-    };
+    let clock: Arc<dyn WatchClock> = Arc::new(SystemWatchClock { origin: started });
+    let watchdog = watch_stall_with_clock(
+        clock,
+        beat,
+        stall,
+        Duration::from_secs(1).min(stall),
+        WALL_JUMP_THRESHOLD,
+        POST_JUMP_GRACE,
+    );
     let summary = tokio::select! {
         result = harness.run(task, Arc::new(gate), tx) => result?,
-        _ = watchdog => anyhow::bail!("the reviewer stalled: no output for {} seconds", stall.as_secs()),
+        reason = watchdog => anyhow::bail!("{reason}"),
     };
     Ok(Reply { text: collect.await?, usage: summary.usage })
 }
@@ -501,4 +576,87 @@ async fn review(
     report.lint_notes = lint.notes;
     report.usage = usage;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeWatchClock {
+        mono_ms: AtomicU64,
+        wall_ms: AtomicU64,
+    }
+
+    impl WatchClock for FakeWatchClock {
+        fn monotonic(&self) -> Duration {
+            Duration::from_millis(self.mono_ms.load(Ordering::Relaxed))
+        }
+
+        fn wall(&self) -> Duration {
+            Duration::from_millis(self.wall_ms.load(Ordering::Relaxed))
+        }
+    }
+
+    #[tokio::test]
+    async fn review_watchdog_detects_wall_clock_jump_and_stops_silent_reviewer() {
+        let clock = Arc::new(FakeWatchClock {
+            mono_ms: AtomicU64::new(0),
+            wall_ms: AtomicU64::new(1_700_000_000_000),
+        });
+        let beat = Arc::new(AtomicU64::new(0));
+        let watch = tokio::spawn(watch_stall_with_clock(
+            clock.clone(),
+            beat.clone(),
+            Duration::from_secs(180),
+            Duration::from_millis(10),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+
+        // Simulate 346s host freeze (wall jumps +346s while monotonic only advances 1s).
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        clock.mono_ms.fetch_add(1_000, Ordering::Relaxed);
+        clock.wall_ms.fetch_add(347_000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!watch.is_finished(), "must wait 30s active monotonic grace after wall jump");
+
+        // Advance 31s of active monotonic time with no reviewer output -> stalls without waiting 180s!
+        clock.mono_ms.fetch_add(31_000, Ordering::Relaxed);
+        clock.wall_ms.fetch_add(31_000, Ordering::Relaxed);
+        let reason = tokio::time::timeout(Duration::from_secs(2), watch)
+            .await
+            .expect("watchdog should fire after post-jump grace")
+            .unwrap();
+        assert!(reason.contains("wall-clock jump"), "{reason}");
+
+        // Second check: output during grace window cancels the post-jump stall.
+        let clock2 = Arc::new(FakeWatchClock {
+            mono_ms: AtomicU64::new(0),
+            wall_ms: AtomicU64::new(1_700_000_000_000),
+        });
+        let beat2 = Arc::new(AtomicU64::new(0));
+        let watch2 = tokio::spawn(watch_stall_with_clock(
+            clock2.clone(),
+            beat2.clone(),
+            Duration::from_secs(180),
+            Duration::from_millis(10),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        clock2.mono_ms.fetch_add(1_000, Ordering::Relaxed);
+        clock2.wall_ms.fetch_add(120_000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Reviewer outputs during the grace window at mono = 10s.
+        clock2.mono_ms.fetch_add(9_000, Ordering::Relaxed);
+        clock2.wall_ms.fetch_add(9_000, Ordering::Relaxed);
+        beat2.store(10_000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Advance another 30s (total 40s since jump, 30s since beat): should NOT stall because beat cleared jump!
+        clock2.mono_ms.fetch_add(30_000, Ordering::Relaxed);
+        clock2.wall_ms.fetch_add(30_000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!watch2.is_finished(), "output during post-jump grace must cancel post-jump stall");
+        watch2.abort();
+    }
 }

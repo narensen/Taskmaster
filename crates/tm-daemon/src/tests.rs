@@ -5485,7 +5485,7 @@ async fn identical_gate_failure_after_noop_repair_is_waived_not_escalated() {
 
     let outcome = drive(cfg, harnesses).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
-    let worker_calls = worker.calls.lock().unwrap();
+    let worker_calls = worker.calls.lock().unwrap().clone();
     let repair_calls: Vec<&String> = worker_calls.iter().filter(|b| b.contains("Checks failed last time")).collect();
     assert_eq!(repair_calls.len(), 1, "must call repair agent at most once: {worker_calls:#?}");
     assert!(mid.calls.lock().unwrap().is_empty(), "must not escalate to mid tier");
@@ -8345,12 +8345,13 @@ async fn small_cli_prompt_uses_single_phase_plan() {
         3
     ));
 
+    type PlannerLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
     let tmp = seeded("p1-3-single-phase");
-    let planner_calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_calls: PlannerLog = Arc::new(Mutex::new(Vec::new()));
     let worker_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     struct SinglePhaseHarness {
-        planner_calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        planner_calls: PlannerLog,
         worker_calls: Arc<Mutex<Vec<String>>>,
         plan_attempts: AtomicUsize,
     }

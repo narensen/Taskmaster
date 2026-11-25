@@ -3888,13 +3888,14 @@ impl Driver {
         let mut checked = checked;
         let mut built = built;
         timings.append(&mut checked.timings);
-        if !checked.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
-            if self.repair_shared(&checked.shared).await? {
-                checked = self.mechanical_checks(&owners).await?;
-                timings.append(&mut checked.timings);
-                if let Some((mut prev_timings, _)) = built.take() {
-                    timings.append(&mut prev_timings);
-                }
+        if !checked.shared.is_empty()
+            && self.shared_repairs() < MAX_SHARED_REPAIRS
+            && self.repair_shared(&checked.shared).await?
+        {
+            checked = self.mechanical_checks(&owners).await?;
+            timings.append(&mut checked.timings);
+            if let Some((mut prev_timings, _)) = built.take() {
+                timings.append(&mut prev_timings);
             }
         }
         self.record_gate_findings("mechanical", checked.pages, &mut failing, &mut next_fingerprints, &mut waived_entries);

@@ -5187,7 +5187,12 @@ impl Driver {
             .unwrap_or(agent);
         self.status_tools.register_tag(scope_key, tag.clone());
         request.feed = Some(Feed { live: self.live.clone(), run: self.id.clone(), agent: tag });
-        request.stall = Some(if self.small { SMALL_STALL } else { STALL });
+        request.stall = Some(self.stall_timeout_for());
+    }
+
+    fn stall_timeout_for(&self) -> Duration {
+        let env_val = std::env::var(STALL_ENV).ok();
+        resolve_stall_timeout(self.config.stall_timeout, env_val.as_deref(), self.small)
     }
 
     /// Notes addressed to the master or to every worker. The master reads them and the
@@ -6087,19 +6092,39 @@ your files (prefer edit/patch/applyPatch over rewriting whole files), and every 
 which runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or shell tools \
 are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
 
+/// Environment variable overriding the per-agent silence/stall timeout in seconds.
+const STALL_ENV: &str = "TASKMASTER_STALL_SECS";
 /// Generous silence window so thinking models are never killed mid-reasoning,
 /// while genuinely hung sockets still recover automatically.
 const SMALL_STALL: Duration = Duration::from_secs(300);
 /// Larger briefs and deep reasoning turns can think quietly for several minutes.
 const STALL: Duration = Duration::from_secs(600);
-/// Fresh agents started after a stall. The last one may wait for the whole timeout.
+/// Fresh agents started after a stall. Every attempt—including the final one—keeps a stall bound.
 const STALL_RESTARTS: usize = 2;
 
+/// Resolve the per-agent stall timeout from explicit config, `TASKMASTER_STALL_SECS`, or defaults.
+pub(crate) fn resolve_stall_timeout(configured: Option<Duration>, env_val: Option<&str>, small: bool) -> Duration {
+    if let Some(d) = configured.filter(|d| !d.is_zero()) {
+        return d;
+    }
+    if let Some(secs) = env_val
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+    {
+        return Duration::from_secs(secs);
+    }
+    if small { SMALL_STALL } else { STALL }
+}
+
 /// Run one agent. One that stalls is stopped and replaced by a fresh agent with the same brief.
+/// The final attempt gets a wider—but still finite—stall bound so a hung agent can never hang forever.
 async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
+    let base_stall = request.stall.unwrap_or(STALL);
+    let final_stall = base_stall.saturating_mul(2);
     for restart in 0..=STALL_RESTARTS {
         if restart == STALL_RESTARTS {
-            request.stall = None;
+            request.stall = Some(final_stall);
         }
         match ask_once(&request).await {
             Err(err) if restart < STALL_RESTARTS && err.downcast_ref::<tm_harness::Stalled>().is_some() => {

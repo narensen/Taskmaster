@@ -7517,3 +7517,95 @@ async fn verify_reports_specific_skipped_checks_and_reasons_instead_of_nothing_r
         "expected message naming skipped test check and missing node_modules, got: {msgs2:#?}"
     );
 }
+
+#[tokio::test]
+async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
+    // 1. Resolution precedence: explicit Config > TASKMASTER_STALL_SECS > small/default fallback.
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, false),
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, true),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("45"), false),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("0"), false),
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("not-a-number"), true),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(Some(Duration::from_secs(12)), Some("45"), false),
+        Duration::from_secs(12)
+    );
+
+    // 2. End-to-end: configured stall_timeout reaches the harness, and the final retry
+    // (restart == STALL_RESTARTS) still carries a finite stall bound rather than None.
+    let tmp = repo("stall-bound");
+    let seen_stalls = Arc::new(Mutex::new(Vec::<Option<Duration>>::new()));
+
+    struct RecordingStallHarness {
+        seen: Arc<Mutex<Vec<Option<Duration>>>>,
+        attempt: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for RecordingStallHarness {
+        fn id(&self) -> &'static str {
+            "stall-rec"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen.lock().unwrap().push(task.stall);
+            let n = self.attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                return Err(tm_harness::Stalled(task.stall.unwrap_or_default()).into());
+            }
+            let f = task.cwd.join("app/a/page.ts");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, "export const a = 1;\n").unwrap();
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RecordingStallHarness {
+        seen: seen_stalls.clone(),
+        attempt: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.stall_timeout = Some(Duration::from_secs(15));
+
+    let out = crate::drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    let stalls = seen_stalls.lock().unwrap().clone();
+    assert_eq!(
+        stalls,
+        vec![
+            Some(Duration::from_secs(15)),
+            Some(Duration::from_secs(15)),
+            Some(Duration::from_secs(30)),
+        ],
+        "expected configured stall on initial/retry attempts and finite bounded stall on final attempt"
+    );
+}

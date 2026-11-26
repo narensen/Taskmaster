@@ -9551,7 +9551,7 @@ async fn flow_env_json_records_after_verify_injects_stable_prefix_hint_and_share
     let calls3 = seen3.lock().unwrap().clone();
     let (brief_a3, shell_a3) = calls3.iter().find(|(b, _)| b.contains("Build page `e`")).expect("e call");
     let (pre_a3, _) = brief_a3.split_once("--- Your task ---").expect("marker in a3");
-    assert!(pre_a3.contains("Verified test environment: run tests with `pytest -q`"), "{pre_a3}");
+    assert!(pre_a3.contains("Verified test environment: run tests with `pytest -q -x --tb=short`"), "{pre_a3}");
     assert!(!pre_a3.contains("shared-venv-fixture"), "stale venv path must be dropped:\n{pre_a3}");
     let shell_a3 = shell_a3.as_ref().expect("shell scope for a3");
     assert!(!shell_a3.readable.contains(&shared_venv), "missing venv must not be mounted");

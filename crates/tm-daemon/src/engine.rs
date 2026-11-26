@@ -6908,7 +6908,7 @@ impl Driver {
                 || display_facts.test_cmd.contains(abs_venv)
             {
                 if display_facts.runner == "pytest" {
-                    display_facts.test_cmd = "pytest -q".into();
+                    display_facts.test_cmd = "pytest -q -x --tb=short".into();
                 } else {
                     self.env_hint.clear();
                     return;

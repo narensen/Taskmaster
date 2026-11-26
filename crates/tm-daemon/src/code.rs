@@ -43,6 +43,7 @@ pub const SCRIPT_SECS: u64 = 600;
 pub const SH_SECS: u64 = 300;
 const MAX_READ: usize = 256 * 1024;
 const MAX_REPLY: usize = 24 * 1024;
+const MAX_TOOL_OUTPUT: usize = 4096;
 const MAX_CALLS: usize = 200;
 
 /// Persistent warm Node sandbox worker script: executes multiple `run_code` bodies over
@@ -697,7 +698,7 @@ impl CodeTools {
                 let command = args["command"].as_str().context("`command` is required")?;
                 self.allowed(scope, op, ToolKind::Execute, None, Some(command)).await?;
                 let (code, text) = self.sandboxed(scope, command).await?;
-                Ok(json!({ "code": code, "output": tail(&text, 8000) }))
+                Ok(json!({ "code": code, "output": tail(&text, MAX_TOOL_OUTPUT) }))
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
@@ -722,7 +723,7 @@ impl CodeTools {
                         let _ = tm_flow::write_env(&root, &facts);
                     }
                 }
-                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, 6000) }))
+                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, MAX_TOOL_OUTPUT) }))
             }
             "readMany" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -931,7 +932,7 @@ impl CodeTools {
                     "affectedFiles": changed,
                     "testFiles": matched_tests,
                     "failed": failed_tests(&text),
-                    "output": tail(&text, 6000)
+                    "output": tail(&text, MAX_TOOL_OUTPUT)
                 }))
             }
             "probeAst" => {
@@ -2687,5 +2688,17 @@ mod tests {
         assert!(steps_after.iter().all(|s| !s.setup), "ready shared venv needs no setup writes");
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tok14_tool_output_cap_keeps_4kb_traceback_tail() {
+        let prefix = "verbose test output line before failure\n".repeat(300);
+        let traceback = "E       AssertionError: bad checksum\nFAILED tests/test_hash.py::test_digest\n1 failed in 0.08s\n";
+        let full = format!("{prefix}{traceback}");
+        assert!(full.len() > MAX_TOOL_OUTPUT * 2);
+        let kept = tail(&full, MAX_TOOL_OUTPUT);
+        assert!(kept.len() <= MAX_TOOL_OUTPUT + 4, "kept len {} exceeded 4KB cap", kept.len());
+        assert!(kept.starts_with('…'));
+        assert!(kept.ends_with(traceback), "must keep trailing traceback: {kept}");
     }
 }

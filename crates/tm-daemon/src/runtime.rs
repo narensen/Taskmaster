@@ -26,7 +26,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 /// Output kept from a failed step: the end, where the errors are.
-const KEEP: usize = 6000;
+pub(crate) const KEEP: usize = 4096;
 
 /// The UI checks of one page may take this long.
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -231,16 +231,16 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
     let mut install: Vec<Step> = Vec::new();
     let test = if poetry {
         install.push(with_env(Step::new("setup", "poetry", &["install", "--no-interaction"])));
-        with_env(Step::new("test", "poetry", &["run", "pytest", "-q"]))
+        with_env(Step::new("test", "poetry", &["run", "pytest", "-q", "-x", "--tb=short"]))
     } else if uv {
         let mut sync = with_env(Step::new("setup", "uv", &["sync", "--all-extras"]));
         sync.env.push(("UV_PROJECT_ENVIRONMENT".into(), venv.display().to_string()));
         install.push(sync);
-        let mut run = with_env(Step::new("test", "uv", &["run", "pytest", "-q"]));
+        let mut run = with_env(Step::new("test", "uv", &["run", "pytest", "-q", "-x", "--tb=short"]));
         run.env.push(("UV_PROJECT_ENVIRONMENT".into(), venv.display().to_string()));
         run
     } else if hatch {
-        with_env(Step::new("test", "hatch", &["run", "pytest", "-q"]))
+        with_env(Step::new("test", "hatch", &["run", "pytest", "-q", "-x", "--tb=short"]))
     } else {
         let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into(), "-q".into()];
         let installable = pyproject.contains("[project]") || pyproject.contains("[build-system]") || tree.join("setup.py").is_file() || tree.join("setup.cfg").is_file();
@@ -256,7 +256,7 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
         args.push("pytest".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         install.push(with_env(Step::new("setup", venv_python.clone(), &refs)));
-        with_env(Step::new("test", venv_python, &["-m", "pytest", "-q"]))
+        with_env(Step::new("test", venv_python, &["-m", "pytest", "-q", "-x", "--tb=short"]))
     };
     if !ready {
         for step in install {
@@ -453,7 +453,7 @@ pub async fn prepare_env(
         // Venv exists but pytest is unavailable inside the worker sandbox; record safe fallback without broken venv.
         return Some(tm_flow::EnvFacts {
             runner: "pytest".into(),
-            test_cmd: "pytest -q".into(),
+            test_cmd: "pytest -q -x --tb=short".into(),
             venv: None,
             python: None,
             install_cmd: None,
@@ -1228,6 +1228,36 @@ mod tests {
             venv_has_pytest_with_home(&venv, Some(&fake_home)).await,
             "self-contained venv with pytest in its own site-packages must pass sandbox check"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tok14_default_pytest_args_are_compact_and_tail_caps_output_preserving_traceback() {
+        let dir = std::env::temp_dir().join(format!("tm-tok14-pytest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_sample.py"), "def test_ok():\n    assert True\n").unwrap();
+        let venv = dir.join("venv");
+
+        let py_steps = python_steps(&dir, &venv);
+        let test_step = py_steps.iter().find(|s| s.name == "test" && !s.setup).expect("pytest step");
+        assert!(
+            test_step.args.windows(4).any(|w| w == ["pytest", "-q", "-x", "--tb=short"]),
+            "default pytest args should include `-q -x --tb=short`, got: {:?}",
+            test_step.args
+        );
+
+        // Long output is capped around 4 KB while preserving the trailing traceback/failure summary.
+        let noise = "passing line of noisy stdout output from earlier tests\n".repeat(200);
+        let tb = "FAILED tests/test_sample.py::test_boom - AssertionError: expected 42\n1 failed in 0.12s\n";
+        let combined = format!("{noise}{tb}");
+        assert!(combined.len() > KEEP * 2);
+        let clipped = tail(&combined);
+        assert!(clipped.len() <= KEEP + 8, "clipped len {} exceeded ~4KB cap", clipped.len());
+        assert!(clipped.starts_with("…\n"), "expected truncation marker: {clipped}");
+        assert!(clipped.ends_with(tb), "must keep trailing traceback: {clipped}");
+        assert!(!clipped.contains(&noise), "noisy prefix must be dropped");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

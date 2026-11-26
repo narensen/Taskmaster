@@ -160,7 +160,7 @@ If a call is refused, say which one in your reply and carry on without it.\n\nTa
 /// Rules for a worker whose shell runs inside the sandbox.
 pub const SHELL_WORKER_RULES: &str = "Rules: you have a shell, confined to a sandbox. Only the current directory, \
 /tmp and $TASKMASTER_SCRATCH can be written. If $TASKMASTER_SHARED_VENV is set, reuse it to run tests \
-(for example `$TASKMASTER_SHARED_VENV/bin/python -m pytest -q`) and do NOT create your own venv; only create a venv in \
+(for example `$TASKMASTER_SHARED_VENV/bin/python -m pytest -q -x --tb=short`) and do NOT create your own venv; only create a venv in \
 `$TASKMASTER_SCRATCH/venv` if no shared venv is provided or an extra package must be installed (package indexes can be reached when needed). \
 Work only inside the current directory. Run the tests for your files before you say you are done, and fix what fails. \
 Leave no server or watcher running when you finish. If a call is refused, say which one in your reply and carry on without it.\n\nTask: ";

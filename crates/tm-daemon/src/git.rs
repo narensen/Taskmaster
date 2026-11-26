@@ -90,6 +90,7 @@ pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {
         ".taskmaster/hosts.json",
         ".taskmaster/taskmaster.db*",
         ".taskmaster/reviews/jobs/",
+        ".flow/index.sqlite*",
     ] {
         if !next.lines().any(|have| have == line) {
             if !changed {

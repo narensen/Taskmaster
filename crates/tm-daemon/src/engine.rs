@@ -770,6 +770,9 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
+    if let Err(err) = tm_flow::build(&driver.tree) {
+        eprintln!("taskmaster: flow build skipped: {err:#}");
+    }
     driver.project_memory = driver.render_project_memory();
     driver.warn_struggling_worker();
     if driver.config.resume_cancelled && driver.run.phase == RunPhase::Failed {
@@ -2618,6 +2621,7 @@ impl Driver {
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|c| !git::same_as(&p.worktree, &self.tree, c))
+                    .filter(|c| !tm_verify::is_flow_path(&c.path))
                     .collect();
                 let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
                 let owned_ok = !paths.is_empty()
@@ -3027,6 +3031,8 @@ impl Driver {
         let paths: Vec<String> = fixed.changed.iter().filter(|p| git::safe_rel(p)).cloned().collect();
         if let Err(err) = git::commit_paths(&self.tree, &format!("taskmaster: auto-fix ({ran})"), &paths) {
             eprintln!("taskmaster: the auto-fixed files were not committed: {err:#}");
+        } else {
+            self.update_flow_files(&paths);
         }
     }
 
@@ -3319,6 +3325,7 @@ impl Driver {
                 .into_iter()
                 .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
                 .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
+                .filter(|c| !tm_verify::is_flow_path(&c.path))
                 .collect();
             for change in &changes {
                 if !git::safe_rel(&change.path) {
@@ -3449,9 +3456,10 @@ impl Driver {
             keys: self.page(page)?.cites.clone(),
             summary,
         };
-        let Some(hash) = self.commit_entries(vec![entry], files, &message)? else {
+        let Some(hash) = self.commit_entries(vec![entry], files.clone(), &message)? else {
             return Ok(failed("worker produced no changes under its owned files"));
         };
+        self.update_flow_files(&files);
         self.records.mark_merged(&self.id, page, &hash)?;
         Ok(WorkerOutcome::Passed)
     }
@@ -3508,6 +3516,7 @@ impl Driver {
         }
         self.project_md = md;
         self.commit_entries(vec![entry], files, "taskmaster: lock contracts")?;
+        self.seed_flow_after_lock(&plan);
         eprintln!("taskmaster: locked contracts");
         Ok(())
     }
@@ -3569,6 +3578,7 @@ impl Driver {
                     summary: amend.summary,
                 };
                 self.commit_entries(vec![entry], vec![], &format!("taskmaster: amend {}", flag.key))?;
+                self.refresh_flow_and_commit();
                 FlagResolution::Amended
             }
         };
@@ -4433,6 +4443,8 @@ impl Driver {
         paths.dedup();
         if let Err(err) = git::commit_paths(&self.tree, message, &paths) {
             eprintln!("taskmaster: the rollback was written but not committed: {err:#}");
+        } else {
+            self.update_flow_files(&paths);
         }
         Ok(())
     }
@@ -4511,9 +4523,11 @@ impl Driver {
             summary,
         };
         // Recorded even when nothing changed, so the repair is not asked for forever.
-        if self.commit_entries(vec![entry.clone()], files, "taskmaster: repair a failure no unit owns")?.is_none() {
+        if self.commit_entries(vec![entry.clone()], files.clone(), "taskmaster: repair a failure no unit owns")?.is_none() {
             self.changes.push(entry);
             self.save_changes()?;
+        } else if !files.is_empty() {
+            self.update_flow_files(&files);
         }
         Ok(())
     }
@@ -4524,7 +4538,7 @@ impl Driver {
         let policy = crate::policy::Policy::load(&self.tree);
         let mut files = Vec::new();
         for change in git::worktree_changes(worktree)? {
-            if !git::safe_rel(&change.path) || change.path.starts_with(".taskmaster/") {
+            if !git::safe_rel(&change.path) || change.path.starts_with(".taskmaster/") || tm_verify::is_flow_path(&change.path) {
                 continue;
             }
             if self.is_contract_test(&change.path) {
@@ -4677,9 +4691,11 @@ impl Driver {
             keys: vec![],
             summary,
         };
-        if self.commit_entries(vec![entry.clone()], files, "taskmaster: repair shared files")?.is_none() {
+        if self.commit_entries(vec![entry.clone()], files.clone(), "taskmaster: repair shared files")?.is_none() {
             self.changes.push(entry);
             self.save_changes()?;
+        } else if !files.is_empty() {
+            self.update_flow_files(&files);
         }
         Ok(true)
     }
@@ -5256,7 +5272,15 @@ impl Driver {
             brief.push_str(&format!("\nContext from planner:\n{}\n", page.context.trim()));
         }
         let contract_paths: Vec<String> = contracts.iter().map(|c| c.path.clone()).collect();
-        let pack = crate::lsp::build_context_pack(&self.tree, &contract_paths, owned, 3072);
+        let budget = if errors.is_some() || tm_flow::is_integrator_unit(&self.tree, page_id) {
+            tm_flow::REPAIR_UNIT_MAP_BUDGET
+        } else {
+            tm_flow::DEFAULT_UNIT_MAP_BUDGET
+        };
+        let pack = match tm_flow::unit_map(&self.tree, page_id, owned, &contract_paths, budget) {
+            Ok(map) => map,
+            Err(_) => crate::lsp::build_context_pack(&self.tree, &contract_paths, owned, 3072),
+        };
         if !pack.is_empty() {
             brief.push('\n');
             brief.push_str(&pack);
@@ -5857,6 +5881,53 @@ impl Driver {
         }
     }
 
+    /// Stage any changed `.flow/` files (respecting `.flow/.gitignore`) and commit them as
+    /// `"taskmaster: update .flow"` so the committed graph tracks every commit Taskmaster makes.
+    fn commit_flow_update(&self) {
+        if !git::has_head(&self.tree) || !self.tree.join(tm_flow::FLOW_DIR).is_dir() {
+            return;
+        }
+        if let Err(err) = git::git(&self.tree, &["add", "-A", "--", tm_flow::FLOW_DIR]) {
+            eprintln!("taskmaster: could not stage .flow: {err:#}");
+            return;
+        }
+        let staged = git::git(&self.tree, &["diff", "--cached", "--name-only", "--", tm_flow::FLOW_DIR])
+            .unwrap_or_default();
+        if staged.trim().is_empty() {
+            return;
+        }
+        if let Err(err) = git::git(&self.tree, &["commit", "-q", "-m", "taskmaster: update .flow"]) {
+            eprintln!("taskmaster: .flow was updated but not committed: {err:#}");
+        }
+    }
+
+    /// Incrementally re-parse `files` into `.flow/` and commit the updated shards.
+    fn update_flow_files(&self, files: &[String]) {
+        if let Err(err) = tm_flow::update_files(&self.tree, files) {
+            eprintln!("taskmaster: flow update failed: {err:#}");
+            return;
+        }
+        self.commit_flow_update();
+    }
+
+    /// Seed `.flow/` from the locked plan and commit the seeded graph before workers spawn.
+    fn seed_flow_after_lock(&self, plan: &Plan) {
+        if let Err(err) = tm_flow::seed_from_plan(&self.tree, plan) {
+            eprintln!("taskmaster: flow seed failed: {err:#}");
+            return;
+        }
+        self.commit_flow_update();
+    }
+
+    /// Incrementally refresh `.flow/` against the current tree and commit if any shards/meta changed.
+    fn refresh_flow_and_commit(&self) {
+        if let Err(err) = tm_flow::build(&self.tree) {
+            eprintln!("taskmaster: flow refresh failed: {err:#}");
+            return;
+        }
+        self.commit_flow_update();
+    }
+
     fn write_docs(&self) -> anyhow::Result<()> {
         if let Some(plan) = &self.run.plan {
             let path = self.tree.join(ARCHITECTURE_FILE);
@@ -6345,12 +6416,16 @@ impl Driver {
         let (merged, before) = {
             let _project = PROJECT.lock().unwrap();
             let before = git::git(&self.project, &["rev-parse", "--verify", "HEAD"]).ok().map(|sha| sha.trim().to_string());
-            (git::merge_branch(&self.project, &branch, &[ARCHITECTURE_FILE, CHANGES_FILE]), before)
+            (git::merge_branch(&self.project, &branch, &[ARCHITECTURE_FILE, CHANGES_FILE, ".flow/"]), before)
         };
         if merged {
             let tree = self.tree.clone();
             self.drop_worktree(&tree);
             self.tree = self.project.clone();
+            {
+                let _project = PROJECT.lock().unwrap();
+                self.refresh_flow_and_commit();
+            }
             if let Ok(tip) = git::git(&self.project, &["rev-parse", "--verify", &format!("{branch}^{{commit}}")])
                 && let Err(err) = self.live.set_tip(&self.id, &tip)
             {

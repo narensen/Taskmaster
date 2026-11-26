@@ -68,7 +68,7 @@ pub fn merge_winner(project: &Path, records: &Records, live: &crate::live::Live,
     let _project = crate::engine::PROJECT.lock().unwrap();
     let before = crate::git::git(project, &["rev-parse", "--verify", "HEAD"])?.trim().to_string();
     let tip = crate::git::git(project, &["rev-parse", "--verify", &format!("{branch}^{{commit}}")])?.trim().to_string();
-    if !crate::git::merge_branch(project, &branch, &[tm_core::docs::ARCHITECTURE_FILE, tm_core::docs::CHANGES_FILE]) {
+    if !crate::git::merge_branch(project, &branch, &[tm_core::docs::ARCHITECTURE_FILE, tm_core::docs::CHANGES_FILE, ".flow/"]) {
         anyhow::bail!("`{branch}` does not merge cleanly into the project; merge it yourself: git merge {branch}");
     }
     let after = crate::git::git(project, &["rev-parse", "--verify", "HEAD"])?.trim().to_string();

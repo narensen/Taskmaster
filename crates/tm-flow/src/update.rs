@@ -350,15 +350,25 @@ pub fn build(tree: &Path) -> anyhow::Result<BuildReport> {
     }
 
     // Reconcile planned nodes & unit owns edges if a plan seed exists.
+    let mut plan_changed = false;
     if let Some(seed) = plan_seed.as_mut()
         && reconcile_plan_seed(seed, &shards, &matchers)
     {
         write_plan_seed(tree, seed)?;
+        plan_changed = true;
     }
 
-    let meta = build_meta(tree, &shards, moves);
-    write_meta(tree, &meta)?;
-    let db = FlowDb::rebuild(tree)?;
+    // Avoid rewriting meta.json on a clean no-op rebuild (e.g. right after committing `.flow/`).
+    if full_rebuild
+        || existing_meta.is_none()
+        || !parsed_paths.is_empty()
+        || !removed.is_empty()
+        || plan_changed
+    {
+        let meta = build_meta(tree, &shards, moves);
+        write_meta(tree, &meta)?;
+    }
+    let db = FlowDb::open_or_rebuild(tree)?;
 
     Ok(BuildReport {
         parsed: parsed_paths,

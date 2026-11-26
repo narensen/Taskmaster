@@ -72,6 +72,14 @@ pub fn undo_run(project: &Path, records: &Records, run: &str) -> anyhow::Result<
         }
     }
     git::git(project, &["commit", "-q", "-m", &format!("taskmaster: undo run {run}")])?;
+    // If undoing the run removed `.flow/meta.json`, also remove the derived SQLite cache left on disk.
+    let flow_dir = project.join(tm_flow::FLOW_DIR);
+    if flow_dir.is_dir() && !flow_dir.join("meta.json").is_file() {
+        for name in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+            let _ = std::fs::remove_file(flow_dir.join(name));
+        }
+        let _ = std::fs::remove_dir(&flow_dir);
+    }
     let commit = git::git(project, &["rev-parse", "--short=8", "HEAD"])?.trim().to_string();
     status["undone"] = json!({ "commit": commit, "at": crate::time::rfc3339_now(), "files": files.len() });
     records.save_status(run, &status)?;

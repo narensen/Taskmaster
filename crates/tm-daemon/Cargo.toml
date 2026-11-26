@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tm-core = { path = "../tm-core" }
 tm-dictionary = { path = "../tm-dictionary" }
+tm-flow = { path = "../tm-flow" }
 tm-harness = { path = "../tm-harness" }
 tm-verify = { path = "../tm-verify" }
 tm-review = { path = "../tm-review" }

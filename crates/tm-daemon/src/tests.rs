@@ -8612,3 +8612,135 @@ async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildca
     assert_eq!(read(&tmp.0.join("tests/test_contract.py")), contract_body);
     assert!(!tmp.0.join(".env").exists(), "policy-denied .env must never be merged");
 }
+
+#[tokio::test]
+async fn flow_graph_seeds_updates_places_unit_map_after_task_marker_keeps_prefix_identical_and_ignores_worker_flow_writes() {
+    let tmp = seeded("flow-engine");
+    let contract_src = "from typing import Protocol\nclass StorageProtocol(Protocol):\n    def save(self) -> None: ...\n";
+    let test_src = "from pkg.btree import BTree\nfrom pkg.executor import Executor\ndef test_flow():\n    b = BTree()\n    e = Executor(b)\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Flow integration fixture".into(),
+        contracts: vec![
+            ContractFile { path: "pkg/contract.py".into(), content: contract_src.into(), phase: 0 },
+            ContractFile { path: "tests/test_flow_contract.py".into(), content: test_src.into(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "pkg/btree.py".into(),
+                brief: "Implement BTree".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "executor".into(),
+                owned_glob: "pkg/executor.py".into(),
+                brief: "Implement Executor".into(),
+                depends_on: vec!["btree".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct FlowHarness {
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for FlowHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            // Gate must deny worker writes into `.flow/`.
+            let flow_edit = tm_harness::PermissionRequest {
+                tool: "write_file".into(),
+                kind: tm_harness::ToolKind::Edit,
+                paths: vec![task.cwd.join(".flow/tampered.json")],
+                command: None,
+                url: None,
+            };
+            assert_eq!(gate.decide(&flow_edit), tm_harness::Decision::Deny);
+
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            if task.brief.contains("Build unit `btree`") {
+                std::fs::write(
+                    task.cwd.join("pkg/btree.py"),
+                    "class BTree:\n    def insert(self, k: int) -> None:\n        pass\n",
+                )?;
+                // Even if a rogue write landed inside `.flow/` in the worktree, judge ignores it
+                // (not counted as outside_owned and never merged into the project).
+                std::fs::create_dir_all(task.cwd.join(".flow"))?;
+                std::fs::write(task.cwd.join(".flow/rogue.json"), "{\"bad\":true}\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:btree\n".into() }).await;
+            } else if task.brief.contains("Build unit `executor`") {
+                std::fs::write(
+                    task.cwd.join("pkg/executor.py"),
+                    "from pkg.contract import StorageProtocol\nfrom pkg.btree import BTree\nclass Executor(StorageProtocol):\n    def __init__(self, bt: BTree) -> None:\n        self.bt = bt\n    def save(self) -> None:\n        self.bt.insert(1)\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:executor\n".into() }).await;
+            } else {
+                let _ = events.send(HarnessEvent::Text { text: "{\"findings\":[]}".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(FlowHarness { briefs: briefs.clone() });
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let seen = briefs.lock().unwrap().clone();
+    let btree_brief = seen.iter().find(|b| b.contains("Build unit `btree`")).expect("btree brief");
+    let exec_brief = seen.iter().find(|b| b.contains("Build unit `executor`")).expect("executor brief");
+
+    // 1. Shared prefix before `--- Your task ---` is byte-identical across units and keeps full contracts.
+    let (pre_b, post_b) = btree_brief.split_once("--- Your task ---").expect("marker in btree brief");
+    let (pre_e, post_e) = exec_brief.split_once("--- Your task ---").expect("marker in executor brief");
+    assert_eq!(pre_b, pre_e, "shared prefix must be byte-identical across units");
+    assert!(pre_b.contains("class StorageProtocol(Protocol):"), "full locked contract must remain in shared prefix");
+    assert!(!pre_b.contains("## Flow unit map"), "unit map must not leak into shared prefix");
+
+    // 2. Unit map sits AFTER `--- Your task ---`, includes cross-unit neighbours, and does not use old context pack.
+    assert!(post_b.contains("## Flow unit map (btree)"), "{post_b}");
+    assert!(post_e.contains("## Flow unit map (executor)"), "{post_e}");
+    assert!(post_e.contains("btree:BTree"), "executor unit map should show cross-unit btree neighbour:\n{post_e}");
+    assert!(!post_e.contains("## Unit context pack"), "old context pack must be replaced by flow unit map");
+
+    // 3. `.flow/` is committed cleanly in the project, `index.sqlite` is gitignored, and worker rogue write was never merged.
+    assert!(tmp.0.join(".flow/meta.json").is_file());
+    assert!(tmp.0.join(".flow/.gitignore").is_file());
+    assert!(tmp.0.join(".flow/files/pkg/btree.py.json").is_file());
+    assert!(tmp.0.join(".flow/files/pkg/executor.py.json").is_file());
+    assert!(!tmp.0.join(".flow/rogue.json").exists(), "worker edits inside .flow/ must never be merged");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "all shards must be fresh after run");
+}

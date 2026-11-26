@@ -1882,6 +1882,7 @@ dependencies = [
  "tm-commons",
  "tm-core",
  "tm-dictionary",
+ "tm-flow",
  "tm-harness",
  "tm-review",
  "tm-token",

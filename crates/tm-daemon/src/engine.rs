@@ -254,6 +254,23 @@ struct Feed {
 }
 
 impl AgentRequest {
+    fn to_worker_task(&self) -> WorkerTask {
+        WorkerTask {
+            brief: self.brief.clone(),
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            dictionary: self.dictionary.clone(),
+            timeout: self.timeout,
+            stall: self.stall,
+            read_only: self.read_only,
+            code_mode: self.code_mode,
+            shell: self.shell.clone().filter(|_| !self.read_only),
+            permission_mode: self.permission_mode,
+            hold: self.hold.clone(),
+        }
+    }
+
     fn bill(&self, role: Role, page: Option<&str>) -> Bill {
         let tag = |key: &str| self.feed.as_ref().and_then(|f| f.agent[key].as_str()).map(str::to_string);
         Bill {
@@ -8539,23 +8556,7 @@ async fn follow(
             end["session_id"] = serde_json::json!(sid);
         }
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
-        match &run {
-            Ok(summary) => {
-                end["ok"] = serde_json::json!(summary.ok);
-                end["denied"] = serde_json::json!(summary.denied);
-                end["cost_usd"] = serde_json::json!(summary.cost_usd);
-                if summary.usage.total() > 0 {
-                    end["usage"] = serde_json::json!(summary.usage);
-                }
-            }
-            Err(err) => {
-                end["ok"] = serde_json::json!(false);
-                end["error"] = serde_json::json!(format!("{err:#}"));
-            }
-        }
-        if !refused.is_empty() {
-            end["refused"] = serde_json::json!(refused);
-        }
+        apply_run_end_fields(&mut end, &run, &refused);
         feed.live.push(&feed.run, &feed.agent, "end", end);
     }
     let summary = match run {
@@ -8618,25 +8619,34 @@ fn apply_end_metrics(end: &mut serde_json::Value, requests: Option<u32>, tool_ca
     }
 }
 
+/// Populate the outcome, usage meter, error, and refused-tool fields of a transcript `"end"` event.
+fn apply_run_end_fields(end: &mut serde_json::Value, run: &anyhow::Result<RunSummary>, refused: &[String]) {
+    match run {
+        Ok(summary) => {
+            end["ok"] = serde_json::json!(summary.ok);
+            end["denied"] = serde_json::json!(summary.denied);
+            end["cost_usd"] = serde_json::json!(summary.cost_usd);
+            // Only a provider that reports usage gets a meter.
+            if summary.usage.total() > 0 {
+                end["usage"] = serde_json::json!(summary.usage);
+            }
+        }
+        Err(err) => {
+            end["ok"] = serde_json::json!(false);
+            end["error"] = serde_json::json!(format!("{err:#}"));
+        }
+    }
+    if !refused.is_empty() {
+        end["refused"] = serde_json::json!(refused);
+    }
+}
+
 /// Resume a previously recorded provider session by id with a short prompt (H2 restart resume
 /// and O7 hibernated warm-session resume). If the provider cannot resume that session, falls
 /// back cleanly to a fresh `ask(request)` with the full brief.
 async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String) -> anyhow::Result<Answer> {
     let gate = gate_for(&request);
-    let task = WorkerTask {
-        brief: request.brief.clone(),
-        cwd: request.cwd.clone(),
-        model: request.model.clone(),
-        effort: request.effort.clone(),
-        dictionary: request.dictionary.clone(),
-        timeout: request.timeout,
-        stall: request.stall,
-        read_only: request.read_only,
-        code_mode: request.code_mode,
-        shell: request.shell.clone().filter(|_| !request.read_only),
-        permission_mode: request.permission_mode,
-        hold: request.hold.clone(),
-    };
+    let task = request.to_worker_task();
     if let Some(feed) = &request.feed {
         feed.live.push(
             &feed.run,
@@ -8673,23 +8683,7 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
             "resumed": true,
         });
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
-        match &run {
-            Ok(summary) => {
-                end["ok"] = serde_json::json!(summary.ok);
-                end["denied"] = serde_json::json!(summary.denied);
-                end["cost_usd"] = serde_json::json!(summary.cost_usd);
-                if summary.usage.total() > 0 {
-                    end["usage"] = serde_json::json!(summary.usage);
-                }
-            }
-            Err(err) => {
-                end["ok"] = serde_json::json!(false);
-                end["error"] = serde_json::json!(format!("{err:#}"));
-            }
-        }
-        if !refused.is_empty() {
-            end["refused"] = serde_json::json!(refused);
-        }
+        apply_run_end_fields(&mut end, &run, &refused);
         feed.live.push(&feed.run, &feed.agent, "end", end);
     }
     match run {
@@ -8739,20 +8733,7 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
         }
     };
     let gate = gate_for(&request);
-    let task = WorkerTask {
-        brief: request.brief.clone(),
-        cwd: request.cwd.clone(),
-        model: request.model.clone(),
-        effort: request.effort.clone(),
-        dictionary: request.dictionary.clone(),
-        timeout: request.timeout,
-        stall: request.stall,
-        read_only: request.read_only,
-        code_mode: request.code_mode,
-        shell: request.shell.clone().filter(|_| !request.read_only),
-        permission_mode: request.permission_mode,
-        hold: request.hold.clone(),
-    };
+    let task = request.to_worker_task();
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
     let started = Instant::now();
@@ -8778,23 +8759,7 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
             end["session_id"] = serde_json::json!(sid);
         }
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
-        match &run {
-            Ok(summary) => {
-                end["ok"] = serde_json::json!(summary.ok);
-                end["denied"] = serde_json::json!(summary.denied);
-                end["cost_usd"] = serde_json::json!(summary.cost_usd);
-                if summary.usage.total() > 0 {
-                    end["usage"] = serde_json::json!(summary.usage);
-                }
-            }
-            Err(err) => {
-                end["ok"] = serde_json::json!(false);
-                end["error"] = serde_json::json!(format!("{err:#}"));
-            }
-        }
-        if !refused.is_empty() {
-            end["refused"] = serde_json::json!(refused);
-        }
+        apply_run_end_fields(&mut end, &run, &refused);
         // A call that could not go on is ended here; the resumed one opens its own block.
         feed.live.push(&feed.run, &feed.agent, "end", end);
     }
@@ -8863,20 +8828,7 @@ fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
 
 async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let gate = gate_for(request);
-    let task = WorkerTask {
-        brief: request.brief.clone(),
-        cwd: request.cwd.clone(),
-        model: request.model.clone(),
-        effort: request.effort.clone(),
-        dictionary: request.dictionary.clone(),
-        timeout: request.timeout,
-        stall: request.stall,
-        read_only: request.read_only,
-        code_mode: request.code_mode,
-        shell: request.shell.clone().filter(|_| !request.read_only),
-        permission_mode: request.permission_mode,
-        hold: request.hold.clone(),
-    };
+    let task = request.to_worker_task();
     let feed = &request.feed;
     if let Some(feed) = &feed {
         // The whole brief: a rejected plan's reasons sit at its end.
@@ -8959,25 +8911,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             end["session_id"] = serde_json::json!(sid);
         }
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
-        match &run {
-            Ok(summary) => {
-                end["ok"] = serde_json::json!(summary.ok);
-                end["denied"] = serde_json::json!(summary.denied);
-                end["cost_usd"] = serde_json::json!(summary.cost_usd);
-                let usage = &summary.usage;
-                // Only a provider that reports usage gets a meter.
-                if usage.input + usage.output + usage.cache_read + usage.cache_write > 0 {
-                    end["usage"] = serde_json::json!(usage);
-                }
-            }
-            Err(err) => {
-                end["ok"] = serde_json::json!(false);
-                end["error"] = serde_json::json!(format!("{err:#}"));
-            }
-        }
-        if !refused.is_empty() {
-            end["refused"] = serde_json::json!(refused);
-        }
+        apply_run_end_fields(&mut end, &run, &refused);
         feed.live.push(&feed.run, &feed.agent, "end", end);
         if let Ok(RunSummary { freed: Some(freed), .. }) = &run {
             let id = feed.agent["id"].as_str().unwrap_or("agent");
@@ -9146,4 +9080,112 @@ fn load_meta(records: &Records, project: &Path, config: &Config, resuming: bool,
     }
     records.save_meta(&config.run_id, &meta)?;
     Ok(meta)
+}
+
+#[cfg(test)]
+mod engine_coherence_tests {
+    use super::*;
+
+    struct DummyHarness;
+
+    #[async_trait::async_trait]
+    impl Harness for DummyHarness {
+        fn id(&self) -> &'static str {
+            "dummy"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            Ok(RunSummary {
+                ok: true,
+                usage: tm_harness::Usage::default(),
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    #[test]
+    fn agent_request_to_worker_task_strips_shell_when_read_only() {
+        let shell = ShellScope {
+            writable: vec![PathBuf::from("/tmp/scratch")],
+            readable: vec![],
+            env: vec![("K".into(), "V".into())],
+        };
+        let mut req = AgentRequest {
+            harness: Arc::new(DummyHarness),
+            brief: "task".into(),
+            cwd: PathBuf::from("/tmp/wt"),
+            model: Some("m".into()),
+            effort: Some("low".into()),
+            dictionary: None,
+            timeout: Duration::from_secs(30),
+            stall: None,
+            read_only: false,
+            no_file_reads: false,
+            feed: None,
+            browser: None,
+            code_mode: true,
+            commit: None,
+            shell: Some(shell.clone()),
+            fetch: false,
+            native_search: false,
+            keep: true,
+            permission_mode: None,
+            hold: None,
+        };
+        let rw_task = req.to_worker_task();
+        assert_eq!(rw_task.shell, Some(shell));
+        assert!(rw_task.code_mode);
+
+        req.read_only = true;
+        let ro_task = req.to_worker_task();
+        assert_eq!(ro_task.shell, None, "read_only requests must never carry a shell scope");
+        assert!(ro_task.read_only);
+    }
+
+    #[test]
+    fn apply_run_end_fields_records_ok_usage_error_and_refused_consistently() {
+        let mut ok_end = serde_json::json!({ "seconds": 1.2 });
+        let ok_res = Ok(RunSummary {
+            ok: true,
+            usage: tm_harness::Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 },
+            cost_usd: Some(0.05),
+            denied: 1,
+            freed: None,
+            requests: Some(2),
+        });
+        apply_run_end_fields(&mut ok_end, &ok_res, &["read_file /etc/passwd".into()]);
+        assert_eq!(ok_end["ok"], true);
+        assert_eq!(ok_end["denied"], 1);
+        assert_eq!(ok_end["cost_usd"], 0.05);
+        assert_eq!(ok_end["usage"]["input"], 100);
+        assert_eq!(ok_end["refused"][0], "read_file /etc/passwd");
+
+        let mut zero_usage_end = serde_json::json!({});
+        apply_run_end_fields(
+            &mut zero_usage_end,
+            &Ok(RunSummary {
+                ok: true,
+                usage: tm_harness::Usage::default(),
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: None,
+            }),
+            &[],
+        );
+        assert!(zero_usage_end.get("usage").is_none());
+        assert!(zero_usage_end.get("refused").is_none());
+
+        let mut err_end = serde_json::json!({});
+        apply_run_end_fields(&mut err_end, &Err(anyhow::anyhow!("timed out")), &[]);
+        assert_eq!(err_end["ok"], false);
+        assert_eq!(err_end["error"], "timed out");
+    }
 }

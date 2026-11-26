@@ -10,6 +10,7 @@ pub mod model;
 pub mod parse;
 pub mod resolve;
 pub mod store;
+pub mod update;
 
 pub use env::{EnvFacts, read_env, write_env};
 pub use model::{
@@ -18,3 +19,7 @@ pub use model::{
     git_blob_sha, is_flow_path, lang_prefix, sig_hash, symbol_node_id, unit_node_id,
 };
 pub use store::FlowDb;
+pub use update::{
+    BuildReport, SeedReport, UpdateReport, build, discover_source_files, ensure_fresh,
+    seed_from_plan, update_files, verify_all,
+};

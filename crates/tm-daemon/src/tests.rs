@@ -9011,3 +9011,208 @@ async fn worker_brief_deduplicates_contracts_full_when_used_and_signatures_other
         cli.len()
     );
 }
+
+#[tokio::test]
+async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_policy_denied() {
+    // 1. Worker writes its owned file PLUS stray junk files (e.g. accidental quoted file and scratch note):
+    //    stray files are ignored (not merged), a warning is logged, and the owned file merges on attempt 1.
+    struct StrayWriter {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for StrayWriter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/cli.py"), "def main():\n    return 0\n")?;
+            // Stray files outside `pkg/cli.py` (neither a locked contract nor policy-denied).
+            std::fs::write(task.cwd.join("\"README.md\""), "accidental quoted file\n")?;
+            std::fs::write(task.cwd.join("scratch_notes.tmp"), "junk\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp = repo("c5-stray-drop");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "pkg/contracts.py".into(),
+            content: "class Api: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![PagePlan {
+            id: "cli".into(),
+            owned_glob: "pkg/cli.py".into(),
+            brief: "Write pkg/cli.py.".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let h: Arc<dyn Harness> = Arc::new(StrayWriter { attempts: attempts.clone() });
+    let mut cfg = config(&tmp.0, p.clone(), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "owned work must merge on attempt 1 without discard/repair");
+    assert_eq!(read(&tmp.0.join("pkg/cli.py")), "def main():\n    return 0\n");
+    assert!(!tmp.0.join("\"README.md\"").exists(), "stray quoted file must not be merged");
+    assert!(!tmp.0.join("scratch_notes.tmp").exists(), "stray temp file must not be merged");
+    let agents_log = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
+    assert!(agents_log.contains("\"kind\":\"stray_files_ignored\""), "warning event should be logged: {agents_log}");
+    assert!(agents_log.contains("scratch_notes.tmp"), "{agents_log}");
+
+    // 2. Worker writes owned file PLUS a locked contract (attempt 1) and then owned file PLUS a
+    //    policy-denied `.env` outside its glob (attempt 2): BOTH must still be refused until attempt 3.
+    struct SensitiveOutsideWriter {
+        attempts: Arc<AtomicUsize>,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Harness for SensitiveOutsideWriter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/cli.py"), format!("v = {n}\n"))?;
+            match n {
+                0 => {
+                    // Attempt 1: touches locked contract outside glob -> must refuse entire unit.
+                    std::fs::write(task.cwd.join("pkg/contracts.py"), "# tampered\n")?;
+                }
+                1 => {
+                    // Attempt 2: touches policy-denied `.env` outside glob -> must refuse entire unit.
+                    std::fs::write(task.cwd.join(".env"), "SECRET=bad\n")?;
+                }
+                _ => {
+                    // Attempt 3: clean owned file + harmless stray file -> merges cleanly.
+                    std::fs::write(task.cwd.join("harmless.tmp"), "ignored\n")?;
+                }
+            }
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp2 = repo("c5-sensitive-refused");
+    let attempts2 = Arc::new(AtomicUsize::new(0));
+    let briefs2 = Arc::new(Mutex::new(Vec::new()));
+    let h2: Arc<dyn Harness> = Arc::new(SensitiveOutsideWriter {
+        attempts: attempts2.clone(),
+        briefs: briefs2.clone(),
+    });
+    let mut cfg2 = config(&tmp2.0, p, true, 1);
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    let harnesses2 = Harnesses {
+        master: h2.clone(),
+        mid: h2.clone(),
+        worker: h2.clone(),
+        reviewer: h2.clone(),
+        verifier: h2,
+    };
+    let outcome2 = drive(cfg2, harnesses2).await.unwrap();
+    assert_eq!(outcome2, Outcome::Finished { ok: true });
+    assert_eq!(attempts2.load(Ordering::SeqCst), 3, "locked contract and .env must both be refused");
+    assert_eq!(read(&tmp2.0.join("pkg/contracts.py")), "class Api: ...\n");
+    assert!(!tmp2.0.join(".env").exists());
+    assert!(!tmp2.0.join("harmless.tmp").exists());
+    assert_eq!(read(&tmp2.0.join("pkg/cli.py")), "v = 2\n");
+    let seen = briefs2.lock().unwrap().clone();
+    assert!(seen[1].contains("pkg/contracts.py") && seen[1].contains("were not merged"), "{}", seen[1]);
+    assert!(seen[2].contains("policy denied write to `.env`"), "{}", seen[2]);
+
+    // 3. Worker writes ONLY a stray file and no owned files -> fails (does not silently pass).
+    struct OnlyStrayWriter;
+
+    #[async_trait]
+    impl Harness for OnlyStrayWriter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::write(task.cwd.join("only_stray.tmp"), "junk\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp3 = repo("c5-only-stray");
+    let h3: Arc<dyn Harness> = Arc::new(OnlyStrayWriter);
+    let mut cfg3 = config(&tmp3.0, Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![],
+        pages: vec![PagePlan {
+            id: "cli".into(),
+            owned_glob: "pkg/cli.py".into(),
+            brief: "Write pkg/cli.py.".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }, true, 1);
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    let harnesses3 = Harnesses {
+        master: h3.clone(),
+        mid: h3.clone(),
+        worker: h3.clone(),
+        reviewer: h3.clone(),
+        verifier: h3,
+    };
+    let outcome3 = drive(cfg3, harnesses3).await.unwrap();
+    assert_eq!(outcome3, Outcome::Finished { ok: false });
+    assert!(!tmp3.0.join("only_stray.tmp").exists());
+}

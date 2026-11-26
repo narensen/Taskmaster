@@ -3330,11 +3330,12 @@ impl Driver {
         let units = self.page(page)?.work_units();
         let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut dropped_stray: Vec<String> = Vec::new();
         for (index, product) in products {
             // A file the same as the run's tree is no change: a warm worktree holds what other
             // units built since, and a rewrite of a file to what it already was is nothing.
             let ignored = self.setup_artifacts.get(&product.worktree);
-            let changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
+            let mut changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
                 .into_iter()
                 .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
                 .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
@@ -3364,10 +3365,42 @@ impl Driver {
             }
             if !outside.is_empty() {
                 let glob = if units.len() > 1 { unit_glob } else { self.page(page)?.owned_glob.clone() };
-                return Ok(failed(format!(
-                    "these files are outside `{glob}` and were not merged: {}",
-                    outside.join(", ")
-                )));
+                let mut locked_outside: Vec<&str> = Vec::new();
+                let mut denied_outside: Vec<(&str, String)> = Vec::new();
+                for path in &outside {
+                    if self.is_locked_contract(path) {
+                        locked_outside.push(path);
+                    } else if let crate::policy::PathVerdict::Denied(denied_glob) = policy.check_path(path) {
+                        denied_outside.push((path, denied_glob));
+                    }
+                }
+                if !locked_outside.is_empty() {
+                    return Ok(failed(format!(
+                        "these files are outside `{glob}` and were not merged (locked contracts are read-only for workers): {}",
+                        locked_outside.join(", ")
+                    )));
+                }
+                if let Some((path, denied_glob)) = denied_outside.first() {
+                    return Ok(failed(format!(
+                        "policy denied write to `{path}` (matched `{denied_glob}`)"
+                    )));
+                }
+                // Non-sensitive stray files outside the unit's owned glob: log a warning and
+                // drop them instead of discarding the unit's valid owned work.
+                let stray_list: Vec<String> = outside.iter().map(|s| (*s).to_string()).collect();
+                eprintln!(
+                    "taskmaster: warning: ignoring stray file(s) outside `{glob}` from {page}: {}",
+                    stray_list.join(", ")
+                );
+                self.live.push(
+                    &self.id,
+                    &serde_json::json!({ "id": self.agent_id(page, None), "page": page }),
+                    "stray_files_ignored",
+                    serde_json::json!({ "glob": glob, "files": stray_list }),
+                );
+                let stray_set: BTreeSet<&str> = outside.iter().copied().collect();
+                changes.retain(|c| !stray_set.contains(c.path.as_str()));
+                dropped_stray.extend(stray_list);
             }
             for change in &changes {
                 if self.is_locked_contract(&change.path) {
@@ -3391,6 +3424,13 @@ impl Driver {
             }
         }
         if all.is_empty() {
+            if !dropped_stray.is_empty() {
+                let glob = self.page(page)?.owned_glob.clone();
+                return Ok(failed(format!(
+                    "these files are outside `{glob}` and were not merged (no owned files were changed): {}",
+                    dropped_stray.join(", ")
+                )));
+            }
             let ok = products.iter().all(|(_, p)| p.answer.ok);
             // The files were already right, from an earlier run, the plan, or a template: the
             // unit is done. Its tests and the project's checks still run at verify. A run told

@@ -4584,9 +4584,16 @@ impl Driver {
         brief.push_str(&clip(output, 8000));
         brief.push('\n');
         let notes = self.live.take_notes(&self.id, &["master"]);
-        let brief = self.with_notes(brief, &notes);
+        let mut brief = self.with_notes(brief, &notes);
         let worktree = self.fresh_worktree("unowned")?;
         let harness = self.harnesses.master.clone();
+        if self.code.is_none() && harness.id() == "antigravity" {
+            let wt = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
+            brief.push_str(&format!(
+                "\nYour worktree directory is `{}`. Pass absolute paths under it to `read_file`, `write_file`, and `edit_file`.\n",
+                wt.display()
+            ));
+        }
         let shell = self.shell_for(&harness, "master-repair");
         let mut request = AgentRequest {
             harness,
@@ -4748,9 +4755,16 @@ impl Driver {
             brief.push_str(&format!("{line}\n"));
         }
         let notes = self.live.take_notes(&self.id, &["master"]);
-        let brief = self.with_notes(brief, &notes);
+        let mut brief = self.with_notes(brief, &notes);
         let worktree = self.fresh_worktree("shared")?;
         let harness = self.harnesses.master.clone();
+        if self.code.is_none() && harness.id() == "antigravity" {
+            let wt = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
+            brief.push_str(&format!(
+                "\nYour worktree directory is `{}`. Pass absolute paths under it to `read_file`, `write_file`, and `edit_file`.\n",
+                wt.display()
+            ));
+        }
         let shell = self.shell_for(&harness, "master-shared");
         let mut request = AgentRequest {
             harness,
@@ -4996,7 +5010,7 @@ impl Driver {
         // A person's notes never land here raw. The master has already read them and
         // written `handed`, which every worker follows.
         let owned = self.owned_files(page, unit, units, &cwd);
-        let mut brief = self.worker_brief(page, unit, units, tier, errors, &owned)?;
+        let mut brief = self.worker_brief(page, unit, units, tier, errors, &owned, &cwd)?;
         if !self.repair_decision.is_empty() {
             brief.push_str("\nThe master decided this for the repair. Follow it:\n");
             brief.push_str(&self.repair_decision);
@@ -5360,11 +5374,24 @@ impl Driver {
             out.push_str(crate::small::QUALITY_BARS);
         }
         out.push_str(&self.project_memory);
-        out.push_str(
-            "\nFor every unit: write only the files your task gives you; a write anywhere else is discarded and fails the unit. \
-             Paths are from the project root. If a Dictionary entry is wrong, stop and reply with \
-             {\"flag\":{\"key\":\"...\",\"issue\":\"...\"}} instead of working around it.\n",
-        );
+        let worker_needs_abs = self.code.is_none() && self.harnesses.worker.id() == "antigravity";
+        if worker_needs_abs {
+            out.push_str(
+                "\nFor every unit: write only the files your task gives you; a write anywhere else is discarded and fails the unit. \
+                 Native file tools (`read_file`, `write_file`, `edit_file`) require absolute paths rooted at your worktree directory shown below (never pass relative paths). \
+                 Do not call `update_steps` or checklist tools. Prefer `edit_file` over rewriting whole files when fixing issues. \
+                 Once your tests pass, stop immediately and emit the release line—do not run trailing `git status`, `git diff`, or redundant test re-runs. \
+                 If a Dictionary entry is wrong, stop and reply with {\"flag\":{\"key\":\"...\",\"issue\":\"...\"}} instead of working around it.\n",
+            );
+        } else {
+            out.push_str(
+                "\nFor every unit: write only the files your task gives you; a write anywhere else is discarded and fails the unit. \
+                 Paths are from the project root. \
+                 Do not call `update_steps` or checklist tools. \
+                 Once your tests pass, stop immediately and emit the release line—do not run trailing `git status`, `git diff`, or redundant test re-runs. \
+                 If a Dictionary entry is wrong, stop and reply with {\"flag\":{\"key\":\"...\",\"issue\":\"...\"}} instead of working around it.\n",
+            );
+        }
         if self.code.is_some() {
             out.push_str(&code_mode_guide(self.harnesses.worker.id()));
         }
@@ -5471,7 +5498,8 @@ impl Driver {
 
     /// One agent's whole context: the shared prefix, then its own task, the files it owns,
     /// the Dictionary entries it cites, what failed last time, and when it is done.
-    fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String]) -> anyhow::Result<String> {
+    #[allow(clippy::too_many_arguments)]
+    fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String], worktree: &Path) -> anyhow::Result<String> {
         let page = self.page(page_id)?.clone();
         let plan = self.plan()?;
         let contracts = &plan.contracts;
@@ -5479,6 +5507,13 @@ impl Driver {
         let cites = if page.cites.is_empty() { "none".to_string() } else { page.cites.join(", ") };
         let split = if units > 1 { page.work_units().get(unit).cloned() } else { None };
         let ui = plan.is_ui(&page);
+        let active_glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str());
+        let needs_abs_paths = self.code.is_none() && self.harness_for(tier).id() == "antigravity";
+        let abs_worktree = if needs_abs_paths {
+            std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf())
+        } else {
+            worktree.to_path_buf()
+        };
         // A page of a web app opens at a route; a module of anything else has none.
         let opening = if ui {
             format!("Build page `{}` for route `{}`.", page.id, page.route)
@@ -5487,8 +5522,24 @@ impl Driver {
         };
         let mut brief = self.shared_prefix_with_contracts(Some(&partition))?;
         brief.push_str(&format!(
-            "{opening}\nYou may create or edit only files matching `{glob}`.\nCite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
-            glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
+            "{opening}\nYou may create or edit only files matching `{active_glob}`.\n",
+        ));
+        if needs_abs_paths {
+            let targets = expand_glob_in_worktree(&abs_worktree, active_glob);
+            brief.push_str(&format!(
+                "Your worktree directory is `{}`. Use absolute paths under it for `read_file`, `write_file`, and `edit_file` (never relative paths).",
+                abs_worktree.display()
+            ));
+            if !targets.is_empty() {
+                brief.push_str(&format!(
+                    " Owned target path(s): {}.",
+                    targets.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            brief.push('\n');
+        }
+        brief.push_str(&format!(
+            "Cite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
             body = page.brief.trim_end(),
         ));
         if !page.context.trim().is_empty() {
@@ -5607,7 +5658,17 @@ impl Driver {
         if owned.is_empty() {
             brief.push_str("None of your files exist yet: create them.\n");
         } else {
-            brief.push_str(&format!("Your files that exist now: {}.\n", owned.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")));
+            let listed: Vec<String> = owned
+                .iter()
+                .map(|f| {
+                    if needs_abs_paths {
+                        format!("`{}`", abs_worktree.join(f).display())
+                    } else {
+                        format!("`{f}`")
+                    }
+                })
+                .collect();
+            brief.push_str(&format!("Your files that exist now: {}.\n", listed.join(", ")));
         }
         if let Some(mine) = &split {
             brief.push_str(&format!(
@@ -5769,7 +5830,9 @@ impl Driver {
         if let Ok(unit_plan) = self.page(page) {
             brief.push_str(&self.todo(unit_plan, true));
         }
-        brief.push_str(&format!("Then end your reply with the line `{RELEASE} {agent}`.\n"));
+        brief.push_str(&format!(
+            "Once tests pass, stop immediately without trailing `git status` or redundant test re-runs, and end your reply with the line `{RELEASE} {agent}`.\n"
+        ));
         brief
     }
 
@@ -7270,7 +7333,36 @@ which runs the project's tests and returns the failures. Query `.flow` inside ru
 or `await flow(\"source\", { id: \"py:pkg/mod.py#Class.method\" })`. When writing Python or multi-line files with triple quotes or backslashes, pass raw file \
 content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments on run_code, or use `String.raw` with `write(path, { raw })`. \
 Fix what it reports in the next script. If your own write, edit or shell tools \
-are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
+are switched off, run_code is the way to write files and run commands: use it from the start. \
+Do not call `update_steps` or run trailing `git status` / redundant re-runs once tests pass. Keep your replies short: the files are the work.\n";
+
+/// Expand an `owned_glob` (including `{a,b}` brace groups) into worktree-absolute path strings
+/// so harnesses whose native file tools require absolute paths (e.g. Antigravity) can write
+/// directly on turn 1 without hitting relative-path permission errors.
+pub(crate) fn expand_glob_in_worktree(worktree: &Path, glob: &str) -> Vec<String> {
+    let trimmed = glob.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let rels: Vec<String> = if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && open < close
+        && !trimmed[open + 1..close].contains(['{', '}'])
+    {
+        let prefix = &trimmed[..open];
+        let suffix = &trimmed[close + 1..];
+        trimmed[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(|part| format!("{prefix}{part}{suffix}"))
+            .collect()
+    } else {
+        vec![trimmed.to_string()]
+    };
+    rels.into_iter()
+        .map(|rel| worktree.join(rel.trim_start_matches("./")).display().to_string())
+        .collect()
+}
 
 /// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`
 /// (e.g. `mcp_dictionary_run_code` on Antigravity) so agents call the real tool on their first try.

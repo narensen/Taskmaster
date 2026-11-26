@@ -11110,3 +11110,136 @@ async fn tok1_instrumentation_logs_mcp_replies_requests_and_separates_synthetic_
     assert_eq!(end["mcp_calls"], 2);
     assert_eq!(end["mcp_reply_bytes"].as_u64(), worker_row.mcp_reply_bytes);
 }
+
+#[test]
+fn tok3_expand_glob_in_worktree_handles_braces_prefix_and_plain() {
+    let wt = Path::new("/tmp/wt-demo");
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "{pkg/a.py,tests/test_a.py}"),
+        vec!["/tmp/wt-demo/pkg/a.py", "/tmp/wt-demo/tests/test_a.py"]
+    );
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "pkg/{a.py,b.py}"),
+        vec!["/tmp/wt-demo/pkg/a.py", "/tmp/wt-demo/pkg/b.py"]
+    );
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "./pkg/solo.py"),
+        vec!["/tmp/wt-demo/pkg/solo.py"]
+    );
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "pkg/**"),
+        vec!["/tmp/wt-demo/pkg/**"]
+    );
+}
+
+#[tokio::test]
+async fn tok3_antigravity_non_code_mode_worker_gets_absolute_worktree_paths_and_hygiene_rules() {
+    let tmp = seeded("tok3-paths");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp.0.join("pkg/a.py"), "X = 1\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "init"]);
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan {
+                id: "alpha".into(),
+                owned_glob: "{pkg/a.py,tests/test_a.py}".into(),
+                brief: "Implement alpha.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "beta".into(),
+                owned_glob: "pkg/b.py".into(),
+                brief: "Implement beta.".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct CaptureAgy {
+        seen: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for CaptureAgy {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen.lock().unwrap().push((task.cwd.clone(), task.brief.clone()));
+            if task.brief.contains("Build unit `alpha`") {
+                std::fs::create_dir_all(task.cwd.join("tests"))?;
+                std::fs::write(task.cwd.join("pkg/a.py"), "X = 2\n")?;
+                std::fs::write(task.cwd.join("tests/test_a.py"), "def test_x(): assert True\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:alpha\n".into() }).await;
+            } else {
+                std::fs::write(task.cwd.join("pkg/b.py"), "Y = 2\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:beta\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. Non-code-mode Antigravity: worktree-absolute paths + hygiene rules + byte-identical shared prefix.
+    let cap = Arc::new(CaptureAgy { seen: std::sync::Mutex::new(Vec::new()) });
+    let h: Arc<dyn Harness> = cap.clone();
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 2);
+    cfg.run_id = "tok3-no-code".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let captured = cap.seen.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    let prefix0 = captured[0].1.split("--- Your task ---").next().unwrap();
+    let prefix1 = captured[1].1.split("--- Your task ---").next().unwrap();
+    assert_eq!(prefix0, prefix1, "shared prefix must remain byte-identical across units");
+    assert!(prefix0.contains("require absolute paths rooted at your worktree directory"));
+    assert!(prefix0.contains("Do not call `update_steps`"));
+    assert!(prefix0.contains("do not run trailing `git status`"));
+
+    let (alpha_cwd, alpha_brief) = captured.iter().find(|(_, b)| b.contains("Build unit `alpha`")).unwrap();
+    let alpha_abs = std::fs::canonicalize(alpha_cwd).unwrap_or_else(|_| alpha_cwd.clone());
+    let expected_a = alpha_abs.join("pkg/a.py").display().to_string();
+    let expected_test = alpha_abs.join("tests/test_a.py").display().to_string();
+    assert!(alpha_brief.contains(&format!("Your worktree directory is `{}`", alpha_abs.display())));
+    assert!(alpha_brief.contains(&format!("`{expected_a}`")));
+    assert!(alpha_brief.contains(&format!("`{expected_test}`")));
+    assert!(alpha_brief.contains(&format!("Your files that exist now: `{expected_a}`.")));
+
+    // 2. Code-mode Antigravity: keeps relative paths and hygiene rules, no native absolute-path block.
+    let tmp_cm = seeded("tok3-paths-cm");
+    std::fs::create_dir_all(tmp_cm.0.join("pkg")).unwrap();
+    std::fs::write(tmp_cm.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp_cm.0.join("pkg/a.py"), "X = 1\n").unwrap();
+    git(&tmp_cm.0, &["add", "."]);
+    git(&tmp_cm.0, &["commit", "-q", "-m", "init"]);
+    let cap_cm = Arc::new(CaptureAgy { seen: std::sync::Mutex::new(Vec::new()) });
+    let h_cm: Arc<dyn Harness> = cap_cm.clone();
+    let harnesses_cm = Harnesses { master: h_cm.clone(), mid: h_cm.clone(), worker: h_cm.clone(), reviewer: h_cm.clone(), verifier: h_cm };
+    let mut cfg_cm = config(&tmp_cm.0, plan, true, 1);
+    cfg_cm.run_id = "tok3-code-mode".into();
+    cfg_cm.checks = false;
+    cfg_cm.runtime_checks = false;
+    cfg_cm.code_mode = true;
+    cfg_cm.browser = false;
+    assert_eq!(drive(cfg_cm, harnesses_cm).await.unwrap(), Outcome::Finished { ok: true });
+
+    let captured_cm = cap_cm.seen.lock().unwrap().clone();
+    let (_, alpha_cm) = captured_cm.iter().find(|(_, b)| b.contains("Build unit `alpha`")).unwrap();
+    assert!(alpha_cm.contains("Paths are from the project root."));
+    assert!(!alpha_cm.contains("Your worktree directory is"));
+    assert!(alpha_cm.contains("Do not call `update_steps`"));
+    assert!(alpha_cm.contains("trailing `git status`"));
+}

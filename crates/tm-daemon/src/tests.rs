@@ -12055,3 +12055,98 @@ async fn tok9_warm_planner_session_repairs_and_local_contract_compaction_avoids_
     assert!(locked.lines().count() <= tm_core::CONTRACT_LINES);
     assert!(locked.contains("def m_43(self) -> int:"));
 }
+
+#[tokio::test]
+async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_spec() {
+    let run_probe = |tmp: &Tmp, code_mode: bool| {
+        let root = tmp.0.clone();
+        async move {
+            let plan = Plan {
+                kind: tm_core::ProjectKind::Library,
+                pages: vec![PagePlan {
+                    id: "core".into(),
+                    owned_glob: "pkg/core.py".into(),
+                    brief: "Write pkg/core.py.".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let listed_tools = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let captured_brief = Arc::new(Mutex::new(String::new()));
+            struct ListProbe {
+                tools: Arc<Mutex<Vec<serde_json::Value>>>,
+                brief: Arc<Mutex<String>>,
+            }
+            #[async_trait]
+            impl Harness for ListProbe {
+                fn id(&self) -> &'static str {
+                    "antigravity"
+                }
+                async fn run(
+                    &self,
+                    task: WorkerTask,
+                    _gate: Arc<dyn PermissionGate>,
+                    events: mpsc::Sender<HarnessEvent>,
+                ) -> anyhow::Result<RunSummary> {
+                    *self.brief.lock().unwrap() = task.brief.clone();
+                    if let Some(dict) = task.dictionary.clone() {
+                        let tools = tokio::task::spawn_blocking(move || {
+                            let resp: serde_json::Value = ureq::post(&dict.url)
+                                .set("Authorization", &format!("Bearer {}", dict.bearer_token))
+                                .set("Content-Type", "application/json")
+                                .send_json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+                                .unwrap()
+                                .into_json()
+                                .unwrap();
+                            resp["result"]["tools"].as_array().cloned().unwrap_or_default()
+                        })
+                        .await?;
+                        *self.tools.lock().unwrap() = tools;
+                    }
+                    std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                    std::fs::write(task.cwd.join("pkg/core.py"), "X = 1\n")?;
+                    let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+                }
+            }
+            let h: Arc<dyn Harness> = Arc::new(ListProbe {
+                tools: listed_tools.clone(),
+                brief: captured_brief.clone(),
+            });
+            let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+            let mut cfg = config(&root, plan, true, 1);
+            cfg.checks = false;
+            cfg.runtime_checks = false;
+            cfg.code_mode = code_mode;
+            cfg.browser = false;
+            assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+            (listed_tools.lock().unwrap().clone(), captured_brief.lock().unwrap().clone())
+        }
+    };
+
+    // 1. Stdlib-only greenfield worker: cite/index/search/set_status/docs are all pruned.
+    let tmp_stdlib = seeded("tok10-stdlib");
+    let (tools_off, brief_off) = run_probe(&tmp_stdlib, false).await;
+    let names_off: Vec<&str> = tools_off.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names_off, vec!["flow_query"], "stdlib non-code worker should only see flow_query: {names_off:?}");
+    assert!(!brief_off.contains("for local-first API docs"), "brief should not advertise pruned docs tool");
+
+    // 2. Project with external npm deps + Code Mode: keeps `docs` and trimmed `run_code`, still prunes dict & set_status.
+    let tmp_deps = seeded("tok10-deps");
+    std::fs::write(tmp_deps.0.join("package.json"), r#"{"name":"demo","dependencies":{"zod":"^3.0.0"}}"#).unwrap();
+    git(&tmp_deps.0, &["add", "."]);
+    git(&tmp_deps.0, &["commit", "-q", "-m", "deps"]);
+    let has_node = crate::code::CodeTools::new(None).is_some();
+    let (tools_deps, _) = run_probe(&tmp_deps, has_node).await;
+    let names_deps: Vec<&str> = tools_deps.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names_deps.contains(&"docs"), "project with external deps should keep docs: {names_deps:?}");
+    assert!(names_deps.contains(&"flow_query"), "{names_deps:?}");
+    for pruned in ["cite", "index", "search", "set_status"] {
+        assert!(!names_deps.contains(&pruned), "{pruned} must be pruned from worker tools/list: {names_deps:?}");
+    }
+    if has_node {
+        let rc = tools_deps.iter().find(|t| t["name"] == "run_code").expect("run_code schema");
+        let spec_len = serde_json::to_string(rc).unwrap().len();
+        assert!(spec_len < 1000, "trimmed run_code schema should stay concise (<1000 bytes), got {spec_len} bytes");
+    }
+}

@@ -59,10 +59,27 @@ pub trait Extension: Send + Sync {
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value>;
 }
 
+/// Per-token visibility policy for `tools/list`. Pruning unused tool schemas from worker
+/// sessions cuts per-turn prompt tokens while keeping `tools/call` dispatch intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicy {
+    /// Advertise built-in Dictionary tools (`cite`, `index`, `search`).
+    pub dictionary: bool,
+    /// Specific extension tool names to omit from `tools/list` (e.g. `set_status`, `docs`).
+    pub hidden_tools: Vec<String>,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self { dictionary: true, hidden_tools: Vec::new() }
+    }
+}
+
 pub struct McpState {
     local: LocalStore,
     commons: Option<LocalStore>,
     tokens: Mutex<HashMap<String, Grant>>,
+    policies: Mutex<HashMap<String, ToolPolicy>>,
     cites: Mutex<Vec<CiteRecord>>,
     extension: Mutex<Option<Arc<dyn Extension>>>,
     observer: Mutex<Option<ReplyObserver>>,
@@ -74,6 +91,7 @@ impl McpState {
             local: store,
             commons: None,
             tokens: Mutex::default(),
+            policies: Mutex::default(),
             cites: Mutex::default(),
             extension: Mutex::default(),
             observer: Mutex::default(),
@@ -85,6 +103,7 @@ impl McpState {
             local,
             commons: Some(commons),
             tokens: Mutex::default(),
+            policies: Mutex::default(),
             cites: Mutex::default(),
             extension: Mutex::default(),
             observer: Mutex::default(),
@@ -126,8 +145,14 @@ impl McpState {
         }
     }
 
+    /// Configure which tool schemas `tools/list` advertises for `token`.
+    pub fn set_tool_policy(&self, token: &str, policy: ToolPolicy) {
+        self.policies.lock().unwrap().insert(token.into(), policy);
+    }
+
     pub fn revoke(&self, token: &str) {
         self.tokens.lock().unwrap().remove(token);
+        self.policies.lock().unwrap().remove(token);
     }
 
     pub fn cites(&self) -> Vec<CiteRecord> {
@@ -151,6 +176,9 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
         .and_then(|v| v.strip_prefix("Bearer "));
     let grant = token.and_then(|t| state.tokens.lock().unwrap().get(t).cloned());
     let Some(grant) = grant else { return StatusCode::UNAUTHORIZED.into_response() };
+    let policy = token
+        .and_then(|t| state.policies.lock().unwrap().get(t).cloned())
+        .unwrap_or_default();
     let Ok(msg) = serde_json::from_str::<Value>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -172,12 +200,18 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
         {
             if let Some(tools) = listed["tools"].as_array_mut() {
                 tools.extend(extension.tools(&grant));
+                apply_tool_policy(tools, &policy);
             }
             return Json(json!({ "jsonrpc": "2.0", "id": id, "result": listed })).into_response();
         }
     }
     let reply = match dispatch(&state, &grant, &msg) {
-        Ok(result) => {
+        Ok(mut result) => {
+            if method == "tools/list"
+                && let Some(tools) = result["tools"].as_array_mut()
+            {
+                apply_tool_policy(tools, &policy);
+            }
             if method == "tools/call" {
                 let name = msg["params"]["name"].as_str().unwrap_or_default();
                 state.record_reply(&grant, name, &result);
@@ -189,6 +223,19 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
         }
     };
     Json(reply).into_response()
+}
+
+fn apply_tool_policy(tools: &mut Vec<Value>, policy: &ToolPolicy) {
+    tools.retain(|tool| {
+        let name = tool["name"].as_str().unwrap_or("");
+        if !policy.dictionary && matches!(name, "cite" | "index" | "search") {
+            return false;
+        }
+        if policy.hidden_tools.iter().any(|h| h == name) {
+            return false;
+        }
+        true
+    });
 }
 
 /// UTF-8 byte length of the text blocks in an MCP tool result (falls back to JSON byte length).
@@ -519,5 +566,23 @@ mod tests {
         let cites = state.cites();
         assert_eq!(cites.len(), 1);
         assert_eq!(cites[0].grant.page, "unit_b");
+    }
+
+    #[tokio::test]
+    async fn tool_policy_prunes_unused_schemas_from_tools_list_while_keeping_call_dispatch() {
+        let (state, app) = setup();
+        state.extend(Arc::new(Echo));
+        state.set_tool_policy(
+            "tok-a",
+            ToolPolicy { dictionary: false, hidden_tools: vec!["echo".into()] },
+        );
+        let (status, listed) = rpc(&app, Some("tok-a"), json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed["result"]["tools"].as_array().unwrap().is_empty(), "{listed}");
+
+        // Explicit tools/call still dispatches if invoked directly.
+        let (call_status, res) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
+        assert_eq!(call_status, StatusCode::OK);
+        assert_eq!(res["result"]["isError"], false);
     }
 }

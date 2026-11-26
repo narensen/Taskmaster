@@ -1677,31 +1677,21 @@ impl Extension for CodeTools {
             return Vec::new();
         };
         let description = if scope.read_only {
-            "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
-             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), flow(op, args) (query the .flow code graph: find/node/neighbors/source), probe.ast(path), check(), status(text), wait({url, port, log, agent, timeout}), and console.log. \
-             Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
+            "Async JS body over repo (relative paths). Helpers: read, readMany, grep, ls, diff, symbols, flow(op, args), probe.ast, check, status, wait, console.log."
         } else {
-            "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
-             Functions: read(path), readMany(globs), write(path, text | { raw }), writeFile(path, content | { raw }), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
-             applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
-             grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), flow(op, args) (query the .flow code graph: find/node/neighbors/source), probe.ast(path), sh(command), \
-             test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
-             status(text) to set a live one-line status, wait({url, port, log, agent, timeout}) to wait for a server/port/log/sibling unit, \
-             and console.log. For Python/code with triple quotes or backslashes, pass raw file content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments (written before `code` runs), or use `String.raw` with `write(path, { raw })`. \
-             Paths are relative to your worktree. The same permissions as your own tools apply. \
-             Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
+            "Async JS body over worktree (relative paths; await/return). Helpers: read, readMany, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow(op, args), probe.ast, sh, test, testAffected, check, browser, status, wait, console.log. Use `files` or `writeFile` for raw multi-line files; end with `return await test()`."
         };
         let properties = if scope.read_only {
             json!({
-                "code": { "type": "string", "description": "The body of an async function" }
+                "code": { "type": "string", "description": "Async JS body" }
             })
         } else {
             json!({
-                "code": { "type": "string", "description": "The body of an async function (optional when `files` or `writeFile` is provided)" },
+                "code": { "type": "string", "description": "Async JS body (optional if files/writeFile set)" },
                 "files": {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
-                    "description": "Optional map of unquoted relative path (e.g. `src/app.py`, not `\"src/app.py\"`) -> raw UTF-8 file content written directly before `code` runs; avoids JS string escaping for Python triple quotes, backticks, or backslashes"
+                    "description": "Relative path -> raw UTF-8 content written before code runs"
                 },
                 "writeFile": {
                     "type": "object",
@@ -1711,7 +1701,7 @@ impl Extension for CodeTools {
                         "raw": { "type": "string" }
                     },
                     "required": ["path"],
-                    "description": "Optional single raw file write `{path, content}` applied before `code` runs"
+                    "description": "Single raw write {path, content} before code runs"
                 }
             })
         };

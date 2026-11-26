@@ -2521,6 +2521,7 @@ impl Driver {
                                         unit: String::new(),
                                     },
                                 );
+                                self.mcp.set_tool_policy(&tok, self.worker_tool_policy(&page));
                                 self.tokens.insert(page.clone(), tok);
                             }
                             let owned = self.owned_files(&page, index, units.len(), &warm.worktree);
@@ -5771,10 +5772,13 @@ impl Driver {
         let fetch_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_fetch");
         let adv_tool = tm_harness::mcp_tool_name(wid, "dictionary", "advisories");
         let search_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_search");
+        let show_docs = project_has_external_deps(&self.tree) || self.web_access.enabled;
+        out.push_str("\nDocumentation & code graph:\n");
+        if show_docs {
+            out.push_str(&format!("- Call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages.\n"));
+        }
         out.push_str(&format!(
-            "\nDocumentation & code graph:\n\
-             - Call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages.\n\
-             - Query the `.flow` code graph with `{flow_tool}` instead of reading whole files outside your unit. Examples:\n\
+            "- Query the `.flow` code graph with `{flow_tool}` instead of reading whole files outside your unit. Examples:\n\
                1. Find symbols: `{flow_tool}({{\"op\": \"find\", \"query\": \"StorageEngine\"}})`\n\
                2. Inspect callers / 1-hop neighbors: `{flow_tool}({{\"op\": \"neighbors\", \"id\": \"py:pkg/mod.py#Class.method\", \"k\": 1, \"dir\": \"in\"}})`\n\
                3. Read a symbol's full source body: `{flow_tool}({{\"op\": \"source\", \"id\": \"py:pkg/mod.py#Class.method\"}})`\n\
@@ -6507,6 +6511,28 @@ impl Driver {
         DictionaryAccess { name: "dictionary".into(), url: self.url.clone(), bearer_token: token.to_string() }
     }
 
+    /// Determine which MCP tool schemas to advertise in `tools/list` for a worker unit.
+    /// Prunes unused `cite`/`index`/`search` (when all cited entries are already inlined in the
+    /// brief), standalone `set_status` (available inside `run_code` as `status()`), and `docs`
+    /// (when the project uses no external third-party packages and web access is disabled).
+    fn worker_tool_policy(&self, page_id: &str) -> tm_dictionary::ToolPolicy {
+        let has_unpublished_cite = self
+            .page(page_id)
+            .ok()
+            .zip(self.catalog().ok())
+            .is_some_and(|(page, catalog)| {
+                page.cites.iter().any(|k| catalog.resolve(k).ok().flatten().is_none())
+            });
+        let mut hidden = vec!["set_status".to_string()];
+        if !project_has_external_deps(&self.tree) && !self.web_access.enabled {
+            hidden.push("docs".to_string());
+        }
+        tm_dictionary::ToolPolicy {
+            dictionary: has_unpublished_cite,
+            hidden_tools: hidden,
+        }
+    }
+
     fn grant_pages(&mut self) -> anyhow::Result<()> {
         let pages: Vec<String> =
             self.run.plan.as_ref().map(|plan| plan.pages.iter().map(|p| p.id.clone()).collect()).unwrap_or_default();
@@ -6516,6 +6542,7 @@ impl Driver {
             }
             let token = fresh_token()?;
             self.mcp.grant(&token, Grant { run: self.config.run_id.clone(), page: page.clone(), unit: String::new() });
+            self.mcp.set_tool_policy(&token, self.worker_tool_policy(&page));
             self.tokens.insert(page, token);
         }
         Ok(())
@@ -6530,6 +6557,7 @@ impl Driver {
         }
         let token = fresh_token()?;
         self.mcp.grant(&token, Grant { run: self.config.run_id.clone(), page: page.to_string(), unit: unit.to_string() });
+        self.mcp.set_tool_policy(&token, self.worker_tool_policy(page));
         self.tokens.insert(key, token.clone());
         Ok(token)
     }
@@ -7769,6 +7797,64 @@ pub(crate) fn expand_glob_in_worktree(worktree: &Path, glob: &str) -> Vec<String
     rels.into_iter()
         .map(|rel| worktree.join(rel.trim_start_matches("./")).display().to_string())
         .collect()
+}
+
+/// True when `tree` declares external third-party packages (Node, Python, Rust, or Go),
+/// indicating the local `docs(package)` MCP tool may be useful to workers.
+pub(crate) fn project_has_external_deps(tree: &Path) -> bool {
+    if tree.join("node_modules").is_dir() {
+        return true;
+    }
+    if let Ok(raw) = fs::read_to_string(tree.join("package.json"))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        for key in ["dependencies", "devDependencies", "peerDependencies"] {
+            if val[key].as_object().is_some_and(|m| !m.is_empty()) {
+                return true;
+            }
+        }
+    }
+    for req in ["requirements.txt", "requirements-dev.txt"] {
+        if let Ok(raw) = fs::read_to_string(tree.join(req)) {
+            let has_pkg = raw.lines().map(str::trim).any(|l| {
+                !l.is_empty()
+                    && !l.starts_with('#')
+                    && !l.starts_with('-')
+                    && !l.to_ascii_lowercase().starts_with("pytest")
+            });
+            if has_pkg {
+                return true;
+            }
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(tree.join("pyproject.toml")) {
+        let lower = raw.to_ascii_lowercase();
+        let in_deps = lower.contains("dependencies = [")
+            && !lower.contains("dependencies = []")
+            && !lower.contains("dependencies = [\"pytest\"]")
+            && !lower.contains("dependencies = ['pytest']");
+        if in_deps || lower.contains("[tool.poetry.dependencies]") {
+            return true;
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(tree.join("Cargo.toml"))
+        && let Some((_, rest)) = raw.split_once("[dependencies]")
+    {
+        let has_crate = rest
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with('['))
+            .map(str::trim)
+            .any(|l| !l.is_empty() && !l.starts_with('#') && l.contains('='));
+        if has_crate {
+            return true;
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(tree.join("go.mod"))
+        && raw.lines().any(|l| l.trim_start().starts_with("require "))
+    {
+        return true;
+    }
+    false
 }
 
 /// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`

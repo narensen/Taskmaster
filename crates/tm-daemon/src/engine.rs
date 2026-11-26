@@ -2060,7 +2060,12 @@ impl Driver {
             self.checkpoint("done");
         }
         self.settle_commons(ok)?;
+        let had_branch = self.branch.is_some();
         self.deliver(ok);
+        if ok && !had_branch {
+            let _project = PROJECT.lock().unwrap();
+            self.refresh_flow_and_commit();
+        }
         self.write_status(ok)?;
         self.persist()?;
         Ok(())
@@ -6679,6 +6684,13 @@ impl Driver {
     /// the master and its workers, as [`crate::turns::turn_mode`] decides.
     fn open_turn(&mut self) -> anyhow::Result<()> {
         self.finalized = false;
+        self.web_tools.set_flow_root(self.tree.clone());
+        if let Some(code) = &self.code {
+            code.set_flow_root(self.tree.clone());
+        }
+        if self.tree.join(tm_flow::FLOW_DIR).is_dir() && self.check_flow_staleness("follow_up") > 0 {
+            self.commit_flow_update();
+        }
         self.refresh_env_hint();
         let pending: Vec<crate::live::Note> = self.live.notes(&self.id).into_iter().filter(|note| !note.delivered).collect();
         let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;

@@ -787,7 +787,7 @@ impl CodeTools {
                     if tm_flow::is_flow_path(rel) {
                         return Ok(json!({
                             "applied": false,
-                            "error": format!("refused: `{rel}` is inside `.flow/`, which is managed by Taskmaster"),
+                            "error": format!("policy denied write to `{rel}` (`.flow/` is managed by Taskmaster)"),
                             "files": [],
                             "diagnostics": [],
                         }));
@@ -1567,7 +1567,7 @@ fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
         .replace('\\', "/");
     let rel = rel.trim_start_matches("./");
     if tm_flow::is_flow_path(rel) {
-        bail!("refused: `{rel}` is inside `.flow/`, which is managed by Taskmaster");
+        bail!("policy denied write to `{rel}` (`.flow/` is managed by Taskmaster)");
     }
     let policy = crate::policy::Policy::load(&scope.cwd);
     if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {

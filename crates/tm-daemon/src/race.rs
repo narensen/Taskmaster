@@ -71,6 +71,16 @@ pub fn merge_winner(project: &Path, records: &Records, live: &crate::live::Live,
     if !crate::git::merge_branch(project, &branch, &[tm_core::docs::ARCHITECTURE_FILE, tm_core::docs::CHANGES_FILE, ".flow/"]) {
         anyhow::bail!("`{branch}` does not merge cleanly into the project; merge it yourself: git merge {branch}");
     }
+    if project.join(tm_flow::FLOW_DIR).is_dir() {
+        if let Err(err) = tm_flow::build(project) {
+            eprintln!("taskmaster: flow refresh after race merge failed: {err:#}");
+        } else if crate::git::git(project, &["add", "-A", "--", tm_flow::FLOW_DIR]).is_ok() {
+            let staged = crate::git::git(project, &["diff", "--cached", "--name-only", "--", tm_flow::FLOW_DIR]).unwrap_or_default();
+            if !staged.trim().is_empty() {
+                let _ = crate::git::git(project, &["commit", "-q", "-m", "taskmaster: update .flow"]);
+            }
+        }
+    }
     let after = crate::git::git(project, &["rev-parse", "--verify", "HEAD"])?.trim().to_string();
     let base = crate::git::git(project, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
     let commit = crate::git::git(project, &["rev-parse", "--short=8", "HEAD"]).unwrap_or_default().trim().to_string();

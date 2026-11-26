@@ -536,27 +536,48 @@ pub fn seed_from_plan(tree: &Path, plan: &Plan) -> anyhow::Result<SeedReport> {
     };
     let matchers = OwnerMatchers::from_seed(Some(&seed));
 
-    // Read existing shards and parse every contract file that exists on disk.
+    // Read existing shards, parse every contract file on disk, and also parse any tracked
+    // source file whose shard is missing or stale (e.g. template files written during `lock()`).
     let mut shards = read_all_shards(tree)?;
-    let mut parsed_contracts = Vec::new();
-    for cpath in &contracts {
-        let full = tree.join(cpath);
+    let mut to_parse_paths: BTreeSet<String> = contracts.iter().cloned().collect();
+    for path in discover_source_files(tree) {
+        let needs = match shards.get(&path) {
+            Some(existing) => std::fs::read(tree.join(&path))
+                .map(|bytes| git_blob_sha(&bytes) != existing.blob)
+                .unwrap_or(false),
+            None => true,
+        };
+        if needs {
+            to_parse_paths.insert(path);
+        }
+    }
+    let mut parsed_files = Vec::new();
+    for path in &to_parse_paths {
+        let full = tree.join(path);
         if !full.is_file() {
             continue;
         }
         let Ok(source) = std::fs::read_to_string(&full) else { continue };
-        if let Some(pf) = parse_file(cpath, &source) {
-            parsed_contracts.push(pf);
+        if let Some(pf) = parse_file(path, &source) {
+            parsed_files.push(pf);
         }
     }
 
-    let catalog = SymbolCatalog::build(&shards, &parsed_contracts);
-    for pf in &parsed_contracts {
-        let mut shard = catalog.resolve_shard(pf, None);
-        mark_contract_nodes(&mut shard);
+    let catalog = SymbolCatalog::build(&shards, &parsed_files);
+    for pf in &parsed_files {
+        let is_contract = matchers.is_contract(&pf.path);
+        let owner = if is_contract { None } else { matchers.owner_of(&pf.path) };
+        let mut shard = catalog.resolve_shard(pf, owner);
+        if is_contract {
+            mark_contract_nodes(&mut shard);
+        }
         write_shard(tree, &shard)?;
         shards.insert(shard.path.clone(), shard);
     }
+    let parsed_contracts: Vec<&ParsedFile> = parsed_files
+        .iter()
+        .filter(|pf| matchers.is_contract(&pf.path))
+        .collect();
 
     // Tag existing shards with their plan owner if newly assigned.
     let existing_paths: Vec<String> = shards.keys().cloned().collect();

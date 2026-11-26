@@ -9786,3 +9786,162 @@ class BTreeProtocol(Protocol):
     assert_eq!(db.get_node("py:tinydb/btree.py#BTree").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
     assert_eq!(db.get_node("py:tinydb/btree.py#BTree.insert").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
 }
+
+#[tokio::test]
+async fn flow_env_json_prepared_before_wave1_with_relative_paths_and_shared_venv_reuse() {
+    let tmp = seeded("flow-env-wave1");
+    let contract_test = "def test_ok():\n    assert True\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Python CLI with wave-1 shared env".into(),
+        contracts: vec![ContractFile {
+            path: "tests/test_smoke_contract.py".into(),
+            content: contract_test.into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "alpha".into(),
+                owned_glob: "pkg/alpha.py".into(),
+                brief: "Write pkg/alpha.py".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "beta".into(),
+                owned_glob: "pkg/beta.py".into(),
+                brief: "Write pkg/beta.py".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    #[derive(Clone)]
+    struct EarlyEnvCall {
+        brief: String,
+        env_exists: bool,
+        env_facts: Option<tm_flow::EnvFacts>,
+        shell: Option<tm_harness::ShellScope>,
+        sandbox_ran_python: bool,
+    }
+    let seen: Arc<Mutex<Vec<EarlyEnvCall>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct EarlyEnvHarness {
+        seen: Arc<Mutex<Vec<EarlyEnvCall>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for EarlyEnvHarness {
+        fn id(&self) -> &'static str {
+            "fake-early-env"
+        }
+        fn sandboxed_shell(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Inspect `.flow/env.json` directly inside the wave-1 worker's worktree!
+            let env_exists = task.cwd.join(".flow/env.json").is_file();
+            let env_facts = tm_flow::read_env(&task.cwd).ok().flatten();
+            // If bwrap is usable and TASKMASTER_SHARED_VENV is set, execute the shared venv python inside bwrap!
+            let mut sandbox_ran_python = false;
+            if tm_harness::sandbox::bwrap_usable()
+                && let Some(ref shell) = task.shell
+                && shell.env.iter().any(|(k, _)| k == "TASKMASTER_SHARED_VENV")
+            {
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()));
+                let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
+                let sh = std::fs::canonicalize("/bin/sh")?;
+                let cmd_str = r#""$TASKMASTER_SHARED_VENV/bin/python" -c "import sys; print(sys.prefix)""#;
+                let args = sandbox.bwrap_args_with(&sh, &["-c".into(), cmd_str.into()], &task.cwd, false, Some(shell));
+                let out = std::process::Command::new("bwrap").args(&args).output()?;
+                sandbox_ran_python = out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+            }
+            self.seen.lock().unwrap().push(EarlyEnvCall {
+                brief: task.brief.clone(),
+                env_exists,
+                env_facts,
+                shell: task.shell.clone(),
+                sandbox_ran_python,
+            });
+
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            if task.brief.contains("Build unit `alpha`") {
+                std::fs::write(task.cwd.join("pkg/alpha.py"), "def a():\n    return 1\n")?;
+            } else if task.brief.contains("Build unit `beta`") {
+                std::fs::write(task.cwd.join("pkg/beta.py"), "def b():\n    return 2\n")?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(EarlyEnvHarness { seen: seen.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.run_id = "env-early-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = true;
+    cfg.browser = false;
+
+    let out = tokio::time::timeout(Duration::from_secs(40), drive(cfg, harnesses))
+        .await
+        .expect("early env run timed out")
+        .unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let calls = seen.lock().unwrap().clone();
+    let alpha = calls.iter().find(|c| c.brief.contains("Build unit `alpha`")).expect("alpha call");
+    let beta = calls.iter().find(|c| c.brief.contains("Build unit `beta`")).expect("beta call");
+
+    // 1. `.flow/env.json` existed BEFORE wave-1 worker briefs were built!
+    assert!(alpha.env_exists, ".flow/env.json must already exist in wave-1 worker worktree");
+    assert!(beta.env_exists, ".flow/env.json must already exist in wave-1 worker worktree");
+    let env_on_disk = alpha.env_facts.as_ref().expect("env.json readable during wave 1");
+    assert_eq!(env_on_disk.runner, "pytest");
+
+    // 2. Every path committed in `.flow/env.json` is relative (no absolute machine paths!).
+    let committed_env = tm_flow::read_env(&tmp.0).unwrap().expect("committed .flow/env.json");
+    assert!(!committed_env.test_cmd.starts_with('/'), "test_cmd must be relative: {}", committed_env.test_cmd);
+    assert!(!committed_env.test_cmd.contains(&tmp.0.display().to_string()), "must not contain machine path: {}", committed_env.test_cmd);
+    if let Some(ref v) = committed_env.venv {
+        assert!(!std::path::Path::new(v).is_absolute(), "venv must be relative: {v}");
+    }
+    if let Some(ref py) = committed_env.python {
+        assert!(!std::path::Path::new(py).is_absolute(), "python must be relative: {py}");
+    }
+    if let Some(ref ic) = committed_env.install_cmd {
+        assert!(!ic.contains(&tmp.0.display().to_string()), "install_cmd must be relative: {ic}");
+    }
+
+    // 3. Shared prefix is byte-identical across wave-1 units AND carries the verified test environment hint.
+    let (pre_a, _) = alpha.brief.split_once("--- Your task ---").unwrap();
+    let (pre_b, _) = beta.brief.split_once("--- Your task ---").unwrap();
+    assert_eq!(pre_a, pre_b, "shared prefix must remain byte-identical across wave-1 units");
+    assert!(pre_a.contains("Verified test environment:"), "{pre_a}");
+    if committed_env.venv.is_some() {
+        assert!(pre_a.contains("do NOT create a new venv"), "{pre_a}");
+        let shell_a = alpha.shell.as_ref().expect("shell scope for alpha");
+        assert!(
+            shell_a.env.iter().any(|(k, _)| k == "TASKMASTER_SHARED_VENV"),
+            "TASKMASTER_SHARED_VENV must be exported to wave-1 workers: {:?}",
+            shell_a.env
+        );
+        if tm_harness::sandbox::bwrap_usable() {
+            assert!(alpha.sandbox_ran_python, "worker sandbox must be able to execute shared venv python");
+        }
+    }
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+}

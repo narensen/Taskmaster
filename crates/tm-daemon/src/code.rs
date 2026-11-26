@@ -305,6 +305,7 @@ pub struct CodeTools {
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     runtime: Mutex<Option<CodeRuntimeCtx>>,
     flow_root: Mutex<Option<PathBuf>>,
+    project_root: Mutex<Option<PathBuf>>,
     /// How long one script may run.
     script_limit: Duration,
     /// How long one `sh` or `test` call may run.
@@ -323,6 +324,7 @@ impl CodeTools {
             browsers,
             runtime: Mutex::new(None),
             flow_root: Mutex::new(None),
+            project_root: Mutex::new(None),
             script_limit: Duration::from_secs(SCRIPT_SECS),
             sh_limit: Duration::from_secs(SH_SECS),
         }))
@@ -331,6 +333,11 @@ impl CodeTools {
     /// Set the run's live `.flow` tree root (e.g. `driver.tree`) used by `flow(op, args)`.
     pub fn set_flow_root(&self, root: PathBuf) {
         *self.flow_root.lock().unwrap() = Some(root);
+    }
+
+    /// Set the project root used to relativize paths written to `.flow/env.json`.
+    pub fn set_project_root(&self, root: PathBuf) {
+        *self.project_root.lock().unwrap() = Some(root);
     }
 
     /// Attach run-scoped `Live`, `Records`, and `StatusTools` so `status()` and `wait()` work.
@@ -689,34 +696,7 @@ impl CodeTools {
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
-                let fallback_venv = scope
-                    .shell
-                    .as_ref()
-                    .and_then(|s| s.writable.first())
-                    .map(|scratch| scratch.join("venv"))
-                    .unwrap_or_else(|| scope.cwd.join(".venv"));
-                // Prefer an already-prepared shared read-only venv mounted into the worker's sandbox
-                // when it needs zero setup writes; otherwise fall back to the writable scratch venv.
-                let shared_venv = scope
-                    .shell
-                    .as_ref()
-                    .and_then(|s| s.readable.iter().find(|d| d.join("pyvenv.cfg").is_file()))
-                    .cloned();
-                let (venv, steps) = match shared_venv {
-                    Some(shared) => {
-                        let candidate = crate::runtime::steps(&scope.cwd, &shared);
-                        if candidate.iter().any(|s| !s.setup) && !candidate.iter().any(|s| s.setup) {
-                            (shared, candidate)
-                        } else {
-                            let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
-                            (fallback_venv, steps)
-                        }
-                    }
-                    None => {
-                        let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
-                        (fallback_venv, steps)
-                    }
-                };
+                let (venv, steps) = select_test_steps(scope);
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
                 }
@@ -724,9 +704,15 @@ impl CodeTools {
                 let (code, text) = self.sandboxed(scope, &command).await?;
                 if code == Some(0) {
                     let flow_root = self.flow_root.lock().unwrap().clone();
-                    if let Some(root) = flow_root
+                    let rel_base = self
+                        .project_root
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .or_else(|| flow_root.clone());
+                    if let (Some(root), Some(base)) = (flow_root, rel_base)
                         && tm_flow::read_env(&root).ok().flatten().is_none()
-                        && let Some(facts) = crate::runtime::env_facts_from_steps(&steps, &venv)
+                        && let Some(facts) = crate::runtime::env_facts_from_steps_rel(&steps, &venv, &base)
                     {
                         let _ = tm_flow::write_env(&root, &facts);
                     }
@@ -913,13 +899,7 @@ impl CodeTools {
                     })
                     .take(12)
                     .collect();
-                let venv = scope
-                    .shell
-                    .as_ref()
-                    .and_then(|s| s.writable.first())
-                    .map(|scratch| scratch.join("venv"))
-                    .unwrap_or_else(|| scope.cwd.join(".venv"));
-                let steps = crate::runtime::steps(&scope.cwd, &venv);
+                let (_, steps) = select_test_steps(scope);
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({
                         "ok": true,
@@ -1232,6 +1212,37 @@ async fn probe_local_http(url: &str) -> Option<u16> {
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
 /// One shell line that runs the project's test steps: setup steps may fail and are reported,
 /// the checks must all pass.
+fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
+    let fallback_venv = scope
+        .shell
+        .as_ref()
+        .and_then(|s| s.writable.first())
+        .map(|scratch| scratch.join("venv"))
+        .unwrap_or_else(|| scope.cwd.join(".venv"));
+    // Prefer an already-prepared shared read-only venv mounted into the worker's sandbox
+    // when it needs zero setup writes; otherwise fall back to the writable scratch venv.
+    let shared_venv = scope
+        .shell
+        .as_ref()
+        .and_then(|s| s.readable.iter().find(|d| d.join("pyvenv.cfg").is_file()))
+        .cloned();
+    match shared_venv {
+        Some(shared) => {
+            let candidate = crate::runtime::steps(&scope.cwd, &shared);
+            if candidate.iter().any(|s| !s.setup) && !candidate.iter().any(|s| s.setup) {
+                (shared, candidate)
+            } else {
+                let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+                (fallback_venv, steps)
+            }
+        }
+        None => {
+            let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+            (fallback_venv, steps)
+        }
+    }
+}
+
 fn test_command(steps: &[crate::runtime::Step]) -> String {
     let line = |step: &crate::runtime::Step| {
         let mut parts: Vec<String> = step.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();

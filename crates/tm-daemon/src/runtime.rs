@@ -372,6 +372,100 @@ pub fn env_facts_from_steps(steps: &[Step], venv: &Path) -> Option<tm_flow::EnvF
     })
 }
 
+/// Derive `.flow/env.json` facts from a set of verified [`Step`]s and relativize paths against
+/// `base` (the project root) so committed `.flow/env.json` files never store absolute machine paths.
+pub fn env_facts_from_steps_rel(steps: &[Step], venv: &Path, base: &Path) -> Option<tm_flow::EnvFacts> {
+    env_facts_from_steps(steps, venv).map(|facts| facts.relativize(base))
+}
+
+/// Prepare the run's test/runtime environment BEFORE wave 1 starts (creating and verifying the
+/// shared Python venv if needed, without running the project's tests themselves yet) and return
+/// relative [`tm_flow::EnvFacts`] ready to commit into `.flow/env.json`.
+pub async fn prepare_env(
+    tree: &Path,
+    venv: &Path,
+    project_root: &Path,
+    plan_has_python: bool,
+    timeout: Duration,
+) -> Option<tm_flow::EnvFacts> {
+    let mut all_steps = steps(tree, venv);
+    if all_steps.is_empty() && plan_has_python {
+        all_steps = python_steps(tree, venv);
+    }
+    if all_steps.is_empty() {
+        return None;
+    }
+
+    let setup_steps: Vec<Step> = all_steps.iter().filter(|s| s.setup).cloned().collect();
+    if !setup_steps.is_empty() {
+        let mut idx = 0usize;
+        while idx < setup_steps.len() {
+            let step = &setup_steps[idx];
+            // If this is a bare `pip install -q pytest` (no `-e` / `-r` project dependencies) and
+            // `--system-site-packages` already made `pytest` runnable inside `venv`, skip the network pip call.
+            let is_bare_pytest_install = step.args.iter().any(|a| a == "pip")
+                && step.args.iter().any(|a| a == "pytest")
+                && !step.args.iter().any(|a| a == "-e" || a == "-r");
+            if is_bare_pytest_install && venv_has_pytest(venv).await {
+                if let Some((file, stamp)) = &step.stamp {
+                    let _ = std::fs::write(file, stamp);
+                }
+                idx += 1;
+                continue;
+            }
+            let _ = run_steps(tree, std::slice::from_ref(step), timeout).await;
+            idx += 1;
+        }
+        // If a pip install failed offline (e.g. no network), still stamp the venv when system-site-packages
+        // already provides pytest so workers reuse the shared venv instead of rebuilding per unit.
+        if venv_has_pytest(venv).await {
+            let stamp_file = venv.join(".taskmaster-deps");
+            if !stamp_file.is_file() {
+                let _ = std::fs::write(&stamp_file, python_stamp(tree));
+            }
+        }
+    }
+
+    let is_python_plan = all_steps.iter().any(|s| {
+        !s.setup
+            && (s.program.ends_with("pytest")
+                || s.program.ends_with("pytest.exe")
+                || s.args.iter().any(|a| a == "pytest"))
+    });
+    if is_python_plan && venv.is_dir() && !venv_has_pytest(venv).await {
+        // Venv exists but pytest is unavailable inside it; still record safe fallback without broken venv.
+        return Some(tm_flow::EnvFacts {
+            runner: "pytest".into(),
+            test_cmd: "pytest -q".into(),
+            venv: None,
+            python: None,
+            install_cmd: None,
+        });
+    }
+
+    env_facts_from_steps_rel(&all_steps, venv, project_root)
+}
+
+async fn venv_has_pytest(venv: &Path) -> bool {
+    let bin = venv.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+    if !bin.is_file() {
+        return false;
+    }
+    let mut cmd = Command::new(&bin);
+    clean_env(&mut cmd);
+    cmd.args(["-m", "pytest", "--version"])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(15), cmd.status())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|s| s.success())
+}
+
 /// Exclude later-phase contract test paths from test runner steps (e.g. pytest `--ignore=<path>`)
 /// so intermediate-phase verify does not execute tests for phases that have not been built yet.
 pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {

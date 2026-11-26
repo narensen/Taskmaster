@@ -340,4 +340,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn worker_sandbox_can_execute_shared_read_only_venv_python() {
+        if !bwrap_usable() {
+            eprintln!("bubblewrap is not usable here; skipping");
+            return;
+        }
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !has_python3 {
+            eprintln!("python3 not installed; skipping");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("tm-sandbox-venv-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let work = base.join("work");
+        let scratch = base.join("scratch");
+        let venv = base.join("shared-venv");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", "--system-site-packages", &venv.display().to_string()])
+            .status()
+            .unwrap();
+        assert!(mk.success(), "failed to create test venv");
+
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()));
+        let sandbox = Sandbox { home, state_dirs: vec![] };
+        let scope = crate::ShellScope {
+            writable: vec![scratch.clone()],
+            readable: vec![venv.clone()],
+            env: vec![
+                ("TASKMASTER_SHARED_VENV".into(), venv.display().to_string()),
+                ("TASKMASTER_SCRATCH".into(), scratch.display().to_string()),
+                ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+            ],
+        };
+        let sh = std::fs::canonicalize("/bin/sh").unwrap();
+        let script = r#""$TASKMASTER_SHARED_VENV/bin/python" -c "import sys; print(sys.prefix)""#.to_string();
+        let args = sandbox.bwrap_args_with(&sh, &["-c".into(), script], &work, false, Some(&scope));
+        let out = std::process::Command::new("bwrap").args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "worker sandbox must execute shared venv python: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), venv.display().to_string());
+
+        // Shared venv itself must remain read-only inside the worker sandbox.
+        let ro_script = r#"echo nope > "$TASKMASTER_SHARED_VENV/tamper" 2>/dev/null"#;
+        let ro_args = sandbox.bwrap_args_with(&sh, &["-c".into(), ro_script.into()], &work, false, Some(&scope));
+        let ro_status = std::process::Command::new("bwrap").args(&ro_args).status().unwrap();
+        assert!(!ro_status.success(), "shared venv must not be writable by workers");
+        assert!(!venv.join("tamper").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

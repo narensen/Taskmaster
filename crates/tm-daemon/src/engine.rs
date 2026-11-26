@@ -780,6 +780,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     driver.web_tools.set_flow_root(driver.tree.clone());
     if let Some(code) = &driver.code {
         code.set_flow_root(driver.tree.clone());
+        code.set_project_root(driver.project.clone());
     }
     driver.repo_map = crate::repomap::render(&driver.tree);
     if let Err(err) = tm_flow::build(&driver.tree) {
@@ -1984,6 +1985,7 @@ impl Driver {
             Command::RequestApproval => self.approve(),
             Command::LockContracts => {
                 self.lock()?;
+                self.prepare_run_env().await;
                 self.persist()?;
                 // The next phase depends only on the interfaces just locked: plan it while
                 // this one builds.
@@ -5133,10 +5135,14 @@ impl Driver {
         if verify_venv.is_dir() {
             candidate_venvs.push(verify_venv);
         }
-        if let Ok(Some(facts)) = tm_flow::read_env(&self.tree)
-            && let Some(v) = facts.venv.as_deref().filter(|s| !s.is_empty())
+        let loaded_env = tm_flow::read_env(&self.tree)
+            .ok()
+            .flatten()
+            .or_else(|| tm_flow::read_env(&self.project).ok().flatten());
+        if let Some(facts) = loaded_env
+            && let Some(raw_v) = facts.venv.as_deref().filter(|s| !s.is_empty())
         {
-            let vp = PathBuf::from(v);
+            let vp = resolve_env_path(raw_v, &self.project, &self.tree);
             if vp.is_dir() && !candidate_venvs.contains(&vp) {
                 candidate_venvs.push(vp);
             }
@@ -6181,9 +6187,10 @@ impl Driver {
         }
     }
 
-    /// Load `.flow/env.json` into `self.env_hint` for the shared prefix.
-    /// Called ONLY at run start, phase boundaries (`next_phase`), and new turns (`open_turn`)
-    /// so `shared_prefix()` stays byte-identical across units within a phase.
+    /// Load `.flow/env.json` into `self.env_hint` for the shared prefix, resolving relative paths
+    /// against `self.project` (falling back to `self.tree`) at use time.
+    /// Called ONLY at run start, right after `lock()` before wave 1, at phase boundaries (`next_phase`),
+    /// and on new turns (`open_turn`) so `shared_prefix()` stays byte-identical across units within a phase.
     /// If a recorded venv path no longer exists on disk, drop the stale venv fields and keep
     /// only the runner/test command as a sensible fallback.
     fn refresh_env_hint(&mut self) {
@@ -6191,10 +6198,25 @@ impl Driver {
             .ok()
             .flatten()
             .or_else(|| tm_flow::read_env(&self.project).ok().flatten());
-        let Some(mut facts) = loaded else {
+        let Some(raw_facts) = loaded else {
             self.env_hint.clear();
             return;
         };
+        let resolve_base = raw_facts
+            .venv
+            .as_deref()
+            .filter(|v| !v.is_empty() && !Path::new(v).is_absolute())
+            .map(|v| {
+                if self.project.join(v).is_dir() {
+                    &self.project
+                } else if self.tree.join(v).is_dir() {
+                    &self.tree
+                } else {
+                    &self.project
+                }
+            })
+            .unwrap_or(&self.project);
+        let mut facts = raw_facts.resolve(resolve_base);
         if let Some(ref venv) = facts.venv
             && !Path::new(venv).is_dir()
         {
@@ -6213,10 +6235,56 @@ impl Driver {
         self.env_hint = facts.shared_prefix_line();
     }
 
-    /// Record verified test/venv environment facts into `.flow/env.json` after the first
-    /// successful verify run and commit the `.flow/` update.
+    /// Prepare the run's test/runtime environment right after `lock()`, BEFORE wave 1 starts,
+    /// writing repo-relative paths into `.flow/env.json` and updating `self.env_hint` so every
+    /// wave-1 worker gets the verified environment hint in its byte-identical shared prefix and
+    /// can reuse the shared venv instead of building its own.
+    async fn prepare_run_env(&mut self) {
+        if !self.config.runtime_checks {
+            return;
+        }
+        // If `.flow/env.json` already exists with a valid resolved environment, reuse it as-is.
+        if let Some(existing) = tm_flow::read_env(&self.tree)
+            .ok()
+            .flatten()
+            .or_else(|| tm_flow::read_env(&self.project).ok().flatten())
+        {
+            let venv_ok = match existing.venv.as_deref().filter(|s| !s.is_empty()) {
+                Some(v) => resolve_env_path(v, &self.project, &self.tree).is_dir(),
+                None => !existing.test_cmd.trim().is_empty(),
+            };
+            if venv_ok {
+                self.refresh_env_hint();
+                return;
+            }
+        }
+        let plan_has_python = self.run.plan.as_ref().is_some_and(|plan| {
+            plan.contracts.iter().any(|c| c.path.ends_with(".py"))
+                || plan.pages.iter().any(|p| p.owned_glob.contains(".py"))
+        });
+        let venv = self.verify_venv();
+        if let Some(facts) = runtime::prepare_env(
+            &self.tree,
+            &venv,
+            &self.project,
+            plan_has_python,
+            checks::STEP_TIMEOUT,
+        )
+        .await
+        {
+            match tm_flow::write_env(&self.tree, &facts) {
+                Ok(true) => self.commit_flow_update(),
+                Ok(false) => {}
+                Err(err) => eprintln!("taskmaster: could not write .flow/env.json: {err:#}"),
+            }
+            self.refresh_env_hint();
+        }
+    }
+
+    /// Record verified test/venv environment facts into `.flow/env.json` with relative paths
+    /// after verify succeeds and commit the `.flow/` update.
     fn record_verified_env(&self, steps: &[runtime::Step], venv: &Path) {
-        let Some(facts) = runtime::env_facts_from_steps(steps, venv) else {
+        let Some(facts) = runtime::env_facts_from_steps_rel(steps, venv, &self.project) else {
             return;
         };
         match tm_flow::write_env(&self.tree, &facts) {
@@ -7961,6 +8029,22 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         refused,
         kept,
     })
+}
+
+fn resolve_env_path(raw: &str, project: &Path, tree: &Path) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let under_project = project.join(p);
+    if under_project.exists() {
+        return under_project;
+    }
+    let under_tree = tree.join(p);
+    if under_tree.exists() {
+        return under_tree;
+    }
+    under_project
 }
 
 fn dict_prefixes() -> Vec<String> {

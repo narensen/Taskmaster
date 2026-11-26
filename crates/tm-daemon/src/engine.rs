@@ -388,6 +388,8 @@ struct Driver {
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     /// `run_code` for each page being built, when Code Mode is on and Node is here.
     code: Option<Arc<crate::code::CodeTools>>,
+    /// Daemon MCP extension for `docs`, `flow_query`, and web access.
+    web_tools: Arc<crate::web_access::WebTools>,
     /// Status-line MCP extension (O6) always available to every agent.
     status_tools: Arc<crate::code::StatusTools>,
     /// Mid-tier checks running beside the build (see `checker.rs`).
@@ -661,7 +663,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         extensions.push(code.clone());
     }
     extensions.push(status_tools.clone());
-    extensions.push(web_tools);
+    extensions.push(web_tools.clone());
     mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
     mcp.grant(&security_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: "security".into() });
@@ -736,6 +738,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         small: false,
         browsers,
         code,
+        web_tools,
         status_tools,
         checks: JoinSet::new(),
         checked: BTreeSet::new(),
@@ -769,6 +772,10 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         mutation_cache,
     };
     driver.open_tree(meta.base.as_deref())?;
+    driver.web_tools.set_flow_root(driver.tree.clone());
+    if let Some(code) = &driver.code {
+        code.set_flow_root(driver.tree.clone());
+    }
     driver.repo_map = crate::repomap::render(&driver.tree);
     if let Err(err) = tm_flow::build(&driver.tree) {
         eprintln!("taskmaster: flow build skipped: {err:#}");
@@ -5214,11 +5221,12 @@ impl Driver {
         }
         let wid = self.harnesses.worker.id();
         let docs_tool = tm_harness::mcp_tool_name(wid, "dictionary", "docs");
+        let flow_tool = tm_harness::mcp_tool_name(wid, "dictionary", "flow_query");
         let fetch_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_fetch");
         let adv_tool = tm_harness::mcp_tool_name(wid, "dictionary", "advisories");
         let search_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_search");
         out.push_str(&format!(
-            "\nDocumentation: call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages."
+            "\nDocumentation & code graph: call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages, and `{flow_tool}(op, ...)` (`find`/`node`/`neighbors`/`source`) to query `.flow` instead of reading whole files."
         ));
         if self.web_access.enabled {
             let mut extra = Vec::new();
@@ -6422,6 +6430,10 @@ impl Driver {
             let tree = self.tree.clone();
             self.drop_worktree(&tree);
             self.tree = self.project.clone();
+            self.web_tools.set_flow_root(self.tree.clone());
+            if let Some(code) = &self.code {
+                code.set_flow_root(self.tree.clone());
+            }
             {
                 let _project = PROJECT.lock().unwrap();
                 self.refresh_flow_and_commit();
@@ -6588,8 +6600,8 @@ const PLAN_ATTEMPTS: usize = 3;
 
 /// How an agent with Code Mode is told to work, in the shared prefix.
 const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, \
-diff, symbols, sh, test, check and browser (read-only roles get read, readMany, grep, ls, diff, symbols). Batch your work into \
-a few scripts rather than many single tool calls: one script loads what you need with readMany/symbols and writes or patches \
+diff, symbols, flow, sh, test, check and browser (read-only roles get read, readMany, grep, ls, diff, symbols, flow). Batch your work into \
+a few scripts rather than many single tool calls: one script loads what you need with flow/readMany/symbols and writes or patches \
 your files (prefer edit/patch/applyPatch over rewriting whole files), and every script that changes code ends with `return await test()`, \
 which runs the project's tests and returns the failures. When writing Python or multi-line files with triple quotes or backslashes, pass raw file \
 content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments on run_code, or use `String.raw` with `write(path, { raw })`. \

@@ -78,6 +78,7 @@ const grep = (text, glob) => call("grep", { text, glob });
 const ls = (glob) => call("ls", { glob });
 const diff = (glob) => call("diff", { glob });
 const symbols = (glob) => call("symbols", { glob });
+const flow = (op, args = {}) => call("flow", { op: String(op ?? ""), args: args && typeof args === "object" ? args : {} });
 const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
 const test = () => call("test", {});
 const testAffected = (paths) => call("testAffected", { files: Array.isArray(paths) ? paths : (paths ? [paths] : []) });
@@ -102,7 +103,7 @@ async function runBody(code) {
   let fn;
   try {
     fn = new AsyncFunction(
-      "read", "write", "writeFile", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
+      "read", "write", "writeFile", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols", "flow",
       "readMany", "test", "testAffected", "probe", "diagnostics", "outline", "definition", "references",
       "sh", "check", "browser", "status", "wait", "console", "require",
       `return (async () => {\n${code}\n})();`
@@ -113,7 +114,7 @@ async function runBody(code) {
   }
   try {
     const result = await fn(
-      read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
+      read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow,
       readMany, test, testAffected, probe, diagnostics, outline, definition, references,
       sh, check, browser, status, wait, scopedConsole, require
     );
@@ -303,6 +304,7 @@ pub struct CodeTools {
     scopes: Mutex<HashMap<String, Arc<Scope>>>,
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     runtime: Mutex<Option<CodeRuntimeCtx>>,
+    flow_root: Mutex<Option<PathBuf>>,
     /// How long one script may run.
     script_limit: Duration,
     /// How long one `sh` or `test` call may run.
@@ -320,9 +322,15 @@ impl CodeTools {
             scopes: Mutex::new(HashMap::new()),
             browsers,
             runtime: Mutex::new(None),
+            flow_root: Mutex::new(None),
             script_limit: Duration::from_secs(SCRIPT_SECS),
             sh_limit: Duration::from_secs(SH_SECS),
         }))
+    }
+
+    /// Set the run's live `.flow` tree root (e.g. `driver.tree`) used by `flow(op, args)`.
+    pub fn set_flow_root(&self, root: PathBuf) {
+        *self.flow_root.lock().unwrap() = Some(root);
     }
 
     /// Attach run-scoped `Live`, `Records`, and `StatusTools` so `status()` and `wait()` work.
@@ -485,7 +493,7 @@ impl CodeTools {
                 "write" | "edit" | "patch" | "applyPatch" | "tryPatch" | "sh" | "test" | "testAffected" | "browser"
             )
         {
-            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
+            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, flow, probe.ast, check)");
         }
         let path = |key: &str| -> anyhow::Result<PathBuf> {
             let raw = args[key].as_str().context("a path is required")?;
@@ -621,6 +629,30 @@ impl CodeTools {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
                 let syms = crate::repomap::extract_symbols(&scope.cwd, args["glob"].as_str())?;
                 Ok(json!(syms))
+            }
+            "flow" => {
+                self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
+                let sub_op = args["op"].as_str().unwrap_or("").trim().to_string();
+                if sub_op.is_empty() {
+                    bail!("flow(op, args) requires `op` (`find`, `node`, `neighbors`, or `source`)");
+                }
+                let sub_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+                let root = self
+                    .flow_root
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .filter(|r| r.join(tm_flow::FLOW_DIR).is_dir())
+                    .unwrap_or_else(|| scope.cwd.clone());
+                let out = tokio::task::spawn_blocking(move || {
+                    if !root.join(tm_flow::FLOW_DIR).is_dir() {
+                        let _ = tm_flow::build(&root);
+                    }
+                    tm_flow::execute_op(&root, &sub_op, &sub_args)
+                })
+                .await
+                .context("flow query task panicked")??;
+                Ok(out.json)
             }
             "ls" | "grep" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -1512,13 +1544,13 @@ impl Extension for CodeTools {
         };
         let description = if scope.read_only {
             "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
-             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), check(), status(text), wait({url, port, log, agent, timeout}), and console.log. \
+             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), flow(op, args) (query the .flow code graph: find/node/neighbors/source), probe.ast(path), check(), status(text), wait({url, port, log, agent, timeout}), and console.log. \
              Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
         } else {
             "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
              Functions: read(path), readMany(globs), write(path, text | { raw }), writeFile(path, content | { raw }), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
              applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
-             grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), sh(command), \
+             grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), flow(op, args) (query the .flow code graph: find/node/neighbors/source), probe.ast(path), sh(command), \
              test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
              status(text) to set a live one-line status, wait({url, port, log, agent, timeout}) to wait for a server/port/log/sibling unit, \
              and console.log. For Python/code with triple quotes or backslashes, pass raw file content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments (written before `code` runs), or use `String.raw` with `write(path, { raw })`. \
@@ -2150,6 +2182,61 @@ mod tests {
             assert_eq!(tools.tools(&rev_grant).len(), 1);
             tools.detach("reviewer");
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_flow_queries_graph_for_workers_and_readonly_roles() {
+        let Some(tools) = CodeTools::new(None) else {
+            eprintln!("no node here; run_code is not exercised");
+            return;
+        };
+        let dir = repo("flow-code");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(
+            dir.join("pkg/lib.py"),
+            "def greet(name: str) -> str:\n    \"\"\"Return greeting.\"\"\"\n    return f'hi {name}'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkg/main.py"),
+            "from pkg.lib import greet\ndef run() -> str:\n    return greet('world')\n",
+        )
+        .unwrap();
+        tm_flow::build(&dir).unwrap();
+
+        let worker_gate = Arc::new(WorktreeGate::new(&dir, vec![]));
+        tools.attach("home", &dir, worker_gate, None);
+        let ro_gate = Arc::new(WorktreeGate::new(&dir, vec![]).read_only());
+        tools.attach_readonly("reviewer", &dir, ro_gate);
+
+        let rev_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: String::new() };
+        assert!(tools.tools(&grant())[0]["description"].as_str().unwrap().contains("flow(op, args)"));
+        assert!(tools.tools(&rev_grant)[0]["description"].as_str().unwrap().contains("flow(op, args)"));
+
+        let script = r#"
+            const found = await flow("find", { query: "greet" });
+            const detail = await flow("node", { id: "py:pkg/main.py#run" });
+            const nbrs = await flow("neighbors", { id: "py:pkg/main.py#run", k: 1, kinds: ["calls"], dir: "out" });
+            const src = await flow("source", { id: "py:pkg/lib.py#greet" });
+            return {
+                foundId: found.nodes[0].id,
+                callees: detail.outgoing.map((e) => e.peer_id),
+                nbrCount: nbrs.nodes.length,
+                srcHasDef: src.code.includes("def greet"),
+            };
+        "#;
+        for g in [grant(), rev_grant] {
+            let reply = tools.run(&g, script).await.unwrap();
+            assert!(reply.contains("py:pkg/lib.py#greet"), "{reply}");
+            assert!(reply.contains("\"srcHasDef\": true"), "{reply}");
+        }
+
+        // Code Mode also denies writing into `.flow/`.
+        let write_flow = tools.run(&grant(), r#"await write(".flow/meta.json", "{}");"#).await.unwrap();
+        assert!(write_flow.contains("policy denied write to `.flow/meta.json`"), "{write_flow}");
+
+        tools.detach_all();
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -18,7 +18,7 @@ serde_json.workspace = true
 globset = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha1 = "0.11"
-sha2 = "0.10"
+sha2 = "0.11"
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }

@@ -317,6 +317,10 @@ impl PermissionGate for ApprovalGate {
     }
 
     async fn decide_async(&self, request: &PermissionRequest) -> Decision {
+        // Workers may never write into `.flow/`, even under FullAccess, AutoEdits, or Supervised modes.
+        if self.inner.is_flow_edit(request) {
+            return Decision::Deny;
+        }
         let base = self.inner.decide(request);
         let policy = self.approvals.policy();
         let (mode, full_access) = self.approvals.effective_mode(&self.run);
@@ -450,5 +454,47 @@ mod rule_tests {
         for kind in [ToolKind::Read, ToolKind::Edit, ToolKind::Execute, ToolKind::Fetch] {
             assert!(ask_reason(Mode::Never, kind, true).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn approval_gate_never_allows_or_prompts_flow_writes_even_in_full_access_or_risky() {
+        let dir = std::env::temp_dir().join(format!("tm-flow-approval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".flow")).unwrap();
+        let live = Arc::new(Live::new(Arc::new(crate::store::FileStore::new(dir.join("state")))));
+        let agent = json!({ "id": "page:core", "role": "worker", "owned_glob": "src/**" });
+        let req = PermissionRequest {
+            tool: "run_code.write".into(),
+            kind: ToolKind::Edit,
+            paths: vec![dir.join(".flow/meta.json")],
+            command: None,
+            url: None,
+        };
+
+        for perm in [
+            tm_harness::PermissionMode::FullAccess,
+            tm_harness::PermissionMode::AutoEdits,
+            tm_harness::PermissionMode::Supervised,
+            tm_harness::PermissionMode::Auto,
+        ] {
+            live.approvals.set_run_mode("r-flow", Some(perm));
+            let mut inner = WorktreeGate::new(&dir, vec![]);
+            if perm == tm_harness::PermissionMode::FullAccess {
+                inner = inner.with_full_access();
+            }
+            let gate = ApprovalGate::new(inner, live.clone(), "r-flow".into(), agent.clone());
+            assert_eq!(
+                gate.decide_async(&req).await,
+                Decision::Deny,
+                "`.flow/` edit must be unconditionally denied under {perm:?}"
+            );
+            assert_eq!(
+                live.approvals.count("r-flow"),
+                0,
+                "`.flow/` edit must never queue an approval prompt under {perm:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

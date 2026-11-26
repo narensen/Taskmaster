@@ -3683,7 +3683,7 @@ impl Driver {
             if let Ok(output) = std::process::Command::new("git")
                 .arg("-C")
                 .arg(worktree)
-                .args(["diff", "--no-color", "--stat", &base, "--", ".", ":!.taskmaster"])
+                .args(["diff", "--no-color", "--stat", &base, "--", ".", ":!.taskmaster", ":!.flow"])
                 .output()
                 && output.status.success()
             {
@@ -3697,7 +3697,7 @@ impl Driver {
             if let Ok(output) = std::process::Command::new("git")
                 .arg("-C")
                 .arg(worktree)
-                .args(["diff", "--no-color", "-U2", &base, "--", ".", ":!.taskmaster"])
+                .args(["diff", "--no-color", "-U2", &base, "--", ".", ":!.taskmaster", ":!.flow"])
                 .output()
                 && output.status.success()
             {

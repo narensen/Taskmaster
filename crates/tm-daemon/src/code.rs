@@ -784,6 +784,14 @@ impl CodeTools {
                 let mut staged: Vec<(PathBuf, Option<String>, String)> = Vec::new();
                 for file_patch in &patches {
                     let rel = file_patch.target_path();
+                    if tm_flow::is_flow_path(rel) {
+                        return Ok(json!({
+                            "applied": false,
+                            "error": format!("refused: `{rel}` is inside `.flow/`, which is managed by Taskmaster"),
+                            "files": [],
+                            "diagnostics": [],
+                        }));
+                    }
                     if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
                         return Ok(json!({
                             "applied": false,
@@ -1549,8 +1557,8 @@ fn is_write_file_tool(name: &str) -> bool {
     matches!(strip_dict_prefix(name), "writeFile" | "write_file")
 }
 
-/// Refuse writes matching `Policy::denied_globs` (such as `.env`, `*.pem`, `*.key`) across
-/// every Code Mode write/edit primitive, matching `tryPatch`.
+/// Refuse writes into Taskmaster's `.flow/` directory or matching `Policy::denied_globs`
+/// (such as `.env`, `*.pem`, `*.key`) across every Code Mode write/edit primitive, matching `tryPatch`.
 fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
     let rel = file
         .strip_prefix(&scope.cwd)
@@ -1558,6 +1566,9 @@ fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
         .to_string_lossy()
         .replace('\\', "/");
     let rel = rel.trim_start_matches("./");
+    if tm_flow::is_flow_path(rel) {
+        bail!("refused: `{rel}` is inside `.flow/`, which is managed by Taskmaster");
+    }
     let policy = crate::policy::Policy::load(&scope.cwd);
     if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
         bail!("policy denied write to `{rel}` (matched `{glob}`)");
@@ -2493,6 +2504,63 @@ mod tests {
         assert_eq!(wf["isError"], false, "{wf}");
         assert_eq!(std::fs::read_to_string(dir.join("tinydb/wf.py")).unwrap(), "z = 3\n");
         assert!(!dir.join("\"tinydb/wf.py\"").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_refuses_all_writes_and_patches_into_flow_dir() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("flow-ro");
+        std::fs::create_dir_all(dir.join(".flow")).unwrap();
+        std::fs::write(dir.join(".flow/meta.json"), "{\"schema_version\":1}\n").unwrap();
+        // Even with a full-access WorktreeGate, Code Mode must refuse every mutation under `.flow/`.
+        let gate = Arc::new(WorktreeGate::new(&dir, vec![]).with_full_access());
+        tools.attach("home", &dir, gate, None);
+
+        // 1. JS write / edit / patch / applyPatch / tryPatch
+        let res = tools
+            .run(
+                &grant(),
+                r#"
+                const errs = [];
+                for (const [label, fn] of [
+                    ["write", () => write(".flow/evil.json", "{}")],
+                    ["edit", () => edit(".flow/meta.json", "1", "2")],
+                    ["patch", () => patch(".flow/meta.json", [{ find: "1", replace: "2" }])],
+                    ["applyPatch", () => applyPatch("--- a/.flow/meta.json\n+++ b/.flow/meta.json\n@@ -1 +1 @@\n-{\"schema_version\":1}\n+{\"schema_version\":2}\n")],
+                ]) {
+                    try { await fn(); errs.push(label + ":ALLOWED"); } catch (e) { errs.push(label + ":" + e.message); }
+                }
+                const tp = await tryPatch("--- a/.flow/meta.json\n+++ b/.flow/meta.json\n@@ -1 +1 @@\n-{\"schema_version\":1}\n+{\"schema_version\":2}\n");
+                return { errs, tp };
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(!res.contains(":ALLOWED"), "Code Mode allowed a `.flow/` write:\n{res}");
+        assert!(res.contains("\"applied\": false"), "tryPatch must refuse `.flow/`:\n{res}");
+
+        // 2. Direct writeFile & run_code `files` argument
+        let wf = tools
+            .call(&grant(), "writeFile", &json!({ "path": ".flow/evil2.json", "content": "{}" }))
+            .await
+            .unwrap();
+        assert_eq!(wf["isError"], true, "{wf}");
+        let fm = tools
+            .call(&grant(), "run_code", &json!({ "files": { ".flow/evil3.json": "{}" } }))
+            .await
+            .unwrap();
+        assert_eq!(fm["isError"], true, "{fm}");
+
+        // Verify disk is untouched.
+        assert_eq!(std::fs::read_to_string(dir.join(".flow/meta.json")).unwrap(), "{\"schema_version\":1}\n");
+        assert!(!dir.join(".flow/evil.json").exists());
+        assert!(!dir.join(".flow/evil2.json").exists());
+        assert!(!dir.join(".flow/evil3.json").exists());
 
         tools.detach_all();
         std::fs::remove_dir_all(dir).ok();

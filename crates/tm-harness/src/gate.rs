@@ -173,11 +173,16 @@ impl WorktreeGate {
     }
 
     /// True when `path` targets `.flow` or any file under `.flow/` inside the worktree.
-    fn is_flow_path(&self, path: &Path) -> bool {
+    pub fn is_flow_path(&self, path: &Path) -> bool {
         let Some(rel) = self.relative(path) else {
             return false;
         };
         matches!(rel.components().next(), Some(Component::Normal(first)) if first == ".flow")
+    }
+
+    /// True when `request` attempts to edit any file inside `.flow/`.
+    pub fn is_flow_edit(&self, request: &PermissionRequest) -> bool {
+        request.kind == ToolKind::Edit && request.paths.iter().any(|p| self.is_flow_path(p))
     }
 
     fn readable(&self, path: &Path) -> bool {

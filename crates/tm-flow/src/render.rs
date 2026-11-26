@@ -79,18 +79,38 @@ pub fn unit_map(
     let node_by_id: BTreeMap<&str, &Node> = all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     // Identify every node belonging to this unit (by owner or owned_files list).
+    // Separate production symbols from owned test-file symbols so unit tests never drown out
+    // the unit's own API, referenced contracts, or cross-unit neighbours.
     let mut unit_node_ids: BTreeSet<&str> = BTreeSet::new();
-    let mut unit_nodes: Vec<&Node> = Vec::new();
+    let mut prod_nodes: Vec<&Node> = Vec::new();
+    let mut own_test_nodes: Vec<&Node> = Vec::new();
     for n in &all_nodes {
         let belongs = n.owner.as_deref() == Some(unit_id)
             || (!n.path.is_empty() && owned_file_set.contains(&n.path));
         if belongs && n.kind != NodeKind::Unit {
             unit_node_ids.insert(n.id.as_str());
             if n.kind != NodeKind::File {
-                unit_nodes.push(n);
+                if tm_core::is_test_path(&n.path) {
+                    own_test_nodes.push(n);
+                } else {
+                    prod_nodes.push(n);
+                }
             }
         }
     }
+    let mut unit_nodes: Vec<&Node> = if prod_nodes.is_empty() {
+        std::mem::take(&mut own_test_nodes)
+    } else {
+        prod_nodes
+    };
+    // Exported symbols first so budget caps keep public APIs visible before private helpers.
+    unit_nodes.sort_by(|a, b| {
+        (!a.exported)
+            .cmp(&(!b.exported))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.span[0].cmp(&b.span[0]))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     let is_contract_node = |n: &Node| -> bool {
         n.status == NodeStatus::Contract
@@ -102,8 +122,16 @@ pub fn unit_map(
     // 3. 1-hop cross-unit neighbours (high-confidence or planned).
     let mut cross_lines: Vec<String> = Vec::new();
     let mut seen_cross: BTreeSet<String> = BTreeSet::new();
-    // 4. Tests touching this unit.
+    // 4. Tests touching this unit (both cross-file tests and the unit's own top-level test functions).
     let mut test_nodes: BTreeMap<&str, &Node> = BTreeMap::new();
+    for n in own_test_nodes {
+        if n.parent.is_none()
+            && !n.name.starts_with('_')
+            && (n.name.starts_with("test_") || n.name.starts_with("Test"))
+        {
+            test_nodes.insert(n.id.as_str(), n);
+        }
+    }
 
     for edge in &all_edges {
         let from_mine = unit_node_ids.contains(edge.from.as_str());
@@ -161,7 +189,12 @@ pub fn unit_map(
     }
 
     // For units with declared `depends_on` (e.g. greenfield integrator units with no files yet),
-    // also include exported built/planned symbols from upstream dependencies as cross-unit context.
+    // also include exported built/planned non-test symbols from upstream dependencies as cross-unit context.
+    let mut seen_cross_nodes: BTreeSet<String> = all_edges
+        .iter()
+        .filter(|e| unit_node_ids.contains(e.from.as_str()) && !unit_node_ids.contains(e.to.as_str()))
+        .map(|e| e.to.clone())
+        .collect();
     if let Some(seed) = &plan_seed
         && let Some(u) = seed.units.iter().find(|u| u.id == unit_id)
     {
@@ -171,15 +204,13 @@ pub fn unit_map(
                     && n.kind != NodeKind::File
                     && n.kind != NodeKind::Unit
                     && n.exported
+                    && !tm_core::is_test_path(&n.path)
             }) {
-                if seen_cross.insert(format!("dep:{}", n.id)) {
+                if seen_cross_nodes.insert(n.id.clone()) && seen_cross.insert(format!("dep:{}", n.id)) {
                     cross_lines.push(format_dep_symbol(dep_unit, n));
                 }
             }
         }
-        // Also surface contract tests that import/test this unit's planned symbols (already in test_nodes
-        // if edges exist), plus if unit has no files yet and a contract test references a contract
-        // interface mentioned alongside it.
     }
 
     if unit_nodes.is_empty()
@@ -190,89 +221,154 @@ pub fn unit_map(
         return Ok(String::new());
     }
 
-    let mut out = format!("## Flow unit map ({unit_id})\n");
-    let mut truncated = false;
-
-    if !unit_nodes.is_empty() {
-        append_section_header(&mut out, "Your symbols:\n", budget_chars, &mut truncated);
-        for n in &unit_nodes {
-            let line = format_own_node(n);
-            if !push_line(&mut out, &line, budget_chars) {
-                truncated = true;
-                break;
-            }
-        }
-    }
-
-    if !truncated && !contract_refs.is_empty() {
-        append_section_header(&mut out, "Referenced contracts (line refs only):\n", budget_chars, &mut truncated);
-        for n in contract_refs.values() {
-            let line = format!(
+    let header = format!("## Flow unit map ({unit_id})\n");
+    let own_lines: Vec<String> = unit_nodes.iter().map(|n| format_own_node(n)).collect();
+    let contract_lines: Vec<String> = contract_refs
+        .values()
+        .map(|n| {
+            format!(
                 "- contract {} ({}) {}:{}-{}\n",
                 qualified_label(n),
                 n.kind.as_str(),
                 n.path,
                 n.span[0],
                 n.span[1]
-            );
-            if !push_line(&mut out, &line, budget_chars) {
-                truncated = true;
+            )
+        })
+        .collect();
+    let test_lines: Vec<String> = test_nodes
+        .values()
+        .map(|n| format!("- test {} {}:{}\n", qualified_label(n), n.path, n.span[0]))
+        .collect();
+
+    let sections: [(&str, &[String], usize); 4] = [
+        ("Your symbols:\n", &own_lines, 40),
+        ("Referenced contracts (line refs only):\n", &contract_lines, 20),
+        ("Cross-unit neighbours:\n", &cross_lines, 25),
+        ("Tests touching this unit:\n", &test_lines, 15),
+    ];
+
+    // Water-fill budget allocation across non-empty sections so a large symbol list never
+    // starves referenced contracts, cross-unit neighbours, or tests.
+    let avail = budget_chars.saturating_sub(header.len());
+    let needs: [usize; 4] = std::array::from_fn(|i| {
+        let (title, lines, _) = sections[i];
+        if lines.is_empty() {
+            0
+        } else {
+            title.len() + lines.iter().map(String::len).sum::<usize>()
+        }
+    });
+    let total_need: usize = needs.iter().sum();
+
+    let caps: [usize; 4] = if total_need <= avail {
+        needs
+    } else {
+        allocate_section_budgets(&needs, &[40, 20, 25, 15], avail)
+    };
+
+    let mut out = header;
+    for (idx, (title, lines, _)) in sections.iter().enumerate() {
+        if lines.is_empty() || caps[idx] == 0 {
+            continue;
+        }
+        let sec_budget = caps[idx].min(budget_chars.saturating_sub(out.len()));
+        if sec_budget < title.len() {
+            continue;
+        }
+        let mut sec = String::with_capacity(sec_budget);
+        sec.push_str(title);
+        let mut written = 0usize;
+        for line in *lines {
+            let remaining_after = lines.len() - written - 1;
+            let reserve = if remaining_after > 0 { 24 } else { 0 };
+            if sec.len() + line.len() + reserve > sec_budget {
                 break;
             }
+            sec.push_str(line);
+            written += 1;
+        }
+        if written < lines.len() {
+            let omitted = lines.len() - written;
+            let note = format!("... (+{omitted} more)\n");
+            if sec.len() + note.len() <= sec_budget {
+                sec.push_str(&note);
+            }
+        }
+        if written > 0 {
+            out.push_str(&sec);
         }
     }
 
-    if !truncated && !cross_lines.is_empty() {
-        append_section_header(&mut out, "Cross-unit neighbours:\n", budget_chars, &mut truncated);
-        for line in &cross_lines {
-            if !push_line(&mut out, line, budget_chars) {
-                truncated = true;
-                break;
-            }
-        }
-    }
-
-    if !truncated && !test_nodes.is_empty() {
-        append_section_header(&mut out, "Tests touching this unit:\n", budget_chars, &mut truncated);
-        for n in test_nodes.values() {
-            let line = format!("- test {} {}:{}\n", qualified_label(n), n.path, n.span[0]);
-            if !push_line(&mut out, &line, budget_chars) {
-                truncated = true;
-                break;
-            }
-        }
-    }
-
-    if truncated {
-        let marker = "... (unit map truncated to budget)\n";
-        while out.len() + marker.len() > budget_chars {
+    if out.len() > budget_chars {
+        while out.len() > budget_chars {
             if let Some(pos) = out[..out.len().saturating_sub(1)].rfind('\n') {
                 out.truncate(pos + 1);
             } else {
-                out.clear();
+                out.truncate(budget_chars);
                 break;
             }
-        }
-        if out.len() + marker.len() <= budget_chars {
-            out.push_str(marker);
         }
     }
 
     Ok(out)
 }
 
-fn append_section_header(out: &mut String, header: &str, budget: usize, truncated: &mut bool) {
-    if !push_line(out, header, budget) {
-        *truncated = true;
+fn allocate_section_budgets(needs: &[usize; 4], weights: &[usize; 4], total: usize) -> [usize; 4] {
+    let mut caps = [0usize; 4];
+    let mut active = [false; 4];
+    for i in 0..4 {
+        active[i] = needs[i] > 0;
     }
-}
-
-fn push_line(out: &mut String, line: &str, budget: usize) -> bool {
-    if out.len() + line.len() > budget {
-        return false;
+    let mut left = total;
+    loop {
+        let weight_sum: usize = (0..4).filter(|&i| active[i]).map(|i| weights[i]).sum();
+        if weight_sum == 0 || left == 0 {
+            break;
+        }
+        let mut settled_any = false;
+        let mut distributed = 0usize;
+        for i in 0..4 {
+            if !active[i] {
+                continue;
+            }
+            let share = left.saturating_mul(weights[i]) / weight_sum;
+            let remaining_need = needs[i].saturating_sub(caps[i]);
+            if share >= remaining_need {
+                caps[i] += remaining_need;
+                distributed += remaining_need;
+                active[i] = false;
+                settled_any = true;
+            }
+        }
+        if settled_any {
+            left = left.saturating_sub(distributed);
+            continue;
+        }
+        // Distribute remaining budget proportionally among active sections.
+        for i in 0..4 {
+            if !active[i] {
+                continue;
+            }
+            let share = (left.saturating_mul(weights[i]) / weight_sum).min(needs[i] - caps[i]);
+            caps[i] += share;
+            distributed += share;
+        }
+        left = left.saturating_sub(distributed);
+        // Hand out any rounding remainder to the first still-unsatisfied active section.
+        for i in 0..4 {
+            if left == 0 {
+                break;
+            }
+            if active[i] && caps[i] < needs[i] {
+                let extra = left.min(needs[i] - caps[i]);
+                caps[i] += extra;
+                left -= extra;
+            }
+        }
+        break;
     }
-    out.push_str(line);
-    true
+    caps
 }
 
 fn qualified_label(node: &Node) -> String {

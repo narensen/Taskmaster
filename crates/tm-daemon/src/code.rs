@@ -2654,17 +2654,17 @@ mod tests {
     #[tokio::test]
     async fn tok11_code_mode_guide_and_two_call_write_then_fix_discipline() {
         let guide = crate::engine::code_mode_guide("antigravity");
-        assert!(guide.contains("two-call discipline"), "{guide}");
-        assert!(guide.contains("Call 1 (write + test in one call)"), "{guide}");
+        assert!(guide.contains("Write + test (1-2 calls)"), "{guide}");
         assert!(guide.contains("return await test()"), "{guide}");
-        assert!(guide.contains("Call 2 (fix + re-test"), "{guide}");
+        assert!(guide.contains("test(\"tests/test_<unit>.py\")"), "{guide}");
+        assert!(guide.contains("Fix + re-test"), "{guide}");
         assert!(guide.contains("mcp_dictionary_run_code"), "{guide}");
         assert!(!guide.contains(" run_code"), "bare run_code should be rewritten: {guide}");
 
-        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("two-call discipline"));
-        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Call 1"));
-        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Call 2"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("1-2 `run_code` calls"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("return await test(\"tests/test_<unit>.py\")"));
         assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("return await test()"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("no whole-file rewrites"));
 
         let Some(tools) = CodeTools::new(None) else {
             return;

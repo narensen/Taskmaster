@@ -121,7 +121,7 @@ Off by default (`Settings → Web access`). Worker sandboxes keep `--unshare-net
 
 ## Code Mode & warm code intelligence
 
-Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only planners/reviewers) receive `run_code`: a sandboxed async JavaScript runtime behind the same permission gate as their native tools, exposing `read`, `readMany`, `write`, `edit`, `patch`, `applyPatch`, `tryPatch`, `testAffected`, `grep`, `ls`, `diff`, `symbols`, `sh`, `test`, `check`, and `browser` (scoped strictly to the run's preview origin). Claude Code workers use Claude Code's native code mode.
+Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only planners/reviewers) receive `run_code`: a sandboxed async JavaScript runtime behind the same permission gate as their native tools, exposing `read`, `readMany`, `write`, `writeFile`, `edit`, `patch`, `applyPatch`, `tryPatch`, `test(paths?)`, `testAffected(paths?)`, `grep`, `ls`, `diff`, `symbols`, `flow`, `sh`, `check`, and `browser` (scoped strictly to the run's preview origin). Workers batch related writes in 1–2 `run_code` calls ending in targeted `test(paths)` or full `test()`, and active worktrees receive race-safe live sync of newly landed sibling files outside their owned glob. Claude Code workers use `run_code` with native edit/shell tools withheld.
 
 Alongside Code Mode, the daemon maintains:
 

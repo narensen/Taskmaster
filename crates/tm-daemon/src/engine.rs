@@ -8850,11 +8850,11 @@ fn leading_quoted_ident(text: &str) -> Option<String> {
 }
 
 /// How an agent with Code Mode is told to work, in the shared prefix.
-const CODE_MODE_GUIDE: &str = "\nCode Mode is on — use run_code for ALL reads, writes, edits, and tests (two-call discipline):\n\
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on — use run_code for ALL reads, writes, edits, and tests:\n\
 - Your worktree is mounted read-only to native file tools (`write_file`/`edit_file` fail with `read-only file system`, and native shell is blocked). Do NOT call native `read_file`, `write_file`, `edit_file`, or `run_command`; if any native tool errors or is refused, immediately use run_code instead of ending your turn.\n\
-- Call 1 (write + test in one call): pass all owned files + concise unit tests via `files` (`{\"path\":\"content\"}`, or `writeFile`, or `String.raw` with `write(path, { raw })`) AND set `code` to `return await test()` in the SAME run_code call. Always `await` every helper call. Skip probing Python/venv or listing files.\n\
-- Call 2 (fix + re-test, only if Call 1 failed): batch `readMany`/`edit`/`patch`/`applyPatch` (no whole-file rewrites) and end with `return await test()`. On any run_code error, inspect partial edits, fix the script, and retry run_code.\n\
-- Helpers inside `code`: read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, diff, symbols, sh, test, testAffected, check, browser, and `.flow` (`await flow(\"find\", { query })`, `await flow(\"neighbors\", { id, k: 1, dir: \"in\" })`, `await flow(\"source\", { id })`, `await flow(\"batch\", { queries })`). Stop once tests pass (no `update_steps` or trailing `git status`).\n";
+- Write + test (1-2 calls): batch related owned files via `files` (`{\"path\":\"content\"}`, or `writeFile`, or `String.raw` with `write(path, { raw })`) in 1-2 write calls (combine small units in 1 call, or write implementation then concise unit tests in call 2), and end the last write call with `return await test(\"tests/test_<unit>.py\")` (or `return await test()` for full verification). Always `await` every helper call. Skip probing Python/venv or listing files.\n\
+- Fix + re-test (only if tests fail): batch targeted `readMany`/`edit`/`patch`/`applyPatch` (no whole-file rewrites) and end with `return await test(...)` / `return await test()`. On any run_code error, inspect partial edits, fix the script, and retry run_code.\n\
+- Helpers inside `code`: read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, diff, symbols, sh, test(paths?), testAffected(paths?), check, browser, and `.flow` (`await flow(\"find\", { query })`, `await flow(\"neighbors\", { id, k: 1, dir: \"in\" })`, `await flow(\"source\", { id })`, `await flow(\"batch\", { queries })`). Stop once tests pass (no `update_steps` or trailing `git status`).\n";
 
 /// Expand an `owned_glob` (including `{a,b}` brace groups) into worktree-absolute path strings
 /// so harnesses whose native file tools require absolute paths (e.g. Antigravity) can write

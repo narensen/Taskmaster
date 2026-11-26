@@ -13584,7 +13584,7 @@ async fn fix_n9_code_mode_dedupes_prompt_enforces_repair_run_code_and_saves_toke
     let (_, framed_off) = &briefs_off[0];
     assert!(raw_on.contains("Code Mode is on"));
     assert!(
-        !framed_on.contains("Code Mode is active — use two-call discipline"),
+        !framed_on.contains("Code Mode is active —"),
         "framed_brief_for must not duplicate CODE_MODE_WRITE_RULES when CODE_MODE_GUIDE is present"
     );
     let overhead_bytes = framed_on.len().saturating_sub(framed_off.len()) + schema_on.saturating_sub(schema_off);
@@ -14119,4 +14119,19 @@ async fn tb18_early_started_integrator_receives_landed_siblings_and_passes_test(
         h.saw_sibling.load(Ordering::SeqCst),
         "active cli worktree must receive parser.py via live sync when parser lands"
     );
+}
+
+#[test]
+fn tb18_code_mode_guide_allows_one_to_two_write_calls_and_targeted_test() {
+    let guide = crate::engine::code_mode_guide("claude");
+    assert!(guide.contains("1-2 write calls"), "{guide}");
+    assert!(!guide.contains("Call 1 (write + test in one call)"), "{guide}");
+    assert!(guide.contains("test(paths?)"), "{guide}");
+    assert!(guide.contains("testAffected(paths?)"), "{guide}");
+    assert!(guide.contains("Skip probing Python/venv"), "{guide}");
+    assert!(guide.contains("no whole-file rewrites"), "{guide}");
+    assert!(guide.contains("mcp__dictionary__run_code"), "{guide}");
+
+    assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("1-2 `run_code` calls"));
+    assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Never spend a call probing Python/venv"));
 }

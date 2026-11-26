@@ -8834,3 +8834,180 @@ async fn scheduling_wave_starts_long_pole_unit_first_under_parallel_limit() {
         "wave 1 (parallel=2) must start root_pole (downstream=2) and big_mid (downstream=1, largest), got full order: {order:?}"
     );
 }
+
+#[tokio::test]
+async fn worker_brief_deduplicates_contracts_full_when_used_and_signatures_otherwise() {
+    struct BriefCapturer {
+        briefs: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Harness for BriefCapturer {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            self.briefs.lock().unwrap().push((unit.clone(), task.brief.clone()));
+            let file = task.cwd.join(format!("tinydb/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            let _ = events.send(HarnessEvent::Text { text: format!("done\nRELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let contracts_py = concat!(
+        "\"\"\"Core shared protocols.\"\"\"\n",
+        "class BTreeProtocol:\n",
+        "    # SHARED_BODY_MARKER_ALPHA\n",
+        "    def search(self, key: str) -> bytes | None: ...\n",
+        "    def insert(self, key: str, value: bytes) -> None: ...\n",
+    );
+    let ast_nodes_py = concat!(
+        "\"\"\"AST node definitions.\"\"\"\n",
+        "class SelectStmt:\n",
+        "    # AST_BODY_MARKER_BETA\n",
+        "    columns: tuple[str, ...]\n",
+        "    table: str\n",
+        "    limit: int | None\n",
+        "class InsertStmt:\n",
+        "    # AST_BODY_MARKER_GAMMA\n",
+        "    table: str\n",
+        "    values: tuple[str, ...]\n",
+    );
+    let acceptance_py = format!(
+        concat!(
+            "\"\"\"End-to-end acceptance tests.\"\"\"\n",
+            "def test_end_to_end_cli() -> None:\n",
+            "    # ACCEPTANCE_BODY_MARKER_DELTA\n",
+            "{}",
+            "    assert True\n",
+        ),
+        "    x = 'padding line for realistic acceptance test size'\n".repeat(30),
+    );
+
+    let tmp = repo("c4-brief-dedup");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![
+            ContractFile { path: "tinydb/contracts.py".into(), content: contracts_py.into(), phase: 0 },
+            ContractFile { path: "tinydb/ast_nodes.py".into(), content: ast_nodes_py.into(), phase: 0 },
+            ContractFile { path: "tests/test_acceptance_contract.py".into(), content: acceptance_py.clone(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "tinydb/btree.py".into(),
+                brief: "Implement BTreeProtocol from tinydb.contracts.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "parser".into(),
+                owned_glob: "tinydb/parser.py".into(),
+                brief: "Implement SQL parser using tinydb.contracts and tinydb.ast_nodes.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "tinydb/cli.py".into(),
+                brief: "Wire CLI using tinydb.contracts.".into(),
+                done: "All tests including tests/test_acceptance_contract.py pass.".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(BriefCapturer { briefs: briefs.clone() });
+    let mut cfg = config(&tmp.0, p, true, 3);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let captured = briefs.lock().unwrap().clone();
+    let get = |id: &str| captured.iter().find(|(u, _)| u == id).map(|(_, b)| b.clone()).unwrap();
+    let btree = get("btree");
+    let parser = get("parser");
+    let cli = get("cli");
+
+    // Shared prefix remains byte-identical across workers for prompt caching.
+    let prefix = |b: &str| b.split("--- Your task ---").next().unwrap().to_string();
+    assert_eq!(prefix(&btree), prefix(&parser));
+    assert_eq!(prefix(&btree), prefix(&cli));
+
+    // `tinydb/contracts.py` is used by all units -> appears ONCE in full, never repeated in context pack.
+    for (name, b) in [("btree", &btree), ("parser", &parser), ("cli", &cli)] {
+        assert_eq!(
+            b.matches("class BTreeProtocol").count(),
+            1,
+            "{name} brief must contain tinydb/contracts.py exactly once (not full + signatures): {b}"
+        );
+        assert!(b.contains("SHARED_BODY_MARKER_ALPHA"), "{name} brief should have full tinydb/contracts.py");
+        assert!(
+            !b.contains("### `tinydb/contracts.py`"),
+            "{name} brief must not duplicate tinydb/contracts.py in context pack"
+        );
+    }
+
+    // `tinydb/ast_nodes.py` is used by `parser` only:
+    // - `parser` gets full text ONCE (never signatures too).
+    // - `btree` and `cli` get signatures ONLY ONCE (never full body).
+    assert_eq!(parser.matches("class SelectStmt").count(), 1, "parser must see SelectStmt once: {parser}");
+    assert!(parser.contains("AST_BODY_MARKER_BETA"), "parser must get full ast_nodes.py");
+    assert!(!parser.contains("### `tinydb/ast_nodes.py`"));
+
+    assert_eq!(btree.matches("class SelectStmt").count(), 1, "btree must see SelectStmt signature once: {btree}");
+    assert!(!btree.contains("AST_BODY_MARKER_BETA"), "btree must NOT get full body of unused ast_nodes.py");
+
+    // `tests/test_acceptance_contract.py` is referenced by `cli` only:
+    // - `cli` gets full text ONCE.
+    // - `btree` and `parser` get signatures ONLY ONCE (saving the full acceptance body).
+    assert_eq!(cli.matches("def test_end_to_end_cli").count(), 1, "cli must see acceptance test once: {cli}");
+    assert!(cli.contains("ACCEPTANCE_BODY_MARKER_DELTA"), "cli must get full acceptance test");
+    assert_eq!(btree.matches("def test_end_to_end_cli").count(), 1, "btree must see acceptance test signature once: {btree}");
+    assert!(!btree.contains("ACCEPTANCE_BODY_MARKER_DELTA"), "btree must NOT get full body of unused acceptance test");
+    assert!(!parser.contains("ACCEPTANCE_BODY_MARKER_DELTA"), "parser must NOT get full body of unused acceptance test");
+
+    // Deduplicated brief for `btree` is strictly smaller than the old brief that pasted
+    // all full contracts AND all contract signatures.
+    let old_extra_bytes = ast_nodes_py.len() + acceptance_py.len();
+    assert!(
+        btree.len() + 1000 < cli.len() + old_extra_bytes,
+        "btree brief ({}) should be materially smaller than pasting all contracts + signatures",
+        btree.len()
+    );
+    assert!(
+        btree.len() < cli.len(),
+        "btree ({}) should be smaller than cli ({}) because cli needs full acceptance test",
+        btree.len(),
+        cli.len()
+    );
+}

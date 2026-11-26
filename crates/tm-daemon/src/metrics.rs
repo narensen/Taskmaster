@@ -142,6 +142,8 @@ mod tests {
                     page: Some("a".into()),
                     harness: "grok".into(),
                     model: Some("grok-4".into()),
+                    model_requested: None,
+                    model_used: None,
                     input: 1000,
                     output: 200,
                     cache_read: 800,
@@ -156,6 +158,9 @@ mod tests {
                     brief_hash: None,
                     difficulty: None,
                     language: None,
+                    requests: None,
+                    mcp_calls: None,
+                    mcp_reply_bytes: None,
                 },
             )
             .unwrap();

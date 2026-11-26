@@ -593,7 +593,7 @@ impl Extension for PageBrowsers {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        let canonical = crate::code::strip_dict_prefix(name);
+        let canonical = tm_dictionary::strip_dict_prefix(name);
         if !TOOL_NAMES.contains(&canonical) {
             return None;
         }

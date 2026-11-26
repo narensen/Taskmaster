@@ -14,7 +14,7 @@ pub use citations::{Citation, Citations, page_is_fresh};
 pub use errorography::{Book, Mistake, PROMOTE_AT, ProjectNote, digest, project_lesson};
 pub use ledger::{
     LedgerEntry, ModelScore, ModelScorecard, Prices, RECOMMEND_FIRST_PASS, Role, SCORE_MIN_UNITS, STRUGGLING_FIRST_PASS, Shape, Spend, StratifiedScore, Totals, auto_route, forecast,
-    scorecard, stratified_scores, totals,
+    lookup_price, scorecard, stratified_scores, totals,
 };
 pub use plan::{
     CONTRACT_LINES, CONTRACT_LINES_SOFT, DraftEntry, PLAN_CONTRACT_LINES, Rejection, Rule, check_plan,

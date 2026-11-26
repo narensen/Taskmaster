@@ -26,7 +26,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 /// Output kept from a failed step: the end, where the errors are.
-const KEEP: usize = 6000;
+pub(crate) const KEEP: usize = 4096;
 
 /// The UI checks of one page may take this long.
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -198,7 +198,16 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
     path.push(if cfg!(windows) { ";" } else { ":" });
     path.push(clean_path());
     let path = path.to_string_lossy().into_owned();
-    let venv_env = vec![("VIRTUAL_ENV".to_string(), venv.display().to_string()), ("PATH".to_string(), path), ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into())];
+    let venv_env = vec![
+        ("VIRTUAL_ENV".to_string(), venv.display().to_string()),
+        ("PATH".to_string(), path),
+        ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
+        // Never let host `~/.local/lib` user site-packages mask missing venv installs: workers run
+        // inside bubblewrap with `--tmpfs $HOME`, so every dependency must live inside `venv` (or
+        // system site-packages under `/usr`).
+        ("PYTHONNOUSERSITE".into(), "1".into()),
+        ("PIP_USER".into(), "0".into()),
+    ];
     let stamp = python_stamp(tree);
     let stamp_file = venv.join(".taskmaster-deps");
     let ready = std::fs::read_to_string(&stamp_file).is_ok_and(|have| have == stamp) && bin.is_dir();
@@ -222,16 +231,16 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
     let mut install: Vec<Step> = Vec::new();
     let test = if poetry {
         install.push(with_env(Step::new("setup", "poetry", &["install", "--no-interaction"])));
-        with_env(Step::new("test", "poetry", &["run", "pytest", "-q"]))
+        with_env(Step::new("test", "poetry", &["run", "pytest", "-q", "-x", "--tb=short"]))
     } else if uv {
         let mut sync = with_env(Step::new("setup", "uv", &["sync", "--all-extras"]));
         sync.env.push(("UV_PROJECT_ENVIRONMENT".into(), venv.display().to_string()));
         install.push(sync);
-        let mut run = with_env(Step::new("test", "uv", &["run", "pytest", "-q"]));
+        let mut run = with_env(Step::new("test", "uv", &["run", "pytest", "-q", "-x", "--tb=short"]));
         run.env.push(("UV_PROJECT_ENVIRONMENT".into(), venv.display().to_string()));
         run
     } else if hatch {
-        with_env(Step::new("test", "hatch", &["run", "pytest", "-q"]))
+        with_env(Step::new("test", "hatch", &["run", "pytest", "-q", "-x", "--tb=short"]))
     } else {
         let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into(), "-q".into()];
         let installable = pyproject.contains("[project]") || pyproject.contains("[build-system]") || tree.join("setup.py").is_file() || tree.join("setup.cfg").is_file();
@@ -247,7 +256,7 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
         args.push("pytest".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         install.push(with_env(Step::new("setup", venv_python.clone(), &refs)));
-        with_env(Step::new("test", venv_python, &["-m", "pytest", "-q"]))
+        with_env(Step::new("test", venv_python, &["-m", "pytest", "-q", "-x", "--tb=short"]))
     };
     if !ready {
         for step in install {
@@ -305,6 +314,213 @@ pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
     out
 }
 
+/// Derive `.flow/env.json` facts from a set of verified [`Step`]s that just passed.
+pub fn env_facts_from_steps(steps: &[Step], venv: &Path) -> Option<tm_flow::EnvFacts> {
+    let test_step = steps
+        .iter()
+        .rev()
+        .find(|s| s.name == "test" && !s.setup)
+        .or_else(|| steps.iter().rev().find(|s| !s.setup))?;
+    let test_cmd = test_step.line();
+    if test_cmd.is_empty() {
+        return None;
+    }
+    let is_pytest = is_pytest_step(test_step);
+    let runner = if is_pytest {
+        if matches!(test_step.program.as_str(), "poetry" | "uv" | "hatch") {
+            test_step.program.clone()
+        } else {
+            "pytest".to_string()
+        }
+    } else if test_step.program == "cargo" {
+        "cargo".to_string()
+    } else if matches!(test_step.program.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+        test_step.program.clone()
+    } else {
+        "custom".to_string()
+    };
+
+    let env_venv = test_step
+        .env
+        .iter()
+        .find(|(k, _)| k == "VIRTUAL_ENV" || k == "UV_PROJECT_ENVIRONMENT")
+        .map(|(_, v)| PathBuf::from(v))
+        .or_else(|| {
+            (is_pytest && venv.join("pyvenv.cfg").is_file()).then(|| venv.to_path_buf())
+        });
+    let venv_str = env_venv
+        .as_ref()
+        .filter(|p| p.is_dir())
+        .map(|p| p.display().to_string());
+
+    let python = env_venv.as_ref().and_then(|v| {
+        let bin = v.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+        if bin.is_file() {
+            Some(bin.display().to_string())
+        } else if test_step.program.contains("python") {
+            Some(test_step.program.clone())
+        } else {
+            None
+        }
+    });
+
+    let install_cmd = steps
+        .iter()
+        .rev()
+        .find(|s| s.setup && !s.args.iter().any(|a| a == "venv"))
+        .map(Step::line);
+
+    Some(tm_flow::EnvFacts {
+        runner,
+        test_cmd,
+        venv: venv_str,
+        python,
+        install_cmd,
+    })
+}
+
+/// Derive `.flow/env.json` facts from a set of verified [`Step`]s and relativize paths against
+/// `base` (the project root) so committed `.flow/env.json` files never store absolute machine paths.
+pub fn env_facts_from_steps_rel(steps: &[Step], venv: &Path, base: &Path) -> Option<tm_flow::EnvFacts> {
+    env_facts_from_steps(steps, venv).map(|facts| facts.relativize(base))
+}
+
+/// Prepare the run's test/runtime environment BEFORE wave 1 starts (creating and verifying the
+/// shared Python venv if needed, without running the project's tests themselves yet) and return
+/// relative [`tm_flow::EnvFacts`] ready to commit into `.flow/env.json`.
+pub async fn prepare_env(
+    tree: &Path,
+    venv: &Path,
+    project_root: &Path,
+    plan_has_python: bool,
+    timeout: Duration,
+) -> Option<tm_flow::EnvFacts> {
+    let mut all_steps = steps(tree, venv);
+    if all_steps.is_empty() && plan_has_python {
+        all_steps = python_steps(tree, venv);
+    }
+    if all_steps.is_empty() {
+        return None;
+    }
+
+    let is_python_plan = all_steps.iter().any(is_pytest_step);
+    let stamp_file = venv.join(".taskmaster-deps");
+    // Self-heal a stale `.taskmaster-deps` stamp (e.g. created when host `~/.local/lib` masked a
+    // missing venv pytest): clear the stamp and re-generate setup steps so pytest is installed
+    // into the shared venv itself.
+    if is_python_plan && stamp_file.is_file() && !venv_has_pytest(venv).await {
+        let _ = std::fs::remove_file(&stamp_file);
+        all_steps = steps(tree, venv);
+        if all_steps.is_empty() && plan_has_python {
+            all_steps = python_steps(tree, venv);
+        }
+    }
+
+    let setup_steps: Vec<Step> = all_steps.iter().filter(|s| s.setup).cloned().collect();
+    if !setup_steps.is_empty() {
+        let mut idx = 0usize;
+        while idx < setup_steps.len() {
+            let step = &setup_steps[idx];
+            // Only skip a bare `pip install -q pytest` when `pytest` is ALREADY importable inside
+            // the same sandbox view workers get (e.g. system site-packages under `/usr`, never `~/.local`).
+            let is_bare_pytest_install = step.args.iter().any(|a| a == "pip")
+                && step.args.iter().any(|a| a == "pytest")
+                && !step.args.iter().any(|a| a == "-e" || a == "-r");
+            if is_bare_pytest_install && venv_has_pytest(venv).await {
+                if let Some((file, stamp)) = &step.stamp {
+                    let _ = std::fs::write(file, stamp);
+                }
+                idx += 1;
+                continue;
+            }
+            let _ = run_steps(tree, std::slice::from_ref(step), timeout).await;
+            idx += 1;
+        }
+        // Stamp only when pytest is genuinely importable inside the sandbox view.
+        if venv_has_pytest(venv).await {
+            if !stamp_file.is_file() {
+                let _ = std::fs::write(&stamp_file, python_stamp(tree));
+            }
+        } else if is_python_plan {
+            let _ = std::fs::remove_file(&stamp_file);
+        }
+    }
+
+    if is_python_plan && venv.is_dir() && !venv_has_pytest(venv).await {
+        let _ = std::fs::remove_file(&stamp_file);
+        // Venv exists but pytest is unavailable inside the worker sandbox; record safe fallback without broken venv.
+        return Some(tm_flow::EnvFacts {
+            runner: "pytest".into(),
+            test_cmd: "pytest -q -x --tb=short".into(),
+            venv: None,
+            python: None,
+            install_cmd: None,
+        });
+    }
+
+    env_facts_from_steps_rel(&all_steps, venv, project_root)
+}
+
+/// True when `step` is a non-setup test step that runs `pytest`.
+pub(crate) fn is_pytest_step(step: &Step) -> bool {
+    !step.setup
+        && (step.program.ends_with("pytest")
+            || step.program.ends_with("pytest.exe")
+            || step.args.iter().any(|a| a == "pytest"))
+}
+
+/// Check whether `venv`'s Python can import `pytest` under the same sandbox view workers get:
+/// bubblewrap with `--tmpfs $HOME` when usable, plus `-s` and `PYTHONNOUSERSITE=1` everywhere
+/// so host `~/.local/lib` user site-packages can never mask a missing venv package.
+pub(crate) async fn venv_has_pytest(venv: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    venv_has_pytest_with_home(venv, home.as_deref()).await
+}
+
+async fn venv_has_pytest_with_home(venv: &Path, home: Option<&Path>) -> bool {
+    let bin = venv.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+    if !bin.is_file() {
+        return false;
+    }
+    let mut cmd = if tm_harness::sandbox::bwrap_usable()
+        && let Some(home) = home
+    {
+        let sandbox = tm_harness::sandbox::Sandbox {
+            home: home.to_path_buf(),
+            state_dirs: Vec::new(),
+        };
+        let args = sandbox.bwrap_ro_probe_args(
+            &bin,
+            &["-s".into(), "-m".into(), "pytest".into(), "--version".into()],
+            &[venv.to_path_buf()],
+            &[
+                ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+                ("PYTHONNOUSERSITE".into(), "1".into()),
+            ],
+        );
+        let mut c = Command::new("bwrap");
+        c.args(args);
+        c
+    } else {
+        let mut c = Command::new(&bin);
+        clean_env(&mut c);
+        c.args(["-s", "-m", "pytest", "--version"])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONNOUSERSITE", "1")
+            .env_remove("PYTHONUSERBASE");
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(15), cmd.status())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|s| s.success())
+}
+
 /// Exclude later-phase contract test paths from test runner steps (e.g. pytest `--ignore=<path>`)
 /// so intermediate-phase verify does not execute tests for phases that have not been built yet.
 pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {
@@ -315,10 +531,7 @@ pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {
         if step.name != "test" {
             continue;
         }
-        let is_pytest = step.program.ends_with("pytest")
-            || step.program.ends_with("pytest.exe")
-            || step.args.iter().any(|a| a == "pytest");
-        if is_pytest {
+        if is_pytest_step(step) {
             for path in ignore_paths {
                 let flag = format!("--ignore={path}");
                 if !step.args.contains(&flag) {
@@ -478,6 +691,112 @@ pub fn attribute(output: &str, owners: &Owners, routes: &[(PageId, String)]) -> 
         }
     }
     (pages, rest.trim().to_string())
+}
+
+/// True when a test step's failure output clearly points to a deterministic assertion, logic,
+/// import, syntax, or compile error rather than a transient/flaky failure (such as a timeout,
+/// connection reset, port collision, or lock contention). Used to skip wasteful flaky-test reruns.
+pub fn is_deterministic_test_failure(output: &str) -> bool {
+    if output.trim().is_empty() {
+        return false;
+    }
+    let lower = output.to_ascii_lowercase();
+    const TRANSIENT_MARKERS: &[&str] = &[
+        "timeout",
+        "timed out",
+        "deadline exceeded",
+        "econnrefused",
+        "econnreset",
+        "etimedout",
+        "ehostunreach",
+        "enetunreach",
+        "eaddrinuse",
+        "eaddrnotavail",
+        "epipe",
+        "eagain",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "connectionerror",
+        "broken pipe",
+        "socket hang up",
+        "address already in use",
+        "port already in use",
+        "temporarily unavailable",
+        "service unavailable",
+        "too many requests",
+        "rate limit",
+        "http 429",
+        "http 503",
+        "502 bad gateway",
+        "504 gateway",
+        "deadlock",
+        "database is locked",
+        "sqlite_busy",
+        "getaddrinfo",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "segmentation fault",
+        "segfault",
+        "sigkill",
+        "sigterm",
+    ];
+    if TRANSIENT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    const DETERMINISTIC_MARKERS: &[&str] = &[
+        // Python / pytest / JS / Java
+        "AssertionError",
+        "SyntaxError",
+        "IndentationError",
+        "TabError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "NameError",
+        "TypeError",
+        "AttributeError",
+        "KeyError",
+        "IndexError",
+        "ValueError",
+        "ZeroDivisionError",
+        "UnboundLocalError",
+        "NotImplementedError",
+        "RecursionError",
+        // JS / TS
+        "ReferenceError",
+        "RangeError",
+        "Cannot find module",
+        "ERR_MODULE_NOT_FOUND",
+        "ERR_ASSERTION",
+        // Rust
+        "assertion failed",
+        "assertion `left == right` failed",
+        "assertion left == right failed",
+        "panicked at",
+        "error[E",
+        // Go
+        "[build failed]",
+        "compilation failed",
+    ];
+    if DETERMINISTIC_MARKERS.iter().any(|m| output.contains(m)) {
+        return true;
+    }
+    // Pytest short-traceback assertion lines (`E   assert ...`).
+    if output.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("E ")
+            .is_some_and(|rest| rest.trim_start().starts_with("assert "))
+    }) {
+        return true;
+    }
+    // Jest / Vitest expectation diff (`Expected:` + `Received:`).
+    if output.contains("Expected:") && output.contains("Received:") {
+        return true;
+    }
+    // C / C++ assert macro (`Assertion `...` failed`).
+    output.contains("Assertion `") && output.contains("` failed")
 }
 
 // The browser.
@@ -871,6 +1190,217 @@ mod tests {
         let (_, failure) = run_steps(&dir, &again, Duration::from_secs(120)).await;
         assert!(failure.is_none(), "{failure:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_facts_extracted_from_python_cargo_and_npm_steps() {
+        let dir = std::env::temp_dir().join(format!("tm-env-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let venv = dir.join("venv");
+        let bin = venv.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let py = bin.join("python");
+        std::fs::write(&py, "#!/bin/sh\n").unwrap();
+
+        let py_step = Step {
+            name: "test".into(),
+            program: py.display().to_string(),
+            args: vec!["-m".into(), "pytest".into(), "-q".into()],
+            env: vec![("VIRTUAL_ENV".into(), venv.display().to_string())],
+            setup: false,
+            stamp: None,
+        };
+        let facts = env_facts_from_steps(&[py_step], &venv).unwrap();
+        assert_eq!(facts.runner, "pytest");
+        assert!(facts.test_cmd.contains("-m pytest -q"), "{}", facts.test_cmd);
+        assert_eq!(facts.venv.as_deref(), Some(venv.to_str().unwrap()));
+        assert_eq!(facts.python.as_deref(), Some(py.to_str().unwrap()));
+
+        let cargo_facts = env_facts_from_steps(&[Step::new("test", "cargo", &["test", "--quiet"])], &venv).unwrap();
+        assert_eq!(cargo_facts.runner, "cargo");
+        assert_eq!(cargo_facts.test_cmd, "cargo test --quiet");
+        assert_eq!(cargo_facts.venv, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn venv_has_pytest_rejects_user_site_pytest_hidden_by_sandbox() {
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !has_python3 {
+            eprintln!("python3 not installed; skipping");
+            return;
+        }
+        // Discover Python's major.minor for site-packages layout.
+        let ver_out = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .unwrap();
+        let py_mm = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
+
+        let dir = std::env::temp_dir().join(format!("tm-venv-hidden-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake_home = dir.join("home");
+        let user_site = fake_home.join(format!(".local/lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&user_site).unwrap();
+        std::fs::write(user_site.join("__init__.py"), "__version__ = '0.0.0-user'\n").unwrap();
+        std::fs::write(user_site.join("__main__.py"), "print('pytest 0.0.0-user')\n").unwrap();
+
+        // Create a venv WITHOUT `--system-site-packages`? Wait: `--system-site-packages` is what
+        // `python_steps` uses, and we want to reproduce the exact case where host `~/.local/lib`
+        // makes `pytest` importable outside bwrap while hidden inside bwrap (`--tmpfs $HOME`).
+        // If the host happens to have system-wide `/usr/lib/python3/dist-packages/pytest`, test a
+        // plain venv so system pytest cannot mask the assertion; otherwise use `--system-site-packages`
+        // directly to reproduce the exact production path.
+        let system_has_pytest = std::process::Command::new("python3")
+            .args(["-s", "-m", "pytest", "--version"])
+            .env("PYTHONNOUSERSITE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let venv = dir.join("venv");
+        let mut mk_args = vec!["-m", "venv"];
+        if !system_has_pytest {
+            mk_args.push("--system-site-packages");
+        }
+        let venv_s = venv.display().to_string();
+        mk_args.push(&venv_s);
+        let mk = std::process::Command::new("python3").args(&mk_args).status().unwrap();
+        assert!(mk.success(), "failed to create venv");
+
+        // Reproduce the old bug: outside bwrap without `-s` / `PYTHONNOUSERSITE=1`, user site-packages
+        // under `fake_home/.local/lib` makes `venv/bin/python -m pytest --version` appear to succeed
+        // (when `--system-site-packages` is active).
+        let venv_python = venv.join("bin/python");
+        if !system_has_pytest {
+            let unisolated = std::process::Command::new(&venv_python)
+                .args(["-m", "pytest", "--version"])
+                .env("HOME", &fake_home)
+                .env("PYTHONUSERBASE", fake_home.join(".local"))
+                .env_remove("PYTHONNOUSERSITE")
+                .output()
+                .unwrap();
+            assert!(
+                unisolated.status.success(),
+                "expected unisolated host probe to see fake_home/.local pytest: stderr={}",
+                String::from_utf8_lossy(&unisolated.stderr)
+            );
+        }
+
+        // Under the sandbox view (`venv_has_pytest_with_home`), `~/.local/lib` is hidden so the
+        // empty venv MUST report false — never fooling `prepare_env` into skipping installation.
+        assert!(
+            !venv_has_pytest_with_home(&venv, Some(&fake_home)).await,
+            "venv_has_pytest must reject a venv whose pytest only exists in hidden ~/.local/lib"
+        );
+
+        // Also check `python_steps` sets `PYTHONNOUSERSITE=1` and `PIP_USER=0` so `pip install`
+        // installs into the venv instead of saying "Requirement already satisfied" in ~/.local.
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("tests")).unwrap();
+        std::fs::write(proj.join("tests/test_a.py"), "def test_ok(): pass\n").unwrap();
+        let py_steps = python_steps(&proj, &venv);
+        let pip_step = py_steps.iter().find(|s| s.setup && s.args.iter().any(|a| a == "pip")).expect("pip setup step");
+        assert!(
+            pip_step.env.iter().any(|(k, v)| k == "PYTHONNOUSERSITE" && v == "1"),
+            "pip setup step must set PYTHONNOUSERSITE=1: {:?}",
+            pip_step.env
+        );
+        assert!(
+            pip_step.env.iter().any(|(k, v)| k == "PIP_USER" && v == "0"),
+            "pip setup step must set PIP_USER=0: {:?}",
+            pip_step.env
+        );
+
+        // Now install a self-contained `pytest` directly inside `venv`'s own `site-packages`:
+        // `venv_has_pytest_with_home` must now succeed inside the sandbox view!
+        let venv_site = venv.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(venv_site.join("__init__.py"), "__version__ = '0.0.0-venv'\n").unwrap();
+        std::fs::write(venv_site.join("__main__.py"), "print('pytest 0.0.0-venv')\n").unwrap();
+        assert!(
+            venv_has_pytest_with_home(&venv, Some(&fake_home)).await,
+            "self-contained venv with pytest in its own site-packages must pass sandbox check"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tok14_default_pytest_args_are_compact_and_tail_caps_output_preserving_traceback() {
+        let dir = std::env::temp_dir().join(format!("tm-tok14-pytest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_sample.py"), "def test_ok():\n    assert True\n").unwrap();
+        let venv = dir.join("venv");
+
+        let py_steps = python_steps(&dir, &venv);
+        let test_step = py_steps.iter().find(|s| s.name == "test" && !s.setup).expect("pytest step");
+        assert!(
+            test_step.args.windows(4).any(|w| w == ["pytest", "-q", "-x", "--tb=short"]),
+            "default pytest args should include `-q -x --tb=short`, got: {:?}",
+            test_step.args
+        );
+
+        // Long output is capped around 4 KB while preserving the trailing traceback/failure summary.
+        let noise = "passing line of noisy stdout output from earlier tests\n".repeat(200);
+        let tb = "FAILED tests/test_sample.py::test_boom - AssertionError: expected 42\n1 failed in 0.12s\n";
+        let combined = format!("{noise}{tb}");
+        assert!(combined.len() > KEEP * 2);
+        let clipped = tail(&combined);
+        assert!(clipped.len() <= KEEP + 8, "clipped len {} exceeded ~4KB cap", clipped.len());
+        assert!(clipped.starts_with("…\n"), "expected truncation marker: {clipped}");
+        assert!(clipped.ends_with(tb), "must keep trailing traceback: {clipped}");
+        assert!(!clipped.contains(&noise), "noisy prefix must be dropped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_pytest_step_matches_runners_and_ignores_setup_steps() {
+        assert!(is_pytest_step(&Step::new("test", "/venv/bin/python", &["-m", "pytest", "-q"])));
+        assert!(is_pytest_step(&Step::new("test", "pytest", &["-q"])));
+        assert!(is_pytest_step(&Step::new("test", "C:\\venv\\Scripts\\pytest.exe", &["-q"])));
+        assert!(is_pytest_step(&Step::new("test", "uv", &["run", "pytest", "-q"])));
+        let mut setup_step = Step::new("setup", "/venv/bin/python", &["-m", "pip", "install", "pytest"]);
+        setup_step.setup = true;
+        assert!(!is_pytest_step(&setup_step));
+        assert!(!is_pytest_step(&Step::new("test", "cargo", &["test", "--quiet"])));
+    }
+
+    #[test]
+    fn fix_n9_deterministic_test_failure_detection() {
+        // Real pytest AssertionError output from tb15-mdtodo-tmhcode.
+        let pytest_assert = concat!(
+            "F\n",
+            "=================================== FAILURES ===================================\n",
+            "tests/test_acceptance_contract.py:44: in test_storage_format_and_core_commands\n",
+            "    assert todo.read_text(encoding=\"utf-8\") == expected_md\n",
+            "E   AssertionError: assert '# Todo\\n- [ ' == '# Todo\\n<!-- next-id: 4 -->\\n'\n",
+            "FAILED tests/test_acceptance_contract.py::test_storage_format_and_core_commands - AssertionError\n",
+        );
+        assert!(is_deterministic_test_failure(pytest_assert));
+        assert!(is_deterministic_test_failure("E   assert 1 == 2\n1 failed in 0.05s"));
+        assert!(is_deterministic_test_failure("ModuleNotFoundError: No module named 'mdtodo'"));
+        assert!(is_deterministic_test_failure("SyntaxError: invalid syntax"));
+        assert!(is_deterministic_test_failure("thread 'main' panicked at 'assertion `left == right` failed'"));
+        assert!(is_deterministic_test_failure("ReferenceError: foo is not defined"));
+        assert!(is_deterministic_test_failure("Expected: 42\nReceived: 41"));
+
+        // Transient / flaky failures must still return false so the flaky rerun stays active.
+        assert!(!is_deterministic_test_failure("timeout waiting for port 3000"));
+        assert!(!is_deterministic_test_failure("Error: connect ECONNREFUSED 127.0.0.1:8080"));
+        assert!(!is_deterministic_test_failure("OSError: [Errno 98] Address already in use"));
+        assert!(!is_deterministic_test_failure("AssertionError: timed out waiting for server"));
+        assert!(!is_deterministic_test_failure(""));
+        assert!(!is_deterministic_test_failure("exit status 1"));
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

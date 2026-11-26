@@ -54,6 +54,9 @@ pub struct WorktreeGate {
     /// Extra read-only locations, e.g. the harness's own state directory.
     readable: Vec<PathBuf>,
     read_only: bool,
+    /// Refuse filesystem reads inside the worktree (e.g. brownfield planner already given a `.flow`
+    /// repo summary), while still allowing explicit `readable` harness config directories and MCP.
+    no_file_reads: bool,
     /// The one origin the browser tool may open (`http://127.0.0.1:<port>`). `None` refuses
     /// every browser call.
     browser: Option<String>,
@@ -76,6 +79,7 @@ impl WorktreeGate {
             allowed_tool_prefixes,
             readable: Vec::new(),
             read_only: false,
+            no_file_reads: false,
             browser: None,
             shell: false,
             fetch_hosts: Vec::new(),
@@ -115,6 +119,14 @@ impl WorktreeGate {
     /// Refuse every edit, for reviewers and verifiers.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// Refuse direct filesystem reads inside the worktree (used when the planner already receives
+    /// a `.flow` repository summary and touched-symbol map). Extra `readable` harness directories
+    /// and allowed MCP tool prefixes remain accessible.
+    pub fn without_file_reads(mut self) -> Self {
+        self.no_file_reads = true;
         self
     }
 
@@ -172,9 +184,23 @@ impl WorktreeGate {
         self.resolve(path).starts_with(&self.root)
     }
 
+    /// True when `path` targets `.flow` or any file under `.flow/` inside the worktree.
+    pub fn is_flow_path(&self, path: &Path) -> bool {
+        let Some(rel) = self.relative(path) else {
+            return false;
+        };
+        matches!(rel.components().next(), Some(Component::Normal(first)) if first == ".flow")
+    }
+
+    /// True when `request` attempts to edit any file inside `.flow/`.
+    pub fn is_flow_edit(&self, request: &PermissionRequest) -> bool {
+        request.kind == ToolKind::Edit && request.paths.iter().any(|p| self.is_flow_path(p))
+    }
+
     fn readable(&self, path: &Path) -> bool {
         let resolved = self.resolve(path);
-        resolved.starts_with(&self.root) || self.readable.iter().any(|r| resolved.starts_with(r))
+        (!self.no_file_reads && resolved.starts_with(&self.root))
+            || self.readable.iter().any(|r| resolved.starts_with(r))
     }
 
     fn resolve(&self, path: &Path) -> PathBuf {
@@ -186,6 +212,10 @@ impl WorktreeGate {
 
 impl PermissionGate for WorktreeGate {
     fn decide(&self, request: &PermissionRequest) -> Decision {
+        // Workers may never write into `.flow/`; only Taskmaster updates the knowledge graph.
+        if request.kind == ToolKind::Edit && request.paths.iter().any(|p| self.is_flow_path(p)) {
+            return Decision::Deny;
+        }
         // Before the prefixes: the browser tool is served beside the Dictionary, but it
         // may only open the run's own preview.
         if request.kind == ToolKind::Browser {
@@ -445,5 +475,32 @@ mod tests {
         // Does not widen WebFetch or shell.
         assert_eq!(g.decide(&fetch), Decision::Deny);
         assert_eq!(g.decide(&request("run_command", ToolKind::Execute, &[])), Decision::Deny);
+    }
+
+    #[test]
+    fn denies_worker_edits_into_flow_dir_while_allowing_reads() {
+        let g = gate();
+        let edit_meta = request("write_file", ToolKind::Edit, &["/nonexistent/tm/work-a/.flow/meta.json"]);
+        let edit_rel = request("write_file", ToolKind::Edit, &[".flow/files/app.py.json"]);
+        assert_eq!(g.decide(&edit_meta), Decision::Deny);
+        assert_eq!(g.decide(&edit_rel), Decision::Deny);
+        assert_eq!(g.clone().with_full_access().decide(&edit_meta), Decision::Deny);
+
+        let read_meta = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/.flow/meta.json"]);
+        assert_eq!(g.decide(&read_meta), Decision::Allow);
+    }
+
+    #[test]
+    fn without_file_reads_denies_worktree_reads_but_keeps_harness_state_and_dictionary() {
+        let g = gate()
+            .read_only()
+            .without_file_reads()
+            .with_readable("/nonexistent/home/.claude");
+        let repo_read = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/pkg/store.py"]);
+        let state_read = request("view_file", ToolKind::Read, &["/nonexistent/home/.claude/settings.json"]);
+        let dict_call = request("mcp__dictionary__flow_query", ToolKind::Dictionary, &[]);
+        assert_eq!(g.decide(&repo_read), Decision::Deny);
+        assert_eq!(g.decide(&state_read), Decision::Allow);
+        assert_eq!(g.decide(&dict_call), Decision::Allow);
     }
 }

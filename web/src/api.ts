@@ -620,6 +620,8 @@ export interface AgentEntry {
     | "end"
     | "command"
     | "output"
+    | "tool_diff"
+    | "mcp_reply"
     | "preview"
     | "approval_requested"
     | "approval_resolved"

@@ -90,6 +90,7 @@ pub fn ensure_exclude(repo: &Path) -> anyhow::Result<()> {
         ".taskmaster/hosts.json",
         ".taskmaster/taskmaster.db*",
         ".taskmaster/reviews/jobs/",
+        ".flow/index.sqlite*",
     ] {
         if !next.lines().any(|have| have == line) {
             if !changed {
@@ -166,6 +167,31 @@ pub fn sync_worktree(worktree: &Path, tree: &Path) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(tree.join(&change.path), &dest).with_context(|| format!("cannot copy {}", change.path))?;
+    }
+    Ok(())
+}
+
+/// Reset a reusable worktree cleanly to `tree`'s exact `HEAD` commit and remove any untracked
+/// files left by the previous unit, so a warm ACP session can safely build a subsequent unit
+/// without inheriting stale edits or stray files.
+pub fn reset_worktree(worktree: &Path, tree: &Path) -> anyhow::Result<()> {
+    if worktree == tree {
+        bail!("cannot reset the main run tree as a reusable worker worktree");
+    }
+    let target = head(tree)?;
+    git(worktree, &["reset", "--hard", &target])?;
+    git(worktree, &["clean", "-fd"])?;
+    // Drop any derived `.flow/index.sqlite*` left behind so nothing reads a stale index.
+    let flow_dir = worktree.join(".flow");
+    if flow_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&flow_dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("index.sqlite") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
     Ok(())
 }
@@ -269,7 +295,10 @@ pub fn merge_branch(repo: &Path, branch: &str, generated: &[&str]) -> bool {
 fn settle_generated(repo: &Path, generated: &[&str]) -> bool {
     let Ok(unmerged) = git(repo, &["diff", "--name-only", "--diff-filter=U", "-z"]) else { return false };
     let paths: Vec<&str> = unmerged.split('\0').filter(|path| !path.is_empty()).collect();
-    if paths.is_empty() || !paths.iter().all(|path| generated.contains(path)) {
+    let is_gen = |path: &str| {
+        generated.iter().any(|g| if g.ends_with('/') { path.starts_with(g) } else { path == *g })
+    };
+    if paths.is_empty() || !paths.iter().all(|path| is_gen(path)) {
         return false;
     }
     let mut take = vec!["checkout", "--theirs", "--"];
@@ -303,10 +332,7 @@ pub fn commit_paths(repo: &Path, message: &str, paths: &[String]) -> anyhow::Res
 
 /// A relative path that cannot climb out of the project.
 pub fn safe_rel(path: &str) -> bool {
-    let path = Path::new(path);
-    !path.is_absolute()
-        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
-        && !path.as_os_str().is_empty()
+    tm_core::safe_rel(path)
 }
 
 fn link_dir(src: &Path, dst: &Path) {
@@ -626,6 +652,46 @@ mod tests {
         found.sort();
         assert_eq!(found, vec!["db/engine.py".to_string(), "tests/test_engine.py".to_string()]);
         assert!(is_artifact("a/b/__pycache__/c.pyc") && is_artifact("target/debug/x") && !is_artifact("src/target.rs"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reset_worktree_brings_reused_worktree_to_clean_head_and_drops_prior_unit_files() {
+        let root = std::env::temp_dir().join(format!("tm-git-reset-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap();
+        git(&repo, &["config", "user.name", "Test"]).unwrap();
+        git(&repo, &["config", "user.email", "test@example.com"]).unwrap();
+        std::fs::write(repo.join("base.py"), "BASE = 1\n").unwrap();
+        git(&repo, &["add", "."]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let h1 = head(&repo).unwrap();
+        add_worktree(&repo, &wt, &h1).unwrap();
+
+        // Simulate unit 1 editing a tracked file, writing an untracked file, and leaving a derived .flow sqlite.
+        std::fs::write(wt.join("base.py"), "BASE = 999\n").unwrap();
+        std::fs::write(wt.join("stray_unit1.py"), "X = 1\n").unwrap();
+        std::fs::create_dir_all(wt.join(".flow")).unwrap();
+        std::fs::write(wt.join(".flow/index.sqlite"), "stale").unwrap();
+
+        // Meanwhile main tree merges unit 1's real file at a newer commit.
+        std::fs::write(repo.join("unit1.py"), "U1 = 1\n").unwrap();
+        git(&repo, &["add", "."]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "unit 1"]).unwrap();
+
+        reset_worktree(&wt, &repo).unwrap();
+        assert_eq!(head(&wt).unwrap(), head(&repo).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("base.py")).unwrap(), "BASE = 1\n");
+        assert_eq!(std::fs::read_to_string(wt.join("unit1.py")).unwrap(), "U1 = 1\n");
+        assert!(!wt.join("stray_unit1.py").exists());
+        assert!(!wt.join(".flow/index.sqlite").exists());
+        assert!(worktree_changes(&wt).unwrap().is_empty());
+        assert!(reset_worktree(&repo, &repo).is_err());
+
+        let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

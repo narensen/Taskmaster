@@ -5,4 +5,4 @@ mod languages;
 pub mod ownership;
 
 pub use graph::{ImportGraph, load_sources};
-pub use ownership::{Owners, outside_owned};
+pub use ownership::{Owners, is_flow_path, outside_owned};

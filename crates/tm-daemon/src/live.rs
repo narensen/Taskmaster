@@ -144,6 +144,8 @@ pub struct Live {
     pub approvals: Arc<crate::approvals::Approvals>,
     /// Provider rate-limit / usage window tracker populated from CLI reports (O4).
     pub usage: crate::usage::UsageTracker,
+    /// Per-call daemon-side MCP reply metrics keyed by `agent["call"]`.
+    mcp_stats: Mutex<HashMap<u64, (u32, u64)>>,
     /// Where an `approval_requested` entry is also sent, for a notification to the person.
     alerts: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<(String, Value)>>,
 }
@@ -302,8 +304,34 @@ impl Live {
             cmd_output: CommandOutputHub::default(),
             approvals: Arc::default(),
             usage: crate::usage::UsageTracker::new(),
+            mcp_stats: Mutex::new(HashMap::new()),
             alerts: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Record one daemon-served MCP tool reply in `agents.jsonl` and accumulate per-call stats.
+    pub fn record_mcp_reply(&self, run: &str, agent: &Value, tool: &str, reply_bytes: usize, is_error: bool) {
+        if let Some(call) = agent["call"].as_u64() {
+            let mut stats = self.mcp_stats.lock().unwrap();
+            let entry = stats.entry(call).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(reply_bytes as u64);
+        }
+        self.push(
+            run,
+            agent,
+            "mcp_reply",
+            json!({
+                "tool": tool,
+                "reply_bytes": reply_bytes,
+                "is_error": is_error,
+            }),
+        );
+    }
+
+    /// Take and remove accumulated `(mcp_calls, mcp_reply_bytes)` for a finished call id.
+    pub fn take_mcp_stats(&self, call: u64) -> (u32, u64) {
+        self.mcp_stats.lock().unwrap().remove(&call).unwrap_or((0, 0))
     }
 
     /// Send every question put to a person to `tx` as well (run, question), for notifications.

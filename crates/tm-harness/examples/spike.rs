@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
                 HarnessEvent::Text { text } => said.push_str(&text),
                 HarnessEvent::Thought { .. }
                 | HarnessEvent::SessionStarted { .. }
+                | HarnessEvent::ModelSelected { .. }
                 | HarnessEvent::RateLimit(_) => {}
                 HarnessEvent::ToolResult { id, text, diff } => {
                     let text: String = text.chars().take(120).collect();
@@ -72,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
                         let diff: String = diff.chars().take(120).collect();
                         println!("diff   {diff}");
                     }
+                }
+                HarnessEvent::ToolDiff { id, diff, synthetic } => {
+                    let diff: String = diff.chars().take(120).collect();
+                    println!("diff   {id} (synthetic={synthetic}) {diff}");
                 }
             }
         }

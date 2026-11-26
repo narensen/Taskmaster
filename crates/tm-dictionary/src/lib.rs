@@ -7,6 +7,9 @@ pub mod remote;
 pub mod store;
 
 pub use catalog::Catalog;
-pub use mcp::{CiteRecord, Extension, Grant, McpState, router};
+pub use mcp::{
+    CiteRecord, DICT_TOOL_PREFIXES, Extension, Grant, McpReplyRecord, McpState, ReplyObserver,
+    ToolPolicy, router, strip_dict_prefix,
+};
 pub use remote::CommonsRemote;
 pub use store::{LocalStore, matches_hash};

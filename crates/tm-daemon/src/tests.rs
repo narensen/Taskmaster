@@ -170,7 +170,7 @@ impl Harness for Fake {
         }
         let _ = events.send(HarnessEvent::Text { text: script.text }).await;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: Some(tm_harness::Freed { processes: 1, lingering: 0 }) })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: Some(tm_harness::Freed { processes: 1, lingering: 0 }), requests: None })
     }
 }
 
@@ -188,7 +188,7 @@ impl tm_harness::Session for FakeSession {
         std::fs::create_dir_all(self.cwd.join(format!("app/{}", self.id)))?;
         std::fs::write(self.cwd.join(format!("app/{}/page.ts", self.id)), format!("export const page = \"{}\"; // fixed\n", self.id))?;
         let _ = events.send(HarnessEvent::Text { text: "fixed".into() }).await;
-        Ok(RunSummary { ok: true, usage: Usage { input: 10, output: 5, cache_read: 90, cache_write: 0 }, cost_usd: Some(0.001), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage: Usage { input: 10, output: 5, cache_read: 90, cache_write: 0 }, cost_usd: Some(0.001), denied: 0, freed: None, requests: None })
     }
 
     async fn close(self: Box<Self>) -> tm_harness::Freed {
@@ -607,7 +607,7 @@ impl Harness for EarlyChecked {
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(file, body)?;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
     }
 }
 
@@ -665,7 +665,7 @@ impl Harness for ContractTested {
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(file, body)?;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
     }
 }
 
@@ -834,7 +834,7 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     let logic = calls.iter().find(|c| c.contains("You are unit `logic`")).unwrap();
     assert!(logic.contains("You are done when: clicking add shows a todo."), "{logic}");
     assert!(logic.contains("export type Id = string;"), "{logic}");
-    assert!(logic.contains("Unit `markup` (another worker) owns `app/a/index.html`.") && !logic.contains("The markup."), "{logic}");
+    assert!(logic.contains("`markup` (`app/a/index.html`)") && !logic.contains("The markup."), "{logic}");
     assert!(logic.contains("None of your files exist yet") && logic.contains("do not list, search or read other files"), "{logic}");
     assert!(!logic.contains("Search the Commons"), "{logic}");
     assert!(logic.contains("end your reply with the line `RELEASE page:a/logic`"), "{logic}");
@@ -1216,9 +1216,9 @@ async fn every_agent_call_is_charged_to_the_run() {
     assert_eq!(status["spent"]["unpriced_calls"], 0);
     // One web page and no review, sized from the plan because nothing ran here before,
     // with the cache reads counted apart.
-    assert_eq!(status["estimate"]["tokens"], 40_000);
+    assert_eq!(status["estimate"]["tokens"], 30_000);
     // (plus the contract every builder carries in its prompt)
-    assert!((120_000..120_100).contains(&status["estimate"]["cache_read"].as_u64().unwrap()), "{status}");
+    assert!((80_000..80_100).contains(&status["estimate"]["cache_read"].as_u64().unwrap()), "{status}");
 }
 
 #[tokio::test]
@@ -1495,6 +1495,8 @@ fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
         page: Some("a".into()),
         harness: "grok-build".into(),
         model: None,
+        model_requested: None,
+        model_used: None,
         input: 1000,
         output: 100,
         cache_read: 0,
@@ -1509,6 +1511,9 @@ fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
         brief_hash: None,
         difficulty: None,
         language: None,
+        requests: None,
+        mcp_calls: None,
+        mcp_reply_bytes: None,
     };
     assert!(cost_words(&[call(None, None)]).starts_with("unpriced"), "no price is not $0.00");
     assert!(cost_words(&[call(Some(0.0), Some("provider"))]).contains("charged nothing (a free model)"));
@@ -1862,11 +1867,11 @@ async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
     let mut second = config(&tmp.0, plan(&[("b", &[]), ("c", &[])]), true, 1);
     second.run_id = "two".into();
     assert_eq!(run(second, &world).await.unwrap(), Outcome::Finished { ok: true });
-    // Every fake call is 120 tokens and one cent: two pages at 1.3 calls each, no review.
+    // Every fake call is 120 tokens and one cent: two pages at 1.15 calls each, no review.
     let status = Records::files(&tmp.0).status("two").unwrap().unwrap();
-    assert_eq!(status["estimate"]["tokens"], 312);
+    assert_eq!(status["estimate"]["tokens"], 276);
     // A cent per 120 tokens, over the fresh tokens and the contract read from the cache.
-    assert!((0.026..0.03).contains(&status["estimate"]["usd"].as_f64().unwrap()), "{status}");
+    assert!((0.023..0.028).contains(&status["estimate"]["usd"].as_f64().unwrap()), "{status}");
     assert_eq!(status["estimate"]["priced"], true);
     assert_eq!(status["spent"]["fresh"], 2 * 120);
 }
@@ -2632,7 +2637,7 @@ mod http {
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
         assert_eq!(done["cancelled"], false);
-        assert_eq!(done["estimate"]["tokens"], 2 * 40_000);
+        assert_eq!(done["estimate"]["tokens"], 2 * 30_000);
         let calls = done["spent"]["calls"].as_u64().unwrap();
         assert!(calls >= 2 && done["spent"]["tokens"] == calls * 120, "{done}");
         assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);
@@ -5160,7 +5165,7 @@ async fn w1_release_gate_nudges_worker_that_skips_tests_exactly_once() {
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5222,7 +5227,7 @@ async fn w2_red_green_gate_refuses_new_test_that_already_passes_on_base() {
                 std::fs::write(&app_file, "VALUE = 2\n")?;
                 std::fs::write(&test_file, "import sys\nsys.path.insert(0, 'app/a')\nimport mod\nassert mod.VALUE == 2\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5276,7 +5281,7 @@ async fn w3_best_of_n_races_hard_unit_merges_winner_removes_loser_and_bills_both
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, self.body)?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.02), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.02), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5353,7 +5358,7 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, format!("# attempt {attempt}\ndef add(x, y):\n    return x + y\n"))?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5408,7 +5413,7 @@ async fn mutation_gate_without_import_edge_is_skipped() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5463,7 +5468,7 @@ async fn identical_gate_failure_after_noop_repair_is_waived_not_escalated() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5569,7 +5574,7 @@ async fn mutation_gate_all_skipped_is_inconclusive() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5656,7 +5661,7 @@ async fn intermediate_phase_verify_skips_later_phase_contract_tests() {
                     "dictionary": []
                 });
                 let _ = _events.send(HarnessEvent::Text { text: phase2_json.to_string() }).await;
-                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None });
             }
             if task.brief.contains("Build unit `core`") {
                 std::fs::create_dir_all(task.cwd.join("pkg"))?;
@@ -5665,7 +5670,7 @@ async fn intermediate_phase_verify_skips_later_phase_contract_tests() {
                 std::fs::create_dir_all(task.cwd.join("pkg"))?;
                 std::fs::write(task.cwd.join("pkg/cli.py"), "from pkg.core import value\n\ndef run_cli():\n    return f'ok:{value()}'\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5766,7 +5771,7 @@ async fn repair_shared_refuses_locked_contract_test() {
         ) -> anyhow::Result<RunSummary> {
             std::fs::create_dir_all(task.cwd.join("pkg"))?;
             std::fs::write(task.cwd.join("pkg/mod.py"), "def ok():\n    return True\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5790,7 +5795,7 @@ async fn repair_shared_refuses_locked_contract_test() {
             if test_path.is_file() {
                 std::fs::write(&test_path, "import pytest\npytestmark = pytest.mark.skipif(True, reason='hack')\ndef test_x(): assert False\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5869,7 +5874,7 @@ async fn o1_taskmaster_yaml_setup_copy_and_trust_by_hash() {
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6049,7 +6054,7 @@ async fn a1_queued_notes_batch_into_one_turn_and_steer_note_reaches_master_befor
             if task.brief.starts_with("Read these notes") {
                 self.master_briefs.lock().unwrap().push(task.brief.clone());
                 let _ = events.send(HarnessEvent::Text { text: "Master says: follow the steer note.".into() }).await;
-                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None });
             }
             self.worker_briefs.lock().unwrap().push(task.brief.clone());
             // When page `a` runs, drop 1 steer note (reaches master before page `b`) and 2 queued notes (batched into 1 turn after finish).
@@ -6074,7 +6079,7 @@ async fn a1_queued_notes_batch_into_one_turn_and_steer_note_reaches_master_befor
                 std::fs::create_dir_all(file.parent().unwrap())?;
                 std::fs::write(&file, "export const a = 2;\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6181,7 +6186,7 @@ async fn h1_pending_approval_marks_run_blocked_needs_you_and_approving_clears_it
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6315,7 +6320,7 @@ async fn a2_rewind_restores_checkpoint_and_drops_later_turns_from_view_and_next_
             } else {
                 std::fs::write(&file, "export const v = 'turn1';\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6478,7 +6483,7 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
             std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
             std::fs::write(&page_file, "export const a = 1;\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6505,6 +6510,8 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     role: tm_core::Role::Worker,
                     harness: "claude".into(),
                     model: Some("claude-sonnet".into()),
+                    model_requested: None,
+                    model_used: None,
                     page: Some(format!("p{i}")),
                     ok: true,
                     input: 100,
@@ -6519,6 +6526,9 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     brief_hash: None,
                     difficulty: Some("normal".into()),
                     language: Some("general".into()),
+                    requests: None,
+                    mcp_calls: None,
+                    mcp_reply_bytes: None,
                 },
             )
             .unwrap();
@@ -6531,6 +6541,8 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     role: tm_core::Role::Worker,
                     harness: "codex".into(),
                     model: Some("gpt-5".into()),
+                    model_requested: None,
+                    model_used: None,
                     page: Some(format!("q{i}")),
                     ok: true,
                     input: 200,
@@ -6545,6 +6557,9 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     brief_hash: None,
                     difficulty: Some("normal".into()),
                     language: Some("general".into()),
+                    requests: None,
+                    mcp_calls: None,
+                    mcp_reply_bytes: None,
                 },
             )
             .unwrap();
@@ -6634,7 +6649,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
             std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
             std::fs::write(&page_file, "export const a = 'fresh';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn run_kept(
             &self,
@@ -6661,7 +6676,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
             std::fs::write(&page_file, "export const a = 'resumed';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "continued after restart".into() }).await;
             (
-                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None }),
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None, requests: None }),
                 None,
             )
         }
@@ -6756,7 +6771,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
             _timeout: Duration,
         ) -> anyhow::Result<RunSummary> {
             self.follow_ups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         fn session_id(&self) -> Option<&str> {
             Some(&self.sid)
@@ -6786,7 +6801,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
             _gate: Arc<dyn tm_harness::PermissionGate>,
             _events: tokio::sync::mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn run_kept(
             &self,
@@ -6806,7 +6821,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
                 follow_ups: self.follow_ups.clone(),
             });
             (
-                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }),
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }),
                 Some(sess),
             )
         }
@@ -6826,7 +6841,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
             std::fs::write(&page_file, "export const a = 'repaired-by-id';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "fixed via resume".into() }).await;
             (
-                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None }),
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None, requests: None }),
                 None,
             )
         }
@@ -7090,7 +7105,7 @@ async fn o3_batched_diff_review_groups_three_comments_on_two_pages_into_two_note
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, format!("export const p = '{page}';\n"))?;
             let _ = events.send(HarnessEvent::Text { text: "updated".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7207,7 +7222,7 @@ async fn o2_preview_design_mode_proxy_and_capture_routes_h1_to_page_worker() {
             let file = task.cwd.join(format!("app/{page}/page.ts"));
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7339,7 +7354,7 @@ impl Harness for Plain {
     }
     async fn run(&self, _task: WorkerTask, _gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> anyhow::Result<RunSummary> {
         let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
-        Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.0), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.0), denied: 0, freed: None, requests: None })
     }
 }
 
@@ -7464,7 +7479,7 @@ async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brie
             _gate: Arc<dyn tm_harness::PermissionGate>,
             _events: tokio::sync::mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn run_kept(
             &self,
@@ -7482,7 +7497,7 @@ async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brie
                     closed: self.closed.clone(),
                     follow_ups: self.follow_ups.clone(),
                 });
-                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }), Some(sess))
             } else {
                 // Fallback fresh ask() receives the full worker brief and fixes the file.
                 let _ = std::fs::remove_file(task.cwd.join("outside.txt"));
@@ -7490,7 +7505,7 @@ async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brie
                 std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
                 std::fs::write(&page_file, "export const a = 'recovered';\n").unwrap();
                 let _ = events.send(HarnessEvent::Text { text: "fixed on fallback".into() }).await;
-                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), None)
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }), None)
             }
         }
     }
@@ -7567,7 +7582,7 @@ async fn single_worker_error_in_join_one_escalates_instead_of_aborting_run() {
             std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
             std::fs::write(&page_file, "export const a = 'from-mid';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7628,7 +7643,7 @@ async fn stalled_worker_in_batch_does_not_abort_sibling_and_retries() {
                 std::fs::write(&f, "export const b = 'ok';\n").unwrap();
             }
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7714,7 +7729,7 @@ async fn planner_rejects_contract_constants_contradicting_prompt_and_repairs_wit
                 .to_string()
             };
             let _ = events.send(HarnessEvent::Text { text: reply }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7787,7 +7802,7 @@ async fn verify_reports_import_failure_reasons_and_keeps_parallel_build_timings(
                 std::fs::write(&f, "export const b = 2;\n").unwrap();
             }
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7846,7 +7861,7 @@ async fn finalize_runs_once_on_error_return_and_success_paths() {
             _events: mpsc::Sender<HarnessEvent>,
             _timeout: Duration,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn close(self: Box<Self>) -> tm_harness::Freed {
             self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7886,7 +7901,7 @@ async fn finalize_runs_once_on_error_return_and_success_paths() {
             std::fs::write(&f, format!("export const {page} = 1;\n")).unwrap();
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
             let sess: Box<dyn tm_harness::Session> = Box::new(CountingSession { closed: self.closed.clone() });
-            (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+            (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }), Some(sess))
         }
     }
 
@@ -8052,7 +8067,7 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(&f, "export const a = 1;\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -8227,7 +8242,7 @@ async fn unit_with_contract_only_dependency_starts_immediately() {
                 std::fs::write(task.cwd.join("tinydb/storage.py"), "from tinydb.contract import BTreeProtocol\nclass Storage:\n    pass\n")?;
             }
             self.inflight.fetch_sub(1, Ordering::SeqCst);
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -8445,6 +8460,7 @@ async fn small_cli_prompt_uses_single_phase_plan() {
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8595,6 +8611,7 @@ async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildca
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8674,6 +8691,7 @@ async fn contract_soft_cap_warns_without_repair_while_hard_cap_triggers_repair()
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8766,6 +8784,7 @@ async fn scheduling_wave_starts_long_pole_unit_first_under_parallel_limit() {
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8886,6 +8905,7 @@ async fn worker_brief_deduplicates_contracts_full_when_used_and_signatures_other
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9060,6 +9080,7 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9146,6 +9167,7 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9201,6 +9223,7 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9230,4 +9253,4771 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
     let outcome3 = drive(cfg3, harnesses3).await.unwrap();
     assert_eq!(outcome3, Outcome::Finished { ok: false });
     assert!(!tmp3.0.join("only_stray.tmp").exists());
+}
+
+#[tokio::test]
+async fn flow_graph_seeds_updates_places_unit_map_after_task_marker_keeps_prefix_identical_and_ignores_worker_flow_writes() {
+    let tmp = seeded("flow-engine");
+    let contract_src = "from typing import Protocol\nclass StorageProtocol(Protocol):\n    def save(self) -> None: ...\n";
+    let test_src = "from pkg.btree import BTree\nfrom pkg.executor import Executor\ndef test_flow():\n    b = BTree()\n    e = Executor(b)\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Flow integration fixture".into(),
+        contracts: vec![
+            ContractFile { path: "pkg/contract.py".into(), content: contract_src.into(), phase: 0 },
+            ContractFile { path: "tests/test_flow_contract.py".into(), content: test_src.into(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "pkg/btree.py".into(),
+                brief: "Implement BTree".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "executor".into(),
+                owned_glob: "pkg/executor.py".into(),
+                brief: "Implement Executor on top of pkg/contract.py.".into(),
+                depends_on: vec!["btree".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct FlowHarness {
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for FlowHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            // Gate must deny worker writes into `.flow/`.
+            let flow_edit = tm_harness::PermissionRequest {
+                tool: "write_file".into(),
+                kind: tm_harness::ToolKind::Edit,
+                paths: vec![task.cwd.join(".flow/tampered.json")],
+                command: None,
+                url: None,
+            };
+            assert_eq!(gate.decide(&flow_edit), tm_harness::Decision::Deny);
+
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            if task.brief.contains("Build unit `btree`") {
+                std::fs::write(
+                    task.cwd.join("pkg/btree.py"),
+                    "class BTree:\n    def insert(self, k: int) -> None:\n        pass\n",
+                )?;
+                // Even if a rogue write landed inside `.flow/` in the worktree, judge ignores it
+                // (not counted as outside_owned and never merged into the project).
+                std::fs::create_dir_all(task.cwd.join(".flow"))?;
+                std::fs::write(task.cwd.join(".flow/rogue.json"), "{\"bad\":true}\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:btree\n".into() }).await;
+            } else if task.brief.contains("Build unit `executor`") {
+                std::fs::write(
+                    task.cwd.join("pkg/executor.py"),
+                    "from pkg.contract import StorageProtocol\nfrom pkg.btree import BTree\nclass Executor(StorageProtocol):\n    def __init__(self, bt: BTree) -> None:\n        self.bt = bt\n    def save(self) -> None:\n        self.bt.insert(1)\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:executor\n".into() }).await;
+            } else {
+                let _ = events.send(HarnessEvent::Text { text: "{\"findings\":[]}".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(FlowHarness { briefs: briefs.clone() });
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let seen = briefs.lock().unwrap().clone();
+    let btree_brief = seen.iter().find(|b| b.contains("Build unit `btree`")).expect("btree brief");
+    let exec_brief = seen.iter().find(|b| b.contains("Build unit `executor`")).expect("executor brief");
+
+    // 1. Shared prefix before `--- Your task ---` is byte-identical across units and keeps full contracts.
+    let (pre_b, post_b) = btree_brief.split_once("--- Your task ---").expect("marker in btree brief");
+    let (pre_e, post_e) = exec_brief.split_once("--- Your task ---").expect("marker in executor brief");
+    assert_eq!(pre_b, pre_e, "shared prefix must be byte-identical across units");
+    // Since C4 (main), a contract used by only some units is given in full in that unit's section
+    // instead of the shared prefix; either way the executor that uses it must see it in full.
+    assert!(exec_brief.contains("class StorageProtocol(Protocol):"), "full locked contract must reach the unit that uses it");
+    assert!(!pre_b.contains("## Flow unit map"), "unit map must not leak into shared prefix");
+
+    // 2. Unit map sits AFTER `--- Your task ---`, includes cross-unit neighbours, and does not use old context pack.
+    assert!(post_b.contains("## Flow unit map (btree)"), "{post_b}");
+    assert!(post_e.contains("## Flow unit map (executor)"), "{post_e}");
+    assert!(post_e.contains("btree:BTree"), "executor unit map should show cross-unit btree neighbour:\n{post_e}");
+    assert!(!post_e.contains("## Unit context pack"), "old context pack must be replaced by flow unit map");
+
+    // 3. `.flow/` is committed cleanly in the project, `index.sqlite` is gitignored, and worker rogue write was never merged.
+    assert!(tmp.0.join(".flow/meta.json").is_file());
+    assert!(tmp.0.join(".flow/.gitignore").is_file());
+    assert!(tmp.0.join(".flow/files/pkg/btree.py.json").is_file());
+    assert!(tmp.0.join(".flow/files/pkg/executor.py.json").is_file());
+    assert!(!tmp.0.join(".flow/rogue.json").exists(), "worker edits inside .flow/ must never be merged");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "all shards must be fresh after run");
+}
+
+#[tokio::test]
+async fn flow_env_json_records_after_verify_injects_stable_prefix_hint_and_shares_venv() {
+    let tmp = seeded("flow-env");
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("tests/test_smoke.py"), "def test_ok():\n    assert True\n").unwrap();
+    let _ = crate::git::commit_paths(&tmp.0, "add smoke test", &["tests/test_smoke.py".into()]);
+
+    type SeenCalls = Arc<Mutex<Vec<(String, Option<tm_harness::ShellScope>)>>>;
+    struct EnvHarness {
+        seen: SeenCalls,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for EnvHarness {
+        fn id(&self) -> &'static str {
+            "fake-env"
+        }
+        fn sandboxed_shell(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen.lock().unwrap().push((task.brief.clone(), task.shell.clone()));
+            if let Some(page) = task
+                .brief
+                .split("Build page `")
+                .nth(1)
+                .and_then(|rest| rest.split('`').next())
+            {
+                let f = task.cwd.join(format!("app/{page}/page.ts"));
+                std::fs::create_dir_all(f.parent().unwrap())?;
+                std::fs::write(&f, format!("export const {page} = 1;\n"))?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    // 1. First run: runtime_checks succeeds on Python smoke test and writes `.flow/env.json`.
+    let seen1 = Arc::new(Mutex::new(Vec::new()));
+    let h1: Arc<dyn Harness> = Arc::new(EnvHarness { seen: seen1.clone() });
+    let harnesses1 = Harnesses {
+        master: h1.clone(),
+        mid: h1.clone(),
+        worker: h1.clone(),
+        reviewer: h1.clone(),
+        verifier: h1,
+    };
+    let mut cfg1 = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg1.run_id = "env-run-1".into();
+    cfg1.checks = false;
+    cfg1.runtime_checks = true;
+    cfg1.code_mode = false;
+    cfg1.worker_shell = false;
+    cfg1.browser = false;
+
+    let out1 = tokio::time::timeout(Duration::from_secs(30), drive(cfg1, harnesses1))
+        .await
+        .expect("run 1 timed out")
+        .unwrap();
+    assert_eq!(out1, Outcome::Finished { ok: true });
+    let env_facts = tm_flow::read_env(&tmp.0)
+        .unwrap()
+        .expect(".flow/env.json must be written after first passing runtime verify");
+    assert_eq!(env_facts.runner, "pytest");
+    assert!(!env_facts.test_cmd.is_empty());
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+
+    // 2. Second run: seed a real venv directory in `.flow/env.json` and verify the prefix hint
+    //    is present, byte-identical across units `a` and `b`, and the venv is mounted read-only.
+    let shared_venv = tmp.0.join(".taskmaster/shared-venv-fixture");
+    std::fs::create_dir_all(shared_venv.join("bin")).unwrap();
+    std::fs::write(shared_venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::write(shared_venv.join("bin/python"), "#!/bin/sh\n").unwrap();
+    let seeded_facts = tm_flow::EnvFacts {
+        runner: "pytest".into(),
+        test_cmd: format!("{}/bin/python -m pytest -q", shared_venv.display()),
+        venv: Some(shared_venv.display().to_string()),
+        python: Some(format!("{}/bin/python", shared_venv.display())),
+        install_cmd: None,
+    };
+    tm_flow::write_env(&tmp.0, &seeded_facts).unwrap();
+    let _ = crate::git::commit_paths(&tmp.0, "seed flow env fixture", &[".flow/env.json".into()]);
+
+    let seen2 = Arc::new(Mutex::new(Vec::new()));
+    let h2: Arc<dyn Harness> = Arc::new(EnvHarness { seen: seen2.clone() });
+    let harnesses2 = Harnesses {
+        master: h2.clone(),
+        mid: h2.clone(),
+        worker: h2.clone(),
+        reviewer: h2.clone(),
+        verifier: h2,
+    };
+    let mut cfg2 = config(&tmp.0, plan(&[("c", &[]), ("d", &[])]), true, 2);
+    cfg2.run_id = "env-run-2".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.worker_shell = true;
+    cfg2.browser = false;
+
+    let out2 = tokio::time::timeout(Duration::from_secs(20), drive(cfg2, harnesses2))
+        .await
+        .expect("run 2 timed out")
+        .unwrap();
+    assert_eq!(out2, Outcome::Finished { ok: true });
+
+    let calls2 = seen2.lock().unwrap().clone();
+    let (brief_a, shell_a) = calls2.iter().find(|(b, _)| b.contains("Build page `c`")).expect("c call");
+    let (brief_b, shell_b) = calls2.iter().find(|(b, _)| b.contains("Build page `d`")).expect("d call");
+    let (pre_a, _) = brief_a.split_once("--- Your task ---").expect("marker in a");
+    let (pre_b, _) = brief_b.split_once("--- Your task ---").expect("marker in b");
+    assert_eq!(pre_a, pre_b, "shared prefix must stay byte-identical across units");
+    assert!(
+        pre_a.contains("Verified test environment:") && pre_a.contains(&shared_venv.display().to_string()),
+        "shared prefix should include one-line env hint with venv:\n{pre_a}"
+    );
+    let shell_a = shell_a.as_ref().expect("shell scope for a");
+    let shell_b = shell_b.as_ref().expect("shell scope for b");
+    assert!(shell_a.readable.contains(&shared_venv), "venv must be mounted read-only: {:?}", shell_a.readable);
+    assert!(shell_b.readable.contains(&shared_venv), "venv must be mounted read-only: {:?}", shell_b.readable);
+    assert!(
+        shell_a.env.iter().any(|(k, v)| k == "TASKMASTER_SHARED_VENV" && v == &shared_venv.display().to_string()),
+        "TASKMASTER_SHARED_VENV should be set: {:?}",
+        shell_a.env
+    );
+
+    // 3. Third run: delete the venv directory so `.flow/env.json` points to a stale path ->
+    //    fallback drops the missing venv path from prefix hint and shell mounts cleanly.
+    std::fs::remove_dir_all(&shared_venv).unwrap();
+    let seen3 = Arc::new(Mutex::new(Vec::new()));
+    let h3: Arc<dyn Harness> = Arc::new(EnvHarness { seen: seen3.clone() });
+    let harnesses3 = Harnesses {
+        master: h3.clone(),
+        mid: h3.clone(),
+        worker: h3.clone(),
+        reviewer: h3.clone(),
+        verifier: h3,
+    };
+    let mut cfg3 = config(&tmp.0, plan(&[("e", &[])]), true, 1);
+    cfg3.run_id = "env-run-3".into();
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    cfg3.code_mode = false;
+    cfg3.worker_shell = true;
+    cfg3.browser = false;
+
+    let out3 = tokio::time::timeout(Duration::from_secs(20), drive(cfg3, harnesses3))
+        .await
+        .expect("run 3 timed out")
+        .unwrap();
+    assert_eq!(out3, Outcome::Finished { ok: true });
+
+    let calls3 = seen3.lock().unwrap().clone();
+    let (brief_a3, shell_a3) = calls3.iter().find(|(b, _)| b.contains("Build page `e`")).expect("e call");
+    let (pre_a3, _) = brief_a3.split_once("--- Your task ---").expect("marker in a3");
+    assert!(pre_a3.contains("Verified test environment: run tests with `pytest -q -x --tb=short`"), "{pre_a3}");
+    assert!(!pre_a3.contains("shared-venv-fixture"), "stale venv path must be dropped:\n{pre_a3}");
+    let shell_a3 = shell_a3.as_ref().expect("shell scope for a3");
+    assert!(!shell_a3.readable.contains(&shared_venv), "missing venv must not be mounted");
+}
+
+#[tokio::test]
+async fn planner_json_local_repair_avoids_replan_and_unrepairable_uses_ask_repair() {
+    struct ScriptedPlanner {
+        replies: Mutex<std::collections::VecDeque<String>>,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for ScriptedPlanner {
+        fn id(&self) -> &'static str {
+            "fake-planner"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "{}".into());
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let make_harnesses = |replies: Vec<String>| -> (Harnesses, Arc<Mutex<Vec<String>>>) {
+        let briefs = Arc::new(Mutex::new(Vec::new()));
+        let h: Arc<dyn Harness> = Arc::new(ScriptedPlanner {
+            replies: Mutex::new(replies.into()),
+            briefs: briefs.clone(),
+        });
+        (
+            Harnesses {
+                master: h.clone(),
+                mid: h.clone(),
+                worker: h.clone(),
+                reviewer: h.clone(),
+                verifier: h,
+            },
+            briefs,
+        )
+    };
+
+    // 1. Repairable invalid JSON (unescaped `""` in string, like n6) succeeds in 1 planner call (no replan/repair).
+    let tmp1 = seeded("plan-json-local");
+    let repairable = "```json\n{\n  \"kind\": \"cli\",\n  \"summary\": \"Demo CLI\",\n  \"units\": [\n    {\"id\": \"cli\", \"owned_glob\": \"app.py\", \"brief\": \"Format None as `\"\"`, other values as str(v).\", \"done\": \"pytest passes\",}\n  ]\n}\n```";
+    let (h1, briefs1) = make_harnesses(vec![repairable.into()]);
+    let mut cfg1 = Config::new(&tmp1.0);
+    cfg1.prompt = Some("Build a demo CLI.".into());
+    cfg1.yes = false;
+    cfg1.fast_path = false;
+    cfg1.timeout = Duration::from_secs(20);
+    let out1 = drive(cfg1, h1).await.unwrap();
+    assert!(matches!(out1, Outcome::NeedsApproval { .. }), "{out1:?}");
+    assert_eq!(
+        briefs1.lock().unwrap().len(),
+        1,
+        "local JSON repair must accept the plan in a single planner call without replanning"
+    );
+
+    // 2. Unrepairable invalid JSON triggers small `ask_repair` turn (NOT a fresh full replan) with accurate line/col error.
+    let tmp2 = seeded("plan-json-repair");
+    let broken = "{\n  \"kind\": \"cli\",\n  \"units\": [\n    {\"id\": \"cli\", \"owned_glob\": \"app.py\", \"brief\": [}\n  ]\n}";
+    let fixed = r#"{"kind":"cli","summary":"Fixed","units":[{"id":"cli","owned_glob":"app.py","brief":"Build CLI","done":"tests pass"}]}"#;
+    let (h2, briefs2) = make_harnesses(vec![broken.into(), fixed.into()]);
+    let mut cfg2 = Config::new(&tmp2.0);
+    cfg2.prompt = Some("Build a demo CLI.".into());
+    cfg2.yes = false;
+    cfg2.fast_path = false;
+    cfg2.timeout = Duration::from_secs(20);
+    let out2 = drive(cfg2, h2).await.unwrap();
+    assert!(matches!(out2, Outcome::NeedsApproval { .. }), "{out2:?}");
+    let seen2 = briefs2.lock().unwrap().clone();
+    assert_eq!(seen2.len(), 2, "expected initial plan + 1 small ask_repair call");
+    assert!(
+        seen2[1].contains("Fix the JSON syntax error") && seen2[1].contains("invalid JSON at line "),
+        "second call must be ask_repair with accurate JSON error, got:\n{}",
+        seen2[1]
+    );
+    assert!(seen2[1].contains("\"brief\": [}"), "ask_repair must include the broken JSON:\n{}", seen2[1]);
+
+    // 3. Truly missing JSON object reports "no JSON object" and falls back to a fresh planner call.
+    let tmp3 = seeded("plan-json-missing");
+    let (h3, briefs3) = make_harnesses(vec!["I cannot produce JSON right now.".into(), fixed.into()]);
+    let mut cfg3 = Config::new(&tmp3.0);
+    cfg3.prompt = Some("Build a demo CLI.".into());
+    cfg3.yes = false;
+    cfg3.fast_path = false;
+    cfg3.timeout = Duration::from_secs(20);
+    let out3 = drive(cfg3, h3).await.unwrap();
+    assert!(matches!(out3, Outcome::NeedsApproval { .. }), "{out3:?}");
+    let seen3 = briefs3.lock().unwrap().clone();
+    assert_eq!(seen3.len(), 2);
+    assert!(
+        seen3[1].contains("no JSON object") && !seen3[1].contains("Fix the JSON syntax error"),
+        "missing JSON should report 'no JSON object' and re-ask planner, got:\n{}",
+        seen3[1]
+    );
+}
+
+#[tokio::test]
+async fn flow_wave1_units_receive_unit_maps_when_contract_test_uses_subprocess_only() {
+    let tmp = seeded("flow-n6-wave1");
+    let contract_src = "\
+from typing import Any, Protocol
+class StorageError(Exception):
+    pass
+class Token:
+    pass
+class BTreeProtocol(Protocol):
+    def insert(self, key: Any, value: Any) -> None: ...
+    def search(self, key: Any) -> Any | None: ...
+";
+    // Subprocess-only acceptance contract test: imports NOTHING from `tinydb`.
+    let test_src = "import subprocess, sys\ndef test_cli():\n    assert subprocess.run([sys.executable, '-m', 'tinydb']).returncode == 0\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "N6-shaped greenfield CLI plan".into(),
+        contracts: vec![
+            ContractFile { path: "tinydb/contract.py".into(), content: contract_src.into(), phase: 0 },
+            ContractFile { path: "tests/test_acceptance_contract.py".into(), content: test_src.into(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "{tinydb/btree.py,tests/test_btree.py}".into(),
+                brief: "Implement B-tree in `tinydb/btree.py` conforming to `BTreeProtocol`.".into(),
+                context: "Locked: `BTreeProtocol` and `StorageError` in `tinydb/contract.py`. Export `class BTree` from `tinydb/btree.py`. Sibling: `tinydb/storage.py` will import `BTree` from `tinydb.btree`.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "frontend".into(),
+                owned_glob: "{tinydb/tokenizer.py,tinydb/parser.py}".into(),
+                brief: "Implement lexer and parser using `Token` from `tinydb/contract.py`.".into(),
+                context: "In `tinydb/tokenizer.py`, export `tokenize(sql: str) -> list[Token]`. In `tinydb/parser.py`, export `parse(sql: str)`. Sibling: `tinydb/storage.py` is separate; never import `tinydb.btree`.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "storage".into(),
+                owned_glob: "tinydb/storage.py".into(),
+                brief: "Implement storage engine using `BTree`.".into(),
+                context: "Import `BTree` from `tinydb.btree` and `parse` from `tinydb.parser`. Export `class StorageEngine`.".into(),
+                depends_on: vec!["btree".into(), "frontend".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct Wave1Harness {
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for Wave1Harness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+            if task.brief.contains("Build unit `btree`") {
+                std::fs::write(
+                    task.cwd.join("tinydb/btree.py"),
+                    "from tinydb.contract import BTreeProtocol\nclass BTree(BTreeProtocol):\n    def insert(self, key, value): pass\n    def search(self, key): return None\n",
+                )?;
+            } else if task.brief.contains("Build unit `frontend`") {
+                std::fs::write(task.cwd.join("tinydb/tokenizer.py"), "def tokenize(sql: str):\n    return []\n")?;
+                std::fs::write(task.cwd.join("tinydb/parser.py"), "def parse(sql: str):\n    return []\n")?;
+            } else if task.brief.contains("Build unit `storage`") {
+                std::fs::write(
+                    task.cwd.join("tinydb/storage.py"),
+                    "from tinydb.btree import BTree\nclass StorageEngine:\n    pass\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(Wave1Harness { briefs: briefs.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let seen = briefs.lock().unwrap().clone();
+    let btree = seen.iter().find(|b| b.contains("Build unit `btree`")).expect("btree brief");
+    let frontend = seen.iter().find(|b| b.contains("Build unit `frontend`")).expect("frontend brief");
+    let storage = seen.iter().find(|b| b.contains("Build unit `storage`")).expect("storage brief");
+
+    // Shared prefix remains byte-identical across wave-1 and wave-2 units.
+    let (pre_b, post_b) = btree.split_once("--- Your task ---").unwrap();
+    let (pre_f, post_f) = frontend.split_once("--- Your task ---").unwrap();
+    let (pre_s, post_s) = storage.split_once("--- Your task ---").unwrap();
+    assert_eq!(pre_b, pre_f);
+    assert_eq!(pre_b, pre_s);
+
+    // BOTH wave-1 units received non-empty unit maps AFTER `--- Your task ---`!
+    assert!(post_b.contains("## Flow unit map (btree)"), "{post_b}");
+    assert!(post_b.contains("file tinydb/btree.py [planned]"), "{post_b}");
+    assert!(post_b.contains("contract BTreeProtocol"), "{post_b}");
+    assert!(post_b.contains("storage:storage.py ▸ imports btree:BTree [planned]"), "{post_b}");
+
+    assert!(post_f.contains("## Flow unit map (frontend)"), "{post_f}");
+    assert!(post_f.contains("file tinydb/tokenizer.py [planned]"), "{post_f}");
+    assert!(post_f.contains("tokenize [planned]"), "{post_f}");
+    assert!(post_f.contains("contract Token"), "{post_f}");
+    assert!(post_f.contains("storage:storage.py ▸ imports frontend:parse [planned]"), "{post_f}");
+
+    // Wave-2 unit sees btree/frontend flipped to built!
+    assert!(post_s.contains("## Flow unit map (storage)"), "{post_s}");
+    assert!(post_s.contains("btree:BTree") && post_s.contains("[built]"), "{post_s}");
+
+    // After run finishes, all planned symbols that landed have status Built with the exact same IDs.
+    let db = tm_flow::FlowDb::open_or_rebuild(&tmp.0).unwrap();
+    assert_eq!(db.get_node("py:tinydb/btree.py").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
+    assert_eq!(db.get_node("py:tinydb/btree.py#BTree").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
+    assert_eq!(db.get_node("py:tinydb/btree.py#BTree.insert").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
+}
+
+#[tokio::test]
+async fn flow_env_json_prepared_before_wave1_with_relative_paths_and_shared_venv_reuse() {
+    let tmp = seeded("flow-env-wave1");
+    let contract_test = "def test_ok():\n    assert True\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Python CLI with wave-1 shared env".into(),
+        contracts: vec![ContractFile {
+            path: "tests/test_smoke_contract.py".into(),
+            content: contract_test.into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "alpha".into(),
+                owned_glob: "pkg/alpha.py".into(),
+                brief: "Write pkg/alpha.py".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "beta".into(),
+                owned_glob: "pkg/beta.py".into(),
+                brief: "Write pkg/beta.py".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    #[derive(Clone)]
+    struct EarlyEnvCall {
+        brief: String,
+        env_exists: bool,
+        env_facts: Option<tm_flow::EnvFacts>,
+        shell: Option<tm_harness::ShellScope>,
+        sandbox_ran_python: bool,
+    }
+    let seen: Arc<Mutex<Vec<EarlyEnvCall>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct EarlyEnvHarness {
+        seen: Arc<Mutex<Vec<EarlyEnvCall>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for EarlyEnvHarness {
+        fn id(&self) -> &'static str {
+            "fake-early-env"
+        }
+        fn sandboxed_shell(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Inspect `.flow/env.json` directly inside the wave-1 worker's worktree!
+            let env_exists = task.cwd.join(".flow/env.json").is_file();
+            let env_facts = tm_flow::read_env(&task.cwd).ok().flatten();
+            // If bwrap is usable and TASKMASTER_SHARED_VENV is set, execute the shared venv python inside bwrap!
+            let mut sandbox_ran_python = false;
+            if tm_harness::sandbox::bwrap_usable()
+                && let Some(ref shell) = task.shell
+                && shell.env.iter().any(|(k, _)| k == "TASKMASTER_SHARED_VENV")
+            {
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()));
+                let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
+                let sh = std::fs::canonicalize("/bin/sh")?;
+                let cmd_str = r#""$TASKMASTER_SHARED_VENV/bin/python" -c "import sys; print(sys.prefix)""#;
+                let args = sandbox.bwrap_args_with(&sh, &["-c".into(), cmd_str.into()], &task.cwd, false, Some(shell));
+                let out = std::process::Command::new("bwrap").args(&args).output()?;
+                sandbox_ran_python = out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+            }
+            self.seen.lock().unwrap().push(EarlyEnvCall {
+                brief: task.brief.clone(),
+                env_exists,
+                env_facts,
+                shell: task.shell.clone(),
+                sandbox_ran_python,
+            });
+
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            if task.brief.contains("Build unit `alpha`") {
+                std::fs::write(task.cwd.join("pkg/alpha.py"), "def a():\n    return 1\n")?;
+            } else if task.brief.contains("Build unit `beta`") {
+                std::fs::write(task.cwd.join("pkg/beta.py"), "def b():\n    return 2\n")?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(EarlyEnvHarness { seen: seen.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.run_id = "env-early-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = true;
+    cfg.browser = false;
+
+    let out = tokio::time::timeout(Duration::from_secs(40), drive(cfg, harnesses))
+        .await
+        .expect("early env run timed out")
+        .unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let calls = seen.lock().unwrap().clone();
+    let alpha = calls.iter().find(|c| c.brief.contains("Build unit `alpha`")).expect("alpha call");
+    let beta = calls.iter().find(|c| c.brief.contains("Build unit `beta`")).expect("beta call");
+
+    // 1. `.flow/env.json` existed BEFORE wave-1 worker briefs were built!
+    assert!(alpha.env_exists, ".flow/env.json must already exist in wave-1 worker worktree");
+    assert!(beta.env_exists, ".flow/env.json must already exist in wave-1 worker worktree");
+    let env_on_disk = alpha.env_facts.as_ref().expect("env.json readable during wave 1");
+    assert_eq!(env_on_disk.runner, "pytest");
+
+    // 2. Every path committed in `.flow/env.json` is relative (no absolute machine paths!).
+    let committed_env = tm_flow::read_env(&tmp.0).unwrap().expect("committed .flow/env.json");
+    assert!(!committed_env.test_cmd.starts_with('/'), "test_cmd must be relative: {}", committed_env.test_cmd);
+    assert!(!committed_env.test_cmd.contains(&tmp.0.display().to_string()), "must not contain machine path: {}", committed_env.test_cmd);
+    if let Some(ref v) = committed_env.venv {
+        assert!(!std::path::Path::new(v).is_absolute(), "venv must be relative: {v}");
+    }
+    if let Some(ref py) = committed_env.python {
+        assert!(!std::path::Path::new(py).is_absolute(), "python must be relative: {py}");
+    }
+    if let Some(ref ic) = committed_env.install_cmd {
+        assert!(!ic.contains(&tmp.0.display().to_string()), "install_cmd must be relative: {ic}");
+    }
+
+    // 3. Shared prefix is byte-identical across wave-1 units AND carries the verified test environment hint.
+    let (pre_a, _) = alpha.brief.split_once("--- Your task ---").unwrap();
+    let (pre_b, _) = beta.brief.split_once("--- Your task ---").unwrap();
+    assert_eq!(pre_a, pre_b, "shared prefix must remain byte-identical across wave-1 units");
+    assert!(pre_a.contains("Verified test environment:"), "{pre_a}");
+    if committed_env.venv.is_some() {
+        assert!(pre_a.contains("do NOT create a new venv"), "{pre_a}");
+        let shell_a = alpha.shell.as_ref().expect("shell scope for alpha");
+        assert!(
+            shell_a.env.iter().any(|(k, _)| k == "TASKMASTER_SHARED_VENV"),
+            "TASKMASTER_SHARED_VENV must be exported to wave-1 workers: {:?}",
+            shell_a.env
+        );
+        if tm_harness::sandbox::bwrap_usable() {
+            assert!(alpha.sandbox_ran_python, "worker sandbox must be able to execute shared venv python");
+        }
+    }
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+}
+
+#[tokio::test]
+async fn flow_worker_brief_includes_harness_exact_flow_query_examples_for_every_harness() {
+    struct NamedHarness {
+        id: &'static str,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for NamedHarness {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/mod.py"), "def run_it() -> int:\n    return 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let cases: &[(&'static str, &str, &str, bool)] = &[
+        ("antigravity", "mcp_dictionary_flow_query", "mcp_dictionary_run_code", false),
+        ("claude", "mcp__dictionary__flow_query", "mcp__dictionary__run_code", false),
+        ("grok-build", "dictionary__flow_query", "dictionary__run_code", false),
+        ("opencode", "dictionary_flow_query", "dictionary_run_code", false),
+        ("codex", "flow_query", "run_code", false),
+        ("antigravity", "mcp_dictionary_flow_query", "mcp_dictionary_run_code", true),
+    ];
+
+    for (idx, &(hid, expected_flow, expected_run_code, code_mode)) in cases.iter().enumerate() {
+        let tmp = seeded(&format!("flow-guide-{hid}-{idx}"));
+        let p = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            summary: format!("Flow guide test for {hid}"),
+            pages: vec![PagePlan {
+                id: "core".into(),
+                owned_glob: "pkg/mod.py".into(),
+                brief: "Implement pkg/mod.py".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let briefs = Arc::new(Mutex::new(Vec::new()));
+        let h: Arc<dyn Harness> = Arc::new(NamedHarness { id: hid, briefs: briefs.clone() });
+        let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+        let mut cfg = config(&tmp.0, p, true, 1);
+        cfg.run_id = format!("flow-guide-{idx}");
+        cfg.checks = false;
+        cfg.runtime_checks = false;
+        cfg.code_mode = code_mode;
+        cfg.browser = false;
+
+        let out = drive(cfg, harnesses).await.unwrap();
+        assert_eq!(out, Outcome::Finished { ok: true }, "case {hid} (code_mode={code_mode})");
+
+        let captured = briefs.lock().unwrap().clone();
+        let brief = captured
+            .iter()
+            .find(|b| b.contains("Build unit `core`"))
+            .unwrap_or_else(|| panic!("missing worker brief for {hid}"));
+
+        // Must carry concrete examples using this harness's exact flow_query MCP tool name.
+        assert!(
+            brief.contains(&format!(r#"`{expected_flow}({{"op": "find""#)),
+            "expected find example with `{expected_flow}` for `{hid}`:\n{brief}"
+        );
+        assert!(
+            brief.contains(&format!(r#"`{expected_flow}({{"op": "neighbors""#)),
+            "expected neighbors example with `{expected_flow}` for `{hid}`:\n{brief}"
+        );
+        assert!(
+            brief.contains(&format!(r#"`{expected_flow}({{"op": "source""#)),
+            "expected source example with `{expected_flow}` for `{hid}`:\n{brief}"
+        );
+
+        if code_mode && crate::code::CodeTools::new(None).is_some() {
+            assert!(
+                brief.contains(expected_run_code),
+                "expected `{expected_run_code}` in Code Mode brief for `{hid}`:\n{brief}"
+            );
+            assert!(
+                brief.contains(r#"await flow("find""#)
+                    && brief.contains(r#"await flow("neighbors""#)
+                    && brief.contains(r#"await flow("source""#),
+                "expected concrete Code Mode flow() examples in brief for `{hid}`:\n{brief}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn flow_preinjected_context_included_for_existing_files_and_later_wave_within_budget() {
+    let tmp = seeded("flow-preinject");
+    // Brownfield repo with existing Python files committed BEFORE the run starts.
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/codec.py"),
+        "def encode_row(row: dict) -> bytes:\n    return str(row).encode()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/store.py"),
+        "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        return encode_row(row)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/api.py"),
+        "from pkg.store import StoreEngine\n\ndef handle_insert(engine: StoreEngine, row: dict) -> bytes:\n    return engine.persist_row(row)\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "existing brownfield code"]);
+
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Extend existing StoreEngine and add a wave-2 reporter".into(),
+        pages: vec![
+            PagePlan {
+                id: "store".into(),
+                owned_glob: "pkg/store.py".into(),
+                brief: "Update StoreEngine.persist_row to validate non-empty rows.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "codec".into(),
+                owned_glob: "pkg/codec.py".into(),
+                brief: "Update encode_row to use utf-8 explicitly.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "reporter".into(),
+                owned_glob: "pkg/reporter.py".into(),
+                brief: "Create pkg/reporter.py calling StoreEngine.persist_row to log saved rows.".into(),
+                depends_on: vec!["store".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct PreinjectHarness {
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for PreinjectHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            if task.brief.contains("Build unit `store`") {
+                std::fs::write(
+                    task.cwd.join("pkg/store.py"),
+                    "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        if not row:\n            raise ValueError('empty')\n        return encode_row(row)\n",
+                )?;
+            } else if task.brief.contains("Build unit `codec`") {
+                std::fs::write(
+                    task.cwd.join("pkg/codec.py"),
+                    "def encode_row(row: dict) -> bytes:\n    return str(row).encode('utf-8')\n",
+                )?;
+            } else if task.brief.contains("Build unit `reporter`") {
+                std::fs::write(
+                    task.cwd.join("pkg/reporter.py"),
+                    "from pkg.store import StoreEngine\n\ndef report_insert(engine: StoreEngine, row: dict) -> int:\n    return len(engine.persist_row(row))\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(PreinjectHarness { briefs: briefs.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.run_id = "flow-preinject-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let out = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let all = briefs.lock().unwrap().clone();
+    let store_b = all.iter().find(|b| b.contains("Build unit `store`")).expect("store brief");
+    let codec_b = all.iter().find(|b| b.contains("Build unit `codec`")).expect("codec brief");
+    let reporter_b = all.iter().find(|b| b.contains("Build unit `reporter`")).expect("reporter brief");
+
+    // 1. Shared prefix stays byte-identical across wave-1 units (pre-injected context is strictly after `--- Your task ---`).
+    let (pre_store, task_store) = store_b.split_once("--- Your task ---").unwrap();
+    let (pre_codec, task_codec) = codec_b.split_once("--- Your task ---").unwrap();
+    let (_, task_reporter) = reporter_b.split_once("--- Your task ---").unwrap();
+    assert_eq!(pre_store, pre_codec, "wave-1 shared prefixes must remain byte-identical");
+    assert!(!pre_store.contains("## Pre-injected flow context"), "pre-injected context must not enter shared prefix");
+
+    // 2. Unit `store` (editing existing file) gets pre-injected node + 1-hop neighbors + callers.
+    assert!(task_store.contains("## Pre-injected flow context (existing code)"), "{task_store}");
+    assert!(task_store.contains("node py:pkg/store.py#StoreEngine.persist_row"), "{task_store}");
+    assert!(task_store.contains("callers:") && task_store.contains("handle_insert"), "expected callers in store brief:\n{task_store}");
+    assert!(task_store.contains("neighbors(1-hop):") && task_store.contains("encode_row"), "expected 1-hop neighbors in store brief:\n{task_store}");
+
+    // 3. Unit `codec` (editing existing file) also gets pre-injected node + callers (`StoreEngine.persist_row`).
+    assert!(task_codec.contains("## Pre-injected flow context (existing code)"), "{task_codec}");
+    assert!(task_codec.contains("node py:pkg/codec.py#encode_row"), "{task_codec}");
+    assert!(task_codec.contains("callers:") && task_codec.contains("StoreEngine.persist_row"), "{task_codec}");
+
+    // 4. Wave-2 unit `reporter` (new file referencing wave-1 built symbol) gets pre-injected context too.
+    assert!(task_reporter.contains("## Pre-injected flow context (existing code)"), "{task_reporter}");
+    assert!(task_reporter.contains("node py:pkg/store.py#StoreEngine.persist_row"), "{task_reporter}");
+    assert!(task_reporter.contains("callers:") && task_reporter.contains("handle_insert"), "{task_reporter}");
+
+    // 5. Combined flow map + pre-injected context stays within DEFAULT_UNIT_MAP_BUDGET.
+    let map_start = task_store.find("## Flow unit map (store)").expect("unit map in store brief");
+    let tail = &task_store[map_start..];
+    let end = tail.find("\nYour files that exist now:").unwrap_or(tail.len());
+    assert!(
+        end <= tm_flow::DEFAULT_UNIT_MAP_BUDGET + 4,
+        "combined unit_map + pre-injected context ({end} bytes) exceeded budget {}",
+        tm_flow::DEFAULT_UNIT_MAP_BUDGET
+    );
+}
+
+#[tokio::test]
+async fn flow_audit_mcp_tool_listed_and_callable_code_mode_off_and_on() {
+    fn mcp_rpc(url: &str, token: &str, body: serde_json::Value) -> serde_json::Value {
+        let resp = ureq::post(url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_json(body)
+            .expect("HTTP POST /mcp failed");
+        assert_eq!(resp.status(), 200);
+        resp.into_json().expect("invalid MCP JSON reply")
+    }
+
+    #[derive(Clone, Default)]
+    struct McpProbeLog {
+        worker_tools: Vec<String>,
+        flow_query_replies: Vec<(String, String)>,
+        run_code_flow_reply: Option<String>,
+        reviewer_tools: Vec<String>,
+        reviewer_flow_reply: Option<String>,
+        reviewer_brief: Option<String>,
+    }
+
+    struct LiveMcpHarness {
+        log: Arc<Mutex<McpProbeLog>>,
+        code_mode: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for LiveMcpHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let dict = task.dictionary.clone().expect("every worker/reviewer must receive DictionaryAccess");
+            let url = dict.url.clone();
+            let tok = dict.bearer_token.clone();
+            let is_reviewer = task.read_only;
+            let code_mode = self.code_mode;
+            let probe = tokio::task::spawn_blocking(move || {
+                let init = mcp_rpc(
+                    &url,
+                    &tok,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": { "protocolVersion": "2025-11-25" }
+                    }),
+                );
+                assert!(init["result"]["serverInfo"]["name"].as_str().is_some(), "{init}");
+
+                let listed = mcp_rpc(&url, &tok, serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
+                let names: Vec<String> = listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|t| t["name"].as_str().map(str::to_string))
+                    .collect();
+
+                let mut replies = Vec::new();
+                for tool_name in [
+                    "flow_query",
+                    "mcp_dictionary_flow_query",
+                    "mcp__dictionary__flow_query",
+                    "dictionary__flow_query",
+                    "dictionary_flow_query",
+                ] {
+                    let res = mcp_rpc(
+                        &url,
+                        &tok,
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": { "name": tool_name, "arguments": { "op": "find", "query": "Greeter" } }
+                        }),
+                    );
+                    assert_eq!(res["result"]["isError"], false, "{tool_name}: {res}");
+                    let txt = res["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
+                    replies.push((tool_name.to_string(), txt));
+                }
+
+                // Also exercise `node`, `neighbors`, and `source` via `flow_query`.
+                let node_res = mcp_rpc(
+                    &url,
+                    &tok,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                        "params": { "name": "flow_query", "arguments": { "op": "node", "id": "py:pkg/contract.py#Greeter" } }
+                    }),
+                );
+                assert_eq!(node_res["result"]["isError"], false, "{node_res}");
+                let src_res = mcp_rpc(
+                    &url,
+                    &tok,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                        "params": { "name": "flow_query", "arguments": { "op": "source", "id": "py:pkg/contract.py#Greeter" } }
+                    }),
+                );
+                assert_eq!(src_res["result"]["isError"], false, "{src_res}");
+                assert!(
+                    src_res["result"]["content"][0]["text"].as_str().unwrap_or("").contains("class Greeter"),
+                    "{src_res}"
+                );
+
+                let mut rc_reply = None;
+                if code_mode && names.iter().any(|n| n == "run_code") {
+                    let script = r#"
+                        const f = await flow("find", { query: "Greeter" });
+                        const s = await flow("source", { id: "py:pkg/contract.py#Greeter" });
+                        return { count: f.nodes.length, hasClass: s.code.includes("class Greeter") };
+                    "#;
+                    let rc = mcp_rpc(
+                        &url,
+                        &tok,
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                            "params": { "name": "mcp_dictionary_run_code", "arguments": { "code": script } }
+                        }),
+                    );
+                    assert_eq!(rc["result"]["isError"], false, "run_code flow() failed (read_only={is_reviewer}): {rc}");
+                    rc_reply = Some(rc["result"]["content"][0]["text"].as_str().unwrap_or("").to_string());
+                }
+                (names, replies, rc_reply)
+            })
+            .await?;
+
+            {
+                let mut g = self.log.lock().unwrap();
+                if is_reviewer {
+                    g.reviewer_tools = probe.0;
+                    g.reviewer_flow_reply = probe.2.or_else(|| probe.1.first().map(|(_, t)| t.clone()));
+                    g.reviewer_brief = Some(task.brief.clone());
+                } else {
+                    g.worker_tools = probe.0;
+                    g.flow_query_replies = probe.1;
+                    g.run_code_flow_reply = probe.2;
+                }
+            }
+
+            if !is_reviewer {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(
+                    task.cwd.join("pkg/impl.py"),
+                    "from pkg.contract import Greeter\n\nclass RealGreeter(Greeter):\n    def hello(self) -> str:\n        return 'hi'\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            } else {
+                let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let has_node = crate::code::CodeTools::new(None).is_some();
+    for code_mode in [false, true] {
+        let tmp = seeded(&format!("flow-audit-mcp-cm-{code_mode}"));
+        let p = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            summary: "Verify live MCP flow_query in Code Mode off and on".into(),
+            contracts: vec![ContractFile {
+                path: "pkg/contract.py".into(),
+                content: "from typing import Protocol\n\nclass Greeter(Protocol):\n    def hello(self) -> str: ...\n".into(),
+                phase: 0,
+            }],
+            pages: vec![PagePlan {
+                id: "impl".into(),
+                owned_glob: "pkg/impl.py".into(),
+                brief: "Implement Greeter in pkg/impl.py".into(),
+                cites: vec!["greet_api".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dict_dir = tmp.0.join(".taskmaster/dictionary");
+        tm_dictionary::LocalStore::open(&dict_dir)
+            .unwrap()
+            .publish("greet_api", tm_core::EntryKind::Hint, "greeter", "Greeter.hello() -> str", "py")
+            .unwrap();
+
+        let log = Arc::new(Mutex::new(McpProbeLog::default()));
+        let h: Arc<dyn Harness> = Arc::new(LiveMcpHarness { log: log.clone(), code_mode });
+        let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+        let mut cfg = config(&tmp.0, p, true, 1);
+        cfg.run_id = format!("mcp-cm-{code_mode}");
+        cfg.checks = false;
+        cfg.runtime_checks = false;
+        cfg.code_mode = code_mode;
+        cfg.browser = false;
+
+        let out = drive(cfg, harnesses).await.unwrap();
+        assert_eq!(out, Outcome::Finished { ok: true });
+
+        let probed = log.lock().unwrap().clone();
+        assert!(
+            probed.worker_tools.iter().any(|t| t == "flow_query"),
+            "flow_query must be listed for workers (code_mode={code_mode}): {:?}",
+            probed.worker_tools
+        );
+        if !code_mode {
+            assert!(!probed.worker_tools.iter().any(|t| t == "run_code"));
+        } else if has_node {
+            assert!(probed.worker_tools.iter().any(|t| t == "run_code"));
+            let rc = probed.run_code_flow_reply.as_deref().unwrap_or("");
+            assert!(rc.contains("\"hasClass\": true"), "worker Code Mode flow() failed: {rc}");
+        }
+        assert_eq!(probed.flow_query_replies.len(), 5);
+        for (name, txt) in &probed.flow_query_replies {
+            assert!(txt.contains("py:pkg/contract.py#Greeter"), "{name} returned: {txt}");
+        }
+        // Reviewer also got flow_query (and read-only run_code flow() when code_mode=true) and its diff excluded `.flow/`.
+        if !probed.reviewer_tools.is_empty() {
+            assert!(probed.reviewer_tools.iter().any(|t| t == "flow_query"));
+            if code_mode && has_node {
+                assert!(probed.reviewer_tools.iter().any(|t| t == "run_code"));
+                assert!(probed.reviewer_flow_reply.as_deref().unwrap_or("").contains("\"hasClass\": true"));
+            }
+            if let Some(ref rb) = probed.reviewer_brief {
+                assert!(
+                    !rb.contains("diff --git a/.flow/"),
+                    "review_prefix diff must exclude `.flow/` noise:\n{rb}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn flow_audit_staleness_gate_repairs_and_emits_flow_stale_event_in_run() {
+    let tmp = seeded("flow-audit-stale");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Verify staleness gate detects tampering, repairs, and emits flow_stale".into(),
+        pages: vec![
+            PagePlan {
+                id: "alpha".into(),
+                owned_glob: "pkg/alpha.py".into(),
+                brief: "Write pkg/alpha.py".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "beta".into(),
+                owned_glob: "pkg/beta.py".into(),
+                brief: "Write pkg/beta.py".into(),
+                depends_on: vec!["alpha".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct TamperHarness {
+        project: PathBuf,
+        run_id: String,
+    }
+    #[async_trait::async_trait]
+    impl Harness for TamperHarness {
+        fn id(&self) -> &'static str {
+            "fake-stale"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            if task.brief.contains("Build unit `alpha`") {
+                std::fs::write(task.cwd.join("pkg/alpha.py"), "def alpha_fn() -> int:\n    return 1\n")?;
+            } else if task.brief.contains("Build unit `beta`") {
+                std::fs::write(task.cwd.join("pkg/beta.py"), "def beta_fn() -> int:\n    return 2\n")?;
+                // Tamper with alpha's shard in the run's live branch worktree so the staleness gate catches it!
+                let tree = crate::git::worktree_dir(&self.project, &self.run_id, "tree");
+                let shard = tree.join(".flow/files/pkg/alpha.py.json");
+                if shard.is_file() {
+                    let raw = std::fs::read_to_string(&shard)?;
+                    let mut v: serde_json::Value = serde_json::from_str(&raw)?;
+                    v["blob"] = serde_json::json!("0000000000000000000000000000000000000000");
+                    std::fs::write(&shard, serde_json::to_string_pretty(&v)?)?;
+                }
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(TamperHarness {
+        project: tmp.0.clone(),
+        run_id: "stale-gate-1".into(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::new(
+        tmp.0.join(".taskmaster/runs"),
+    ))));
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.run_id = "stale-gate-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    cfg.live = Some(live.clone());
+
+    let out = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let (_, entries) = live.read("stale-gate-1", 0);
+    let stale_ev = entries
+        .iter()
+        .find(|e| e["kind"].as_str() == Some("flow_stale"))
+        .unwrap_or_else(|| panic!("expected flow_stale event in live transcript; got: {entries:?}"));
+    assert!(stale_ev["count"].as_u64().unwrap_or(0) >= 1, "{stale_ev}");
+    let paths: Vec<&str> = stale_ev["paths"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(paths.contains(&"pkg/alpha.py"), "expected pkg/alpha.py in flow_stale paths: {stale_ev}");
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "post-run .flow must be 100% fresh");
+}
+
+#[tokio::test]
+async fn flow_audit_commit_paths_flag_repair_and_race_merge() {
+    // 1. Flag amendment (`arbitrate`) + unowned repair (`repair_unowned`) keep `.flow` fresh.
+    let tmp = seeded("flow-audit-commits");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Exercise flag amendment and unowned repair commit paths".into(),
+        pages: vec![PagePlan {
+            id: "core".into(),
+            owned_glob: "pkg/core.py".into(),
+            brief: "Write pkg/core.py".into(),
+            cites: vec!["api_rule".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let dict_dir = tmp.0.join(".taskmaster/dictionary");
+    tm_dictionary::LocalStore::open(&dict_dir)
+        .unwrap()
+        .publish("api_rule", tm_core::EntryKind::Hint, "old rule", "return 1", "py")
+        .unwrap();
+
+    // Seed an unowned failing test and a passing unit test so `verify_project` triggers
+    // `repair_unowned`, a broken first repair triggers `rollback`, and the second repair succeeds!
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_unowned.py"),
+        "from pkg.helper import VALUE\ndef test_val():\n    assert VALUE == 42\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_core_check.py"),
+        "from pkg.core import core_val\ndef test_core():\n    assert core_val() == 2\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/helper.py"), "VALUE = 0\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "seed unowned failing helper"]);
+
+    struct FlagAndRepairHarness {
+        flagged: std::sync::atomic::AtomicBool,
+        repair_attempt: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Harness for FlagAndRepairHarness {
+        fn id(&self) -> &'static str {
+            "fake-commits"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("objected to Dictionary entry") {
+                let reply = r#"{"resolution":"amended","kind":"hint","summary":"new rule","content":"return 2","stack":"py"}"#;
+                let _ = events.send(HarnessEvent::Text { text: reply.into() }).await;
+            } else if task.brief.contains("names no file any unit owns") {
+                let attempt = self.repair_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    // Break owned `pkg/core.py` with an exception whose traceback names `pkg/core.py`,
+                    // so Taskmaster attributes the failure to unit `core` and rolls back the repair.
+                    std::fs::write(task.cwd.join("pkg/core.py"), "def core_val() -> int:\n    raise ValueError('broken')\n")?;
+                    std::fs::write(task.cwd.join("pkg/helper.py"), "VALUE = 42\n")?;
+                } else {
+                    std::fs::write(task.cwd.join("pkg/helper.py"), "VALUE = 42\n")?;
+                }
+                let _ = events.send(HarnessEvent::Text { text: "fixed helper".into() }).await;
+            } else if task.brief.contains("Build unit `core`") {
+                if !self.flagged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = events
+                        .send(HarnessEvent::Text {
+                            text: r#"{"flag":{"key":"api_rule","issue":"should return 2"}}"#.into(),
+                        })
+                        .await;
+                } else {
+                    std::fs::write(task.cwd.join("pkg/core.py"), "def core_val() -> int:\n    return 2\n")?;
+                    let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+                }
+            } else {
+                let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(FlagAndRepairHarness {
+        flagged: std::sync::atomic::AtomicBool::new(false),
+        repair_attempt: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.run_id = "audit-commits-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let out = tokio::time::timeout(Duration::from_secs(40), drive(cfg, harnesses))
+        .await
+        .expect("commits audit run timed out")
+        .unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(std::fs::read_to_string(tmp.0.join("pkg/helper.py")).unwrap(), "VALUE = 42\n");
+    assert!(
+        std::fs::read_to_string(tmp.0.join("pkg/core.py")).unwrap().contains("return 2"),
+        "rollback must have restored pkg/core.py"
+    );
+    assert!(log(&tmp.0).contains("roll back a repair that broke core"), "expected rollback commit in log:\n{}", log(&tmp.0));
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "after flag + rollback + repair_unowned, .flow must be fresh");
+    assert!(
+        !git_out(&tmp.0, &["ls-files", ".flow"]).contains("index.sqlite"),
+        "index.sqlite must never be committed"
+    );
+
+    // 2. `race::merge_winner` refreshes `.flow/` when merging a winning branch on top of another commit.
+    let tmp_race = seeded("flow-audit-race");
+    crate::git::ensure_exclude(&tmp_race.0).unwrap();
+    std::fs::create_dir_all(tmp_race.0.join("pkg")).unwrap();
+    std::fs::write(tmp_race.0.join("pkg/base.py"), "def base() -> int:\n    return 1\n").unwrap();
+    tm_flow::build(&tmp_race.0).unwrap();
+    git(&tmp_race.0, &["add", "."]);
+    git(&tmp_race.0, &["commit", "-q", "-m", "base with flow"]);
+
+    let base_sha = git_out(&tmp_race.0, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&tmp_race.0, &["checkout", "-q", "-b", "taskmaster/race-win"]);
+    std::fs::write(tmp_race.0.join("pkg/winner.py"), "def won() -> int:\n    return 7\n").unwrap();
+    tm_flow::update_files(&tmp_race.0, &["pkg/winner.py".into()]).unwrap();
+    git(&tmp_race.0, &["add", "."]);
+    git(&tmp_race.0, &["commit", "-q", "-m", "winner work"]);
+
+    // Advance main with a conflicting `.flow/meta.json` and another file!
+    git(&tmp_race.0, &["checkout", "-q", "-"]);
+    std::fs::write(tmp_race.0.join("pkg/other.py"), "def other() -> int:\n    return 9\n").unwrap();
+    tm_flow::update_files(&tmp_race.0, &["pkg/other.py".into()]).unwrap();
+    git(&tmp_race.0, &["add", "."]);
+    git(&tmp_race.0, &["commit", "-q", "-m", "main moved"]);
+
+    let records = Records::files(&tmp_race.0);
+    records
+        .save_meta(
+            "race-win",
+            &crate::store::Meta {
+                parallel: 1,
+                branch: Some("taskmaster/race-win".into()),
+                base: Some(base_sha),
+                template: None,
+                focused: false,
+            },
+        )
+        .unwrap();
+    let live = crate::live::Live::new(records.store().clone());
+    let _commit = crate::race::merge_winner(&tmp_race.0, &records, &live, "race-win").unwrap();
+    assert!(
+        tm_flow::verify_all(&tmp_race.0).unwrap().is_empty(),
+        "race::merge_winner must refresh `.flow/` so both main and winner shards are present and fresh"
+    );
+    let q = tm_flow::FlowQuery::open(&tmp_race.0).unwrap();
+    assert!(q.node("py:pkg/winner.py#won").unwrap().is_some());
+    assert!(q.node("py:pkg/other.py#other").unwrap().is_some());
+    assert!(!git_out(&tmp_race.0, &["ls-files", ".flow"]).contains("index.sqlite"));
+    assert_eq!(git_out(&tmp_race.0, &["status", "--porcelain"]).trim(), "");
+}
+
+#[tokio::test]
+async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
+    let tmp = seeded("flow-audit-brownfield");
+    // Existing brownfield code committed BEFORE Run 1 starts.
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/base.py"), "def base_val() -> int:\n    return 10\n").unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/service.py"),
+        "from pkg.base import base_val\n\ndef compute() -> int:\n    return base_val() + 1\n",
+    )
+    .unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "initial brownfield code"]);
+
+    let plan1 = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Brownfield run 1 with template, cancel, and resume".into(),
+        contracts: vec![ContractFile {
+            path: "tests/test_bf.py".into(),
+            content: "from pkg.service import compute\nfrom pkg.extra import extra_val\ndef test_all():\n    assert compute() == 12\n    assert extra_val() == 24\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "service".into(),
+                owned_glob: "pkg/service.py".into(),
+                brief: "Update compute() to return base_val() + 2".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "extra".into(),
+                owned_glob: "pkg/extra.py".into(),
+                brief: "Create pkg/extra.py calling compute() from pkg.service to return compute() * 2".into(),
+                depends_on: vec!["service".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let fail_extra = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let seen_briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct BrownfieldHarness {
+        fail_extra: Arc<std::sync::atomic::AtomicBool>,
+        seen_briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for BrownfieldHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen_briefs.lock().unwrap().push(task.brief.clone());
+            if task.brief.contains("Build unit `service`") {
+                std::fs::write(
+                    task.cwd.join("pkg/service.py"),
+                    "from pkg.base import base_val\n\ndef compute() -> int:\n    return base_val() + 2\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+                return Ok(RunSummary {
+                    ok: true,
+                    usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                    cost_usd: Some(0.0),
+                    denied: 0,
+                    freed: None,
+                    requests: None,
+                });
+            }
+            if task.brief.contains("Build unit `extra`") {
+                if self.fail_extra.load(std::sync::atomic::Ordering::SeqCst) {
+                    anyhow::bail!("simulated cancel during wave 2");
+                }
+                std::fs::write(
+                    task.cwd.join("pkg/extra.py"),
+                    "from pkg.service import compute\n\ndef extra_val() -> int:\n    return compute() * 2\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+                return Ok(RunSummary {
+                    ok: true,
+                    usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                    cost_usd: Some(0.0),
+                    denied: 0,
+                    freed: None,
+                    requests: None,
+                });
+            }
+            let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+
+    let make_harnesses = || {
+        let h: Arc<dyn Harness> = Arc::new(BrownfieldHarness {
+            fail_extra: fail_extra.clone(),
+            seen_briefs: seen_briefs.clone(),
+        });
+        Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h }
+    };
+
+    let tmpl_dir = std::env::temp_dir().join(format!("tm-bf-tmpl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmpl_dir);
+    std::fs::create_dir_all(tmpl_dir.join("pkg")).unwrap();
+    std::fs::write(tmpl_dir.join("pkg/__init__.py"), "VERSION = '1.0'\n").unwrap();
+
+    // Pass 1: Run 1 builds unit `service` (with template file), then fails/cancels on wave-2 `extra`.
+    let mut cfg1 = config(&tmp.0, plan1.clone(), true, 1);
+    cfg1.run_id = "bf-run-1".into();
+    cfg1.checks = false;
+    cfg1.runtime_checks = true;
+    cfg1.code_mode = false;
+    cfg1.browser = false;
+    cfg1.template = Some(tmpl_dir.display().to_string());
+    let res1 = tokio::time::timeout(Duration::from_secs(40), drive(cfg1, make_harnesses()))
+        .await
+        .expect("bf pass 1 timed out");
+    assert!(res1.is_err(), "expected simulated cancel failure on wave 2");
+    // Branch exists and has no `index.sqlite` tracked; main checkout is still clean and untouched.
+    assert!(git_out(&tmp.0, &["branch", "--list", "taskmaster/bf-run-1"]).contains("bf-run-1"));
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(
+        !git_out(&tmp.0, &["ls-tree", "-r", "--name-only", "taskmaster/bf-run-1", ".flow"]).contains("index.sqlite")
+    );
+
+    // Pass 2: Resume Run 1 cleanly with `resume_cancelled = true` -> wave-2 `extra` completes & merges!
+    fail_extra.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut cfg1_resume = config(&tmp.0, plan1, true, 1);
+    cfg1_resume.run_id = "bf-run-1".into();
+    cfg1_resume.resume_cancelled = true;
+    cfg1_resume.checks = false;
+    cfg1_resume.runtime_checks = true;
+    cfg1_resume.code_mode = false;
+    cfg1_resume.browser = false;
+    let out1 = tokio::time::timeout(Duration::from_secs(40), drive(cfg1_resume, make_harnesses()))
+        .await
+        .expect("bf resume timed out")
+        .unwrap();
+    assert_eq!(out1, Outcome::Finished { ok: true });
+
+    // Check every committed `.flow` artifact after Run 1 lands.
+    let flow_tracked = git_out(&tmp.0, &["ls-files", ".flow"]);
+    assert!(flow_tracked.contains(".flow/.gitignore"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/meta.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/plan.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/env.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/__init__.py.json"), "template file must be sharded: {flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/base.py.json"), "brownfield file must be sharded: {flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/service.py.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/extra.py.json"), "{flow_tracked}");
+    assert!(!flow_tracked.contains("index.sqlite"), "index.sqlite must NEVER be committed: {flow_tracked}");
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "post-merge `.flow` must be 100% fresh");
+
+    // Verify resumed wave-2 unit `extra` received both unit map + pre-injected context + verified env hint!
+    let briefs = seen_briefs.lock().unwrap().clone();
+    let extra_brief = briefs.iter().rev().find(|b| b.contains("Build unit `extra`")).expect("extra brief");
+    let (pre_extra, task_extra) = extra_brief.split_once("--- Your task ---").unwrap();
+    assert!(pre_extra.contains("Verified test environment:"), "resumed run must restore env_hint:\n{pre_extra}");
+    assert!(task_extra.contains("## Flow unit map (extra)"), "{task_extra}");
+    assert!(task_extra.contains("## Pre-injected flow context (existing code)"), "{task_extra}");
+    assert!(task_extra.contains("py:pkg/service.py#compute"), "{task_extra}");
+
+    // Run 2 on top of Run 1: modifies existing brownfield `pkg/service.py` to add `v2_helper`.
+    let plan2 = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Brownfield run 2 adding v2_helper".into(),
+        pages: vec![PagePlan {
+            id: "service2".into(),
+            owned_glob: "pkg/service.py".into(),
+            brief: "Add v2_helper() to pkg/service.py".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    struct Run2Harness;
+    #[async_trait::async_trait]
+    impl Harness for Run2Harness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::write(
+                task.cwd.join("pkg/service.py"),
+                "from pkg.base import base_val\n\ndef compute() -> int:\n    return base_val() + 2\n\ndef v2_helper() -> int:\n    return 99\n",
+            )?;
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+                requests: None,
+            })
+        }
+    }
+    let h2: Arc<dyn Harness> = Arc::new(Run2Harness);
+    let harnesses2 = Harnesses { master: h2.clone(), mid: h2.clone(), worker: h2.clone(), reviewer: h2.clone(), verifier: h2 };
+    let mut cfg2 = config(&tmp.0, plan2, true, 1);
+    cfg2.run_id = "bf-run-2".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    let out2 = drive(cfg2, harnesses2).await.unwrap();
+    assert_eq!(out2, Outcome::Finished { ok: true });
+    assert!(tm_flow::FlowQuery::open(&tmp.0).unwrap().node("py:pkg/service.py#v2_helper").unwrap().is_some());
+
+    // Undo Run 2 (brownfield undo where `.flow/meta.json` STILL exists): SQLite must immediately drop `v2_helper`!
+    let records = Records::files(&tmp.0);
+    let u2 = crate::undo::undo_run(&tmp.0, &records, "bf-run-2").unwrap();
+    assert!(matches!(u2, crate::undo::Undo::Done { .. }), "{u2:?}");
+    assert!(
+        tm_flow::FlowQuery::open(&tmp.0).unwrap().node("py:pkg/service.py#v2_helper").unwrap().is_none(),
+        "stale v2_helper symbol must not remain in `.flow/index.sqlite` after brownfield undo"
+    );
+    assert!(tm_flow::FlowQuery::open(&tmp.0).unwrap().node("py:pkg/extra.py#extra_val").unwrap().is_some());
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty());
+
+    // Undo Run 1 (removes `.flow/meta.json` completely): `.flow/` and derived `index.sqlite` must be cleaned up!
+    let u1 = crate::undo::undo_run(&tmp.0, &records, "bf-run-1").unwrap();
+    assert!(matches!(u1, crate::undo::Undo::Done { .. }), "{u1:?}");
+    assert!(!tmp.0.join(".flow").exists(), "empty `.flow/` and derived index.sqlite must be removed after full undo");
+    assert!(tmp.0.join("pkg/base.py").is_file(), "pre-existing brownfield file must stay intact");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    let _ = std::fs::remove_dir_all(&tmpl_dir);
+}
+
+#[tokio::test]
+async fn tok1_instrumentation_logs_mcp_replies_requests_and_separates_synthetic_diffs() {
+    let tmp = seeded("tok1-instr");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp.0.join("pkg/base.py"), "def base_val() -> int:\n    return 7\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "init"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "instrumented run".into(),
+        contracts: vec![],
+        pages: vec![PagePlan {
+            id: "svc".into(),
+            owned_glob: "pkg/svc.py".into(),
+            brief: "create svc".into(),
+            done: "svc exists".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct InstrHarness;
+    #[async_trait]
+    impl Harness for InstrHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Simulate calling MCP `flow_query` and `index` against the live daemon MCP server.
+            if let Some(dict) = task.dictionary.clone() {
+                tokio::task::spawn_blocking(move || {
+                    for (id, name, args) in [
+                        (1, "mcp_dictionary_flow_query", serde_json::json!({ "op": "find", "query": "base_val" })),
+                        (2, "mcp_dictionary_index", serde_json::json!({})),
+                    ] {
+                        let resp: serde_json::Value = ureq::post(&dict.url)
+                            .set("Authorization", &format!("Bearer {}", dict.bearer_token))
+                            .set("Content-Type", "application/json")
+                            .send_json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "tools/call",
+                                "params": { "name": name, "arguments": args }
+                            }))
+                            .expect("MCP POST failed")
+                            .into_json()
+                            .expect("invalid MCP JSON");
+                        assert!(resp["result"]["content"].is_array(), "MCP call {name} failed: {resp}");
+                    }
+                })
+                .await?;
+            }
+            // Emit a synthetic write_file diff (ToolDiff) and a real command output (ToolResult).
+            let _ = events
+                .send(HarnessEvent::ToolCall {
+                    id: "c_write".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "pkg/svc.py" }),
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolDiff {
+                    id: "c_write".into(),
+                    diff: "--- a/pkg/svc.py\n+++ b/pkg/svc.py\n+def f(): return 1\n".into(),
+                    synthetic: true,
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolCall {
+                    id: "c_cmd".into(),
+                    name: "run_command".into(),
+                    input: serde_json::json!({ "CommandLine": "echo ok" }),
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolResult {
+                    id: "c_cmd".into(),
+                    text: "ok\n".into(),
+                    diff: None,
+                })
+                .await;
+            std::fs::write(task.cwd.join("pkg/svc.py"), "def f() -> int:\n    return 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:svc\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 500, output: 120, cache_read: 200, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+                requests: Some(3),
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(InstrHarness);
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "tok1-run".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    let out = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let records = Records::files(&tmp.0);
+    let ledger = records.ledger("tok1-run").unwrap();
+    let worker_row = ledger.iter().find(|e| e.page.as_deref() == Some("svc")).expect("worker ledger row");
+    assert_eq!(worker_row.requests, Some(3));
+    assert_eq!(worker_row.mcp_calls, Some(2));
+    assert!(worker_row.mcp_reply_bytes.unwrap_or(0) > 10, "expected nonzero mcp_reply_bytes: {worker_row:?}");
+
+    let raw_agents = std::fs::read_to_string(tmp.0.join(".taskmaster/runs/tok1-run/agents.jsonl")).unwrap();
+    let entries: Vec<serde_json::Value> = raw_agents.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+
+    let mcp_replies: Vec<&serde_json::Value> = entries.iter().filter(|e| e["kind"] == "mcp_reply").collect();
+    assert_eq!(mcp_replies.len(), 2, "expected 2 mcp_reply entries, got: {mcp_replies:#?}");
+    assert!(mcp_replies.iter().any(|e| e["tool"] == "flow_query" && e["reply_bytes"].as_u64().unwrap_or(0) > 0));
+    assert!(mcp_replies.iter().any(|e| e["tool"] == "index" && e["reply_bytes"].as_u64().unwrap_or(0) > 0));
+
+    let tool_diffs: Vec<&serde_json::Value> = entries.iter().filter(|e| e["kind"] == "tool_diff").collect();
+    assert_eq!(tool_diffs.len(), 1, "synthetic diff must be logged as kind=tool_diff");
+    assert_eq!(tool_diffs[0]["synthetic"], true);
+    let worker_outputs: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["kind"] == "output" && e["agent"]["id"] != "runtime")
+        .collect();
+    assert_eq!(worker_outputs.len(), 1, "only real ToolResult should be logged as kind=output: {worker_outputs:#?}");
+    assert_eq!(worker_outputs[0]["id"], "c_cmd");
+
+    let end = entries.iter().find(|e| e["kind"] == "end").expect("end entry");
+    assert_eq!(end["requests"], 3);
+    assert_eq!(end["tool_calls"], 2);
+    assert_eq!(end["mcp_calls"], 2);
+    assert_eq!(end["mcp_reply_bytes"].as_u64(), worker_row.mcp_reply_bytes);
+}
+
+#[test]
+fn tok3_expand_glob_in_worktree_handles_braces_prefix_and_plain() {
+    let wt = Path::new("/tmp/wt-demo");
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "{pkg/a.py,tests/test_a.py}"),
+        vec!["/tmp/wt-demo/pkg/a.py", "/tmp/wt-demo/tests/test_a.py"]
+    );
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "pkg/{a.py,b.py}"),
+        vec!["/tmp/wt-demo/pkg/a.py", "/tmp/wt-demo/pkg/b.py"]
+    );
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "./pkg/solo.py"),
+        vec!["/tmp/wt-demo/pkg/solo.py"]
+    );
+    assert_eq!(
+        crate::engine::expand_glob_in_worktree(wt, "pkg/**"),
+        vec!["/tmp/wt-demo/pkg/**"]
+    );
+}
+
+#[tokio::test]
+async fn tok3_antigravity_non_code_mode_worker_gets_absolute_worktree_paths_and_hygiene_rules() {
+    let tmp = seeded("tok3-paths");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp.0.join("pkg/a.py"), "X = 1\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "init"]);
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan {
+                id: "alpha".into(),
+                owned_glob: "{pkg/a.py,tests/test_a.py}".into(),
+                brief: "Implement alpha.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "beta".into(),
+                owned_glob: "pkg/b.py".into(),
+                brief: "Implement beta.".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct CaptureAgy {
+        seen: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for CaptureAgy {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen.lock().unwrap().push((task.cwd.clone(), task.brief.clone()));
+            if task.brief.contains("Build unit `alpha`") {
+                std::fs::create_dir_all(task.cwd.join("tests"))?;
+                std::fs::write(task.cwd.join("pkg/a.py"), "X = 2\n")?;
+                std::fs::write(task.cwd.join("tests/test_a.py"), "def test_x(): assert True\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:alpha\n".into() }).await;
+            } else {
+                std::fs::write(task.cwd.join("pkg/b.py"), "Y = 2\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:beta\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. Non-code-mode Antigravity: worktree-absolute paths + hygiene rules + byte-identical shared prefix.
+    let cap = Arc::new(CaptureAgy { seen: std::sync::Mutex::new(Vec::new()) });
+    let h: Arc<dyn Harness> = cap.clone();
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 2);
+    cfg.run_id = "tok3-no-code".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let captured = cap.seen.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    let prefix0 = captured[0].1.split("--- Your task ---").next().unwrap();
+    let prefix1 = captured[1].1.split("--- Your task ---").next().unwrap();
+    assert_eq!(prefix0, prefix1, "shared prefix must remain byte-identical across units");
+    assert!(prefix0.contains("require absolute paths rooted at your worktree directory"));
+    assert!(prefix0.contains("Do not call `update_steps`"));
+    assert!(prefix0.contains("do not run trailing `git status`"));
+
+    let (alpha_cwd, alpha_brief) = captured.iter().find(|(_, b)| b.contains("Build unit `alpha`")).unwrap();
+    let alpha_abs = std::fs::canonicalize(alpha_cwd).unwrap_or_else(|_| alpha_cwd.clone());
+    let expected_a = alpha_abs.join("pkg/a.py").display().to_string();
+    let expected_test = alpha_abs.join("tests/test_a.py").display().to_string();
+    assert!(alpha_brief.contains(&format!("Your worktree directory is `{}`", alpha_abs.display())));
+    assert!(alpha_brief.contains(&format!("`{expected_a}`")));
+    assert!(alpha_brief.contains(&format!("`{expected_test}`")));
+    assert!(alpha_brief.contains(&format!("Your files that exist now: `{expected_a}`.")));
+
+    // 2. Code-mode Antigravity: keeps relative paths and hygiene rules, no native absolute-path block.
+    let tmp_cm = seeded("tok3-paths-cm");
+    std::fs::create_dir_all(tmp_cm.0.join("pkg")).unwrap();
+    std::fs::write(tmp_cm.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp_cm.0.join("pkg/a.py"), "X = 1\n").unwrap();
+    git(&tmp_cm.0, &["add", "."]);
+    git(&tmp_cm.0, &["commit", "-q", "-m", "init"]);
+    let cap_cm = Arc::new(CaptureAgy { seen: std::sync::Mutex::new(Vec::new()) });
+    let h_cm: Arc<dyn Harness> = cap_cm.clone();
+    let harnesses_cm = Harnesses { master: h_cm.clone(), mid: h_cm.clone(), worker: h_cm.clone(), reviewer: h_cm.clone(), verifier: h_cm };
+    let mut cfg_cm = config(&tmp_cm.0, plan, true, 1);
+    cfg_cm.run_id = "tok3-code-mode".into();
+    cfg_cm.checks = false;
+    cfg_cm.runtime_checks = false;
+    cfg_cm.code_mode = true;
+    cfg_cm.browser = false;
+    assert_eq!(drive(cfg_cm, harnesses_cm).await.unwrap(), Outcome::Finished { ok: true });
+
+    let captured_cm = cap_cm.seen.lock().unwrap().clone();
+    let (_, alpha_cm) = captured_cm.iter().find(|(_, b)| b.contains("Build unit `alpha`")).unwrap();
+    assert!(alpha_cm.contains("Paths are from the project root."));
+    assert!(!alpha_cm.contains("Your worktree directory is"));
+    assert!(alpha_cm.contains("Do not call `update_steps`"));
+    assert!(alpha_cm.contains("trailing `git status`"));
+}
+
+#[tokio::test]
+async fn tok4_single_phase_plan_rejects_oversplit_beyond_parallel_wave_cap() {
+    let prompt = concat!(
+        "Build \"tinydb\", a minimal SQL database engine in Python 3.11 (standard library only).\n\n",
+        "Requirements:\n",
+        "- CLI: `python -m tinydb <dbfile>` opens a REPL; `python -m tinydb <dbfile> -f script.sql` runs a file and prints results.\n",
+        "- SQL support: CREATE TABLE (INTEGER, TEXT, REAL columns, PRIMARY KEY), INSERT, SELECT with WHERE (=, !=, <, >, <=, >=, AND, OR), ",
+        "ORDER BY (ASC/DESC), LIMIT, INNER JOIN on equality, COUNT/SUM/AVG/MIN/MAX with GROUP BY, UPDATE, DELETE, DROP TABLE.\n",
+        "- Storage: data persists to a single file on disk; primary keys are indexed with a B-tree you implement yourself.\n",
+        "- Output: SELECT results print as pipe-separated rows with a header line.\n",
+        "- Errors: invalid SQL or unknown tables/columns print an error line and do not crash the REPL.\n\n",
+        "Structure the code into separate modules (tokenizer, parser, planner/executor, storage, btree). ",
+        "Write a pytest suite covering every feature above. Done = all your tests pass and `pytest` exits 0.\n",
+    );
+    let tmp = seeded("tok4-wave-cap");
+    let first_planner_brief = Arc::new(Mutex::new(String::new()));
+    let repairs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct OversplitPlanner {
+        first_brief: Arc<Mutex<String>>,
+        repairs: Arc<Mutex<Vec<String>>>,
+        attempt: AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for OversplitPlanner {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let is_planner = task.brief.contains("Plan this product")
+                || task.brief.contains("Plan this small product")
+                || task.brief.contains("Repair this plan");
+            let reply = if is_planner {
+                if task.brief.contains("Repair this plan") {
+                    self.repairs.lock().unwrap().push(task.brief.clone());
+                } else {
+                    *self.first_brief.lock().unwrap() = task.brief.clone();
+                }
+                if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // 5 units on parallel=3 exceeds the wave cap of 3.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Oversplit 5-unit plan",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [],
+                        "units": [
+                            { "id": "tok", "owned_glob": "tinydb/tok.py", "brief": "Write tokenizer", "context": "", "done": "done" },
+                            { "id": "par", "owned_glob": "tinydb/par.py", "brief": "Write parser", "context": "", "done": "done" },
+                            { "id": "bt", "owned_glob": "tinydb/bt.py", "brief": "Write btree", "context": "", "done": "done" },
+                            { "id": "st", "owned_glob": "tinydb/st.py", "brief": "Write storage", "context": "", "done": "done" },
+                            { "id": "cli", "owned_glob": "tinydb/cli.py", "brief": "Write cli", "context": "", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                } else {
+                    // Merged into 3 cohesive units fitting one wave.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Cohesive 3-unit plan",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [],
+                        "units": [
+                            { "id": "frontend", "owned_glob": "{tinydb/tok.py,tinydb/par.py}", "brief": "Write tokenizer and parser", "context": "", "done": "done" },
+                            { "id": "storage", "owned_glob": "{tinydb/bt.py,tinydb/st.py}", "brief": "Write btree and storage", "context": "", "done": "done" },
+                            { "id": "cli", "owned_glob": "tinydb/cli.py", "brief": "Write cli", "context": "", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                }
+            } else {
+                let unit = task.brief.split("Build unit `").nth(1).and_then(|s| s.split('`').next()).unwrap_or("x");
+                std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+                match unit {
+                    "frontend" => {
+                        std::fs::write(task.cwd.join("tinydb/tok.py"), "# tok\n")?;
+                        std::fs::write(task.cwd.join("tinydb/par.py"), "# par\n")?;
+                    }
+                    "storage" => {
+                        std::fs::write(task.cwd.join("tinydb/bt.py"), "# bt\n")?;
+                        std::fs::write(task.cwd.join("tinydb/st.py"), "# st\n")?;
+                    }
+                    _ => {
+                        std::fs::write(task.cwd.join("tinydb/cli.py"), "# cli\n")?;
+                    }
+                }
+                format!("done\nRELEASE unit:{unit}\n")
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(OversplitPlanner {
+        first_brief: first_planner_brief.clone(),
+        repairs: repairs.clone(),
+        attempt: AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = prompt_config(&tmp.0, prompt, true);
+    cfg.parallel = 3;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let first = first_planner_brief.lock().unwrap().clone();
+    assert!(first.contains("at most 3 cohesive units"), "expected slot-capped single-phase rule, got:\n{first}");
+    let rep = repairs.lock().unwrap().clone();
+    assert_eq!(rep.len(), 1);
+    assert!(rep[0].contains("exceeding the single-wave cap of 3"), "got:\n{}", rep[0]);
+}
+
+#[tokio::test]
+async fn tok5_worker_brief_guides_concise_unit_tests_and_keeps_unrestricted_fix_loop() {
+    let tmp = seeded("tok5-concise-tests");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![
+            ContractFile {
+                path: "pkg/contract.py".into(),
+                content: "def add(a: int, b: int) -> int: ...\n".into(),
+                phase: 0,
+            },
+            ContractFile {
+                path: "tests/test_contract.py".into(),
+                content: "from pkg.math import add\ndef test_add(): assert add(1, 2) == 3\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![PagePlan {
+            id: "math".into(),
+            owned_glob: "{pkg/math.py,tests/test_math.py}".into(),
+            brief: "Implement add.".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let seen = Arc::new(Mutex::new(String::new()));
+    struct Capture(Arc<Mutex<String>>);
+    #[async_trait]
+    impl Harness for Capture {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            *self.0.lock().unwrap() = task.brief.clone();
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::create_dir_all(task.cwd.join("tests"))?;
+            std::fs::write(task.cwd.join("pkg/math.py"), "def add(a: int, b: int) -> int:\n    return a + b\n")?;
+            std::fs::write(task.cwd.join("tests/test_math.py"), "from pkg.math import add\ndef test_zero(): assert add(0, 0) == 0\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:math\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+    let h: Arc<dyn Harness> = Arc::new(Capture(seen.clone()));
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let brief = seen.lock().unwrap().clone();
+    assert!(brief.contains("are the acceptance check for every unit (the main end-to-end check)"), "missing acceptance check guidance:\n{brief}");
+    assert!(brief.contains("~100-150 lines per module"), "missing concise unit-test target:\n{brief}");
+    assert!(brief.contains("fix what fails until they pass"), "must not hard-cap test retries:\n{brief}");
+}
+
+#[tokio::test]
+async fn tok6_effort_routing_routes_antigravity_by_difficulty_keeps_high_for_repairs_and_planner_and_can_disable() {
+    let tmp = seeded("tok6-effort-on");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan {
+                id: "easy_u".into(),
+                owned_glob: "pkg/easy.py".into(),
+                brief: "Easy module.".into(),
+                difficulty: Some("easy".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "norm_u".into(),
+                owned_glob: "pkg/norm.py".into(),
+                brief: "Normal module.".into(),
+                difficulty: Some("normal".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "hard_u".into(),
+                owned_glob: "pkg/hard.py".into(),
+                brief: "Hard module.".into(),
+                difficulty: Some("hard".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    #[derive(Clone, Debug)]
+    struct SeenCall {
+        unit: String,
+        effort: Option<String>,
+        model: Option<String>,
+        is_repair: bool,
+    }
+    struct AgyEffortFake {
+        calls: Arc<Mutex<Vec<SeenCall>>>,
+        fail_norm_once: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for AgyEffortFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let is_repair = task.brief.contains("Checks failed last time");
+            self.calls.lock().unwrap().push(SeenCall {
+                unit: unit.clone(),
+                effort: task.effort.clone(),
+                model: task.model.clone(),
+                is_repair,
+            });
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            match unit.as_str() {
+                "easy_u" => std::fs::write(task.cwd.join("pkg/easy.py"), "X = 1\n")?,
+                "hard_u" => std::fs::write(task.cwd.join("pkg/hard.py"), "Z = 1\n")?,
+                "norm_u" => {
+                    if self.fail_norm_once.swap(false, Ordering::SeqCst) {
+                        // Write outside owned_glob on first pass to trigger a deterministic repair.
+                        std::fs::write(task.cwd.join("pkg/unowned.py"), "BAD = 1\n")?;
+                    } else {
+                        std::fs::write(task.cwd.join("pkg/norm.py"), "Y = 1\n")?;
+                    }
+                }
+                _ => {}
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. Default effort_routing = true: easy -> low, normal -> medium (repair -> None/high), hard -> high.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(AgyEffortFake {
+        calls: calls.clone(),
+        fail_norm_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 1);
+    cfg.models.worker = Some("gemini-4-neon-high".into());
+    cfg.models.mid = Some("gemini-4-neon-high".into());
+    cfg.models.master = Some("gemini-4-neon-high".into());
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let got = calls.lock().unwrap().clone();
+    let easy = got.iter().find(|c| c.unit == "easy_u").unwrap();
+    assert_eq!(easy.effort.as_deref(), Some("low"));
+    assert_eq!(easy.model.as_deref(), Some("gemini-4-neon-high"));
+    let norm_first = got.iter().find(|c| c.unit == "norm_u" && !c.is_repair).unwrap();
+    assert_eq!(norm_first.effort.as_deref(), Some("medium"));
+    let norm_repair = got.iter().find(|c| c.unit == "norm_u" && c.is_repair).unwrap();
+    assert_eq!(norm_repair.effort, None, "repairs must stay at high/un-downgraded effort");
+    let hard = got.iter().find(|c| c.unit == "hard_u").unwrap();
+    assert_eq!(hard.effort.as_deref(), Some("high"));
+
+    // 2. effort_routing = false: every unit gets effort = None so explicit --worker-model stays verbatim.
+    let tmp_off = seeded("tok6-effort-off");
+    let calls_off = Arc::new(Mutex::new(Vec::new()));
+    let h_off: Arc<dyn Harness> = Arc::new(AgyEffortFake {
+        calls: calls_off.clone(),
+        fail_norm_once: std::sync::atomic::AtomicBool::new(false),
+    });
+    let harnesses_off = Harnesses { master: h_off.clone(), mid: h_off.clone(), worker: h_off.clone(), reviewer: h_off.clone(), verifier: h_off };
+    let mut cfg_off = config(&tmp_off.0, plan, true, 1);
+    cfg_off.effort_routing = false;
+    cfg_off.models.worker = Some("gemini-4-neon-high".into());
+    cfg_off.checks = false;
+    cfg_off.runtime_checks = false;
+    cfg_off.browser = false;
+    assert_eq!(drive(cfg_off, harnesses_off).await.unwrap(), Outcome::Finished { ok: true });
+    let got_off = calls_off.lock().unwrap().clone();
+    assert_eq!(got_off.len(), 3);
+    assert!(got_off.iter().all(|c| c.effort.is_none()), "effort_routing=false must pass None effort: {got_off:#?}");
+}
+
+#[tokio::test]
+async fn tok7_warm_session_reuses_clean_session_across_waves_and_enforces_context_and_repair_guards() {
+    let make_plan = || Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: "CONTRACT_SENTINEL = 'SHARED_PREFIX_ONLY_ONCE'\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "u1".into(),
+                owned_glob: "pkg/u1.py".into(),
+                brief: "Write pkg/u1.py implementing u1.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "u2".into(),
+                owned_glob: "pkg/u2.py".into(),
+                brief: "Import pkg.u1 and implement u2.".into(),
+                depends_on: vec!["u1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    #[derive(Default)]
+    struct Stats {
+        fresh_sessions: Mutex<Vec<String>>,
+        follow_ups: Mutex<Vec<String>>,
+        rebind_calls: AtomicUsize,
+        u2_saw_stray: std::sync::atomic::AtomicBool,
+        u2_saw_u1_file: std::sync::atomic::AtomicBool,
+    }
+
+    struct ReuseSession {
+        cwd: PathBuf,
+        stats: Arc<Stats>,
+        usage: Usage,
+        fail_u1_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl tm_harness::Session for ReuseSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.stats.follow_ups.lock().unwrap().push(text.clone());
+            std::fs::create_dir_all(self.cwd.join("pkg"))?;
+            if text.contains("Build unit `u2`") {
+                self.stats
+                    .u2_saw_stray
+                    .store(self.cwd.join(".coverage").exists(), Ordering::SeqCst);
+                self.stats
+                    .u2_saw_u1_file
+                    .store(self.cwd.join("pkg/u1.py").is_file(), Ordering::SeqCst);
+                std::fs::write(self.cwd.join("pkg/u2.py"), "from pkg.u1 import V1\nV2 = V1 + 1\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u2\n".into() }).await;
+            } else {
+                // Repair of u1: remove the stray out-of-glob file and write pkg/u1.py.
+                let _ = std::fs::remove_file(self.cwd.join("pkg/unowned.py"));
+                let _ = self.fail_u1_once.load(Ordering::SeqCst);
+                std::fs::write(self.cwd.join("pkg/u1.py"), "V1 = 1\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u1\n".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: self.usage,
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: Some(1),
+            })
+        }
+
+        fn rebind_gate(&mut self, _gate: Arc<dyn PermissionGate>) {
+            self.stats.rebind_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            Some("warm-sid-1")
+        }
+
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct ReuseHarness {
+        stats: Arc<Stats>,
+        usage: Usage,
+        fail_u1_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Harness for ReuseHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            self.stats.fresh_sessions.lock().unwrap().push(unit.clone());
+            let _ = std::fs::create_dir_all(task.cwd.join("pkg"));
+            if unit == "u1" {
+                if self.fail_u1_once.swap(false, Ordering::SeqCst) {
+                    let _ = std::fs::write(task.cwd.join("pkg/unowned.py"), "BAD = 1\n");
+                } else {
+                    let _ = std::fs::write(task.cwd.join("pkg/u1.py"), "V1 = 1\n");
+                    // Leave a stray untracked artifact-excluded/ignored or unowned? Actually
+                    // write a non-owned untracked file ONLY after? No, ownership check would reject
+                    // stray_u1.txt! Instead test clean reset via an untracked .coverage artifact.
+                    let _ = std::fs::write(task.cwd.join(".coverage"), "stale-cov");
+                }
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u1\n".into() }).await;
+            } else {
+                let _ = std::fs::write(task.cwd.join("pkg/u2.py"), "from pkg.u1 import V1\nV2 = V1 + 1\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u2\n".into() }).await;
+            }
+            let session: Box<dyn tm_harness::Session> = Box::new(ReuseSession {
+                cwd: task.cwd,
+                stats: self.stats.clone(),
+                usage: self.usage,
+                fail_u1_once: self.fail_u1_once.clone(),
+            });
+            let res = Ok(RunSummary {
+                ok: true,
+                usage: self.usage,
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: Some(1),
+            });
+            (res, Some(session))
+        }
+    }
+
+    // 1. Clean wave-1 -> wave-2 reuse under 65k context guard.
+    let tmp1 = seeded("tok7-reuse-ok");
+    let stats1 = Arc::new(Stats::default());
+    let h1: Arc<dyn Harness> = Arc::new(ReuseHarness {
+        stats: stats1.clone(),
+        usage: Usage { input: 12_000, output: 1_500, cache_read: 4_000, cache_write: 0 },
+        fail_u1_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let harnesses1 = Harnesses { master: h1.clone(), mid: h1.clone(), worker: h1.clone(), reviewer: h1.clone(), verifier: h1 };
+    let mut cfg1 = config(&tmp1.0, make_plan(), true, 1);
+    cfg1.run_id = "tok7-ok".into();
+    cfg1.checks = false;
+    cfg1.runtime_checks = false;
+    cfg1.code_mode = false;
+    cfg1.browser = false;
+    assert_eq!(drive(cfg1, harnesses1).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(*stats1.fresh_sessions.lock().unwrap(), vec!["u1".to_string()], "u2 must reuse u1's warm session");
+    let fups1 = stats1.follow_ups.lock().unwrap().clone();
+    assert_eq!(fups1.len(), 1);
+    assert!(fups1[0].contains("Build unit `u2`"));
+    assert!(fups1[0].contains("Your previous unit passed and was merged"));
+    assert!(!fups1[0].contains("SHARED_PREFIX_ONLY_ONCE"), "reused wave brief must omit already-cached shared contracts");
+    assert_eq!(stats1.rebind_calls.load(Ordering::SeqCst), 1, "gate must be rebound before follow_up");
+    assert!(!stats1.u2_saw_stray.load(Ordering::SeqCst), "reset worktree must drop u1's untracked artifacts");
+    assert!(stats1.u2_saw_u1_file.load(Ordering::SeqCst), "reset worktree must contain u1's merged file");
+    let agents_log = std::fs::read_to_string(tmp1.0.join(".taskmaster/runs/tok7-ok/agents.jsonl")).unwrap();
+    assert!(agents_log.contains("\"reused_wave\":true"), "transcript should mark wave reuse");
+
+    // 2. Context guard (>= 65k tokens): u2 must start a fresh session instead of reusing u1's bloated session.
+    let tmp2 = seeded("tok7-ctx-guard");
+    let stats2 = Arc::new(Stats::default());
+    let h2: Arc<dyn Harness> = Arc::new(ReuseHarness {
+        stats: stats2.clone(),
+        usage: Usage { input: 66_000, output: 2_000, cache_read: 0, cache_write: 0 },
+        fail_u1_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let harnesses2 = Harnesses { master: h2.clone(), mid: h2.clone(), worker: h2.clone(), reviewer: h2.clone(), verifier: h2 };
+    let mut cfg2 = config(&tmp2.0, make_plan(), true, 1);
+    cfg2.run_id = "tok7-guard".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(
+        *stats2.fresh_sessions.lock().unwrap(),
+        vec!["u1".to_string(), "u2".to_string()],
+        "sessions >= 65k context must not be reused across waves"
+    );
+    assert!(stats2.follow_ups.lock().unwrap().is_empty());
+
+    // 3. Repaired session guard: a session that needed a repair on u1 must NEVER be reused for u2.
+    let tmp3 = seeded("tok7-repair-guard");
+    let stats3 = Arc::new(Stats::default());
+    let h3: Arc<dyn Harness> = Arc::new(ReuseHarness {
+        stats: stats3.clone(),
+        usage: Usage { input: 8_000, output: 800, cache_read: 0, cache_write: 0 },
+        fail_u1_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    });
+    let harnesses3 = Harnesses { master: h3.clone(), mid: h3.clone(), worker: h3.clone(), reviewer: h3.clone(), verifier: h3 };
+    let mut cfg3 = config(&tmp3.0, make_plan(), true, 1);
+    cfg3.run_id = "tok7-repair".into();
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    cfg3.code_mode = false;
+    cfg3.browser = false;
+    assert_eq!(drive(cfg3, harnesses3).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(
+        *stats3.fresh_sessions.lock().unwrap(),
+        vec!["u1".to_string(), "u2".to_string()],
+        "repaired u1 session must not be reused for u2"
+    );
+    let fups3 = stats3.follow_ups.lock().unwrap().clone();
+    assert_eq!(fups3.len(), 1, "only u1's own repair should use follow_up");
+    assert!(fups3[0].contains("The checks failed after your last turn"));
+}
+
+#[tokio::test]
+async fn tok8_wave1_independent_unit_suppresses_peer_fishing_and_dependent_unit_gets_batch_hint() {
+    let tmp = seeded("tok8-flow-fishing");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: "class ProtocolA:\n    def run(self) -> int: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "peer_a".into(),
+                owned_glob: "pkg/a.py".into(),
+                brief: "Implement AlphaWorker for ProtocolA.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "peer_b".into(),
+                owned_glob: "pkg/b.py".into(),
+                brief: "Implement BetaWorker independent of AlphaWorker.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "integrator".into(),
+                owned_glob: "pkg/app.py".into(),
+                brief: "Wire AlphaWorker and BetaWorker.".into(),
+                depends_on: vec!["peer_a".into(), "peer_b".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs = Arc::new(Mutex::new(std::collections::BTreeMap::<String, String>::new()));
+    struct Capture(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+    #[async_trait]
+    impl Harness for Capture {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("x")
+                .to_string();
+            self.0.lock().unwrap().insert(unit.clone(), task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            match unit.as_str() {
+                "peer_a" => std::fs::write(task.cwd.join("pkg/a.py"), "class AlphaWorker:\n    def run(self) -> int:\n        return 1\n")?,
+                "peer_b" => std::fs::write(task.cwd.join("pkg/b.py"), "class BetaWorker:\n    def run(self) -> int:\n        return 2\n")?,
+                _ => std::fs::write(task.cwd.join("pkg/app.py"), "from pkg.a import AlphaWorker\nfrom pkg.b import BetaWorker\n")?,
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(Capture(briefs.clone()));
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    // parallel=1 forces peer_a to merge into `.flow` before peer_b starts, proving peer_b still
+    // does not get peer_a pre-injected and is explicitly told not to fish peers!
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let got = briefs.lock().unwrap().clone();
+    let b_brief = got.get("peer_b").expect("peer_b brief");
+    assert!(b_brief.contains("do NOT query peer units"), "missing anti-fishing guidance:\n{b_brief}");
+    assert!(!b_brief.contains("Pre-injected flow context"), "independent wave-1 unit must not receive peer pre-injection:\n{b_brief}");
+
+    let app_brief = got.get("integrator").expect("integrator brief");
+    assert!(app_brief.contains("\"op\":\"batch\""), "dependent unit must get batched flow_query hint:\n{app_brief}");
+    assert!(app_brief.contains("AlphaWorker"), "dependent unit should still receive built upstream symbols:\n{app_brief}");
+}
+
+#[tokio::test]
+async fn tok9_warm_planner_session_repairs_and_local_contract_compaction_avoids_replan() {
+    // Part A: warm planner session is reused for `ask_repair` via `follow_up` with compact prompt.
+    let tmp = seeded("tok9-warm-planner");
+    let fresh_planner = Arc::new(Mutex::new(Vec::<String>::new()));
+    let warm_repairs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct WarmPlannerSession {
+        warm_repairs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmPlannerSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.warm_repairs.lock().unwrap().push(text);
+            let fixed = serde_json::json!({
+                "kind": "library",
+                "summary": "Fixed plan",
+                "contracts": [{ "path": "pkg/contract.py", "content": "def api() -> int: ...\n" }],
+                "units": [
+                    { "id": "core", "owned_glob": "pkg/core.py", "brief": "Implement api.", "context": "", "done": "done" }
+                ],
+                "estimate": { "tokens": 0, "usd": 0 },
+                "dictionary": []
+            })
+            .to_string();
+            let _ = events.send(HarnessEvent::Text { text: fixed }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some("planner-warm-1")
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct WarmPlannerHarness {
+        fresh_planner: Arc<Mutex<Vec<String>>>,
+        warm_repairs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Harness for WarmPlannerHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            if task.brief.contains("Plan this") || task.brief.contains("Repair this plan") {
+                self.fresh_planner.lock().unwrap().push(task.brief.clone());
+                // Deliberately invalid: unit `core` has an empty brief so `accept_plan` rejects it.
+                let bad = serde_json::json!({
+                    "kind": "library",
+                    "summary": "Bad plan",
+                    "contracts": [{ "path": "pkg/contract.py", "content": "def api() -> int: ...\n" }],
+                    "units": [
+                        { "id": "core", "owned_glob": "pkg/core.py", "brief": "", "context": "", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string();
+                let _ = events.send(HarnessEvent::Text { text: bad }).await;
+                let sess: Box<dyn tm_harness::Session> = Box::new(WarmPlannerSession {
+                    warm_repairs: self.warm_repairs.clone(),
+                });
+                (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                    Some(sess),
+                )
+            } else {
+                let _ = std::fs::create_dir_all(task.cwd.join("pkg"));
+                let _ = std::fs::write(task.cwd.join("pkg/core.py"), "def api() -> int:\n    return 1\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                    None,
+                )
+            }
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(WarmPlannerHarness {
+        fresh_planner: fresh_planner.clone(),
+        warm_repairs: warm_repairs.clone(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = prompt_config(&tmp.0, "Build a small library package.", true);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let fresh = fresh_planner.lock().unwrap().clone();
+    assert_eq!(fresh.len(), 1, "planner should start only 1 fresh session and repair warmly");
+    assert!(fresh[0].contains("hard 200-line limit per contract"), "must state 200-line contract limit up front:\n{}", fresh[0]);
+    assert!(fresh[0].contains("no trailing commas"), "must state strict JSON rules up front:\n{}", fresh[0]);
+    let reps = warm_repairs.lock().unwrap().clone();
+    assert_eq!(reps.len(), 1, "expected 1 warm follow_up repair");
+    assert!(reps[0].contains("empty brief"), "warm repair must state rejection reason:\n{}", reps[0]);
+    assert!(!reps[0].contains("The plan:\n{"), "warm repair must not resend full plan JSON:\n{}", reps[0]);
+
+    // Part B: near-miss 220-line contract with docstrings/blank lines is compacted locally with 0 repairs!
+    let tmp_c = seeded("tok9-local-compact");
+    let planner_calls_c = Arc::new(AtomicUsize::new(0));
+    struct NearMissPlanner(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Harness for NearMissPlanner {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Plan this") || task.brief.contains("Repair this plan") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let mut contract = String::from("# Header\n\nclass Api:\n    \"\"\"Contract doc.\"\"\"\n\n");
+                for i in 0..44 {
+                    contract.push_str(&format!(
+                        "    # Method {i}\n    def m_{i}(self) -> int:\n        \"\"\"Doc {i}.\"\"\"\n        ...\n\n"
+                    ));
+                }
+                assert!(contract.lines().count() > tm_core::CONTRACT_LINES);
+                let reply = serde_json::json!({
+                    "kind": "library",
+                    "summary": "Near miss contract",
+                    "contracts": [{ "path": "pkg/contract.py", "content": contract }],
+                    "units": [
+                        { "id": "core", "owned_glob": "pkg/core.py", "brief": "Implement Api.", "context": "", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string();
+                let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            } else {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/core.py"), "class ApiImpl: pass\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+    let hc: Arc<dyn Harness> = Arc::new(NearMissPlanner(planner_calls_c.clone()));
+    let harnesses_c = Harnesses { master: hc.clone(), mid: hc.clone(), worker: hc.clone(), reviewer: hc.clone(), verifier: hc };
+    let mut cfg_c = prompt_config(&tmp_c.0, "Build a small library package.", true);
+    cfg_c.checks = false;
+    cfg_c.runtime_checks = false;
+    cfg_c.browser = false;
+    assert_eq!(drive(cfg_c, harnesses_c).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(planner_calls_c.load(Ordering::SeqCst), 1, "local compaction must avoid any replan/repair call");
+    let locked = std::fs::read_to_string(tmp_c.0.join("pkg/contract.py")).unwrap();
+    assert!(locked.lines().count() <= tm_core::CONTRACT_LINES);
+    assert!(locked.contains("def m_43(self) -> int:"));
+}
+
+#[tokio::test]
+async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_spec() {
+    let run_probe = |tmp: &Tmp, code_mode: bool| {
+        let root = tmp.0.clone();
+        async move {
+            let plan = Plan {
+                kind: tm_core::ProjectKind::Library,
+                pages: vec![PagePlan {
+                    id: "core".into(),
+                    owned_glob: "pkg/core.py".into(),
+                    brief: "Write pkg/core.py.".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let listed_tools = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let captured_brief = Arc::new(Mutex::new(String::new()));
+            struct ListProbe {
+                tools: Arc<Mutex<Vec<serde_json::Value>>>,
+                brief: Arc<Mutex<String>>,
+            }
+            #[async_trait]
+            impl Harness for ListProbe {
+                fn id(&self) -> &'static str {
+                    "antigravity"
+                }
+                async fn run(
+                    &self,
+                    task: WorkerTask,
+                    _gate: Arc<dyn PermissionGate>,
+                    events: mpsc::Sender<HarnessEvent>,
+                ) -> anyhow::Result<RunSummary> {
+                    *self.brief.lock().unwrap() = task.brief.clone();
+                    if let Some(dict) = task.dictionary.clone() {
+                        let tools = tokio::task::spawn_blocking(move || {
+                            let resp: serde_json::Value = ureq::post(&dict.url)
+                                .set("Authorization", &format!("Bearer {}", dict.bearer_token))
+                                .set("Content-Type", "application/json")
+                                .send_json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+                                .unwrap()
+                                .into_json()
+                                .unwrap();
+                            resp["result"]["tools"].as_array().cloned().unwrap_or_default()
+                        })
+                        .await?;
+                        *self.tools.lock().unwrap() = tools;
+                    }
+                    std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                    std::fs::write(task.cwd.join("pkg/core.py"), "X = 1\n")?;
+                    let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+                }
+            }
+            let h: Arc<dyn Harness> = Arc::new(ListProbe {
+                tools: listed_tools.clone(),
+                brief: captured_brief.clone(),
+            });
+            let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+            let mut cfg = config(&root, plan, true, 1);
+            cfg.checks = false;
+            cfg.runtime_checks = false;
+            cfg.code_mode = code_mode;
+            cfg.browser = false;
+            assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+            (listed_tools.lock().unwrap().clone(), captured_brief.lock().unwrap().clone())
+        }
+    };
+
+    // 1. Stdlib-only greenfield worker: cite/index/search/set_status/docs are all pruned.
+    let tmp_stdlib = seeded("tok10-stdlib");
+    let (tools_off, brief_off) = run_probe(&tmp_stdlib, false).await;
+    let names_off: Vec<&str> = tools_off.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names_off, vec!["flow_query"], "stdlib non-code worker should only see flow_query: {names_off:?}");
+    assert!(!brief_off.contains("for local-first API docs"), "brief should not advertise pruned docs tool");
+
+    // 2. Project with external npm deps + Code Mode: keeps `docs` and trimmed `run_code`, still prunes dict & set_status.
+    let tmp_deps = seeded("tok10-deps");
+    std::fs::write(tmp_deps.0.join("package.json"), r#"{"name":"demo","dependencies":{"zod":"^3.0.0"}}"#).unwrap();
+    git(&tmp_deps.0, &["add", "."]);
+    git(&tmp_deps.0, &["commit", "-q", "-m", "deps"]);
+    let has_node = crate::code::CodeTools::new(None).is_some();
+    let (tools_deps, _) = run_probe(&tmp_deps, has_node).await;
+    let names_deps: Vec<&str> = tools_deps.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names_deps.contains(&"docs"), "project with external deps should keep docs: {names_deps:?}");
+    assert!(names_deps.contains(&"flow_query"), "{names_deps:?}");
+    for pruned in ["cite", "index", "search", "set_status"] {
+        assert!(!names_deps.contains(&pruned), "{pruned} must be pruned from worker tools/list: {names_deps:?}");
+    }
+    if has_node {
+        let rc = tools_deps.iter().find(|t| t["name"] == "run_code").expect("run_code schema");
+        let spec_len = serde_json::to_string(rc).unwrap().len();
+        assert!(spec_len < 1000, "trimmed run_code schema should stay concise (<1000 bytes), got {spec_len} bytes");
+    }
+}
+
+#[tokio::test]
+async fn tok12_dedupes_context_dict_contracts_uses_repo_relative_env_and_shortens_help_and_siblings() {
+    let tmp = seeded("tok12-dedupe");
+    // Seed a repo-relative venv in `.flow/env.json` and create the directory so it resolves cleanly.
+    let rel_venv = ".taskmaster/runs/tok12/venv";
+    std::fs::create_dir_all(tmp.0.join(rel_venv).join("bin")).unwrap();
+    std::fs::write(tmp.0.join(rel_venv).join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    let rel_facts = tm_flow::EnvFacts {
+        runner: "pytest".into(),
+        test_cmd: format!("{rel_venv}/bin/python -m pytest -q"),
+        venv: Some(rel_venv.into()),
+        python: Some(format!("{rel_venv}/bin/python")),
+        install_cmd: None,
+    };
+    tm_flow::write_env(&tmp.0, &rel_facts).unwrap();
+    git(&tmp.0, &["add", ".flow/env.json"]);
+    git(&tmp.0, &["commit", "-q", "-m", "env"]);
+
+    // Publish a local dictionary entry whose body duplicates the locked contract verbatim.
+    let contract_body = "class StorageProtocol:\n    def get_item_by_key(self, key: str) -> bytes | None: ...\n    def put_item_by_key(self, key: str, value: bytes) -> None: ...\n";
+    let dict_store = tm_dictionary::LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();
+    dict_store
+        .publish("storage-api", tm_core::EntryKind::ComponentApi, "Storage protocol", contract_body, "python")
+        .unwrap();
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: contract_body.into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "store".into(),
+                owned_glob: "pkg/store.py".into(),
+                cites: vec!["storage-api".into()],
+                brief: "Implement StorageProtocol.".into(),
+                context: format!("{contract_body}Unique note: use fsync on flush."),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "pkg/cli.py".into(),
+                brief: "Implement CLI.".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs = Arc::new(Mutex::new(std::collections::BTreeMap::<String, String>::new()));
+    struct Capture(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+    #[async_trait]
+    impl Harness for Capture {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task.brief.split("Build unit `").nth(1).and_then(|s| s.split('`').next()).unwrap_or("x").to_string();
+            self.0.lock().unwrap().insert(unit.clone(), task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join(format!("pkg/{unit}.py")), "X = 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(Capture(briefs.clone()));
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 2);
+    cfg.run_id = "tok12".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let got = briefs.lock().unwrap().clone();
+    let store_brief = got.get("store").unwrap();
+    // 1. Contract body appears ONCE (in locked contracts), NOT duplicated in planner context or dict entry!
+    assert_eq!(
+        store_brief.matches("def get_item_by_key(self, key: str)").count(),
+        1,
+        "contract method signature should not be repeated in planner context or duplicate dict entry:\n{store_brief}"
+    );
+    assert!(store_brief.contains("Unique note: use fsync on flush."), "unique planner note must be preserved");
+    assert!(store_brief.contains("Dictionary `storage-api`"));
+    // 2. Repo-relative env hint without repeating the absolute project root path.
+    let (prefix, _) = store_brief.split_once("--- Your task ---").unwrap();
+    assert!(prefix.contains(".taskmaster/runs/tok12/venv/bin/python -m pytest -q"), "{prefix}");
+    assert!(!prefix.contains(&tmp.0.display().to_string()), "env hint should stay repo-relative:\n{prefix}");
+    // 3. Compact sibling list and shorter graph help.
+    assert!(store_brief.contains("Other units (do not edit their files): `cli` (`pkg/cli.py`)."), "{store_brief}");
+    assert!(!store_brief.contains("Other parallel workers in this run:"));
+    assert!(prefix.contains("\nCode graph:"));
+}
+
+#[tokio::test]
+async fn tok13_brownfield_planner_gets_flow_summary_without_file_reads_and_workers_get_anti_double_read_preinjection() {
+    use tm_harness::{Decision, PermissionGate, PermissionRequest, ToolKind};
+
+    let tmp = seeded("tok13-brownfield");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/codec.py"),
+        "def encode_row(row: dict) -> bytes:\n    return str(row).encode()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/store.py"),
+        "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        return encode_row(row)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/api.py"),
+        "from pkg.store import StoreEngine\n\ndef handle_insert(engine: StoreEngine, row: dict) -> bytes:\n    return engine.persist_row(row)\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "brownfield baseline"]);
+
+    let planner_briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_read_denied: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_dict_allowed: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_code_mode: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let worker_briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct BrownfieldHarness {
+        planner_briefs: Arc<Mutex<Vec<String>>>,
+        planner_read_denied: Arc<Mutex<Vec<bool>>>,
+        planner_dict_allowed: Arc<Mutex<Vec<bool>>>,
+        planner_code_mode: Arc<Mutex<Vec<bool>>>,
+        worker_briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for BrownfieldHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Plan this") {
+                self.planner_briefs.lock().unwrap().push(task.brief.clone());
+                self.planner_code_mode.lock().unwrap().push(task.code_mode);
+                let repo_read = PermissionRequest {
+                    tool: "read_file".into(),
+                    kind: ToolKind::Read,
+                    paths: vec![task.cwd.join("pkg/store.py")],
+                    command: None,
+                    url: None,
+                };
+                let dict_call = PermissionRequest {
+                    tool: "mcp__dictionary__flow_query".into(),
+                    kind: ToolKind::Dictionary,
+                    paths: vec![],
+                    command: None,
+                    url: None,
+                };
+                self.planner_read_denied
+                    .lock()
+                    .unwrap()
+                    .push(gate.decide(&repo_read) == Decision::Deny);
+                self.planner_dict_allowed
+                    .lock()
+                    .unwrap()
+                    .push(gate.decide(&dict_call) == Decision::Allow);
+                let plan_json = serde_json::json!({
+                    "summary": "Validate empty rows in StoreEngine.persist_row and update encode_row",
+                    "kind": "library",
+                    "contracts": [],
+                    "units": [
+                        {
+                            "id": "store",
+                            "owned_glob": "pkg/store.py",
+                            "brief": "Update StoreEngine.persist_row to reject empty rows.",
+                            "context": "",
+                            "done": "StoreEngine.persist_row validates non-empty rows"
+                        }
+                    ],
+                    "dictionary": []
+                })
+                .to_string();
+                let _ = events.send(HarnessEvent::Text { text: plan_json }).await;
+            } else {
+                self.worker_briefs.lock().unwrap().push(task.brief.clone());
+                std::fs::write(
+                    task.cwd.join("pkg/store.py"),
+                    "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        if not row:\n            raise ValueError('empty')\n        return encode_row(row)\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:store\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(BrownfieldHarness {
+        planner_briefs: planner_briefs.clone(),
+        planner_read_denied: planner_read_denied.clone(),
+        planner_dict_allowed: planner_dict_allowed.clone(),
+        planner_code_mode: planner_code_mode.clone(),
+        worker_briefs: worker_briefs.clone(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "tok13".into();
+    cfg.prompt = Some(
+        "Update StoreEngine.persist_row in pkg/store.py to validate empty rows and add multi-module error handling across storage and codec."
+            .into(),
+    );
+    cfg.yes = true;
+    cfg.parallel = 2;
+    cfg.timeout = Duration::from_secs(30);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = true;
+    cfg.fast_path = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    // 1. Planner received `.flow` repo summary + touched-symbol map instead of file-reading tools.
+    let pbriefs = planner_briefs.lock().unwrap();
+    assert_eq!(pbriefs.len(), 1, "expected 1 planner call");
+    let pbrief = &pbriefs[0];
+    assert!(pbrief.contains("## Repository summary (.flow)"), "{pbrief}");
+    assert!(pbrief.contains("Touched / prompt-matched symbols"), "{pbrief}");
+    assert!(pbrief.contains("py:pkg/store.py#StoreEngine.persist_row"), "{pbrief}");
+    assert!(pbrief.contains("Modules & symbols:"), "{pbrief}");
+    assert!(pbrief.contains("without reading repo files"), "{pbrief}");
+    assert_eq!(*planner_code_mode.lock().unwrap(), vec![false], "brownfield planner with .flow summary must not get read-only Code Mode file tools");
+    assert_eq!(*planner_read_denied.lock().unwrap(), vec![true], "brownfield planner WorktreeGate must deny repo read_file calls");
+    assert_eq!(*planner_dict_allowed.lock().unwrap(), vec![true], "brownfield planner keeps dictionary/flow_query access");
+
+    // 2. Worker received pre-injected target symbol metadata + source AND anti-double-read rule.
+    let wbriefs = worker_briefs.lock().unwrap();
+    assert_eq!(wbriefs.len(), 1, "expected 1 worker call");
+    let wbrief = &wbriefs[0];
+    assert!(wbrief.contains("## Pre-injected flow context (existing code)"), "{wbrief}");
+    assert!(wbrief.contains("py:pkg/store.py#StoreEngine.persist_row"), "{wbrief}");
+    assert!(wbrief.contains("### Target symbol source"), "{wbrief}");
+    assert!(wbrief.contains("return encode_row(row)"), "{wbrief}");
+    assert!(wbrief.contains("Anti-double-read rule:") && wbrief.contains("do NOT call `read_file`"), "{wbrief}");
+}
+
+#[tokio::test]
+async fn fix_n8_run_code_error_triggers_automatic_warm_followup_turn() {
+    let tmp = seeded("n8-run-code-followup");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/storage.py"), "def old():\n    return 1\n").unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "baseline"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        summary: "Add add_column to storage.py".into(),
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "pkg/storage.py".into(),
+            brief: "Implement add_column in pkg/storage.py".into(),
+            done: "add_column exists".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let followups: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct WarmCodeErrSession {
+        cwd: PathBuf,
+        followups: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmCodeErrSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.followups.lock().unwrap().push(text);
+            std::fs::write(
+                self.cwd.join("pkg/storage.py"),
+                "def old():\n    return 1\n\ndef add_column():\n    return True\n",
+            )?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct CodeErrHarness {
+        followups: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Harness for CodeErrHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            unreachable!("run_kept is used for keep=true workers")
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            // Simulate storage-facade ending right after an aborted run_code call with no edits landed.
+            let _ = events
+                .send(HarnessEvent::ToolCall {
+                    id: "rc1".into(),
+                    name: "mcp_dictionary_run_code".into(),
+                    input: serde_json::json!({ "code": "edit('pkg/storage.py', {})" }),
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolResult {
+                    id: "rc1".into(),
+                    text: "run_code script aborted before finishing (the script stopped before it finished).".into(),
+                    diff: None,
+                })
+                .await;
+            let _ = events.send(HarnessEvent::Text { text: "stopped".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(WarmCodeErrSession {
+                cwd: task.cwd,
+                followups: self.followups.clone(),
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(2) }),
+                Some(sess),
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(CodeErrHarness { followups: followups.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n8-fix1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = true;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let fups = followups.lock().unwrap().clone();
+    assert_eq!(fups.len(), 1, "expected 1 automatic warm follow-up turn after run_code error: {fups:?}");
+    assert!(
+        fups[0].contains("mcp_dictionary_run_code") && fups[0].contains("errored before completing"),
+        "follow-up must explain run_code error and instruct retry:\n{}",
+        fups[0]
+    );
+    assert!(
+        read(&tmp.0.join("pkg/storage.py")).contains("def add_column"),
+        "warm follow-up must land the edit into the branch"
+    );
+}
+
+#[tokio::test]
+async fn fix_n8_refused_native_run_command_in_code_mode_triggers_actionable_followup_instead_of_silent_pass() {
+    let tmp = seeded("n8-code-mode-refusal");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/storage.py"), "def old():\n    return 1\n").unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "baseline"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        summary: "Add add_column to storage.py".into(),
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "pkg/storage.py".into(),
+            brief: "Implement add_column in pkg/storage.py".into(),
+            done: "add_column exists".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Case 1: worker hits native `run_command (use run_code)` refusal and stops -> daemon sends
+    // actionable warm follow-up pointing to `mcp_dictionary_run_code` + `return await test()` ->
+    // worker applies its edit on the follow-up turn and unit passes.
+    let followups: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct WarmRefusalSession {
+        cwd: PathBuf,
+        followups: Arc<Mutex<Vec<String>>>,
+        apply_fix: bool,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmRefusalSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.followups.lock().unwrap().push(text);
+            if self.apply_fix {
+                std::fs::write(
+                    self.cwd.join("pkg/storage.py"),
+                    "def old():\n    return 1\n\ndef add_column():\n    return True\n",
+                )?;
+            } else {
+                let _ = events
+                    .send(HarnessEvent::PermissionDecided {
+                        tool: "run_command (use run_code)".into(),
+                        allowed: false,
+                    })
+                    .await;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct RefusalHarness {
+        followups: Arc<Mutex<Vec<String>>>,
+        apply_fix: bool,
+        calls: Mutex<usize>,
+    }
+    #[async_trait]
+    impl Harness for RefusalHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            unreachable!("run_kept is used")
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            *self.calls.lock().unwrap() += 1;
+            let _ = events
+                .send(HarnessEvent::PermissionDecided {
+                    tool: "run_command (use run_code)".into(),
+                    allowed: false,
+                })
+                .await;
+            let _ = events.send(HarnessEvent::Text { text: "stopping after denial".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(WarmRefusalSession {
+                cwd: task.cwd,
+                followups: self.followups.clone(),
+                apply_fix: self.apply_fix,
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                Some(sess),
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RefusalHarness {
+        followups: followups.clone(),
+        apply_fix: true,
+        calls: Mutex::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 1);
+    cfg.run_id = "n8-fix2".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = true;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let fups = followups.lock().unwrap().clone();
+    assert_eq!(fups.len(), 1, "expected 1 Code Mode refusal follow-up: {fups:?}");
+    assert!(
+        fups[0].contains("mcp_dictionary_run_code") && fups[0].contains("return await test()") && fups[0].contains("NOT a user refusal"),
+        "follow-up must point directly to run_code + test():\n{}",
+        fups[0]
+    );
+    assert!(read(&tmp.0.join("pkg/storage.py")).contains("def add_column"));
+
+    // Case 2: if a worker STILL changes nothing after a `(use run_code)` refusal, judge_inner must
+    // NOT count it as done silently; it must fail the unit and retry with the redirect guidance.
+    let tmp2 = seeded("n8-code-mode-refusal-noop");
+    std::fs::create_dir_all(tmp2.0.join("pkg")).unwrap();
+    std::fs::write(tmp2.0.join("pkg/storage.py"), "def old():\n    return 1\n").unwrap();
+    git_out(&tmp2.0, &["add", "."]);
+    git_out(&tmp2.0, &["commit", "-m", "baseline"]);
+    let fups2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let h2 = Arc::new(RefusalHarness {
+        followups: fups2.clone(),
+        apply_fix: false,
+        calls: Mutex::new(0),
+    });
+    let h2_dyn: Arc<dyn Harness> = h2.clone();
+    let harnesses2 = Harnesses {
+        master: h2_dyn.clone(),
+        mid: h2_dyn.clone(),
+        worker: h2_dyn.clone(),
+        reviewer: h2_dyn.clone(),
+        verifier: h2_dyn,
+    };
+    let mut cfg2 = config(&tmp2.0, plan, true, 1);
+    cfg2.run_id = "n8-fix2-noop".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = true;
+    cfg2.browser = false;
+    assert_eq!(
+        drive(cfg2, harnesses2).await.unwrap(),
+        Outcome::Finished { ok: false },
+        "no-change unit after (use run_code) refusal must fail rather than silently pass"
+    );
+    let fups2 = fups2.lock().unwrap().clone();
+    assert!(
+        fups2.len() >= 2 && fups2.iter().any(|m| m.contains("mcp_dictionary_run_code")),
+        "must retry with actionable run_code redirect instead of silently passing: {fups2:?}"
+    );
+}
+
+#[tokio::test]
+async fn fix_n8_no_change_brownfield_unit_is_checked_and_sent_back_for_repair() {
+    // Case 1: Brownfield unit with pre-existing owned files and failing acceptance/unit tests.
+    // Attempt 1 changes nothing -> check_no_change_unit runs tests, sees failure, and sends the
+    // unit back for repair instead of counting it as done; Attempt 2 implements the fix and passes.
+    let tmp = seeded("n8-noop-brownfield-tests");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp.0.join("pkg/storage.py"), "class Store:\n    pass\n").unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_storage.py"),
+        "from pkg.storage import Store\n\ndef test_has_add_column():\n    assert hasattr(Store, 'add_column')\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "brownfield baseline"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        summary: "Add add_column to Store".into(),
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "{pkg/storage.py,tests/test_storage.py}".into(),
+            brief: "Implement Store.add_column in pkg/storage.py.".into(),
+            done: "pytest passes with Store.add_column implemented".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct NoopThenFixHarness {
+        attempts: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for NoopThenFixHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = {
+                let mut log = self.attempts.lock().unwrap();
+                log.push(task.brief.clone());
+                log.len()
+            };
+            if n >= 2 {
+                std::fs::write(
+                    task.cwd.join("pkg/storage.py"),
+                    "class Store:\n    def add_column(self, name: str) -> None:\n        pass\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h = Arc::new(NoopThenFixHarness { attempts: Mutex::new(Vec::new()) });
+    let h_dyn: Arc<dyn Harness> = h.clone();
+    let harnesses = Harnesses {
+        master: h_dyn.clone(),
+        mid: h_dyn.clone(),
+        worker: h_dyn.clone(),
+        reviewer: h_dyn.clone(),
+        verifier: h_dyn,
+    };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 1);
+    cfg.run_id = "n8-fix3-tests".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let attempts = h.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2, "must reject attempt 1 no-op and repair on attempt 2: {attempts:?}");
+    assert!(
+        attempts[1].contains("changed none of your owned files") && attempts[1].contains("test_has_add_column"),
+        "repair brief must include the failing test check:\n{}",
+        attempts[1]
+    );
+    assert!(read(&tmp.0.join("pkg/storage.py")).contains("def add_column"));
+
+    // Case 2: Even with runtime_checks disabled, a brownfield initial build whose task clearly
+    // requires implementing changes must NOT be accepted with 0 edits.
+    let tmp2 = seeded("n8-noop-brownfield-brief");
+    std::fs::create_dir_all(tmp2.0.join("pkg")).unwrap();
+    std::fs::write(tmp2.0.join("pkg/storage.py"), "class Store:\n    pass\n").unwrap();
+    git_out(&tmp2.0, &["add", "."]);
+    git_out(&tmp2.0, &["commit", "-m", "brownfield baseline"]);
+
+    let h2 = Arc::new(NoopThenFixHarness { attempts: Mutex::new(Vec::new()) });
+    let h2_dyn: Arc<dyn Harness> = h2.clone();
+    let harnesses2 = Harnesses {
+        master: h2_dyn.clone(),
+        mid: h2_dyn.clone(),
+        worker: h2_dyn.clone(),
+        reviewer: h2_dyn.clone(),
+        verifier: h2_dyn,
+    };
+    let mut cfg2 = config(&tmp2.0, plan, true, 1);
+    cfg2.run_id = "n8-fix3-brief".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+
+    assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
+    let attempts2 = h2.attempts.lock().unwrap().clone();
+    assert_eq!(attempts2.len(), 2, "brownfield no-op requiring changes must be sent back: {attempts2:?}");
+    assert!(
+        attempts2[1].contains("requires implementing changes"),
+        "repair brief must explain why no-op was rejected:\n{}",
+        attempts2[1]
+    );
+    assert!(read(&tmp2.0.join("pkg/storage.py")).contains("def add_column"));
+}
+
+#[tokio::test]
+async fn fix_n8_subprocess_locked_contract_test_failure_triggers_normal_repair_cycle() {
+    // Reproduces the n8 failure mode: a locked acceptance contract test invokes the CLI via
+    // `subprocess.run([sys.executable, "-m", "tinydb", ...])` with NO static `import tinydb`.
+    // When final verify fails on that locked contract test, Taskmaster must route the failure
+    // through `units_reached` into the normal unit repair cycle (NOT abort immediately via
+    // `repair_shared` refusal with 0 repairs), while keeping the locked contract test untouched.
+    let tmp = seeded("n8-verify-repair");
+    std::fs::create_dir_all(tmp.0.join("tinydb")).unwrap();
+    std::fs::write(
+        tmp.0.join("tinydb/__main__.py"),
+        "import sys\nfrom tinydb import run_cli\nsys.exit(run_cli(sys.argv[1:]))\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tinydb/__init__.py"),
+        "from tinydb.storage import add_column\n\ndef run_cli(args):\n    print(add_column(args[0] if args else ''))\n    return 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tinydb/storage.py"),
+        "def add_column(col: str) -> str:\n    return f'old:{col}'\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "baseline cli"]);
+
+    let contract_test = r#"import subprocess, sys
+
+def test_cli_add_column():
+    res = subprocess.run(
+        [sys.executable, "-m", "tinydb", "tag"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "added:tag", res.stdout
+"#;
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Implement add_column CLI support".into(),
+        contracts: vec![ContractFile {
+            path: "tests/test_acceptance_contract.py".into(),
+            content: contract_test.into(),
+            phase: 0,
+        }],
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "{tinydb/storage.py,tinydb/__init__.py}".into(),
+            brief: "Implement add_column returning 'added:<col>' in tinydb/storage.py.".into(),
+            done: "CLI prints added:tag".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct BuggyThenFixedHarness {
+        briefs: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for BuggyThenFixedHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = {
+                let mut log = self.briefs.lock().unwrap();
+                log.push(task.brief.clone());
+                log.len()
+            };
+            if n == 1 {
+                // Attempt 1 writes a buggy implementation so unit build merges and reaches final verify.
+                std::fs::write(
+                    task.cwd.join("tinydb/storage.py"),
+                    "def add_column(col: str) -> str:\n    return f'broken:{col}'\n",
+                )?;
+            } else {
+                // Repair triggered by failed final verify fixes the bug!
+                std::fs::write(
+                    task.cwd.join("tinydb/storage.py"),
+                    "def add_column(col: str) -> str:\n    return f'added:{col}'\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h = Arc::new(BuggyThenFixedHarness { briefs: Mutex::new(Vec::new()) });
+    let h_dyn: Arc<dyn Harness> = h.clone();
+    let harnesses = Harnesses {
+        master: h_dyn.clone(),
+        mid: h_dyn.clone(),
+        worker: h_dyn.clone(),
+        reviewer: h_dyn.clone(),
+        verifier: h_dyn,
+    };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n8-fix4".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(
+        drive(cfg, harnesses).await.unwrap(),
+        Outcome::Finished { ok: true },
+        "failed subprocess locked contract test must trigger normal worker repair cycle and succeed"
+    );
+    let briefs = h.briefs.lock().unwrap().clone();
+    assert_eq!(briefs.len(), 2, "expected initial build + 1 repair turn after verify failure: {briefs:?}");
+    assert!(
+        briefs[1].contains("test_cli_add_column") && briefs[1].contains("tests/test_acceptance_contract.py"),
+        "repair brief must include the failing acceptance contract test output:\n{}",
+        briefs[1]
+    );
+    assert_eq!(
+        read(&tmp.0.join("tests/test_acceptance_contract.py")),
+        contract_test,
+        "locked contract test must stay unmodified"
+    );
+}
+
+#[tokio::test]
+async fn fix_n8_logs_model_requested_and_model_used_in_ledger_and_agents_jsonl() {
+    let tmp = seeded("n8-model-logging");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan {
+                id: "easy_u".into(),
+                owned_glob: "pkg/easy.py".into(),
+                brief: "Easy module.".into(),
+                difficulty: Some("easy".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "norm_u".into(),
+                owned_glob: "pkg/norm.py".into(),
+                brief: "Normal module.".into(),
+                difficulty: Some("normal".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "fallback_u".into(),
+                owned_glob: "pkg/fallback.py".into(),
+                brief: "Fallback module.".into(),
+                difficulty: Some("normal".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct WarmModelSession {
+        cwd: PathBuf,
+        model_used: String,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmModelSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            let _ = std::fs::remove_file(self.cwd.join("pkg/unowned.py"));
+            std::fs::create_dir_all(self.cwd.join("pkg"))?;
+            std::fs::write(self.cwd.join("pkg/easy.py"), "EASY = 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:easy_u\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some("sess-easy-warm")
+        }
+        fn model_used(&self) -> Option<&str> {
+            Some(&self.model_used)
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct ModelLoggingFake {
+        fail_easy_once: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for ModelLoggingFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let requested = task.model.clone();
+            let catalog = vec![
+                "gemini-4-hydrogen-low".to_string(),
+                "gemini-4-hydrogen-medium".to_string(),
+                "gemini-4-hydrogen-high".to_string(),
+            ];
+            let used = if unit == "fallback_u" {
+                // Simulate live server rejecting `-medium` and falling back to requested `-high`.
+                requested.clone().unwrap_or_else(|| "gemini-4-hydrogen-high".into())
+            } else if let Some(req) = requested.as_deref() {
+                tm_harness::acp::resolve_antigravity_model(req, task.effort.as_deref(), &catalog)
+            } else {
+                "gemini-4-hydrogen-high".into()
+            };
+            let _ = events.send(HarnessEvent::SessionStarted { session_id: format!("sess-{unit}") }).await;
+            let _ = events
+                .send(HarnessEvent::ModelSelected { requested: requested.clone(), used: used.clone() })
+                .await;
+            if let Err(err) = std::fs::create_dir_all(task.cwd.join("pkg")) {
+                return (Err(err.into()), None);
+            }
+            let mut kept: Option<Box<dyn tm_harness::Session>> = None;
+            let write_res = match unit.as_str() {
+                "easy_u" => {
+                    if self.fail_easy_once.swap(false, Ordering::SeqCst) {
+                        kept = Some(Box::new(WarmModelSession { cwd: task.cwd.clone(), model_used: used.clone() }));
+                        // Write outside owned_glob on turn 1 to force a warm follow_up turn on the same session.
+                        std::fs::write(task.cwd.join("pkg/unowned.py"), "BAD = 1\n")
+                    } else {
+                        std::fs::write(task.cwd.join("pkg/easy.py"), "EASY = 1\n")
+                    }
+                }
+                "norm_u" => std::fs::write(task.cwd.join("pkg/norm.py"), "NORM = 1\n"),
+                "fallback_u" => std::fs::write(task.cwd.join("pkg/fallback.py"), "FB = 1\n"),
+                _ => Ok(()),
+            };
+            if let Err(err) = write_res {
+                return (Err(err.into()), None);
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                kept,
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(ModelLoggingFake {
+        fail_easy_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n8-fix5".into();
+    cfg.models.worker = Some("gemini-4-hydrogen-high".into());
+    cfg.models.mid = Some("gemini-4-hydrogen-high".into());
+    cfg.models.master = Some("gemini-4-hydrogen-high".into());
+    cfg.effort_routing = true;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let run_dir = tmp.0.join(".taskmaster/runs/n8-fix5");
+    let ledger: Vec<tm_core::LedgerEntry> = read(&run_dir.join("ledger.jsonl"))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let by_page = |page: &str| -> Vec<&tm_core::LedgerEntry> {
+        ledger.iter().filter(|e| e.page.as_deref() == Some(page)).collect()
+    };
+
+    let easy_rows = by_page("easy_u");
+    assert_eq!(easy_rows.len(), 2, "expected initial build + warm follow-up for easy_u: {easy_rows:#?}");
+    for row in &easy_rows {
+        assert_eq!(row.model_requested.as_deref(), Some("gemini-4-hydrogen-high"));
+        assert_eq!(row.model_used.as_deref(), Some("gemini-4-hydrogen-low"));
+        assert_eq!(row.model.as_deref(), Some("gemini-4-hydrogen-low"));
+    }
+
+    let norm_rows = by_page("norm_u");
+    assert_eq!(norm_rows.len(), 1);
+    assert_eq!(norm_rows[0].model_requested.as_deref(), Some("gemini-4-hydrogen-high"));
+    assert_eq!(norm_rows[0].model_used.as_deref(), Some("gemini-4-hydrogen-medium"));
+    assert_eq!(norm_rows[0].model.as_deref(), Some("gemini-4-hydrogen-medium"));
+
+    let fb_rows = by_page("fallback_u");
+    assert_eq!(fb_rows.len(), 1);
+    assert_eq!(fb_rows[0].model_requested.as_deref(), Some("gemini-4-hydrogen-high"));
+    assert_eq!(fb_rows[0].model_used.as_deref(), Some("gemini-4-hydrogen-high"));
+    assert_eq!(fb_rows[0].model.as_deref(), Some("gemini-4-hydrogen-high"));
+
+    let agents: Vec<serde_json::Value> = read(&run_dir.join("agents.jsonl"))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let ends_for = |agent_id: &str| -> Vec<&serde_json::Value> {
+        agents
+            .iter()
+            .filter(|e| e["kind"] == "end" && e["agent"]["id"] == agent_id)
+            .collect()
+    };
+    let starts_for = |agent_id: &str| -> Vec<&serde_json::Value> {
+        agents
+            .iter()
+            .filter(|e| e["kind"] == "start" && e["agent"]["id"] == agent_id)
+            .collect()
+    };
+    let models_for = |agent_id: &str| -> Vec<&serde_json::Value> {
+        agents
+            .iter()
+            .filter(|e| e["kind"] == "model" && e["agent"]["id"] == agent_id)
+            .collect()
+    };
+
+    // easy_u: initial start has model_requested + effort; warm follow_up start also carries model_used;
+    // model event and both end events confirm gemini-4-hydrogen-low.
+    let easy_starts = starts_for("unit:easy_u");
+    assert_eq!(easy_starts.len(), 2, "{easy_starts:#?}");
+    assert_eq!(easy_starts[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(easy_starts[0]["effort"], "low");
+    assert_eq!(easy_starts[1]["follow_up"], true);
+    assert_eq!(easy_starts[1]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(easy_starts[1]["model_used"], "gemini-4-hydrogen-low");
+    let easy_models = models_for("unit:easy_u");
+    assert_eq!(easy_models.len(), 1);
+    assert_eq!(easy_models[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(easy_models[0]["model_used"], "gemini-4-hydrogen-low");
+    let easy_ends = ends_for("unit:easy_u");
+    assert_eq!(easy_ends.len(), 2);
+    assert!(easy_ends.iter().all(|e| {
+        e["model_requested"] == "gemini-4-hydrogen-high" && e["model_used"] == "gemini-4-hydrogen-low"
+    }), "{easy_ends:#?}");
+
+    // norm_u: start has model_requested + effort="medium"; model + end confirm gemini-4-hydrogen-medium.
+    let norm_starts = starts_for("unit:norm_u");
+    assert_eq!(norm_starts[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(norm_starts[0]["effort"], "medium");
+    let norm_ends = ends_for("unit:norm_u");
+    assert_eq!(norm_ends[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(norm_ends[0]["model_used"], "gemini-4-hydrogen-medium");
+
+    // fallback_u: start requested high with effort="medium"; end confirms fallback gemini-4-hydrogen-high.
+    let fb_ends = ends_for("unit:fallback_u");
+    assert_eq!(fb_ends[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(fb_ends[0]["model_used"], "gemini-4-hydrogen-high");
+}
+
+#[tokio::test]
+async fn fix_n9_per_unit_acceptance_test_runs_when_unit_finishes_and_repairs_immediately() {
+    let tmp = seeded("n9-per-unit-acceptance");
+    let core_contract = concat!(
+        "from mdtodo.storage import render_markdown\n\n",
+        "def test_storage_header():\n",
+        "    out = render_markdown(4)\n",
+        "    assert out == '# Todo\\n<!-- next-id: 4 -->\\n'\n",
+    );
+    let cli_contract = concat!(
+        "import subprocess, sys\n\n",
+        "def test_cli_outputs_header():\n",
+        "    r = subprocess.run([sys.executable, '-m', 'mdtodo'], capture_output=True, text=True)\n",
+        "    assert r.returncode == 0\n",
+        "    assert '<!-- next-id: 4 -->' in r.stdout\n",
+    );
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "tests/test_core_contract.py".into(), content: core_contract.into(), phase: 0 },
+            ContractFile { path: "tests/test_acceptance_contract.py".into(), content: cli_contract.into(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "core".into(),
+                owned_glob: "{mdtodo/__init__.py,mdtodo/storage.py}".into(),
+                brief: "Implement mdtodo/storage.py render_markdown.".into(),
+                done: "render_markdown matches contract.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "mdtodo/__main__.py".into(),
+                brief: "Implement mdtodo/__main__.py printing render_markdown(4).".into(),
+                done: "CLI prints rendered markdown.".into(),
+                depends_on: vec!["core".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    // Track exact build/repair sequence: `core` must be repaired BEFORE `cli` ever starts,
+    // proving `tests/test_core_contract.py` ran right when `core` finished (not at final verify),
+    // while `tests/test_acceptance_contract.py` waited for `cli` and did not falsely fail `core`.
+    struct OrderFake {
+        sequence: Arc<Mutex<Vec<String>>>,
+        core_attempts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for OrderFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let is_repair = task.brief.contains("Checks failed last time");
+            self.sequence
+                .lock()
+                .unwrap()
+                .push(format!("{unit}:{}", if is_repair { "repair" } else { "build" }));
+            std::fs::create_dir_all(task.cwd.join("mdtodo"))?;
+            if unit == "core" {
+                std::fs::write(task.cwd.join("mdtodo/__init__.py"), "")?;
+                let attempt = self.core_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    // Missing `<!-- next-id: N -->` header on attempt 1!
+                    std::fs::write(
+                        task.cwd.join("mdtodo/storage.py"),
+                        "def render_markdown(n: int) -> str:\n    return '# Todo\\n'\n",
+                    )?;
+                } else {
+                    assert!(
+                        task.brief.contains("test_core_contract.py") && task.brief.contains("next-id"),
+                        "per-unit acceptance repair brief must include exact failure:\n{}",
+                        task.brief
+                    );
+                    std::fs::write(
+                        task.cwd.join("mdtodo/storage.py"),
+                        "def render_markdown(n: int) -> str:\n    return f'# Todo\\n<!-- next-id: {n} -->\\n'\n",
+                    )?;
+                }
+            } else if unit == "cli" {
+                std::fs::write(
+                    task.cwd.join("mdtodo/__main__.py"),
+                    "from mdtodo.storage import render_markdown\nprint(render_markdown(4), end='')\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let sequence = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(OrderFake {
+        sequence: sequence.clone(),
+        core_attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n9-fix1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let seq = sequence.lock().unwrap().clone();
+    assert_eq!(
+        seq,
+        vec!["core:build", "core:repair", "cli:build"],
+        "core must fail its per-unit acceptance contract test and repair immediately before cli runs"
+    );
+}
+
+#[tokio::test]
+async fn fix_n9_noop_repair_reprompts_same_warm_session_and_rejects_failing_greenfield_noop() {
+    // Greenfield 2-unit project mirroring tb15-mdtodo-tmhcode:
+    // - `core` owns mdtodo/storage.py (writes buggy header on build).
+    // - `cli` owns mdtodo/__main__.py (builds fine; triggers acceptance failure on `<!-- next-id: 4 -->`).
+    // - On `cli`'s warm repair turn 1, the warm session changes NOTHING (no-op repair!).
+    //   Instead of counting it as done or dropping the session, Taskmaster must IMMEDIATELY
+    //   re-prompt the SAME warm session with the concrete failure output, and on that follow-up
+    //   the session fixes the bug and the run finishes cleanly!
+    let tmp = seeded("n9-noop-repair");
+    let contract = concat!(
+        "import subprocess, sys\n\n",
+        "def test_storage_format():\n",
+        "    r = subprocess.run([sys.executable, '-m', 'mdtodo'], capture_output=True, text=True)\n",
+        "    assert r.returncode == 0\n",
+        "    assert r.stdout == '# Todo\\n<!-- next-id: 4 -->\\n'\n",
+    );
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "tests/test_acceptance_contract.py".into(),
+            content: contract.into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "core".into(),
+                owned_glob: "{mdtodo/__init__.py,mdtodo/storage.py}".into(),
+                brief: "Implement mdtodo/storage.py.".into(),
+                done: "storage ready.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "mdtodo/__main__.py".into(),
+                brief: "Implement mdtodo/__main__.py.".into(),
+                done: "CLI passes acceptance contract.".into(),
+                depends_on: vec!["core".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct WarmNoopThenFixSession {
+        cwd: PathBuf,
+        followups: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmNoopThenFixSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            let n = {
+                let mut log = self.followups.lock().unwrap();
+                log.push(text.clone());
+                log.len()
+            };
+            if n == 1 {
+                // First repair turn: agent changes NOTHING (mirrors tb15-mdtodo-tmhcode cli repair #1)!
+                let _ = events.send(HarnessEvent::Text { text: "Looks fine.\nRELEASE unit:cli\n".into() }).await;
+            } else {
+                // Automatic no-op repair follow-up on the SAME warm session: receives concrete failure
+                // output and writes the real fix!
+                std::fs::write(
+                    self.cwd.join("mdtodo/__main__.py"),
+                    "print('# Todo\\n<!-- next-id: 4 -->\\n', end='')\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "Fixed header.\nRELEASE unit:cli\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some("sess-cli-warm")
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct NoopRepairFake {
+        cli_followups: Arc<Mutex<Vec<String>>>,
+        cli_cold_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for NoopRepairFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let _ = std::fs::create_dir_all(task.cwd.join("mdtodo"));
+            if unit == "core" {
+                let _ = std::fs::write(task.cwd.join("mdtodo/__init__.py"), "");
+                let _ = std::fs::write(task.cwd.join("mdtodo/storage.py"), "HEADER = '# Todo\\n'\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                return (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                    None,
+                );
+            }
+            self.cli_cold_calls.fetch_add(1, Ordering::SeqCst);
+            // Initial build omits `<!-- next-id: 4 -->` header!
+            let _ = std::fs::write(
+                task.cwd.join("mdtodo/__main__.py"),
+                "from mdtodo.storage import HEADER\nprint(HEADER, end='')\n",
+            );
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(WarmNoopThenFixSession {
+                cwd: task.cwd.clone(),
+                followups: self.cli_followups.clone(),
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                Some(sess),
+            )
+        }
+    }
+
+    let cli_followups = Arc::new(Mutex::new(Vec::new()));
+    let fake = Arc::new(NoopRepairFake {
+        cli_followups: cli_followups.clone(),
+        cli_cold_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let h: Arc<dyn Harness> = fake.clone();
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n9-fix2".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(
+        fake.cli_cold_calls.load(Ordering::SeqCst),
+        1,
+        "cli must stay on its single warm session instead of spawning a second cold agent"
+    );
+    let followups = cli_followups.lock().unwrap().clone();
+    assert_eq!(
+        followups.len(),
+        2,
+        "expected repair #1 (no-op) + automatic in-session no-op repair follow-up on the SAME warm session: {followups:#?}"
+    );
+    assert!(
+        followups[1].contains("changed none of your owned files") && followups[1].contains("next-id: 4"),
+        "in-session no-op repair follow-up must include concrete failure output:\n{}",
+        followups[1]
+    );
+}
+
+#[tokio::test]
+async fn fix_n9_code_mode_dedupes_prompt_enforces_repair_run_code_and_saves_tokens_over_native() {
+    let has_node = crate::code::CodeTools::new(None).is_some();
+    let run_probe = |tmp: &Tmp, code_mode: bool| {
+        let root = tmp.0.clone();
+        async move {
+            let plan = Plan {
+                kind: tm_core::ProjectKind::Library,
+                pages: vec![PagePlan {
+                    id: "core".into(),
+                    owned_glob: "{pkg/__init__.py,pkg/model.py,pkg/storage.py,tests/test_core.py}".into(),
+                    brief: "Implement pkg/model.py, pkg/storage.py, and tests/test_core.py.".into(),
+                    done: "pytest passes.".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let briefs = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+            let schema_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            struct Probe {
+                briefs: Arc<Mutex<Vec<(String, String)>>>,
+                schema_bytes: Arc<std::sync::atomic::AtomicUsize>,
+                fail_once: std::sync::atomic::AtomicBool,
+            }
+            #[async_trait]
+            impl Harness for Probe {
+                fn id(&self) -> &'static str {
+                    "antigravity"
+                }
+                async fn run(
+                    &self,
+                    task: WorkerTask,
+                    _gate: Arc<dyn PermissionGate>,
+                    events: mpsc::Sender<HarnessEvent>,
+                ) -> anyhow::Result<RunSummary> {
+                    let framed = task.framed_brief_for("mcp_dictionary_run_code");
+                    self.briefs.lock().unwrap().push((task.brief.clone(), framed));
+                    if self.schema_bytes.load(Ordering::SeqCst) == 0
+                        && let Some(dict) = task.dictionary.clone()
+                    {
+                        let bytes = tokio::task::spawn_blocking(move || {
+                            let resp: serde_json::Value = ureq::post(&dict.url)
+                                .set("Authorization", &format!("Bearer {}", dict.bearer_token))
+                                .set("Content-Type", "application/json")
+                                .send_json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+                                .unwrap()
+                                .into_json()
+                                .unwrap();
+                            serde_json::to_string(&resp["result"]["tools"]).unwrap().len()
+                        })
+                        .await?;
+                        self.schema_bytes.store(bytes, Ordering::SeqCst);
+                    }
+                    std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                    std::fs::create_dir_all(task.cwd.join("tests"))?;
+                    if self.fail_once.swap(false, Ordering::SeqCst) {
+                        // Trigger a repair on attempt 1 via an unowned stray file so we also inspect the repair brief.
+                        std::fs::write(task.cwd.join("pkg/stray.py"), "BAD = 1\n")?;
+                    } else {
+                        std::fs::write(task.cwd.join("pkg/__init__.py"), "")?;
+                        std::fs::write(task.cwd.join("pkg/model.py"), "M = 1\n")?;
+                        std::fs::write(task.cwd.join("pkg/storage.py"), "S = 1\n")?;
+                        std::fs::write(task.cwd.join("tests/test_core.py"), "def test_ok(): assert True\n")?;
+                    }
+                    let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+                }
+            }
+            let h: Arc<dyn Harness> = Arc::new(Probe {
+                briefs: briefs.clone(),
+                schema_bytes: schema_bytes.clone(),
+                fail_once: std::sync::atomic::AtomicBool::new(true),
+            });
+            let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+            let mut cfg = config(&root, plan, true, 1);
+            cfg.checks = false;
+            cfg.runtime_checks = false;
+            cfg.code_mode = code_mode;
+            cfg.browser = false;
+            assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+            (briefs.lock().unwrap().clone(), schema_bytes.load(Ordering::SeqCst))
+        }
+    };
+
+    let tmp_off = seeded("n9-cm-off");
+    let (briefs_off, schema_off) = run_probe(&tmp_off, false).await;
+    let tmp_on = seeded("n9-cm-on");
+    let (briefs_on, schema_on) = run_probe(&tmp_on, has_node).await;
+
+    if !has_node {
+        return;
+    }
+
+    // 1. Deduplication: framed_brief_for must NOT prepend duplicate CODE_MODE_WRITE_RULES when
+    //    shared_prefix already includes CODE_MODE_GUIDE ("Code Mode is on").
+    let (raw_on, framed_on) = &briefs_on[0];
+    let (_, framed_off) = &briefs_off[0];
+    assert!(raw_on.contains("Code Mode is on"));
+    assert!(
+        !framed_on.contains("Code Mode is active — use two-call discipline"),
+        "framed_brief_for must not duplicate CODE_MODE_WRITE_RULES when CODE_MODE_GUIDE is present"
+    );
+    let overhead_bytes = framed_on.len().saturating_sub(framed_off.len()) + schema_on.saturating_sub(schema_off);
+    assert!(
+        overhead_bytes < 2_200,
+        "deduplicated Code Mode brief + run_code MCP schema overhead should stay compact, got {overhead_bytes} bytes \
+         (brief {} vs {}, schema {} vs {})",
+        framed_on.len(),
+        framed_off.len(),
+        schema_on,
+        schema_off
+    );
+
+    // 2. Repair brief explicitly warns that native file tools see a read-only worktree and directs
+    //    all reads/edits/tests to `mcp_dictionary_run_code`.
+    let (repair_raw, _) = &briefs_on[1];
+    assert!(
+        repair_raw.contains("read-only worktree")
+            && repair_raw.contains("do NOT call native `read_file`, `write_file`, `edit_file`, or `run_command`")
+            && repair_raw.contains("mcp_dictionary_run_code"),
+        "Code Mode repair brief must enforce run_code and warn about read-only native tools:\n{repair_raw}"
+    );
+
+    // 3. Measure cumulative prompt + schema + turn-history input bytes across a realistic 4-file +
+    //    1-fix unit build:
+    //    - Native tools: 4 write_file + 1 run_command + 1 edit_file + 1 run_command = 7 tool calls (8 model turns).
+    //    - Code Mode two-call: Call 1 (files map + return await test()) + Call 2 (edit + return await test()) = 2 tool calls (3 model turns).
+    //    Even when native harness tools (~14 KB baseline system prompt) remain visible on ACP,
+    //    collapsing 8 turns -> 3 turns cuts cumulative repeated input bytes by >50%.
+    let harness_system_bytes: usize = 14_000;
+    let payload_per_file: usize = 1_200;
+    let test_out_bytes: usize = 400;
+    let fix_patch_bytes: usize = 250;
+
+    // Cumulative input bytes across turns (each turn re-reads system + brief + schema + prior history).
+    let simulate_cumulative_input = |base: usize, turn_additions: &[usize]| -> usize {
+        let mut history = base;
+        let mut total = 0;
+        for &add in turn_additions {
+            total += history;
+            history += add;
+        }
+        total += history; // final assistant reply turn
+        total
+    };
+    let native_base = harness_system_bytes + framed_off.len() + schema_off;
+    let native_total = simulate_cumulative_input(
+        native_base,
+        &[
+            payload_per_file + 80,
+            payload_per_file + 80,
+            payload_per_file + 80,
+            payload_per_file + 80,
+            test_out_bytes,
+            fix_patch_bytes,
+            test_out_bytes,
+        ],
+    );
+    let code_base = harness_system_bytes + framed_on.len() + schema_on;
+    let code_total = simulate_cumulative_input(
+        code_base,
+        &[
+            payload_per_file * 4 + 120 + test_out_bytes, // Call 1: write all 4 files + test
+            fix_patch_bytes + 80 + test_out_bytes,       // Call 2: targeted edit + re-test
+        ],
+    );
+    assert!(
+        code_total * 2 < native_total,
+        "two-call run_code path ({code_total} cumulative input bytes) must save >50% over native 7-call path ({native_total} bytes)"
+    );
+}
+
+#[tokio::test]
+async fn fix_n9_quota_429_stops_planner_without_retry_loop_reports_reset_and_exit_75() {
+    // Reproduces tb15-calcx-plus-tmh / tb15-notesapi-tmh: Antigravity returns
+    // `⚠ Individual quota reached ... Resets in 1h1m23s.` on the planner call.
+    // Taskmaster must stop immediately on call #1 (never retry-loop or print
+    // "the plan reply had no JSON object"), include the reset time, and map to exit code 75.
+    let tmp = seeded("n9-quota-429");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct QuotaPlannerFake {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for QuotaPlannerFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m23s.\n";
+            let _ = events.send(HarnessEvent::Text { text: msg.into() }).await;
+            let hit = tm_harness::detect_quota_or_rate_limit(msg).expect("quota detected");
+            Err(hit.into())
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(QuotaPlannerFake { calls: calls.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "n9-fix4".into();
+    cfg.prompt = Some("Build a tiny Python CLI.".into());
+    cfg.yes = true;
+    cfg.timeout = Duration::from_secs(30);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let err = drive(cfg, harnesses).await.unwrap_err();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "planner must stop on call #1 with zero retry loops when provider quota/429 hits"
+    );
+    let limit = err
+        .downcast_ref::<crate::reply::ReportedLimit>()
+        .expect("must surface typed ReportedLimit, not 'plan reply had no JSON object'");
+    assert_eq!(limit.kind, crate::reply::LimitKind::Quota);
+    assert_eq!(limit.reset.as_deref(), Some("in 1h1m23s"));
+    assert_eq!(limit.exit_code(), crate::reply::QUOTA_LIMIT_EXIT);
+    assert_eq!(limit.exit_code(), 75);
+    assert!(
+        limit.sentence().contains("Antigravity") && limit.sentence().contains("Resets in 1h1m23s"),
+        "error message must include provider and reset time: {}",
+        limit.sentence()
+    );
+}
+
+#[tokio::test]
+async fn fix_n9_price_table_hook_prices_unpriced_harness_calls_and_estimates() {
+    let tmp = seeded("n9-price-hook");
+    let prices_path = tmp.0.join("my-prices.json");
+    std::fs::write(
+        &prices_path,
+        r#"{"gemini-4-hydrogen-medium":{"input":2.0,"output":8.0,"cached_input":0.5}}"#,
+    )
+    .unwrap();
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![PagePlan {
+            id: "core".into(),
+            owned_glob: "pkg/core.py".into(),
+            brief: "Write pkg/core.py.".into(),
+            difficulty: Some("normal".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct UnpricedRoutedFake;
+    #[async_trait]
+    impl Harness for UnpricedRoutedFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let _ = events.send(HarnessEvent::SessionStarted { session_id: "s-price".into() }).await;
+            let _ = events
+                .send(HarnessEvent::ModelSelected {
+                    requested: task.model.clone(),
+                    used: "gemini-4-hydrogen-medium".into(),
+                })
+                .await;
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/core.py"), "X = 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 50_000, output: 10_000, cache_read: 100_000, cache_write: 0 },
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: Some(1),
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(UnpricedRoutedFake);
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n9-fix5".into();
+    cfg.models.worker = Some("gemini-4-hydrogen-high".into());
+    cfg.prices = crate::settings::load_price_table(&crate::Settings::default(), &tmp.0, Some(&prices_path)).unwrap();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let ledger = Records::files(&tmp.0).ledger("n9-fix5").unwrap();
+    assert_eq!(ledger.len(), 1);
+    let row = &ledger[0];
+    assert_eq!(row.model_used.as_deref(), Some("gemini-4-hydrogen-medium"));
+    assert_eq!(row.priced_by.as_deref(), Some("prices"));
+    // 50k * $2/M ($0.10) + 10k * $8/M ($0.08) + 100k * $0.50/M ($0.05) = $0.23.
+    let cost = row.cost_usd.expect("priced from external table");
+    assert!((cost - 0.23).abs() < 1e-6, "expected $0.23, got {cost}");
+}
+
+#[tokio::test]
+async fn fix_n9_skips_flaky_rerun_on_deterministic_pytest_assertion() {
+    let npm = std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("npm").is_file()));
+    if !npm {
+        eprintln!("npm is missing; skipping");
+        return;
+    }
+    let tmp = seeded("n9-det-assert");
+    let count_file = tmp.0.join(".test-invocations");
+    std::fs::write(
+        tmp.0.join("package.json"),
+        r#"{"name":"det-assert","private":true,"scripts":{"test":"sh det.sh"}}"#,
+    )
+    .unwrap();
+    // Script records every invocation outside the worktree (using an absolute path), fails with a
+    // deterministic pytest AssertionError naming `app/a/page.ts` until `app/a/page.ts` contains
+    // `FIXED`, then passes.
+    std::fs::write(
+        tmp.0.join("det.sh"),
+        format!(
+            "echo x >> '{}'\n\
+             if grep -q FIXED app/a/page.ts 2>/dev/null; then exit 0; fi\n\
+             cat >&2 <<'EOF'\n\
+             F\n\
+             app/a/page.ts:1: AssertionError\n\
+             E   AssertionError: assert '# Todo\\n' == '# Todo\\n<!-- next-id: 4 -->\\n'\n\
+             FAILED tests/test_acceptance_contract.py::test_header - AssertionError\n\
+             EOF\n\
+             exit 1\n",
+            count_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n.test-invocations\n").unwrap();
+    std::fs::create_dir_all(tmp.0.join("node_modules")).unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "deterministic failing test"]);
+
+    struct FixOnRepairHarness {
+        attempts: Arc<AtomicUsize>,
+        runs_seen_on_repair: Arc<AtomicUsize>,
+        count_file: PathBuf,
+    }
+    #[async_trait]
+    impl Harness for FixOnRepairHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            std::fs::create_dir_all(task.cwd.join("app/a"))?;
+            if n == 1 {
+                std::fs::write(task.cwd.join("app/a/page.ts"), "export const a = 1;\n")?;
+            } else {
+                let runs = std::fs::read_to_string(&self.count_file)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                self.runs_seen_on_repair.store(runs, Ordering::SeqCst);
+                std::fs::write(task.cwd.join("app/a/page.ts"), "// FIXED\nexport const a = 2;\n")?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE page:a\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let runs_seen_on_repair = Arc::new(AtomicUsize::new(0));
+    let h: Arc<dyn Harness> = Arc::new(FixOnRepairHarness {
+        attempts: Arc::new(AtomicUsize::new(0)),
+        runs_seen_on_repair: runs_seen_on_repair.clone(),
+        count_file: count_file.clone(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    // First verify failed with AssertionError -> must NOT run a flaky rerun (only 1 test run before repair).
+    assert_eq!(
+        runs_seen_on_repair.load(Ordering::SeqCst),
+        1,
+        "deterministic AssertionError must skip the flaky-test rerun"
+    );
+    let total_runs = std::fs::read_to_string(&count_file).unwrap().lines().count();
+    assert_eq!(total_runs, 2, "expected 1 failing verify + 1 passing verify after repair, got {total_runs}");
+}
+
+#[tokio::test]
+async fn fix_n9_independent_disjoint_units_share_wave_and_overlapping_units_serialize() {
+    struct WaveOverlapHarness {
+        wave2_barrier: Arc<tokio::sync::Barrier>,
+        inflight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for WaveOverlapHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            if matches!(unit.as_str(), "b" | "d" | "e") {
+                tokio::time::timeout(Duration::from_secs(5), self.wave2_barrier.wait())
+                    .await
+                    .expect("independent disjoint units b, d, e must all share wave 2 concurrently");
+            }
+            let file = task.cwd.join(format!("pkg/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. `parallel = 3` with an interface contract + hard concrete dependencies:
+    //    `a` -> (`b`, `d`, `e`), and `b` -> `c`.
+    //    `b`, `d`, and `e` are independent of each other with disjoint owned files and MUST all 3
+    //    run concurrently in wave 2 (never starved by blocked `c` occupying a slot).
+    let tmp = repo("n9-wave-share");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: "class Base: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan { id: "a".into(), owned_glob: "pkg/a.py".into(), brief: "Implement pkg/a.py.".into(), ..Default::default() },
+            PagePlan { id: "b".into(), owned_glob: "pkg/b.py".into(), brief: "Import pkg/a.py directly.".into(), depends_on: vec!["a".into()], ..Default::default() },
+            PagePlan { id: "c".into(), owned_glob: "pkg/c.py".into(), brief: "Import pkg/b.py directly.".into(), depends_on: vec!["b".into()], ..Default::default() },
+            PagePlan { id: "d".into(), owned_glob: "pkg/d.py".into(), brief: "Import pkg/a.py directly.".into(), depends_on: vec!["a".into()], ..Default::default() },
+            PagePlan { id: "e".into(), owned_glob: "pkg/e.py".into(), brief: "Import pkg/a.py directly.".into(), depends_on: vec!["a".into()], ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let h = Arc::new(WaveOverlapHarness {
+        wave2_barrier: Arc::new(tokio::sync::Barrier::new(3)),
+        inflight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h.clone() };
+    let mut cfg = config(&tmp.0, p, true, 3);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(h.peak.load(Ordering::SeqCst), 3, "b, d, and e must reach peak concurrency 3 in wave 2");
+
+    // 2. Two units with NO depends_on edge that share an owned file (`pkg/shared.py`) must serialize (peak == 1).
+    struct SleepPeakHarness {
+        inflight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for SleepPeakHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let file = task.cwd.join(format!("pkg/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let tmp2 = repo("n9-wave-overlap");
+    let overlap = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan { id: "u1".into(), owned_glob: "{pkg/u1.py,pkg/shared.py}".into(), brief: "Write u1.".into(), ..Default::default() },
+            PagePlan { id: "u2".into(), owned_glob: "{pkg/shared.py,pkg/u2.py}".into(), brief: "Write u2.".into(), ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let h2 = Arc::new(SleepPeakHarness {
+        inflight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let harnesses2 = Harnesses { master: h2.clone(), mid: h2.clone(), worker: h2.clone(), reviewer: h2.clone(), verifier: h2.clone() };
+    let mut cfg2 = config(&tmp2.0, overlap, true, 2);
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(h2.peak.load(Ordering::SeqCst), 1, "units sharing owned files must not run concurrently");
 }

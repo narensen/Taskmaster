@@ -50,6 +50,15 @@ pub const DECIDE_RULE: &str = "Decide quickly: settle the pages, the shared cont
 Do not work out each file's code or every CSS rule in your head; the workers write those from the design system, and the free \
 checks catch what they miss. A plan written now beats a perfect plan that is never written.\n";
 
+/// Maximum units recommended for a single-phase plan (one parallel wave).
+pub const SINGLE_PHASE_MAX_UNITS: usize = 4;
+
+/// Effective unit cap for a single-phase plan: at most `slots` units in one wave, capped at 4,
+/// and never below 2 so multi-module projects are not forced into one mega-unit.
+pub fn single_phase_wave_cap(slots: usize) -> usize {
+    slots.clamp(2, SINGLE_PHASE_MAX_UNITS)
+}
+
 /// Tell the master model upfront exactly how many parallel workers it can call upon and how
 /// to delegate work to them in JSON with self-contained context for each worker.
 pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
@@ -66,14 +75,16 @@ pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
              (exact file paths, exported symbols/types, DOM ids or API shapes, conventions, and edge cases) so it can build cleanly without guessing.\n"
         );
     }
+    let wave_cap = single_phase_wave_cap(cap);
     format!(
         "Worker pool: you can call upon up to {cap} parallel worker agents{who} simultaneously in this run. \
-         ALWAYS delegate across multiple parallel workers whenever the work spans independent files, layers, or modules \
-         (pages/routes, markup+styles vs. logic/state, backend vs. frontend, core module vs. tests, or distinct subsystems) \
-         via multiple `units` or `parts` with disjoint `owned_glob` patterns so up to {cap} workers build at once. \
+         Each unit launches a fresh worker session with cold-start context overhead, so split into cohesive modules that fit in one parallel wave \
+         (typically 2-{wave_cap} units for a multi-module project, at most {wave_cap} for a single-phase plan). \
+         Merge closely coupled small files (for example tokenizer+parser or btree+storage) into one cohesive unit rather than spawning tiny units, \
+         and do not collapse a multi-module project into a single mega-unit. \
          Only use `depends_on: [\"id\"]` for concrete implementation imports (never for locked `contracts`), with chains no deeper than 2 for <=6 units. \
          Include a concise `summary`. Every worker runs in isolation and only sees its `brief`, `context`, `done`, locked `contracts`, `design`, and cited Dictionary entries: \
-         give each worker self-contained `brief` + `context` (files, exports, types, DOM ids/selectors, shared interfaces, sibling boundaries).\n"
+         give each worker concise, non-redundant `brief` + `context` (only unit-specific notes and sibling boundaries not already stated in locked `contracts` or cited `dictionary` entries).\n"
     )
 }
 
@@ -86,11 +97,10 @@ pub fn units_rule(slots: usize) -> String {
     }
     let range = if most == 2 { "2".to_string() } else { format!("2-{most}") };
     format!(
-        "Split a single page/unit into `parts` ({range} work units, up to {most} parallel workers), \
-         each {{\"id\",\"owned_glob\",\"brief\",\"context\",\"done\"}}, one worker agent per part, built concurrently. \
-         Split by file or concern (for example markup+styles, scripts/state, tests, docs, or independent modules) whenever the files are disjoint given the contracts; \
-         part globs must be disjoint and inside the unit glob (braces list files: `{{app/index.html,app/styles.css}}`); the unit `owned_glob` must cover them all. \
-         Only omit `parts` when a unit is truly one tightly coupled file.\n"
+        "Only split a single oversized page/unit (>400 lines or clearly independent large files) into `parts` ({range} work units, up to {most} parallel workers), \
+         each {{\"id\",\"owned_glob\",\"brief\",\"context\",\"done\"}}, one worker agent per part. \
+         Part globs must be disjoint and inside the unit glob (braces list files: `{{app/index.html,app/styles.css}}`); the unit `owned_glob` must cover them all. \
+         Leave ordinary modules unsplit so you do not pay extra cold-session overhead.\n"
     )
 }
 
@@ -116,17 +126,24 @@ pub const PLAN_EXAMPLES: &str = concat!(
 
 /// How the first planning call sketches a job bigger than a small one: the phases in rough,
 /// and only the first in detail. Later phases are planned while earlier ones build.
-pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A large multi-subsystem job (more than about eight units or multiple distinct layers/apps that cannot fit in one parallel phase) gets `phases`: \
+pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A large multi-subsystem job (multiple distinct layers/apps that cannot fit in one parallel wave of up to 4 cohesive units) gets `phases`: \
 2-6 phases in build order, each {\"id\",\"goal\",\"delivers\":[paths],\"interfaces\":\"signatures only, no bodies\",\"test\":\"the command \
 that runs this phase's tests\",\"needs\":\"interfaces\" or \"results\"}. `needs` is `results` only when a phase cannot be planned \
 until the one before it has been built and tested. With `phases`, `units` and `contracts` cover the first phase only; each later phase \
-is planned, with its own units, once the phases before it have locked their interfaces. A single-package or small job (up to about eight units) \
-has no `phases`: plan it whole across parallel units. Scale the units to the work: one per \
-independent module and its tests, up to the available parallel workers.\n";
+is planned, with its own units, once the phases before it have locked their interfaces. A single-package or small job \
+has no `phases`: plan it whole across 2-4 cohesive units in one wave. Do not over-split small modules into tiny units, and do not collapse a multi-module job into one mega-unit.\n";
 
-/// Planning guidance for a single-package CLI/library/tool prompt that fits in one parallel phase.
-pub const SINGLE_PHASE_RULE: &str = "Plan this whole job in a single phase (`\"phases\": []`): put all units (up to about 8 parallel units with disjoint `owned_glob` patterns and shared `contracts`) \
-directly in `units` so every independent worker starts immediately with no phase barrier and no second planning pass.\n";
+/// Slot-aware single-phase planning rule: at most `slots` units in one wave (max 4), without collapsing to one mega-unit.
+pub fn single_phase_rule(slots: usize) -> String {
+    let cap = single_phase_wave_cap(slots);
+    let range = if cap == 2 { "2".to_string() } else { format!("2-{cap}") };
+    format!(
+        "Plan this whole job in a single phase (`\"phases\": []`): put at most {cap} cohesive units in `units` \
+         (one parallel wave, {range} units when the job spans multiple distinct modules; never exceed {cap}, and do not collapse a multi-module project into one mega-unit) \
+         with disjoint `owned_glob` patterns and shared `contracts` so every worker starts immediately with no phase barrier and no second planning pass. \
+         Merge closely coupled small modules (such as tokenizer+parser or btree+storage) into one cohesive unit rather than spawning tiny units.\n"
+    )
+}
 
 const MULTI_PHASE_CUES: [&str; 16] = [
     "multi-phase",
@@ -219,15 +236,54 @@ pub fn phase_brief(
         brief.push_str(&format!(" (this phase's tests run with `{}`)", phase.test));
     }
     brief.push_str(".\n");
+    brief.push_str(JSON_AND_CONTRACT_LIMIT_RULE);
     brief.push_str(&tm_core::rules_text());
     brief.push_str(&units_rule(slots));
     brief.push_str(DECIDE_RULE);
     brief
 }
 
+/// Up-front JSON formatting and contract line-cap rules shown before plan examples so
+/// planners avoid avoidable JSON syntax errors and >200-line contract rejections.
+pub const JSON_AND_CONTRACT_LIMIT_RULE: &str = "Strict output limits: reply with ONE valid JSON object only \
+(no prose outside JSON, no trailing commas, escape quotes and use \\n inside JSON strings—never raw unescaped newlines). \
+Keep every locked contract concise: target <= 120 lines and NEVER exceed the hard 200-line limit per contract (400 lines total across the plan).\n";
+
+/// Compact repair prompt for a warm planner session that already has the request and its
+/// rejected plan in context: sends only the rejection reasons instead of resending the full plan.
+pub fn warm_repair_brief(errors: &[String]) -> String {
+    if errors.len() == 1 && errors[0].starts_with("invalid JSON at line ") {
+        return format!(
+            "Your last JSON reply had a syntax error:\n- {}\n\
+             Fix only the JSON syntax (no trailing commas, escape quotes and use \\n inside strings) without rewriting content, \
+             and reply with the complete corrected JSON object and nothing else. Do not call any tools.\n",
+            errors[0],
+        );
+    }
+    let mut brief = String::from(
+        "Your last plan was rejected for these reasons:\n",
+    );
+    for error in errors {
+        brief.push_str(&format!("- {error}\n"));
+    }
+    brief.push_str(
+        "Change ONLY what the reasons above name, keep everything else identical, obey the 200-line hard limit per contract \
+         and strict JSON syntax/escaping, and reply with the complete corrected JSON object and nothing else. Do not call any tools.\n",
+    );
+    brief
+}
+
 /// The brief that repairs a rejected plan instead of planning again from nothing: the plan,
 /// the reasons, and the rules. The planner changes only what the reasons name.
 pub fn repair_brief(prompt: &str, plan_json: &str, errors: &[String]) -> String {
+    if errors.len() == 1 && errors[0].starts_with("invalid JSON at line ") {
+        return format!(
+            "Fix the JSON syntax error in this plan without rewriting or dropping any content. \
+             Change only what is needed to make it valid JSON, and reply with the complete corrected JSON object and nothing else. Do not call any tools.\n\n\
+             JSON error:\n- {}\n\nThe broken plan JSON:\n{plan_json}\n",
+            errors[0],
+        );
+    }
     let mut brief = String::from(
         "Repair this plan. It was rejected for the reasons below. Change only what the reasons name, keep everything else \
          exactly as it is, and reply with the whole corrected JSON object and nothing else. Do not call any tools.\n\nThe request it plans:\n",
@@ -267,17 +323,18 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
         brief.push_str("Add new dictionary entries only if a page truly needs one that is not listed.\n");
     }
     brief.push_str(template);
+    let wave_cap = single_phase_wave_cap(slots);
     let unit_guidance = if slots >= 2 {
-        "Divide the work into parallel `units` or `parts` across your available workers whenever multiple files or concerns exist."
+        format!("Use at most {wave_cap} cohesive `units` in one parallel wave (2-{wave_cap} when there are multiple distinct modules; do not over-split small files, and do not collapse a multi-module project into one mega-unit).")
     } else {
-        "Use one unit when a single worker owns the files."
+        "Use 1-2 cohesive units (never over-split tiny files).".to_string()
     };
     brief.push_str(&format!(
-        "\nReply with one JSON object only and do not edit files. {unit_guidance} \
+        "\n{JSON_AND_CONTRACT_LIMIT_RULE}Do not edit files. {unit_guidance} \
          Include a short `summary`. `kind` is web, library, cli, server or migration. \
          `contracts` are shared interface files, only for interfaces used by more than one file or worker; otherwise `[]`. \
          Each unit (or part) is one worker agent: `brief` is its task, `context` is the exact shared ids/interfaces/conventions it needs, `done` one line saying when it is finished. \
-         Keep contracts short. Leave `estimate` at zero.\n"
+         Leave `estimate` at zero.\n"
     ));
     brief.push_str(&plan_shape());
     let io_examples = crate::gates::extract_prompt_io_examples(prompt);
@@ -287,12 +344,6 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
     brief.push_str(DESIGN_RULE);
     brief.push_str(DECIDE_RULE);
     brief.push_str(&units_rule(slots));
-    if slots >= 2 {
-        brief.push_str(
-            "Parallel parts finish sooner: when a unit has separate markup and styles, scripts, docs, or modules and their tests, split it into parts \
-             and pin every id, file name and interface they share in a contract, a cited entry or each part's brief and context.\n",
-        );
-    }
     brief.push_str("Optional unit `difficulty`: easy|normal|hard (hard starts on the mid tier).\n");
     brief
 }
@@ -418,21 +469,26 @@ pub fn is_quick_edit(prompt: &str, existing_files: usize) -> bool {
 }
 
 /// Fast single-shot planning brief for scoped edits in an existing repo, powered by the
-/// deterministic repo map so the planner skips slow file-discovery tool calls.
+/// `.flow` repository summary (or deterministic repo map fallback) so the planner skips file-reading turns.
 pub fn quick_edit_brief(
     prompt: &str,
-    repo_map: &str,
+    repo_summary: &str,
+    uses_flow_summary: bool,
     entries: &[String],
     slots: usize,
     worker_label: Option<&str>,
 ) -> String {
+    let intro = if uses_flow_summary {
+        "Plan this small product quickly. This is a focused edit in an existing repository — the `.flow` repository summary and touched-symbol map below already cover the codebase structure and target symbols; plan directly from it without reading repo files (`read_file`, `ls`, `grep`, and `readMany` are disabled for planning)."
+    } else {
+        "Plan this small product quickly. This is a focused edit in an existing repository — everything you need is in the repository map below; avoid slow exploration tool calls (or batch at most one read-only `run_code` `readMany` call if you must check a specific file)."
+    };
     let mut brief = format!(
-        "Plan this small product quickly. This is a focused edit in an existing repository — everything you need is in the repository map below; \
-         avoid slow exploration tool calls (or batch at most one read-only `run_code` `readMany` call if you must check a specific file).\n\n{}\nRequest:\n{prompt}\n\n",
+        "{intro}\n\n{}\nRequest:\n{prompt}\n\n",
         worker_pool_rule(slots, worker_label),
     );
-    if !repo_map.is_empty() {
-        brief.push_str(repo_map);
+    if !repo_summary.is_empty() {
+        brief.push_str(repo_summary);
         brief.push('\n');
     }
     if !entries.is_empty() {
@@ -442,8 +498,9 @@ pub fn quick_edit_brief(
         }
         brief.push('\n');
     }
+    brief.push_str(JSON_AND_CONTRACT_LIMIT_RULE);
     brief.push_str(
-        "Reply with one compact JSON plan (no `phases`, only the 1-3 units actually touched, exact existing file paths in `owned_glob`, \
+        "Keep it compact (no `phases`, only the 1-3 units actually touched, exact existing file paths in `owned_glob`, \
          optional `difficulty`: `\"easy\"` | `\"normal\"` | `\"hard\"`, and `done` naming the verification command). \
          Do not edit files. Leave `estimate` at zero.\n",
     );
@@ -517,10 +574,29 @@ mod tests {
     fn worker_pool_rule_always_informs_count_and_context() {
         let multi = worker_pool_rule(4, Some("codex / gpt-5"));
         assert!(multi.contains("up to 4 parallel worker agents (codex / gpt-5)"));
-        assert!(multi.contains("ALWAYS delegate across multiple parallel workers"));
+        assert!(!multi.contains("ALWAYS delegate across multiple parallel workers"));
+        assert!(multi.contains("cohesive modules"));
+        assert!(multi.contains("do not collapse a multi-module project into a single mega-unit"));
         assert!(multi.contains("`context`"));
         let single = worker_pool_rule(1, Some("claude"));
         assert!(single.contains("1 worker agent (claude)"));
         assert!(single.contains("`context`"));
+    }
+
+    #[test]
+    fn single_phase_rule_caps_units_at_slots_max_four() {
+        assert_eq!(single_phase_wave_cap(1), 2);
+        assert_eq!(single_phase_wave_cap(2), 2);
+        assert_eq!(single_phase_wave_cap(3), 3);
+        assert_eq!(single_phase_wave_cap(4), 4);
+        assert_eq!(single_phase_wave_cap(8), 4);
+
+        let r3 = single_phase_rule(3);
+        assert!(r3.contains("at most 3 cohesive units"));
+        assert!(r3.contains("do not collapse a multi-module project into one mega-unit"));
+        let r8 = single_phase_rule(8);
+        assert!(r8.contains("at most 4 cohesive units"));
+        assert!(!units_rule(4).contains("Only omit `parts` when a unit is truly one tightly coupled file"));
+        assert!(!small_brief("tiny todo", &[], "", 4, None).contains("Parallel parts finish sooner"));
     }
 }

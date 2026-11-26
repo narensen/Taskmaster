@@ -136,7 +136,7 @@ export function surfaceOf(entry: LedgerEntry): string {
 }
 
 /** Entry kinds that belong to an agent call. */
-const CALL_KINDS = new Set<string>(["start", "text", "thought", "tool_call", "command", "output", "preview", "permission", "end", "stalled", "released", "restarted"]);
+const CALL_KINDS = new Set<string>(["start", "text", "thought", "tool_call", "command", "output", "tool_diff", "mcp_reply", "preview", "permission", "end", "stalled", "released", "restarted"]);
 
 const EDIT_TOOL_RE = /edit|write|patch|strreplace|apply_patch|create_file|replace/i;
 const RUN_TOOL_RE = /bash|shell|command|exec|terminal|run_code/i;
@@ -459,7 +459,8 @@ export class SurfaceBuilder {
         case "command":
           call.items.push({ t: "tool", name: "command", target: e.command ?? null, at: e.at });
           break;
-        case "output": {
+        case "output":
+        case "tool_diff": {
           const byTool = e.id ? findLastTool(call.items, (i) => i.id === e.id) : undefined;
           const open = byTool ?? findLastTool(call.items, (i) => i.output === undefined && i.diff === undefined && !i.bodyOmitted);
           if (open) {

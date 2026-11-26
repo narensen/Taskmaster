@@ -43,6 +43,7 @@ pub const SCRIPT_SECS: u64 = 600;
 pub const SH_SECS: u64 = 300;
 const MAX_READ: usize = 256 * 1024;
 const MAX_REPLY: usize = 24 * 1024;
+const MAX_TOOL_OUTPUT: usize = 4096;
 const MAX_CALLS: usize = 200;
 
 /// Persistent warm Node sandbox worker script: executes multiple `run_code` bodies over
@@ -54,12 +55,30 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const lines = readline.createInterface({ input: process.stdin });
 const waiting = new Map();
 let next = 1;
-const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
-const call = (op, args) => new Promise((resolve, reject) => {
-  const id = next++;
-  waiting.set(id, { resolve, reject });
-  send({ id, op, args });
+let activeState = null;
+process.on("unhandledRejection", (reason) => {
+  if (activeState) {
+    activeState.unhandled.push(String((reason && reason.stack) || reason).split("\n").slice(0, 4).join("\n"));
+  }
 });
+process.on("uncaughtException", (err) => {
+  if (activeState) {
+    activeState.unhandled.push(String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"));
+  }
+});
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+const call = (op, args) => {
+  let markDone;
+  const done = new Promise((r) => { markDone = r; });
+  if (activeState) {
+    activeState.pending.push(done);
+  }
+  return new Promise((resolve, reject) => {
+    const id = next++;
+    waiting.set(id, { resolve, reject, markDone });
+    send({ id, op, args });
+  });
+};
 const read = (path) => call("read", { path });
 const extractText = (value) => {
   if (value && typeof value === "object") {
@@ -70,7 +89,17 @@ const extractText = (value) => {
 };
 const write = (path, text) => call("write", { path, text: extractText(text) });
 const writeFile = (path, text) => call("write", { path, text: extractText(text) });
-const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
+const edit = (path, find, replace, all = false) => {
+  if (find && typeof find === "object") {
+    return call("edit", {
+      path,
+      find: find.find ?? find.target,
+      replace: find.replace ?? find.replacement ?? "",
+      all: Boolean(find.all),
+    });
+  }
+  return call("edit", { path, find, replace, all });
+};
 const patch = (path, edits) => call("patch", { path, edits });
 const applyPatch = (diff) => call("applyPatch", { diff: String(diff) });
 const tryPatch = (diff) => call("tryPatch", { diff: String(diff) });
@@ -78,6 +107,7 @@ const grep = (text, glob) => call("grep", { text, glob });
 const ls = (glob) => call("ls", { glob });
 const diff = (glob) => call("diff", { glob });
 const symbols = (glob) => call("symbols", { glob });
+const flow = (op, args = {}) => call("flow", { op: String(op ?? ""), args: args && typeof args === "object" ? args : {} });
 const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
 const test = () => call("test", {});
 const testAffected = (paths) => call("testAffected", { files: Array.isArray(paths) ? paths : (paths ? [paths] : []) });
@@ -102,7 +132,7 @@ async function runBody(code) {
   let fn;
   try {
     fn = new AsyncFunction(
-      "read", "write", "writeFile", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
+      "read", "write", "writeFile", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols", "flow",
       "readMany", "test", "testAffected", "probe", "diagnostics", "outline", "definition", "references",
       "sh", "check", "browser", "status", "wait", "console", "require",
       `return (async () => {\n${code}\n})();`
@@ -111,15 +141,36 @@ async function runBody(code) {
     send({ done: true, syntaxError: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") });
     return;
   }
+  const state = { pending: [], unhandled: [] };
+  activeState = state;
   try {
     const result = await fn(
-      read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
+      read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow,
       readMany, test, testAffected, probe, diagnostics, outline, definition, references,
       sh, check, browser, status, wait, scopedConsole, require
     );
-    send({ done: true, result: result === undefined ? null : result, logs });
+    if (state.pending.length > 0) {
+      await Promise.all(state.pending);
+      await new Promise((r) => setImmediate(r));
+    }
+    if (state.unhandled.length > 0) {
+      send({
+        done: true,
+        error: "Unawaited call failed (always `await` every helper call):\n" + state.unhandled.join("\n"),
+        logs,
+      });
+    } else {
+      send({ done: true, result: result === undefined ? null : result, logs });
+    }
   } catch (err) {
-    send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"), logs });
+    if (state.pending.length > 0) {
+      await Promise.all(state.pending);
+      await new Promise((r) => setImmediate(r));
+    }
+    const extra = state.unhandled.length > 0 ? "\nUnawaited errors:\n" + state.unhandled.join("\n") : "";
+    send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") + extra, logs });
+  } finally {
+    if (activeState === state) activeState = null;
   }
 }
 
@@ -139,6 +190,7 @@ lines.on("line", (line) => {
   waiting.delete(m.id);
   if (m.error !== undefined) w.reject(new Error(m.error));
   else w.resolve(m.result);
+  w.markDone();
 });
 lines.on("close", () => process.exit(0));
 "#;
@@ -149,6 +201,7 @@ struct WarmNode {
     _guard: tm_harness::GroupGuard,
     stdin: tokio::process::ChildStdin,
     out: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_buf: Arc<Mutex<String>>,
     scratch: PathBuf,
 }
 
@@ -186,11 +239,41 @@ impl WarmNode {
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let (mut child, guard) = tm_harness::spawn_grouped(&mut cmd).context("could not start node")?;
         let stdin = child.stdin.take().context("no stdin")?;
         let out = BufReader::new(child.stdout.take().context("no stdout")?).lines();
-        Ok(WarmNode { child, _guard: guard, stdin, out, scratch })
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let sink = stderr_buf.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stderr;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let piece = String::from_utf8_lossy(&chunk[..n]);
+                            let mut buf = sink.lock().unwrap();
+                            buf.push_str(&piece);
+                            if buf.len() > 4096 {
+                                let trimmed = tail(&buf, 4096);
+                                *buf = trimmed;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Ok(WarmNode { child, _guard: guard, stdin, out, stderr_buf, scratch })
+    }
+
+    fn take_stderr(&self) -> String {
+        let mut buf = self.stderr_buf.lock().unwrap();
+        let out = buf.trim().to_string();
+        buf.clear();
+        out
     }
 
     fn is_alive(&mut self) -> bool {
@@ -234,6 +317,19 @@ impl StatusTools {
         self.tags.lock().unwrap().insert(scope.to_string(), tag);
     }
 
+    /// Resolve the transcript agent tag registered for `grant` (falling back to a minimal tag).
+    pub fn tag_for(&self, grant: &Grant) -> Value {
+        let scope = grant.agent();
+        self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
+            let id = match scope.as_str() {
+                "master" | "reviewer" | "verifier" => scope.clone(),
+                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
+                other => format!("page:{other}"),
+            };
+            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
+        })
+    }
+
     /// Publish a one-line status update into the run's transcript for `grant`.
     pub fn set_status(&self, grant: &Grant, raw: &str) -> String {
         let first_line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
@@ -247,15 +343,7 @@ impl StatusTools {
         if cleaned.is_empty() {
             return String::new();
         }
-        let scope = grant.agent();
-        let tag = self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
-            let id = match scope.as_str() {
-                "master" | "reviewer" | "verifier" => scope.clone(),
-                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
-                other => format!("page:{other}"),
-            };
-            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
-        });
+        let tag = self.tag_for(grant);
         self.live.push(&grant.run, &tag, "status", json!({ "text": cleaned }));
         cleaned
     }
@@ -278,7 +366,7 @@ impl Extension for StatusTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if strip_dict_prefix(name) != "set_status" {
+        if tm_dictionary::strip_dict_prefix(name) != "set_status" {
             return None;
         }
         let text = args["text"].as_str().unwrap_or("");
@@ -303,6 +391,8 @@ pub struct CodeTools {
     scopes: Mutex<HashMap<String, Arc<Scope>>>,
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     runtime: Mutex<Option<CodeRuntimeCtx>>,
+    flow_root: Mutex<Option<PathBuf>>,
+    project_root: Mutex<Option<PathBuf>>,
     /// How long one script may run.
     script_limit: Duration,
     /// How long one `sh` or `test` call may run.
@@ -313,16 +403,28 @@ impl CodeTools {
     /// `None` when Node is not installed: there is nothing to run scripts with.
     pub fn new(browsers: Option<Arc<crate::browser::PageBrowsers>>) -> Option<Arc<CodeTools>> {
         let node = tm_harness::sandbox::resolve_binary("node").ok()?;
-        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| bwrap_works() && tm_harness::sandbox::bwrap_usable());
+        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| tm_harness::sandbox::bwrap_usable());
         Some(Arc::new(CodeTools {
             node,
             bwrap,
             scopes: Mutex::new(HashMap::new()),
             browsers,
             runtime: Mutex::new(None),
+            flow_root: Mutex::new(None),
+            project_root: Mutex::new(None),
             script_limit: Duration::from_secs(SCRIPT_SECS),
             sh_limit: Duration::from_secs(SH_SECS),
         }))
+    }
+
+    /// Set the run's live `.flow` tree root (e.g. `driver.tree`) used by `flow(op, args)`.
+    pub fn set_flow_root(&self, root: PathBuf) {
+        *self.flow_root.lock().unwrap() = Some(root);
+    }
+
+    /// Set the project root used to relativize paths written to `.flow/env.json`.
+    pub fn set_project_root(&self, root: PathBuf) {
+        *self.project_root.lock().unwrap() = Some(root);
     }
 
     /// Attach run-scoped `Live`, `Records`, and `StatusTools` so `status()` and `wait()` work.
@@ -408,6 +510,7 @@ impl CodeTools {
     }
 
     async fn drive_warm(&self, grant: &Grant, scope: &Scope, worker: &mut WarmNode, code: &str) -> Result<String, DriveError> {
+        let _ = worker.take_stderr();
         let req = json!({ "exec": true, "code": code });
         worker
             .stdin
@@ -416,32 +519,61 @@ impl CodeTools {
             .context("could not send script to warm node worker")
             .map_err(DriveError::Broken)?;
         let mut calls = 0usize;
+        let mut applied: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         while let Some(line) = worker.out.next_line().await.map_err(|e| DriveError::Broken(e.into()))? {
             let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
             if message["done"] == true {
                 if let Some(syntax) = message["syntaxError"].as_str() {
                     return Err(DriveError::Syntax(syntax.to_string()));
                 }
-                return Ok(summary(&message));
+                let mut text = summary(&message);
+                if message["error"].as_str().is_some() {
+                    if !applied.is_empty() {
+                        text.push_str(&format!(
+                            "\nPartial edits already applied on disk: {}. Inspect/continue from those edits and retry `run_code` rather than ending.",
+                            applied.join(", ")
+                        ));
+                    } else {
+                        text.push_str(
+                            "\nNo file edits were applied by this call. Fix the script error and retry `run_code` (always `await` every helper call) rather than ending.",
+                        );
+                    }
+                    text = tail(&text, MAX_REPLY);
+                }
+                return Ok(text);
             }
             calls += 1;
             let id = message["id"].clone();
+            let op_name = message["op"].as_str().unwrap_or("");
+            let op_args = &message["args"];
             let reply = if calls > MAX_CALLS {
-                json!({ "id": id, "error": format!("more than {MAX_CALLS} calls in one script") })
+                let msg = format!("more than {MAX_CALLS} calls in one script");
+                failed.push(format!("{op_name}: {msg}"));
+                json!({ "id": id, "error": msg })
             } else {
-                match self.op(grant, scope, message["op"].as_str().unwrap_or(""), &message["args"]).await {
-                    Ok(result) => json!({ "id": id, "result": result }),
-                    Err(err) => json!({ "id": id, "error": format!("{err:#}") }),
+                match self.op(grant, scope, op_name, op_args).await {
+                    Ok(result) => {
+                        record_applied_op(&mut applied, op_name, op_args, &result);
+                        json!({ "id": id, "result": result })
+                    }
+                    Err(err) => {
+                        let target = op_args["path"].as_str().map(|p| format!(" {p}")).unwrap_or_default();
+                        failed.push(format!("{op_name}{target}: {err:#}"));
+                        json!({ "id": id, "error": format!("{err:#}") })
+                    }
                 }
             };
-            worker
-                .stdin
-                .write_all(format!("{reply}\n").as_bytes())
-                .await
-                .context("warm node worker stopped accepting replies")
-                .map_err(DriveError::Broken)?;
+            if let Err(err) = worker.stdin.write_all(format!("{reply}\n").as_bytes()).await {
+                return Err(DriveError::Broken(format_aborted_run_code(
+                    worker,
+                    &applied,
+                    &failed,
+                    Some(&format!("worker stopped accepting replies ({err})")),
+                ).await));
+            }
         }
-        Err(DriveError::Broken(anyhow::anyhow!("the script stopped before it finished")))
+        Err(DriveError::Broken(format_aborted_run_code(worker, &applied, &failed, None).await))
     }
 
     /// Run `command` with `sh -c` in the agent's sandbox: the worktree and its scratch are
@@ -485,7 +617,7 @@ impl CodeTools {
                 "write" | "edit" | "patch" | "applyPatch" | "tryPatch" | "sh" | "test" | "testAffected" | "browser"
             )
         {
-            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
+            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, flow, probe.ast, check)");
         }
         let path = |key: &str| -> anyhow::Result<PathBuf> {
             let raw = args[key].as_str().context("a path is required")?;
@@ -628,6 +760,30 @@ impl CodeTools {
                 let syms = crate::repomap::extract_symbols(&scope.cwd, args["glob"].as_str())?;
                 Ok(json!(syms))
             }
+            "flow" => {
+                self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
+                let sub_op = args["op"].as_str().unwrap_or("").trim().to_string();
+                if sub_op.is_empty() {
+                    bail!("flow(op, args) requires `op` (`find`, `node`, `neighbors`, or `source`)");
+                }
+                let sub_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+                let root = self
+                    .flow_root
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .filter(|r| r.join(tm_flow::FLOW_DIR).is_dir())
+                    .unwrap_or_else(|| scope.cwd.clone());
+                let out = tokio::task::spawn_blocking(move || {
+                    if !root.join(tm_flow::FLOW_DIR).is_dir() {
+                        let _ = tm_flow::build(&root);
+                    }
+                    tm_flow::execute_op(&root, &sub_op, &sub_args)
+                })
+                .await
+                .context("flow query task panicked")??;
+                Ok(out.json)
+            }
             "ls" | "grep" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
                 let files = files(&scope.cwd, args["glob"].as_str())?;
@@ -653,18 +809,32 @@ impl CodeTools {
                 let command = args["command"].as_str().context("`command` is required")?;
                 self.allowed(scope, op, ToolKind::Execute, None, Some(command)).await?;
                 let (code, text) = self.sandboxed(scope, command).await?;
-                Ok(json!({ "code": code, "output": tail(&text, 8000) }))
+                Ok(json!({ "code": code, "output": tail(&text, MAX_TOOL_OUTPUT) }))
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
-                let venv = scope.shell.as_ref().and_then(|s| s.writable.first()).map(|scratch| scratch.join("venv")).unwrap_or_else(|| scope.cwd.join(".venv"));
-                let steps = crate::runtime::steps(&scope.cwd, &venv);
+                let (venv, steps) = select_test_steps(scope).await;
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
                 }
                 let command = test_command(&steps);
                 let (code, text) = self.sandboxed(scope, &command).await?;
-                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, 6000) }))
+                if code == Some(0) {
+                    let flow_root = self.flow_root.lock().unwrap().clone();
+                    let rel_base = self
+                        .project_root
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .or_else(|| flow_root.clone());
+                    if let (Some(root), Some(base)) = (flow_root, rel_base)
+                        && tm_flow::read_env(&root).ok().flatten().is_none()
+                        && let Some(facts) = crate::runtime::env_facts_from_steps_rel(&steps, &venv, &base)
+                    {
+                        let _ = tm_flow::write_env(&root, &facts);
+                    }
+                }
+                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, MAX_TOOL_OUTPUT) }))
             }
             "readMany" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -731,6 +901,14 @@ impl CodeTools {
                 let mut staged: Vec<(PathBuf, Option<String>, String)> = Vec::new();
                 for file_patch in &patches {
                     let rel = file_patch.target_path();
+                    if tm_flow::is_flow_path(rel) {
+                        return Ok(json!({
+                            "applied": false,
+                            "error": format!("policy denied write to `{rel}` (`.flow/` is managed by Taskmaster)"),
+                            "files": [],
+                            "diagnostics": [],
+                        }));
+                    }
                     if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
                         return Ok(json!({
                             "applied": false,
@@ -846,13 +1024,7 @@ impl CodeTools {
                     })
                     .take(12)
                     .collect();
-                let venv = scope
-                    .shell
-                    .as_ref()
-                    .and_then(|s| s.writable.first())
-                    .map(|scratch| scratch.join("venv"))
-                    .unwrap_or_else(|| scope.cwd.join(".venv"));
-                let steps = crate::runtime::steps(&scope.cwd, &venv);
+                let (_, steps) = select_test_steps(scope).await;
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({
                         "ok": true,
@@ -871,7 +1043,7 @@ impl CodeTools {
                     "affectedFiles": changed,
                     "testFiles": matched_tests,
                     "failed": failed_tests(&text),
-                    "output": tail(&text, 6000)
+                    "output": tail(&text, MAX_TOOL_OUTPUT)
                 }))
             }
             "probeAst" => {
@@ -1165,6 +1337,42 @@ async fn probe_local_http(url: &str) -> Option<u16> {
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
 /// One shell line that runs the project's test steps: setup steps may fail and are reported,
 /// the checks must all pass.
+async fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
+    let fallback_venv = scope
+        .shell
+        .as_ref()
+        .and_then(|s| s.writable.first())
+        .map(|scratch| scratch.join("venv"))
+        .unwrap_or_else(|| scope.cwd.join(".venv"));
+    // Prefer an already-prepared shared read-only venv mounted into the worker's sandbox
+    // when it needs zero setup writes AND its pytest is actually importable under the worker
+    // sandbox view (never masked by host `~/.local/lib`); otherwise fall back to the writable scratch venv.
+    let shared_venv = scope
+        .shell
+        .as_ref()
+        .and_then(|s| s.readable.iter().find(|d| d.join("pyvenv.cfg").is_file()))
+        .cloned();
+    match shared_venv {
+        Some(shared) => {
+            let candidate = crate::runtime::steps(&scope.cwd, &shared);
+            let needs_pytest = candidate.iter().any(crate::runtime::is_pytest_step);
+            let ready = candidate.iter().any(|s| !s.setup)
+                && !candidate.iter().any(|s| s.setup)
+                && (!needs_pytest || crate::runtime::venv_has_pytest(&shared).await);
+            if ready {
+                (shared, candidate)
+            } else {
+                let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+                (fallback_venv, steps)
+            }
+        }
+        None => {
+            let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+            (fallback_venv, steps)
+        }
+    }
+}
+
 fn test_command(steps: &[crate::runtime::Step]) -> String {
     let line = |step: &crate::runtime::Step| {
         let mut parts: Vec<String> = step.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();
@@ -1259,6 +1467,69 @@ fn summary(done: &Value) -> String {
         out.push_str(&shown);
     }
     tail(&out, MAX_REPLY)
+}
+
+fn record_applied_op(applied: &mut Vec<String>, op: &str, args: &Value, result: &Value) {
+    let entry = match op {
+        "write" | "edit" | "patch" => args["path"].as_str().map(|p| format!("{op}({p})")),
+        "applyPatch" => result["files"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                let paths: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+                format!("applyPatch({})", paths.join(", "))
+            }),
+        "tryPatch" if result["applied"] == true => result["files"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                let paths: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+                format!("tryPatch({})", paths.join(", "))
+            }),
+        _ => None,
+    };
+    if let Some(item) = entry
+        && !applied.contains(&item)
+    {
+        applied.push(item);
+    }
+}
+
+async fn format_aborted_run_code(
+    worker: &mut WarmNode,
+    applied: &[String],
+    failed: &[String],
+    extra: Option<&str>,
+) -> anyhow::Error {
+    // Give the stderr drain task and child exit status a brief moment to settle.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let status = worker
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map(|s| format!(" (exit {s})"))
+        .unwrap_or_default();
+    let stderr = worker.take_stderr();
+    let mut msg = format!("run_code script aborted before finishing{status} (the script stopped before it finished).");
+    if let Some(reason) = extra {
+        msg.push_str(&format!(" Cause: {reason}."));
+    }
+    if !stderr.is_empty() {
+        msg.push_str(&format!("\nStderr:\n{}", tail(&stderr, 1200)));
+    }
+    if applied.is_empty() {
+        msg.push_str("\nApplied edits on disk before abort: none (worktree unchanged by this call).");
+    } else {
+        msg.push_str(&format!("\nApplied edits on disk before abort: {}.", applied.join(", ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("\nFailed ops before abort:\n- {}", failed.join("\n- ")));
+    }
+    msg.push_str(
+        "\nRecovery: fix the script error and call `run_code` again (always `await` every helper call; use `edit(path, find, replace)` or `files`/`writeFile`, and end with `return await test()`). Do NOT end your turn or switch to native shell/edit tools.",
+    );
+    anyhow::anyhow!(msg)
 }
 
 /// Internal drive failure distinction: syntax errors leave the warm Node worker healthy;
@@ -1439,40 +1710,20 @@ fn find_hunk_pos(lines: &[String], expected: &[&str], hint: isize) -> Option<usi
     None
 }
 
-/// Whether bubblewrap can make a sandbox here; some containers forbid user namespaces.
-fn bwrap_works() -> bool {
-    std::process::Command::new("bwrap")
-        .args(["--ro-bind", "/", "/", "--unshare-net", "--die-with-parent", "true"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Strip any known Dictionary MCP server prefix from a tool name so aliases work uniformly.
-pub(crate) fn strip_dict_prefix(name: &str) -> &str {
-    for prefix in ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            return rest;
-        }
-    }
-    name
-}
-
 /// Accept both the canonical MCP name (`run_code`) and harness-prefixed aliases
 /// (such as `mcp_dictionary_run_code` on Antigravity or `mcp__dictionary__run_code` on Claude).
 fn is_run_code_tool(name: &str) -> bool {
-    strip_dict_prefix(name) == "run_code"
+    tm_dictionary::strip_dict_prefix(name) == "run_code"
 }
 
 /// Accept `writeFile` / `write_file` (with or without a Dictionary prefix) taking `{path, content}`
 /// as separate MCP arguments so raw files bypass JS string escaping.
 fn is_write_file_tool(name: &str) -> bool {
-    matches!(strip_dict_prefix(name), "writeFile" | "write_file")
+    matches!(tm_dictionary::strip_dict_prefix(name), "writeFile" | "write_file")
 }
 
-/// Refuse writes matching `Policy::denied_globs` (such as `.env`, `*.pem`, `*.key`) across
-/// every Code Mode write/edit primitive, matching `tryPatch`.
+/// Refuse writes into Taskmaster's `.flow/` directory or matching `Policy::denied_globs`
+/// (such as `.env`, `*.pem`, `*.key`) across every Code Mode write/edit primitive, matching `tryPatch`.
 fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
     let rel = file
         .strip_prefix(&scope.cwd)
@@ -1480,6 +1731,9 @@ fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
         .to_string_lossy()
         .replace('\\', "/");
     let rel = rel.trim_start_matches("./");
+    if tm_flow::is_flow_path(rel) {
+        bail!("policy denied write to `{rel}` (`.flow/` is managed by Taskmaster)");
+    }
     let policy = crate::policy::Policy::load(&scope.cwd);
     if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
         bail!("policy denied write to `{rel}` (matched `{glob}`)");
@@ -1578,31 +1832,21 @@ impl Extension for CodeTools {
             return Vec::new();
         };
         let description = if scope.read_only {
-            "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
-             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), check(), status(text), wait({url, port, log, agent, timeout}), and console.log. \
-             Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
+            "Async JS body over repo (relative paths). Helpers: read, readMany, grep, ls, diff, symbols, flow(op, args), probe.ast, check, status, wait, console.log."
         } else {
-            "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
-             Functions: read(path), readMany(globs), write(path, text | { raw }), writeFile(path, content | { raw }), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
-             applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
-             grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), sh(command), \
-             test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
-             status(text) to set a live one-line status, wait({url, port, log, agent, timeout}) to wait for a server/port/log/sibling unit, \
-             and console.log. For Python/code with triple quotes or backslashes, pass raw file content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments (written before `code` runs), or use `String.raw` with `write(path, { raw })`. \
-             Paths are relative to your worktree. The same permissions as your own tools apply. \
-             Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
+            "Async JS body over worktree (relative paths; await/return). Helpers: read, readMany, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow(op, args), probe.ast, sh, test, testAffected, check, browser, status, wait, console.log. Use `files` or `writeFile` for raw multi-line files; end with `return await test()`."
         };
         let properties = if scope.read_only {
             json!({
-                "code": { "type": "string", "description": "The body of an async function" }
+                "code": { "type": "string", "description": "Async JS body" }
             })
         } else {
             json!({
-                "code": { "type": "string", "description": "The body of an async function (optional when `files` or `writeFile` is provided)" },
+                "code": { "type": "string", "description": "Async JS body (optional if files/writeFile set)" },
                 "files": {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
-                    "description": "Optional map of unquoted relative path (e.g. `src/app.py`, not `\"src/app.py\"`) -> raw UTF-8 file content written directly before `code` runs; avoids JS string escaping for Python triple quotes, backticks, or backslashes"
+                    "description": "Relative path -> raw UTF-8 content written before code runs"
                 },
                 "writeFile": {
                     "type": "object",
@@ -1612,7 +1856,7 @@ impl Extension for CodeTools {
                         "raw": { "type": "string" }
                     },
                     "required": ["path"],
-                    "description": "Optional single raw file write `{path, content}` applied before `code` runs"
+                    "description": "Single raw write {path, content} before code runs"
                 }
             })
         };
@@ -1850,7 +2094,7 @@ mod tests {
         let scratch = dir.with_extension("scratch");
         let outside = dir.with_extension("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
         tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
         let script = format!(
             r#"return await sh("echo in > made.txt && echo s > $TASKMASTER_SCRATCH/s.txt && (echo out > {}/x.txt || echo refused-outside)");"#,
@@ -1908,7 +2152,7 @@ mod tests {
         std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
         std::fs::write(dir.join("tests/test_calc.py"), "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n").unwrap();
         let scratch = dir.with_extension("scratch");
-        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
         tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
         let text = tools.run(&grant(), "const r = await test(); return { ok: r.ok, failed: r.failed };").await.unwrap();
         assert!(text.contains("\"ok\": false") && text.contains("tests/test_calc.py::test_add"), "{text}");
@@ -2104,6 +2348,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tok11_code_mode_guide_and_two_call_write_then_fix_discipline() {
+        let guide = crate::engine::code_mode_guide("antigravity");
+        assert!(guide.contains("two-call discipline"), "{guide}");
+        assert!(guide.contains("Call 1 (write + test in one call)"), "{guide}");
+        assert!(guide.contains("return await test()"), "{guide}");
+        assert!(guide.contains("Call 2 (fix + re-test"), "{guide}");
+        assert!(guide.contains("mcp_dictionary_run_code"), "{guide}");
+        assert!(!guide.contains(" run_code"), "bare run_code should be rewritten: {guide}");
+
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("two-call discipline"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Call 1"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Call 2"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("return await test()"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("tok11-two-call");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // Call 1: write implementation + unit test via `files` and run script body in ONE call.
+        let call1 = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({
+                    "files": {
+                        "pkg/calc.py": "def add(a, b):\n    return a - b\n",
+                        "tests/test_calc.py": "from pkg.calc import add\ndef test_add(): assert add(2, 3) == 5\n"
+                    },
+                    "code": "return { src: await read('pkg/calc.py'), tst: await read('tests/test_calc.py') };"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call1["isError"], false, "{call1}");
+        assert!(call1["content"][0]["text"].as_str().unwrap().contains("return a - b"));
+
+        // Call 2: targeted `edit` fix in the second call (no whole-file rewrite).
+        let call2 = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({
+                    "code": "await edit('pkg/calc.py', 'return a - b', 'return a + b'); return await read('pkg/calc.py');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call2["isError"], false, "{call2}");
+        assert!(call2["content"][0]["text"].as_str().unwrap().contains("return a + b"));
+
+        tools.detach("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn raw_content_write_handles_python_triple_quotes_and_separate_arguments() {
         assert!(crate::engine::code_mode_guide("antigravity").contains("String.raw"));
         assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("String.raw"));
@@ -2263,6 +2564,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn code_mode_flow_queries_graph_for_workers_and_readonly_roles() {
+        let Some(tools) = CodeTools::new(None) else {
+            eprintln!("no node here; run_code is not exercised");
+            return;
+        };
+        let dir = repo("flow-code");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(
+            dir.join("pkg/lib.py"),
+            "def greet(name: str) -> str:\n    \"\"\"Return greeting.\"\"\"\n    return f'hi {name}'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkg/main.py"),
+            "from pkg.lib import greet\ndef run() -> str:\n    return greet('world')\n",
+        )
+        .unwrap();
+        tm_flow::build(&dir).unwrap();
+
+        let worker_gate = Arc::new(WorktreeGate::new(&dir, vec![]));
+        tools.attach("home", &dir, worker_gate, None);
+        let ro_gate = Arc::new(WorktreeGate::new(&dir, vec![]).read_only());
+        tools.attach_readonly("reviewer", &dir, ro_gate);
+
+        let rev_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: String::new() };
+        assert!(tools.tools(&grant())[0]["description"].as_str().unwrap().contains("flow(op, args)"));
+        assert!(tools.tools(&rev_grant)[0]["description"].as_str().unwrap().contains("flow(op, args)"));
+
+        let script = r#"
+            const found = await flow("find", { query: "greet" });
+            const detail = await flow("node", { id: "py:pkg/main.py#run" });
+            const nbrs = await flow("neighbors", { id: "py:pkg/main.py#run", k: 1, kinds: ["calls"], dir: "out" });
+            const src = await flow("source", { id: "py:pkg/lib.py#greet" });
+            return {
+                foundId: found.nodes[0].id,
+                callees: detail.outgoing.map((e) => e.peer_id),
+                nbrCount: nbrs.nodes.length,
+                srcHasDef: src.code.includes("def greet"),
+            };
+        "#;
+        for g in [grant(), rev_grant] {
+            let reply = tools.run(&g, script).await.unwrap();
+            assert!(reply.contains("py:pkg/lib.py#greet"), "{reply}");
+            assert!(reply.contains("\"srcHasDef\": true"), "{reply}");
+        }
+
+        // Code Mode also denies writing into `.flow/`.
+        let write_flow = tools.run(&grant(), r#"await write(".flow/meta.json", "{}");"#).await.unwrap();
+        assert!(write_flow.contains("policy denied write to `.flow/meta.json`"), "{write_flow}");
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn write_raw_file_and_files_map_sanitize_quoted_keys_and_reject_invalid_paths() {
         let Some(tools) = CodeTools::new(None) else {
             return;
@@ -2360,6 +2716,212 @@ mod tests {
         assert_eq!(wf["isError"], false, "{wf}");
         assert_eq!(std::fs::read_to_string(dir.join("tinydb/wf.py")).unwrap(), "z = 3\n");
         assert!(!dir.join("\"tinydb/wf.py\"").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_refuses_all_writes_and_patches_into_flow_dir() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("flow-ro");
+        std::fs::create_dir_all(dir.join(".flow")).unwrap();
+        std::fs::write(dir.join(".flow/meta.json"), "{\"schema_version\":1}\n").unwrap();
+        // Even with a full-access WorktreeGate, Code Mode must refuse every mutation under `.flow/`.
+        let gate = Arc::new(WorktreeGate::new(&dir, vec![]).with_full_access());
+        tools.attach("home", &dir, gate, None);
+
+        // 1. JS write / edit / patch / applyPatch / tryPatch
+        let res = tools
+            .run(
+                &grant(),
+                r#"
+                const errs = [];
+                for (const [label, fn] of [
+                    ["write", () => write(".flow/evil.json", "{}")],
+                    ["edit", () => edit(".flow/meta.json", "1", "2")],
+                    ["patch", () => patch(".flow/meta.json", [{ find: "1", replace: "2" }])],
+                    ["applyPatch", () => applyPatch("--- a/.flow/meta.json\n+++ b/.flow/meta.json\n@@ -1 +1 @@\n-{\"schema_version\":1}\n+{\"schema_version\":2}\n")],
+                ]) {
+                    try { await fn(); errs.push(label + ":ALLOWED"); } catch (e) { errs.push(label + ":" + e.message); }
+                }
+                const tp = await tryPatch("--- a/.flow/meta.json\n+++ b/.flow/meta.json\n@@ -1 +1 @@\n-{\"schema_version\":1}\n+{\"schema_version\":2}\n");
+                return { errs, tp };
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(!res.contains(":ALLOWED"), "Code Mode allowed a `.flow/` write:\n{res}");
+        assert!(res.contains("\"applied\": false"), "tryPatch must refuse `.flow/`:\n{res}");
+
+        // 2. Direct writeFile & run_code `files` argument
+        let wf = tools
+            .call(&grant(), "writeFile", &json!({ "path": ".flow/evil2.json", "content": "{}" }))
+            .await
+            .unwrap();
+        assert_eq!(wf["isError"], true, "{wf}");
+        let fm = tools
+            .call(&grant(), "run_code", &json!({ "files": { ".flow/evil3.json": "{}" } }))
+            .await
+            .unwrap();
+        assert_eq!(fm["isError"], true, "{fm}");
+
+        // Verify disk is untouched.
+        assert_eq!(std::fs::read_to_string(dir.join(".flow/meta.json")).unwrap(), "{\"schema_version\":1}\n");
+        assert!(!dir.join(".flow/evil.json").exists());
+        assert!(!dir.join(".flow/evil2.json").exists());
+        assert!(!dir.join(".flow/evil3.json").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn select_test_steps_rejects_shared_venv_missing_sandbox_pytest() {
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !has_python3 {
+            return;
+        }
+        let ver_out = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .unwrap();
+        let py_mm = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
+
+        let dir = repo("select-shared-venv");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_ok.py"), "def test_ok():\n    assert True\n").unwrap();
+        let scratch = dir.join(".scratch");
+        let shared = dir.join(".shared-venv");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        // Create an isolated shared venv WITHOUT pytest installed in it, then stamp it as if a
+        // buggy host probe had approved it.
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", &shared.display().to_string()])
+            .status()
+            .unwrap();
+        assert!(mk.success());
+        // Write matching `.taskmaster-deps` stamp (compute by letting runtime::steps tell us the stamp).
+        let probe_steps = crate::runtime::steps(&dir, &shared);
+        let stamp_pair = probe_steps.iter().find_map(|s| s.stamp.clone()).expect("stamp on setup step");
+        std::fs::write(&stamp_pair.0, &stamp_pair.1).unwrap();
+
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: Some(tm_harness::ShellScope {
+                writable: vec![scratch.clone()],
+                readable: vec![shared.clone()],
+                env: vec![],
+            }),
+            read_only: false,
+            warm: tokio::sync::Mutex::new(None),
+        };
+
+        // Even though `.taskmaster-deps` matches, `select_test_steps` must reject `shared` because
+        // `pytest` is not importable in the sandbox view, falling back to `scratch/venv`.
+        let (chosen_before, _) = select_test_steps(&scope).await;
+        assert_eq!(chosen_before, scratch.join("venv"), "broken shared venv must not be selected");
+
+        // Once pytest exists inside `shared`'s own site-packages, `select_test_steps` selects it.
+        let venv_site = shared.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(venv_site.join("__init__.py"), "__version__ = '0.0.0-venv'\n").unwrap();
+        std::fs::write(venv_site.join("__main__.py"), "print('pytest 0.0.0-venv')\n").unwrap();
+
+        let (chosen_after, steps_after) = select_test_steps(&scope).await;
+        assert_eq!(chosen_after, shared, "self-contained shared venv must be selected");
+        assert!(steps_after.iter().all(|s| !s.setup), "ready shared venv needs no setup writes");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tok14_tool_output_cap_keeps_4kb_traceback_tail() {
+        let prefix = "verbose test output line before failure\n".repeat(300);
+        let traceback = "E       AssertionError: bad checksum\nFAILED tests/test_hash.py::test_digest\n1 failed in 0.08s\n";
+        let full = format!("{prefix}{traceback}");
+        assert!(full.len() > MAX_TOOL_OUTPUT * 2);
+        let kept = tail(&full, MAX_TOOL_OUTPUT);
+        assert!(kept.len() <= MAX_TOOL_OUTPUT + 4, "kept len {} exceeded 4KB cap", kept.len());
+        assert!(kept.starts_with('…'));
+        assert!(kept.ends_with(traceback), "must keep trailing traceback: {kept}");
+    }
+
+    #[tokio::test]
+    async fn fix_n8_aborted_run_code_reports_partial_edits_and_unawaited_errors_without_crashing() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("n8-recover");
+        std::fs::write(dir.join("app/a.py"), "x = 1\n").unwrap();
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // 1. Object-arg `edit(path, { target, replacement })` works cleanly.
+        let obj_res = tools
+            .run(
+                &grant(),
+                r#"await edit("app/a.py", { target: "x = 1", replacement: "x = 2" }); return await read("app/a.py");"#,
+            )
+            .await
+            .unwrap();
+        assert!(obj_res.contains("x = 2"), "object-arg edit should apply: {obj_res}");
+
+        // 2. Unawaited failing edit() must NOT kill the warm Node process; it reports a clear error
+        //    and names partial edits that already landed on disk.
+        let unawaited = tools
+            .run(
+                &grant(),
+                r#"
+                await write("app/partial.py", "ok = True\n");
+                edit("app/a.py", "does_not_exist", "x = 3");
+                return "finished";
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            unawaited.contains("Unawaited call failed") && unawaited.contains("does not occur"),
+            "expected actionable unawaited error, got:\n{unawaited}"
+        );
+        assert!(
+            unawaited.contains("Partial edits already applied on disk: write(app/partial.py)"),
+            "expected partial-edit report, got:\n{unawaited}"
+        );
+
+        // 3. Genuine script abort (process.exit(1) after writing a file and failing an op) returns
+        //    an actionable error listing applied edits, failed ops, stderr, and recovery advice,
+        //    and the next run_code call spawns a fresh worker and succeeds.
+        let aborted = tools
+            .run(
+                &grant(),
+                r#"
+                await write("app/before_abort.py", "saved = 1\n");
+                try { await edit("app/a.py", "missing_needle", "y"); } catch (_) {}
+                process.stderr.write("fatal boom\n");
+                process.exit(1);
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(aborted.contains("run_code script aborted before finishing"), "{aborted}");
+        assert!(aborted.contains("write(app/before_abort.py)"), "must list applied edits:\n{aborted}");
+        assert!(
+            aborted.contains("Failed ops before abort") && aborted.contains("does not occur"),
+            "must list failed op:\n{aborted}"
+        );
+        assert!(aborted.contains("fatal boom"), "must surface stderr:\n{aborted}");
+        assert!(aborted.contains("Recovery:"), "{aborted}");
+
+        let recovered = tools.run(&grant(), r#"return await read("app/before_abort.py");"#).await.unwrap();
+        assert!(recovered.contains("saved = 1"), "next run_code call must recover cleanly: {recovered}");
 
         tools.detach_all();
         std::fs::remove_dir_all(dir).ok();

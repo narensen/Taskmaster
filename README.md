@@ -138,13 +138,27 @@ Taskmaster improves the more you run it because every failure and fix feeds back
 - **Stratified model scorecard.** Tracks first-pass rate, average cost, and latency per `(model, difficulty, language)`, recommends the cheapest worker hitting ≥85% first-pass success, warns when a chosen worker is struggling, and powers `--worker auto`.
 - **Dictionary citations.** Each unit records the Dictionary hashes it was built against; later runs skip units whose cited contracts still match.
 - **Reviews that learn.** Independent reviewer and verifier findings (confirmed and rejected) feed into subsequent review passes.
-- **Event-sourced runs.** `events.jsonl` is the source of truth, so crashes, usage-limit stops (exit code `3`), or daemon restarts pick up cleanly from the log.
+- **Event-sourced runs.** `events.jsonl` is the source of truth, so crashes, provider quota / HTTP 429 stops (exit code `75`, `EX_TEMPFAIL`), auth/balance stops (exit code `3`), or daemon restarts pick up cleanly from the log.
 
 ## Studio, operations & safety
 
 - **4-Lens Run Studio & Approval Dock** — switch between **Mission** (live DAG, phases, reasoning glimpses, Web sources), **Review** (findings, PR CI sync, diff inspection), **Telemetry** (4-way token split, cache economics, latency), and **Files**, with a live approval dock for risky tool or off-allowlist fetch requests.
 - **Workflow integrations** — import prompts directly from GitHub/GitLab issue URLs, attach mockups/images/files to runs, connect custom user MCP servers with vaulted secrets, sync PR CI failures and review comments back into repair loops, configure webhook notifications, and schedule recurring runs.
 - **Production hardening** — OS keychain secret vault with universal redaction, Policy-as-Code rules, Preflight Doctor checks before spending tokens, egress allow/deny policy and audit log, supply-chain dependency checks, Flight Recorder debug bundles, run checkpoints and forking, one-click Undo of merged runs, retention GC, `Idempotency-Key` support, Prometheus `/metrics`, and a remote runner mesh.
+
+## Pricing table hook
+
+Harnesses that do not report USD costs stay unpriced by default (no model prices are invented). To price forecasts and `ledger.jsonl` rows by actual `model_used` (falling back to `model_requested` then harness id), configure dollars per 1M tokens via inline `"prices"` or `"prices_file"` in `.taskmaster/config.json` / `~/.taskmaster/config.json`, `TASKMASTER_PRICES=/path/to/prices.json`, or `--prices /path/to/prices.json`:
+
+```json
+{
+  "my-model-id": { "input": 2.0, "output": 8.0, "cached_input": 0.5 }
+}
+```
+
+## Benchmarks
+
+On a hidden-test tinydb build, Taskmaster scored 24/24 in about 410s with ~125k uncached input tokens, against 1,279s for T3 Code and 1,432s for the native Antigravity agent at the same score. Full results, methodology and limitations are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Develop
 

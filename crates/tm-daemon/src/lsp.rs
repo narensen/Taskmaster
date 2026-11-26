@@ -619,7 +619,7 @@ fn walk_sources(root: &Path, dir: &Path, out: &mut Vec<String>) {
         let name = entry.file_name().to_string_lossy().to_string();
         if matches!(
             name.as_str(),
-            ".git" | ".taskmaster" | "node_modules" | "target" | "dist" | "build" | ".venv" | "__pycache__"
+            ".git" | ".flow" | ".taskmaster" | "node_modules" | "target" | "dist" | "build" | ".venv" | "__pycache__"
         ) {
             continue;
         }

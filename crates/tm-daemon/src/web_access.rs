@@ -1651,7 +1651,7 @@ impl WebRole {
         }
     }
 
-    fn agent_tag(grant: &Grant) -> Value {
+    pub(crate) fn agent_tag(grant: &Grant) -> Value {
         match grant.page.as_str() {
             "master" | "planner" => json!({ "id": "master", "role": "planner" }),
             "reviewer" => json!({ "id": "reviewer", "role": "reviewer" }),
@@ -1667,7 +1667,7 @@ struct BudgetCounters {
     planner_fetches: HashMap<String, usize>,
 }
 
-/// Daemon MCP extension exposing `web_search`, `web_fetch`, and `docs` (Items 1.1–1.6).
+/// Daemon MCP extension exposing `web_search`, `web_fetch`, `advisories`, and `docs`.
 pub struct WebTools {
     project: PathBuf,
     settings: WebAccessSettings,
@@ -1737,6 +1737,8 @@ impl WebTools {
             page: matches!(role, WebRole::Worker).then(|| grant.page.clone()),
             harness: "web-access".into(),
             model: Some(format!("{tool}:{}", self.provider.name())),
+            model_requested: None,
+            model_used: None,
             input: 0,
             output: 0,
             cache_read: 0,
@@ -1751,6 +1753,9 @@ impl WebTools {
             brief_hash: None,
             difficulty: None,
             language: None,
+            requests: None,
+            mcp_calls: None,
+            mcp_reply_bytes: None,
         };
         let _ = self.records.charge(&grant.run, &entry);
     }
@@ -2230,6 +2235,10 @@ impl WebTools {
             .ok()
             .flatten();
         if let Some(doc) = local {
+            let body = format!(
+                "# {} @ {} ({}, local: {})\n\n{}",
+                doc.package, doc.version, doc.ecosystem, doc.path, doc.content
+            );
             self.live.push(
                 &grant.run,
                 &agent,
@@ -2241,13 +2250,10 @@ impl WebTools {
                     "symbol": symbol,
                     "source": "local",
                     "path": doc.path,
+                    "reply_bytes": body.len(),
                 }),
             );
             self.record_ledger(grant, role, "docs", true, started.elapsed().as_secs_f64(), Vec::new());
-            let body = format!(
-                "# {} @ {} ({}, local: {})\n\n{}",
-                doc.package, doc.version, doc.ecosystem, doc.path, doc.content
-            );
             return mcp_ok(&body);
         }
 
@@ -2332,7 +2338,7 @@ impl Extension for WebTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        match crate::code::strip_dict_prefix(name) {
+        match tm_dictionary::strip_dict_prefix(name) {
             "web_search" => Some(self.handle_search(grant, args).await),
             "web_fetch" => Some(self.handle_fetch(grant, args).await),
             "advisories" => Some(self.handle_advisories(grant, args).await),
@@ -2342,14 +2348,14 @@ impl Extension for WebTools {
     }
 }
 
-fn mcp_ok(text: &str) -> Value {
+pub(crate) fn mcp_ok(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
     })
 }
 
-fn mcp_err(text: &str) -> Value {
+pub(crate) fn mcp_err(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": true,
@@ -2727,11 +2733,13 @@ mod tests {
         assert_eq!(second["isError"], true);
         assert!(second["content"][0]["text"].as_str().unwrap().contains("Planner search budget reached (1/1"));
 
-        // Verifier gets neither web_search nor web_fetch
+        // Verifier gets neither web_search nor web_fetch (only local docs; flow_query lives in FlowTools)
         let verifier = Grant { run: "run-roles".into(), page: "verifier".into(), unit: String::new() };
         let v_tools = tools.tools(&verifier);
-        assert_eq!(v_tools.len(), 1);
-        assert_eq!(v_tools[0]["name"], "docs");
+        let v_names: Vec<&str> = v_tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(v_names, vec!["docs"]);
+        assert!(!v_names.contains(&"web_search") && !v_names.contains(&"web_fetch"));
+        assert!(!v_names.contains(&"flow_query"), "flow_query is registered via FlowTools, not WebTools");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2924,6 +2932,10 @@ mod tests {
             .await
             .expect("mcp_dictionary_docs must be handled");
         assert!(res["content"][0]["text"].is_string(), "{res}");
+        assert!(
+            tools.call(&worker, "flow_query", &json!({ "op": "find", "query": "x" })).await.is_none(),
+            "WebTools must not dispatch flow_query after FlowTools extraction"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

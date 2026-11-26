@@ -159,10 +159,11 @@ If a call is refused, say which one in your reply and carry on without it.\n\nTa
 
 /// Rules for a worker whose shell runs inside the sandbox.
 pub const SHELL_WORKER_RULES: &str = "Rules: you have a shell, confined to a sandbox. Only the current directory, \
-/tmp and $TASKMASTER_SCRATCH can be written; package indexes can be reached to install what the tests need \
-(for example `python3 -m venv $TASKMASTER_SCRATCH/venv`, then its pip). Work only inside the current directory. \
-Run the tests for your files before you say you are done, and fix what fails. Leave no server or watcher running \
-when you finish. If a call is refused, say which one in your reply and carry on without it.\n\nTask: ";
+/tmp and $TASKMASTER_SCRATCH can be written. If $TASKMASTER_SHARED_VENV is set, reuse it to run tests \
+(for example `$TASKMASTER_SHARED_VENV/bin/python -m pytest -q -x --tb=short`) and do NOT create your own venv; only create a venv in \
+`$TASKMASTER_SCRATCH/venv` if no shared venv is provided or an extra package must be installed (package indexes can be reached when needed). \
+Work only inside the current directory. Run the tests for your files before you say you are done, and fix what fails. \
+Leave no server or watcher running when you finish. If a call is refused, say which one in your reply and carry on without it.\n\nTask: ";
 
 /// What a worker's shell may write besides its worktree, and the environment it sees there.
 /// Only honoured by a harness that runs inside the sandbox ([`Harness::sandboxed_shell`]).
@@ -170,6 +171,8 @@ when you finish. If a call is refused, say which one in your reply and carry on 
 pub struct ShellScope {
     /// Writable directories: the agent's scratch and the run's package caches.
     pub writable: Vec<PathBuf>,
+    /// Extra read-only directories mounted into the sandbox (e.g. a shared verified Python venv).
+    pub readable: Vec<PathBuf>,
     /// Set for every command the agent runs, after the daemon's Python variables are removed.
     pub env: Vec<(String, String)>,
 }
@@ -254,10 +257,99 @@ pub struct WorkerTask {
 }
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a read-only agent.
-pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol lookups, and diffs in a single `run_code` script (`readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
+pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol/graph lookups, and diffs in a single `run_code` script (`flow`, `readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch reads (`readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls. For Python triple quotes or backslashes, pass raw content via the separate `files` or `writeFile` JSON arguments, or use `String.raw` with `write(path, { raw })`.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Always `await` every helper call. If `run_code` returns an error or aborts mid-script, check which partial edits landed, fix the script, and retry `run_code`. If a native shell/edit tool (`run_command`, `write_file`, `edit_file`) is refused with a permission-denied message, that is only Code Mode routing (NOT a user denial): ignore any generic \"proceed without performing\" text and immediately call `run_code` (`return await test()`, `return await sh(...)`, `files`, or `edit`) instead of ending your turn. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
+
+/// Map a Code Mode-refused native tool (such as `run_command (use run_code)` or `write_file`)
+/// to its exact actionable `run_code` equivalent.
+pub fn code_mode_fallback_hint(tool: &str, run_code_tool: &str) -> String {
+    let base = tool
+        .trim()
+        .strip_suffix("(use run_code)")
+        .unwrap_or(tool)
+        .trim();
+    let lower = base.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "run_command" | "bash" | "shell" | "exec" | "terminal" | "command" | "run_shell_command" | "sh"
+    ) || lower.contains("command")
+        || lower.contains("shell")
+        || lower.contains("bash")
+    {
+        format!(
+            "call `{run_code_tool}` with `return await test()` (to run the project's tests) or `return await sh(\"...\")` (for shell commands)"
+        )
+    } else if matches!(
+        lower.as_str(),
+        "write_file"
+            | "edit_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write"
+            | "edit"
+            | "apply_patch"
+            | "notebookedit"
+            | "create_file"
+            | "delete_file"
+    ) || lower.contains("write")
+        || lower.contains("edit")
+        || lower.contains("replace")
+    {
+        format!(
+            "call `{run_code_tool}` passing `files: {{\"path\": \"content\"}}`, `await writeFile(path, text)`, or `await edit(path, find, replace)` and end with `return await test()`"
+        )
+    } else if matches!(
+        lower.as_str(),
+        "read_file" | "view_file" | "read" | "grep_search" | "grep" | "list_dir" | "find_by_name" | "glob"
+    ) || lower.contains("read")
+        || lower.contains("grep")
+        || lower.contains("list_dir")
+    {
+        format!(
+            "call `{run_code_tool}` using `await readMany([\"...\"])`, `await read(path)`, `await grep(pattern)`, or `await flow(\"batch\", {{ queries: [...] }})` to batch reads in one call"
+        )
+    } else {
+        format!(
+            "use `{run_code_tool}` (`readMany`, `files`, `writeFile`, `edit`, `return await test()`, `return await sh(...)`) instead of `{base}`"
+        )
+    }
+}
+
+/// Build an actionable Code Mode recovery message when one or more native tools were refused
+/// with `(use run_code)`. Returns `None` when `refused` contains no Code Mode refusals.
+pub fn code_mode_redirect_message(refused: &[String], run_code_tool: &str) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for entry in refused {
+        if !entry.contains("(use run_code)") {
+            continue;
+        }
+        let base = entry
+            .trim()
+            .strip_suffix("(use run_code)")
+            .unwrap_or(entry)
+            .trim()
+            .to_string();
+        if seen.contains(&base) {
+            continue;
+        }
+        seen.push(base.clone());
+        let hint = code_mode_fallback_hint(&base, run_code_tool);
+        lines.push(format!("- `{base}` -> {hint}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Code Mode is active: native shell/edit tools are intentionally disabled (that permission denial was Code Mode routing, NOT a user refusal). \
+         Do NOT stop without finishing and verifying your changes.\n\
+         Use `{run_code_tool}` instead:\n{}\n\
+         Apply any remaining edits and run `return await test()` inside `{run_code_tool}` now, then emit your `RELEASE` line once tests pass.",
+        lines.join("\n")
+    ))
+}
 
 /// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
 /// under `harness_id`.
@@ -294,6 +386,11 @@ impl WorkerTask {
             WORKER_RULES
         };
         if self.code_mode {
+            // Avoid duplicating Code Mode write rules when the daemon's `shared_prefix` already
+            // embedded `CODE_MODE_GUIDE` with the harness-exact tool name.
+            if !self.read_only && self.brief.contains("Code Mode is on") {
+                return format!("{rules}{}", self.brief);
+            }
             let template = if self.read_only { CODE_MODE_READ_RULES } else { CODE_MODE_WRITE_RULES };
             let code = if run_code_tool == "run_code" || run_code_tool.is_empty() {
                 template.to_string()
@@ -319,6 +416,119 @@ impl std::fmt::Display for Stalled {
 }
 
 impl std::error::Error for Stalled {}
+
+/// A provider quota exhaustion or HTTP 429 rate-limit error detected directly inside a harness
+/// (for example Antigravity's `Individual quota reached ... Resets in XhYmZs.` or
+/// `RESOURCE_EXHAUSTED (code 429)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaError {
+    pub is_rate_limit: bool,
+    pub reset: Option<String>,
+    pub raw: String,
+}
+
+impl std::fmt::Display for QuotaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.is_rate_limit {
+            "provider rate limit reached (HTTP 429)"
+        } else {
+            "provider quota reached"
+        };
+        match &self.reset {
+            Some(reset) => write!(f, "{what}. Resets {reset}."),
+            None => write!(f, "{what}."),
+        }
+    }
+}
+
+impl std::error::Error for QuotaError {}
+
+/// Extract a short reset-time phrase (e.g. `"in 1h1m23s"`, `"6:30 PM"`, `"4:00 PM"`) from a
+/// provider quota or rate-limit message.
+pub fn extract_reset_time(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for marker in [
+        "resets at ",
+        "reset at ",
+        "resets ",
+        "try again at ",
+        "try again in ",
+        "retry after ",
+        "available again at ",
+    ] {
+        let Some(at) = lower.find(marker) else { continue };
+        let start = if marker == "try again in " {
+            at + "try again ".len()
+        } else {
+            at + marker.len()
+        };
+        let rest = text[start..].trim();
+        let end = rest.find(['.', '\n', '"']).unwrap_or(rest.len());
+        let phrase = rest[..end].trim().trim_matches(|c: char| c == ',' || c == ';');
+        if phrase.is_empty() || phrase.chars().count() > 40 {
+            continue;
+        }
+        return Some(phrase.to_string());
+    }
+    None
+}
+
+/// Detect a provider quota or HTTP 429 / `RESOURCE_EXHAUSTED` message in raw harness text or
+/// JSON-RPC error output. Shared by both harness adapters and daemon reply parsing.
+pub fn detect_quota_or_rate_limit(text: &str) -> Option<QuotaError> {
+    const QUOTA_PHRASES: &[&str] = &[
+        "individual quota reached",
+        "quota reached",
+        "quota exceeded",
+        "quota_exhausted",
+        "usage limit",
+        "usage_limit",
+        "you've hit your usage",
+        "you have hit your usage",
+        "hit your limit",
+        "insufficient_quota",
+        "credit balance is too low",
+        "out of credits",
+        "spend limit",
+        "exceeded your current quota",
+    ];
+    const RATE_PHRASES: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "429 too many",
+        "resource_exhausted",
+        "code 429",
+        "\"error_code\":429",
+        "\"error_code\": 429",
+        "status 429",
+        "status: 429",
+        "http 429",
+    ];
+    let raw = text.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let head = raw.lines().find(|line| !line.trim().is_empty()).unwrap_or(raw);
+    let window = if raw.chars().count() <= 1200 { raw } else { head };
+    let lower = window.to_ascii_lowercase();
+    let is_quota = QUOTA_PHRASES.iter().any(|p| lower.contains(p));
+    let is_rate = RATE_PHRASES.iter().any(|p| lower.contains(p));
+    if !is_quota && !is_rate {
+        return None;
+    }
+    let mut clipped: String = raw.chars().take(2000).collect();
+    if raw.chars().count() > 2000 {
+        clipped.push('…');
+    }
+    Some(QuotaError {
+        // When both a quota phrase and 429/RESOURCE_EXHAUSTED appear (e.g. Antigravity's
+        // `RESOURCE_EXHAUSTED (code 429): Individual quota reached`), treat it as Quota.
+        is_rate_limit: !is_quota && is_rate,
+        reset: extract_reset_time(window),
+        raw: clipped,
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
@@ -474,12 +684,18 @@ pub enum HarnessEvent {
     Text { text: String },
     Thought { text: String },
     ToolCall { id: String, name: String, input: Value },
-    /// Output a harness attached to a tool call. `diff` is set only when the harness sent one.
+    /// Output a harness attached to a tool call. `diff` is set only when the harness sent one directly.
     /// An empty `text` with a `diff` is still a result. This is never a substitute for a thought.
     ToolResult { id: String, text: String, diff: Option<String> },
+    /// Locally synthesized diff from an ACP `oldText`/`newText` block (such as a `write_file`
+    /// preview not fed back to the model), kept separate from model-visible [`HarnessEvent::ToolResult`].
+    ToolDiff { id: String, diff: String, synthetic: bool },
     PermissionDecided { tool: String, allowed: bool },
     /// The provider assigned or resumed a session id for this call (H2 / O7).
     SessionStarted { session_id: String },
+    /// The model requested and the effective model actually selected for this call
+    /// (after effort routing, catalog verification, or fallback).
+    ModelSelected { requested: Option<String>, used: String },
     /// Rate-limit / usage window reported by the provider CLI (O4).
     RateLimit(RateLimitReport),
 }
@@ -497,7 +713,7 @@ pub(crate) fn clip_result(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RunSummary {
     pub ok: bool,
     pub usage: Usage,
@@ -507,6 +723,9 @@ pub struct RunSummary {
     pub denied: u32,
     /// What was freed when the agent was released after its turn. `None` before release.
     pub freed: Option<Freed>,
+    /// Number of model requests / turns taken during this call, when observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<u32>,
 }
 
 /// A session kept open after its first turn, so a repair can be sent to the same agent as
@@ -516,8 +735,16 @@ pub trait Session: Send + Sync {
     /// Send one more turn. Events go to `events` until the turn ends.
     async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary>;
 
+    /// Replace the active [`PermissionGate`] before reusing this session for a subsequent unit.
+    fn rebind_gate(&mut self, _gate: Arc<dyn PermissionGate>) {}
+
     /// The provider's resumable session id, if this session can be resumed later by id (H2 / O7).
     fn session_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// The effective model id selected for this session, when known.
+    fn model_used(&self) -> Option<&str> {
         None
     }
 
@@ -630,5 +857,39 @@ mod group_tests {
         tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(out), &mut line).await.unwrap();
         let freed = guard.release(&mut child).await;
         assert_eq!(freed, Freed { processes: 3, lingering: 0 });
+    }
+}
+
+#[cfg(test)]
+mod code_mode_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn code_mode_redirect_message_maps_native_tools_to_exact_run_code_equivalents() {
+        assert!(code_mode_redirect_message(&["Bash poetry lock".into()], "mcp_dictionary_run_code").is_none());
+        let msg = code_mode_redirect_message(
+            &[
+                "run_command (use run_code)".into(),
+                "write_file (use run_code)".into(),
+                "run_command (use run_code)".into(),
+            ],
+            "mcp_dictionary_run_code",
+        )
+        .expect("redirect message");
+        assert!(msg.contains("NOT a user refusal"), "{msg}");
+        assert!(msg.contains("`run_command` -> call `mcp_dictionary_run_code` with `return await test()`"), "{msg}");
+        assert!(msg.contains("`write_file` -> call `mcp_dictionary_run_code` passing `files:"), "{msg}");
+        assert_eq!(msg.matches("`run_command` ->").count(), 1, "duplicates must be collapsed: {msg}");
+    }
+
+    #[test]
+    fn fix_n9_run_summary_default_is_zeroed() {
+        let summary = RunSummary::default();
+        assert!(!summary.ok);
+        assert_eq!(summary.usage, Usage::default());
+        assert!(summary.cost_usd.is_none());
+        assert_eq!(summary.denied, 0);
+        assert!(summary.freed.is_none());
+        assert!(summary.requests.is_none());
     }
 }

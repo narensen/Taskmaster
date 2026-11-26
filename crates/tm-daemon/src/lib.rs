@@ -31,6 +31,7 @@ pub mod egress;
 mod engine;
 mod eval;
 pub mod eval_suite;
+pub mod flow_tools;
 pub mod gates;
 mod git;
 pub mod goals;
@@ -442,6 +443,13 @@ pub struct Config {
     /// Optional silence timeout before a stalled agent is restarted. Falls back to
     /// `TASKMASTER_STALL_SECS` and then the built-in default (150s small / 240s normal).
     pub stall_timeout: Option<Duration>,
+    /// Route worker thinking effort from unit difficulty (e.g. Antigravity `-low`/`-medium` for
+    /// `easy`/`normal`, keeping `-high` for `hard`, repairs, planner, and reviewer). Set `false`
+    /// to pin explicit `--worker-model` choices verbatim.
+    pub effort_routing: bool,
+    /// Maximum estimated context tokens in a clean warm worker session eligible for reuse on a
+    /// subsequent wave's unit (~65k tokens by default; 0 disables cross-unit warm reuse).
+    pub warm_reuse_max_context: u64,
 }
 
 /// How an active run should stop when cancelled.
@@ -524,6 +532,8 @@ impl Config {
             master_answers: false,
             holder: None,
             stall_timeout: None,
+            effort_routing: true,
+            warm_reuse_max_context: crate::engine::WARM_REUSE_MAX_CONTEXT,
         }
     }
 }

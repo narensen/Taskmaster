@@ -72,6 +72,10 @@ impl ClaudeCode {
             // With no edit tools and nobody to approve a prompt, the session can only read.
             vec!["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"]
         } else if task.code_mode {
+            // Code Mode disables Claude's native write/edit/shell tools via `--disallowedTools` so
+            // all mutations and test runs go through `run_code`. Read-only tools (`Read`/`Glob`/
+            // `Grep`) remain available as a low-risk fallback, while prompts steer workers to batch
+            // reads alongside edits inside `run_code`.
             WRITING_TOOLS.to_vec()
         } else if shell {
             Vec::new()
@@ -143,12 +147,18 @@ impl ClaudeCode {
         resume: Option<&str>,
         events: mpsc::Sender<HarnessEvent>,
         timeout: std::time::Duration,
-    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+    ) -> anyhow::Result<(RunSummary, Option<String>, Option<String>)> {
         let mut cmd = self.command_with(task, prompt, persist, resume)?;
         let (proc, mut io) = crate::child::start(&mut cmd, false, task.hold.as_ref())
             .await
             .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let mut stream = Stream { session_id: resume.map(str::to_string), emitted: false, tools: Default::default() };
+        let mut stream = Stream {
+            session_id: resume.map(str::to_string),
+            emitted: false,
+            requested_model: task.model.clone(),
+            model_used: None,
+            tools: Default::default(),
+        };
         if let Some(id) = resume {
             let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
             stream.emitted = true;
@@ -159,9 +169,9 @@ impl ClaudeCode {
         };
         let freed = proc.release().await;
         match result {
-            Ok((mut summary, session_id)) => {
+            Ok((mut summary, session_id, model_used)) => {
                 summary.freed = Some(freed);
-                Ok((summary, session_id))
+                Ok((summary, session_id, model_used))
             }
             Err(err) => Err(err),
         }
@@ -174,6 +184,8 @@ impl ClaudeCode {
 struct Stream {
     session_id: Option<String>,
     emitted: bool,
+    requested_model: Option<String>,
+    model_used: Option<String>,
     tools: std::collections::BTreeSet<String>,
 }
 
@@ -185,7 +197,7 @@ impl Stream {
         io: &mut crate::child::AgentIo,
         events: &mpsc::Sender<HarnessEvent>,
         stall: Option<std::time::Duration>,
-    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+    ) -> anyhow::Result<(RunSummary, Option<String>, Option<String>)> {
         loop {
             let next = io.next_line();
             let line = match stall.filter(|_| self.tools.is_empty()) {
@@ -199,7 +211,7 @@ impl Stream {
                 break;
             };
             if let Some(summary) = self.line(&line, Some(events)).await {
-                return Ok((summary, self.session_id.clone()));
+                return Ok((summary, self.session_id.clone(), self.model_used.clone()));
             }
         }
         bail!("claude exited without a result event")
@@ -217,6 +229,19 @@ impl Stream {
                 out.push(HarnessEvent::SessionStarted { session_id: id.to_string() });
                 self.emitted = true;
             }
+        }
+        let reported_model = msg["model"]
+            .as_str()
+            .or_else(|| msg["message"]["model"].as_str())
+            .filter(|s| !s.is_empty());
+        if let Some(used) = reported_model
+            && self.model_used.as_deref() != Some(used)
+        {
+            self.model_used = Some(used.to_string());
+            out.push(HarnessEvent::ModelSelected {
+                requested: self.requested_model.clone(),
+                used: used.to_string(),
+            });
         }
         if (msg["type"].as_str() == Some("rate_limit_event") || msg.get("rate_limit_info").is_some() || msg.get("rate_limits").is_some())
             && let Some(report) = crate::parse_rate_limit_value(&msg, "claude-cli")
@@ -264,6 +289,7 @@ struct ClaudeSession {
     harness: ClaudeCode,
     task: WorkerTask,
     session_id: String,
+    model_used: Option<String>,
     cleaned: bool,
 }
 
@@ -320,15 +346,23 @@ impl crate::Session for ClaudeSession {
         events: mpsc::Sender<HarnessEvent>,
         timeout: std::time::Duration,
     ) -> anyhow::Result<RunSummary> {
-        let (summary, next_id) = self.harness.execute(&self.task, &text, true, Some(&self.session_id), events, timeout).await?;
+        let (summary, next_id, model_used) =
+            self.harness.execute(&self.task, &text, true, Some(&self.session_id), events, timeout).await?;
         if let Some(id) = next_id {
             self.session_id = id;
+        }
+        if let Some(model) = model_used {
+            self.model_used = Some(model);
         }
         Ok(summary)
     }
 
     fn session_id(&self) -> Option<&str> {
         Some(&self.session_id)
+    }
+
+    fn model_used(&self) -> Option<&str> {
+        self.model_used.as_deref().or(self.task.model.as_deref())
     }
 
     fn detach(mut self: Box<Self>) -> Option<String> {
@@ -361,17 +395,23 @@ impl Harness for ClaudeCode {
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         let prompt = task.framed_brief_for(&Self::run_code_tool(&task));
         match self.execute(&task, &prompt, true, None, events, task.timeout).await {
-            Ok((summary, Some(session_id))) if summary.ok => {
-                let kept: Box<dyn crate::Session> = Box::new(ClaudeSession { harness: self.clone(), task, session_id, cleaned: false });
+            Ok((summary, Some(session_id), model_used)) if summary.ok => {
+                let kept: Box<dyn crate::Session> = Box::new(ClaudeSession {
+                    harness: self.clone(),
+                    task,
+                    session_id,
+                    model_used,
+                    cleaned: false,
+                });
                 (Ok(summary), Some(kept))
             }
-            Ok((summary, Some(session_id))) => {
+            Ok((summary, Some(session_id), _)) => {
                 if let Some(home) = std::env::var_os("HOME") {
                     cleanup_claude_session(&std::path::PathBuf::from(home), &session_id);
                 }
                 (Ok(summary), None)
             }
-            Ok((summary, None)) => (Ok(summary), None),
+            Ok((summary, None, _)) => (Ok(summary), None),
             Err(err) => (Err(err), None),
         }
     }
@@ -385,13 +425,18 @@ impl Harness for ClaudeCode {
         events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         match self.execute(&task, &prompt, true, Some(session_id), events, task.timeout).await {
-            Ok((summary, next_id)) if summary.ok => {
+            Ok((summary, next_id, model_used)) if summary.ok => {
                 let id = next_id.unwrap_or_else(|| session_id.to_string());
-                let kept: Box<dyn crate::Session> =
-                    Box::new(ClaudeSession { harness: self.clone(), task, session_id: id, cleaned: false });
+                let kept: Box<dyn crate::Session> = Box::new(ClaudeSession {
+                    harness: self.clone(),
+                    task,
+                    session_id: id,
+                    model_used,
+                    cleaned: false,
+                });
                 (Ok(summary), Some(kept))
             }
-            Ok((summary, _)) => (Ok(summary), None),
+            Ok((summary, _, _)) => (Ok(summary), None),
             Err(err) => (Err(err), None),
         }
     }
@@ -405,7 +450,10 @@ impl Harness for ClaudeCode {
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         // The stream is one-way: what the last daemon read gives the session, and the result
         // when the turn ended before this daemon took over.
-        let mut stream = Stream::default();
+        let mut stream = Stream {
+            requested_model: task.model.clone(),
+            ..Default::default()
+        };
         let mut ended = None;
         for line in attached.outputs() {
             if let Some(summary) = stream.line(line, None).await {
@@ -414,7 +462,7 @@ impl Harness for ClaudeCode {
         }
         let crate::child::Attached { mut io, proc, keep, .. } = attached;
         let result = match ended {
-            Some(summary) => Ok((summary, stream.session_id.clone())),
+            Some(summary) => Ok((summary, stream.session_id.clone(), stream.model_used.clone())),
             None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events, task.stall)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", task.timeout)),
@@ -423,10 +471,16 @@ impl Harness for ClaudeCode {
         drop(io);
         let freed = proc.release().await;
         match result {
-            Ok((mut summary, session_id)) => {
+            Ok((mut summary, session_id, model_used)) => {
                 summary.freed = Some(freed);
                 let kept: Option<Box<dyn crate::Session>> = match session_id {
-                    Some(session_id) if keep && summary.ok => Some(Box::new(ClaudeSession { harness: self.clone(), task, session_id, cleaned: false })),
+                    Some(session_id) if keep && summary.ok => Some(Box::new(ClaudeSession {
+                        harness: self.clone(),
+                        task,
+                        session_id,
+                        model_used,
+                        cleaned: false,
+                    })),
                     Some(session_id) if keep => {
                         if let Some(home) = std::env::var_os("HOME") {
                             cleanup_claude_session(&std::path::PathBuf::from(home), &session_id);
@@ -448,7 +502,7 @@ impl Harness for ClaudeCode {
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let prompt = task.framed_brief_for(&Self::run_code_tool(&task));
-        self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _)| summary)
+        self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _, _)| summary)
     }
 }
 
@@ -529,6 +583,7 @@ fn summary(result: &Value) -> RunSummary {
         cost_usd: result["total_cost_usd"].as_f64(),
         denied,
         freed: None,
+        requests: result["num_turns"].as_u64().map(|n| n as u32),
     }
 }
 
@@ -782,5 +837,27 @@ mod tests {
             "expected Stalled error on silent Claude stream, got: {err:#}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_attaches_dictionary_mcp_and_allows_mcp_tools_in_code_mode_off_and_on() {
+        let harness = sandboxed();
+        for (read_only, code_mode) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut t = task(read_only, true, code_mode);
+            t.dictionary = Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:43210/mcp".into(),
+                bearer_token: "tok-claude".into(),
+            });
+            let args = harness.args(&t);
+            assert!(
+                after(&args, "--allowedTools").contains(&"mcp__dictionary"),
+                "mcp__dictionary must be allowed for read_only={read_only}, code_mode={code_mode}: {args:?}"
+            );
+            let cfg_raw = after(&args, "--mcp-config").into_iter().next().expect("missing --mcp-config");
+            let cfg: Value = serde_json::from_str(cfg_raw).unwrap();
+            assert_eq!(cfg["mcpServers"]["dictionary"]["url"], "http://127.0.0.1:43210/mcp");
+            assert_eq!(cfg["mcpServers"]["dictionary"]["headers"]["Authorization"], "Bearer tok-claude");
+        }
     }
 }

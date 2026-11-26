@@ -21,8 +21,9 @@ const MAX_SCAN_BYTES: u64 = 128 * 1024;
 /// Maximum cached repo maps retained in memory.
 const MAX_CACHE_ENTRIES: usize = 64;
 
-const IGNORED_DIRS: [&str; 10] = [
+const IGNORED_DIRS: [&str; 11] = [
     ".git/",
+    ".flow/",
     ".taskmaster/",
     "node_modules/",
     "target/",

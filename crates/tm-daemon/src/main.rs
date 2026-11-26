@@ -11,7 +11,7 @@
 //!           [--worker-model <m>] [--mid-model <m>] [--master-model <m>]
 //!           [--reviewer-model <m>] [--verifier-model <m>]
 //!           [--parallel <n>] [--timeout <secs>] [--dictionary <dir>] [--commons <dir>]
-//!           [--run <id>] [--template <next | dir>] [--eval] [--baseline <h>] [--pair]
+//!           [--run <id>] [--template <next | dir>] [--prices <file>] [--eval] [--baseline <h>] [--pair]
 //!           [--no-runtime-checks]
 //! ```
 //!
@@ -27,9 +27,11 @@
 //! `.taskmaster/runs/<id>/`. `--eval` runs the plan again with one model and writes
 //! `.taskmaster/evals/<id>.json`. A prompt is planned once and reused for the baseline.
 //! `--timeout 0` lets an agent call run with no time limit. The exit code is 0 when the
-//! run finishes clean, 1 when it fails, 2 when the plan waits for `--yes`, and 3 when a
-//! provider stopped it (a usage limit, no balance left, a sign-in): run the same command
-//! again to resume.
+//! run finishes clean, 1 when it fails, 2 when the plan waits for `--yes`, 3 when a
+//! provider requires sign-in or credit balance, and 75 (`EX_TEMPFAIL`) when a provider
+//! hits a quota limit or HTTP 429 rate limit (`RESOURCE_EXHAUSTED`): outer scripts can
+//! stop on 75 instead of launching doomed runs, and re-running the same command picks up
+//! where the run stopped once the reset time passes.
 //! `--pair` serves the API and the phone page on this machine's Tailscale address for as
 //! long as the run lasts. `serve` keeps the API up with no run of its own: a frontend
 //! starts, approves and cancels runs through it. It listens on `127.0.0.1:8737` unless
@@ -54,11 +56,14 @@ struct Args {
     yes: bool,
     /// Skip the project's build, its tests and the browser.
     no_runtime_checks: bool,
+    /// Disable effort-based thinking routing and pin explicit model ids verbatim.
+    no_effort_routing: bool,
     parallel: usize,
     /// Seconds per agent call; 0 is no limit. None takes the settings file's limit.
     timeout: Option<u64>,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
+    prices: Option<PathBuf>,
     run_id: String,
     template: Option<String>,
     eval: bool,
@@ -107,15 +112,16 @@ fn main() -> ExitCode {
         Ok(Outcome::Finished { ok: true }) => ExitCode::SUCCESS,
         Ok(Outcome::Finished { ok: false }) => ExitCode::from(1),
         Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => ExitCode::from(2),
-        // A provider stopped the run (a usage limit, no balance, a sign-in): the run is kept
-        // where it stopped, and the same command picks it up again.
+        // A provider stopped the run (quota / HTTP 429 rate limit -> exit 75 EX_TEMPFAIL;
+        // auth / balance -> exit 3): the run is kept where it stopped so the same command resumes it.
         Err(err) if err.downcast_ref::<tm_daemon::reply::ReportedLimit>().is_some() => {
-            eprintln!("taskmaster: {err:#}");
+            let limit = err.downcast_ref::<tm_daemon::reply::ReportedLimit>().expect("checked");
+            eprintln!("taskmaster: {limit}");
             eprintln!(
                 "taskmaster: the run is kept where it stopped. Run the same command again to resume it, \
                  or pass a different --master/--mid/--worker/--reviewer/--verifier to switch the provider."
             );
-            ExitCode::from(3)
+            ExitCode::from(limit.exit_code())
         }
         Err(err) => {
             eprintln!("taskmaster: {err:#}");
@@ -264,7 +270,8 @@ async fn run() -> anyhow::Result<Outcome> {
     config.run_id = args.run_id.clone();
     config.template = args.template.clone();
     config.models = args.models;
-    let settings = Settings::load(&args.project.canonicalize().unwrap_or_else(|_| args.project.clone()))?;
+    let project_root = args.project.canonicalize().unwrap_or_else(|_| args.project.clone());
+    let settings = Settings::load(&project_root)?;
     config.store = settings.store(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone()))?;
     config.checker = settings.checker.enabled;
     config.code_mode = settings.code_mode.enabled;
@@ -272,7 +279,12 @@ async fn run() -> anyhow::Result<Outcome> {
     config.code_sh_secs = settings.code_mode.sh_secs;
     config.worker_shell = settings.sandbox.shell;
     config.package_indexes = settings.sandbox.package_indexes;
-    config.prices = tm_daemon::settings::price_table(&settings);
+    config.effort_routing = if args.no_effort_routing {
+        false
+    } else {
+        tm_daemon::settings::effective_effort_routing(settings.agents.effort_routing)
+    };
+    config.prices = tm_daemon::settings::load_price_table(&settings, &project_root, args.prices.as_deref())?;
     config.remote = settings.remote();
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;
@@ -701,7 +713,7 @@ const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
                      [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
                      [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
                      [--timeout <secs, 0 for none>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
-                     [--template <next | dir>] [--no-runtime-checks] \
+                     [--template <next | dir>] [--no-runtime-checks] [--no-effort-routing] \
                      [--eval] [--baseline <h>] [--pair]\n       \
                      tm-daemon --version\n\
                      harnesses: claude, agy, grok, codex, opencode (worker also accepts auto)";
@@ -723,12 +735,14 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         timeout: None,
         dictionary: None,
         commons: None,
+        prices: None,
         run_id: "current".into(),
         template: None,
         eval: false,
         baseline: "claude".into(),
         pair: false,
         no_runtime_checks: false,
+        no_effort_routing: false,
         roles: Roles::default(),
         models: Models::default(),
     };
@@ -737,6 +751,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         match flag.as_str() {
             "--yes" => args.yes = true,
             "--no-runtime-checks" => args.no_runtime_checks = true,
+            "--no-effort-routing" => args.no_effort_routing = true,
             "--plan" => args.plan = Some(need(&mut argv, "--plan", usage)?.into()),
             "--prompt" => args.prompt = Some(need(&mut argv, "--prompt", usage)?),
             "--prompt-file" => args.prompt_file = Some(need(&mut argv, "--prompt-file", usage)?.into()),
@@ -758,6 +773,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
             }
             "--dictionary" => args.dictionary = Some(need(&mut argv, "--dictionary", usage)?.into()),
             "--commons" => args.commons = Some(need(&mut argv, "--commons", usage)?.into()),
+            "--prices" => args.prices = Some(need(&mut argv, "--prices", usage)?.into()),
             "--run" => args.run_id = need(&mut argv, "--run", usage)?,
             "--template" => args.template = Some(need(&mut argv, "--template", usage)?),
             "--eval" => args.eval = true,

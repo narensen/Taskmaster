@@ -488,7 +488,7 @@ pub fn mutation_test_command(
             let is_missing_path = (program.contains('/') || program.contains('\\')) && !Path::new(&program).is_file();
             if is_missing_path {
                 program = "python3".into();
-                env.retain(|(k, _)| k != "VIRTUAL_ENV" && k != "PATH");
+                env.retain(|(k, _)| !matches!(k.as_str(), "VIRTUAL_ENV" | "PATH" | "PYTHONNOUSERSITE" | "PIP_USER"));
             }
             args.push(contract_path.to_string());
             let mut cmd = Vec::with_capacity(1 + args.len());
@@ -548,15 +548,22 @@ pub struct PlanReview {
 
 /// Deterministic structural plan review run before approval (and paired with a
 /// second-model reviewer when configured): catches overlapping ownership globs,
-/// missing contracts for multi-unit plans, oversized units, and miscalibrated difficulty.
+/// missing contracts for multi-unit plans, oversized units, over-split single-phase plans,
+/// under-sized units that should be merged, and miscalibrated difficulty.
 pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
+    review_plan_structure_for_slots(plan, None)
+}
+
+/// Like [`review_plan_structure`], also checking single-phase unit count against `slots`
+/// (capped at [`crate::small::SINGLE_PHASE_MAX_UNITS`], never forcing collapse to 1 mega-unit).
+pub fn review_plan_structure_for_slots(plan: &Plan, slots: Option<usize>) -> Vec<PlanReviewFinding> {
     let mut findings = Vec::new();
     // 1. Overlapping ownership globs across pages.
     for i in 0..plan.pages.len() {
         for j in (i + 1)..plan.pages.len() {
             let a = &plan.pages[i];
             let b = &plan.pages[j];
-            if globs_likely_overlap(&a.owned_glob, &b.owned_glob) {
+            if tm_core::owned_globs_overlap(&a.owned_glob, &b.owned_glob) {
                 findings.push(PlanReviewFinding {
                     severity: "error".into(),
                     category: "overlap".into(),
@@ -633,7 +640,73 @@ pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
             page: None,
         });
     }
+    // 6. Single-phase wave cap: non-UI single-phase plans should stay within one parallel wave
+    //    (at most `slots` units, capped at 4, never forcing collapse to 1 mega-unit).
+    let wave_cap = slots
+        .map(crate::small::single_phase_wave_cap)
+        .unwrap_or(crate::small::SINGLE_PHASE_MAX_UNITS);
+    if plan.phases.is_empty() && !plan.has_ui() && plan.pages.len() > wave_cap {
+        findings.push(PlanReviewFinding {
+            severity: "warning".into(),
+            category: "oversplit_plan".into(),
+            message: format!(
+                "Single-phase plan has {} units, exceeding the single-wave cap of {} (max {}); merge closely coupled modules into 2-{} cohesive units without collapsing to one mega-unit.",
+                plan.pages.len(),
+                wave_cap,
+                crate::small::SINGLE_PHASE_MAX_UNITS,
+                wave_cap,
+            ),
+            page: None,
+        });
+    }
+    // 7. Under-sized-unit merge check: flag tiny single-file units in >=3-unit plans so
+    //    closely coupled small modules are merged instead of paying extra cold-session overhead
+    //    (never fires on 1-2 unit plans so multi-module projects are never collapsed to 1 mega-unit).
+    if plan.pages.len() >= 3 {
+        let undersized: Vec<&tm_core::PagePlan> = plan
+            .pages
+            .iter()
+            .filter(|page| is_undersized_unit(page))
+            .collect();
+        if undersized.len() >= 2 || (!undersized.is_empty() && plan.pages.len() > wave_cap) {
+            let names: Vec<&str> = undersized.iter().map(|p| p.id.as_str()).collect();
+            findings.push(PlanReviewFinding {
+                severity: "warning".into(),
+                category: "undersized_unit".into(),
+                message: format!(
+                    "Under-sized unit(s) ({}) each own at most one small file; consider merging them with a closely related unit into 2-{} cohesive units rather than paying extra cold-session overhead.",
+                    names.join(", "),
+                    wave_cap,
+                ),
+                page: undersized.first().map(|p| p.id.clone()),
+            });
+        }
+    }
     findings
+}
+
+/// True when `page` looks like an under-sized unit (single concrete source file, no sub-units,
+/// and either tagged `easy` or carrying a very short brief+context) that could be merged with a
+/// closely related sibling in a 3+ unit plan.
+fn is_undersized_unit(page: &tm_core::PagePlan) -> bool {
+    if !page.units.is_empty() {
+        return false;
+    }
+    let glob = page.owned_glob.trim();
+    if glob.contains(['*', '?', '[']) {
+        return false;
+    }
+    let concrete = concrete_paths_in_glob(glob);
+    let non_test = concrete.iter().filter(|p| !is_test_path(p)).count();
+    if non_test > 1 {
+        return false;
+    }
+    let easy = page
+        .difficulty
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("easy"));
+    let short_spec = page.brief.trim().len() < 180 && page.context.trim().len() < 220;
+    easy || short_spec
 }
 
 /// Longest `depends_on` chain length (in nodes) across `plan.pages`.
@@ -740,14 +813,8 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
     shared_contract_path || shared_contract_sym
 }
 
-fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
-    let trimmed = glob.trim();
-    let parts: Vec<&str> = if let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        inner.split(',').map(str::trim).collect()
-    } else {
-        vec![trimmed]
-    };
-    parts
+pub(crate) fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
+    tm_core::glob_alternatives(glob)
         .into_iter()
         .filter(|p| !p.is_empty() && !p.contains(['*', '?', '[', '{']))
         .map(|p| p.trim_start_matches("./").to_string())
@@ -832,31 +899,6 @@ fn extract_declared_symbols(content: &str) -> Vec<String> {
     out
 }
 
-fn globs_likely_overlap(a: &str, b: &str) -> bool {
-    let a = a.trim().trim_start_matches("./");
-    let b = b.trim().trim_start_matches("./");
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    if a == b || a == "**" || b == "**" {
-        return true;
-    }
-    fn prefix(g: &str) -> &str {
-        g.split('*').next().unwrap_or(g).trim_end_matches('/')
-    }
-    let pa = prefix(a);
-    let pb = prefix(b);
-    if !pa.is_empty() && !pb.is_empty() {
-        if a.contains('*') && (pb == pa || pb.starts_with(&format!("{pa}/"))) {
-            return true;
-        }
-        if b.contains('*') && (pa == pb || pa.starts_with(&format!("{pb}/"))) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Auto-fix mechanical findings from a plan review (narrowing overlapping globs and
 /// raising miscalibrated `easy` difficulty on heavily dependent units).
 pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
@@ -864,7 +906,7 @@ pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
     let mut overlapping: BTreeSet<usize> = BTreeSet::new();
     for i in 0..plan.pages.len() {
         for j in (i + 1)..plan.pages.len() {
-            if globs_likely_overlap(&plan.pages[i].owned_glob, &plan.pages[j].owned_glob) {
+            if tm_core::owned_globs_overlap(&plan.pages[i].owned_glob, &plan.pages[j].owned_glob) {
                 overlapping.insert(i);
                 overlapping.insert(j);
             }
@@ -1901,6 +1943,35 @@ pub fn evaluate_contract_proposal(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `.flow` staleness gate: deterministic blob check with automatic repair.
+// ---------------------------------------------------------------------------
+
+/// Result of checking every tracked source file against its `.flow` shard blob hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowFreshResult {
+    pub stale_paths: Vec<String>,
+    pub repaired: usize,
+    /// True when zero stale/missing shards were found. Even when `false`, the gate
+    /// auto-repairs and never fails the run.
+    pub ok: bool,
+}
+
+/// Verify that every tracked source file in `tree` has an up-to-date `.flow` shard.
+/// Any stale, missing, or orphaned shards are automatically re-parsed and counted.
+pub fn check_flow_fresh(tree: &Path) -> anyhow::Result<FlowFreshResult> {
+    let stale_paths = tm_flow::verify_all(tree)?;
+    let repaired = stale_paths.len();
+    if repaired > 0 {
+        tm_flow::update_files(tree, &stale_paths)?;
+    }
+    Ok(FlowFreshResult {
+        stale_paths,
+        repaired,
+        ok: repaired == 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,6 +2028,59 @@ mod tests {
         assert!(findings.iter().any(|f| f.category == "overlap"));
         assert!(apply_mechanical_plan_fixes(&mut plan));
         assert!(review_plan_structure(&plan).iter().all(|f| f.category != "overlap"));
+    }
+
+    #[test]
+    fn tok4_plan_review_flags_oversplit_and_undersized_units_without_collapsing_two_unit_plans() {
+        let contract = ContractFile {
+            path: "tinydb/contract.py".into(),
+            content: "class Token: ...\n".into(),
+            phase: 0,
+        };
+        // 5-unit over-split plan on slots=3 triggers both oversplit_plan and undersized_unit.
+        let oversplit = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![contract.clone()],
+            pages: vec![
+                PagePlan { id: "tok".into(), owned_glob: "{tinydb/tok.py,tests/test_tok.py}".into(), brief: "Write tokenizer.".into(), difficulty: Some("easy".into()), ..Default::default() },
+                PagePlan { id: "par".into(), owned_glob: "{tinydb/par.py,tests/test_par.py}".into(), brief: "Write parser.".into(), difficulty: Some("easy".into()), ..Default::default() },
+                PagePlan { id: "bt".into(), owned_glob: "{tinydb/bt.py,tests/test_bt.py}".into(), brief: "Write btree.".into(), ..Default::default() },
+                PagePlan { id: "st".into(), owned_glob: "{tinydb/st.py,tests/test_st.py}".into(), brief: "Write storage.".into(), ..Default::default() },
+                PagePlan { id: "cli".into(), owned_glob: "{tinydb/cli.py,tests/test_cli.py}".into(), brief: "Write cli.".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let findings = review_plan_structure_for_slots(&oversplit, Some(3));
+        assert!(findings.iter().any(|f| f.category == "oversplit_plan"), "{findings:#?}");
+        assert!(findings.iter().any(|f| f.category == "undersized_unit"), "{findings:#?}");
+
+        // Clean 3-unit cohesive plan on slots=3 passes with neither warning.
+        let long_brief = "Implement the complete cohesive subsystem including parsing, AST validation, error handling, edge-case coverage, and concise unit tests covering every statement form and invalid input path.";
+        let cohesive = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![contract.clone()],
+            pages: vec![
+                PagePlan { id: "frontend".into(), owned_glob: "{tinydb/tok.py,tinydb/par.py,tests/test_front.py}".into(), brief: long_brief.into(), ..Default::default() },
+                PagePlan { id: "storage".into(), owned_glob: "{tinydb/bt.py,tinydb/st.py,tests/test_store.py}".into(), brief: long_brief.into(), ..Default::default() },
+                PagePlan { id: "runtime".into(), owned_glob: "{tinydb/exec.py,tinydb/cli.py,tests/test_exec.py}".into(), brief: long_brief.into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let ok_findings = review_plan_structure_for_slots(&cohesive, Some(3));
+        assert!(ok_findings.iter().all(|f| f.category != "oversplit_plan" && f.category != "undersized_unit"), "{ok_findings:#?}");
+
+        // 2-unit plan never triggers undersized_unit (never encourages collapsing to 1 mega-unit).
+        let two_unit = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![contract],
+            pages: vec![
+                PagePlan { id: "core".into(), owned_glob: "pkg/core.py".into(), brief: "Core.".into(), difficulty: Some("easy".into()), ..Default::default() },
+                PagePlan { id: "cli".into(), owned_glob: "pkg/cli.py".into(), brief: "Cli.".into(), difficulty: Some("easy".into()), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let two_findings = review_plan_structure_for_slots(&two_unit, Some(1));
+        assert!(two_findings.iter().all(|f| f.category != "oversplit_plan" && f.category != "undersized_unit"), "{two_findings:#?}");
     }
 
     #[test]
@@ -2290,6 +2414,35 @@ def test_isolated_and_catches_stub():
         assert!(!hit4);
         let runs_after_4 = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(runs_after_4, 6, "modifying contract must invalidate cache and re-run");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flow_fresh_gate_detects_stale_shards_and_auto_repairs_without_failing() {
+        let root = std::env::temp_dir().join(format!("tm-flow-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/app.py"), "def hello():\n    return 1\n").unwrap();
+        tm_flow::build(&root).unwrap();
+
+        let fresh = check_flow_fresh(&root).unwrap();
+        assert!(fresh.ok);
+        assert_eq!(fresh.repaired, 0);
+
+        // Mutate file on disk without updating `.flow`: gate detects and auto-repairs.
+        std::fs::write(root.join("pkg/app.py"), "def hello():\n    return 2\ndef added():\n    pass\n").unwrap();
+        let stale = check_flow_fresh(&root).unwrap();
+        assert!(!stale.ok);
+        assert_eq!(stale.repaired, 1);
+        assert_eq!(stale.stale_paths, vec!["pkg/app.py"]);
+
+        // Subsequent check is clean and new symbol is indexed.
+        let after = check_flow_fresh(&root).unwrap();
+        assert!(after.ok);
+        assert_eq!(after.repaired, 0);
+        let q = tm_flow::FlowQuery::open(&root).unwrap();
+        assert!(!q.find("added", 5).unwrap().nodes.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

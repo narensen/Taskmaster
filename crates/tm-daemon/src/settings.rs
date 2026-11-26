@@ -54,8 +54,12 @@ pub struct Settings {
     /// How devices reach this daemon.
     pub connect: ConnectSettings,
     /// Dollars per million tokens, by model id or harness id, for calls whose harness
-    /// reports no price. Grok's are built in (see [`built_in_prices`]).
+    /// reports no price. Empty by default (only Grok Build is built in; see [`built_in_prices`]).
     pub prices: std::collections::BTreeMap<String, tm_core::Prices>,
+    /// Optional path to an external JSON price table file keyed by model id (dollars per 1M
+    /// `input`, `output`, and optional `cached_input`). Empty/unset by default; can also be
+    /// supplied via `TASKMASTER_PRICES` or `--prices <file>`.
+    pub prices_file: String,
 }
 
 /// How devices reach this daemon.
@@ -90,11 +94,53 @@ pub fn built_in_prices() -> std::collections::BTreeMap<String, tm_core::Prices> 
     ["grok", "grok-build"].iter().map(|k| (k.to_string(), grok)).collect()
 }
 
-/// The price table a run uses: the built-in prices, then the settings file's over them.
+/// The price table a run uses: the built-in prices, then the settings file's inline prices over them.
 pub fn price_table(settings: &Settings) -> std::collections::BTreeMap<String, tm_core::Prices> {
     let mut table = built_in_prices();
     table.extend(settings.prices.clone());
     table
+}
+
+/// Read a JSON price table file keyed by model id (dollars per 1M tokens).
+/// Accepts either a flat map `{"model-id": {"input": 1.0, "output": 4.0, "cached_input": 0.25}}`
+/// or a wrapper object `{"prices": { ... }}`.
+pub fn load_prices_file(path: &Path) -> anyhow::Result<std::collections::BTreeMap<String, tm_core::Prices>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read price table {}", path.display()))?;
+    let raw: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    let map_val = raw.get("prices").filter(|v| v.is_object()).unwrap_or(&raw);
+    serde_json::from_value(map_val.clone())
+        .with_context(|| format!("{} must map model ids to {{input, output, cached_input?}}", path.display()))
+}
+
+/// Resolve the full price table for a run in precedence order (lowest to highest):
+/// 1. [`built_in_prices`] (Grok Build only; no invented prices for other providers)
+/// 2. `settings.prices_file` (when set, resolved relative to `project`)
+/// 3. `settings.prices` (inline entries in `config.json`)
+/// 4. `TASKMASTER_PRICES` env var (when set to a JSON price table path)
+/// 5. `extra_file` (`--prices <file>` CLI flag, when passed)
+pub fn load_price_table(
+    settings: &Settings,
+    project: &Path,
+    extra_file: Option<&Path>,
+) -> anyhow::Result<std::collections::BTreeMap<String, tm_core::Prices>> {
+    let mut table = built_in_prices();
+    if !is_placeholder(&settings.prices_file) {
+        let p = Path::new(settings.prices_file.trim());
+        let resolved = if p.is_absolute() { p.to_path_buf() } else { project.join(p) };
+        table.extend(load_prices_file(&resolved)?);
+    }
+    table.extend(settings.prices.clone());
+    if let Ok(env_path) = std::env::var("TASKMASTER_PRICES")
+        && !env_path.trim().is_empty()
+    {
+        table.extend(load_prices_file(Path::new(env_path.trim()))?);
+    }
+    if let Some(cli_path) = extra_file {
+        table.extend(load_prices_file(cli_path)?);
+    }
+    Ok(table)
 }
 
 /// A builder's shell. It is only ever given inside the bubblewrap sandbox (or Codex's own),
@@ -117,6 +163,24 @@ impl Default for SandboxSettings {
 /// Default idle duration before a warm session is detached and its process freed (O7): 10 minutes.
 pub const DEFAULT_WARM_IDLE_SECS: u64 = 600;
 
+fn default_true() -> bool {
+    true
+}
+
+/// Resolve effective effort routing from saved settings plus `TASKMASTER_EFFORT_ROUTING`
+/// (`0`/`false`/`off`/`no` disables routing and pins explicit models verbatim; `1`/`true`/`on`/`yes` enables it).
+pub fn effective_effort_routing(setting: bool) -> bool {
+    match std::env::var("TASKMASTER_EFFORT_ROUTING")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("0" | "false" | "off" | "no") => false,
+        Some("1" | "true" | "on" | "yes") => true,
+        _ => setting,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
@@ -126,6 +190,10 @@ pub struct AgentSettings {
     pub budget_usd: f64,
     /// Seconds a warm builder session may sit idle before being released (O7). 0 disables idle release.
     pub warm_idle_secs: u64,
+    /// Route worker thinking effort from unit difficulty (`easy` -> `-low`, `normal` -> `-medium`,
+    /// keeping `-high` for `hard`, repairs, planner, and reviewer). True by default.
+    #[serde(default = "default_true")]
+    pub effort_routing: bool,
 }
 
 impl Default for AgentSettings {
@@ -134,6 +202,7 @@ impl Default for AgentSettings {
             timeout_secs: DEFAULT_AGENT_SECS,
             budget_usd: 0.0,
             warm_idle_secs: DEFAULT_WARM_IDLE_SECS,
+            effort_routing: true,
         }
     }
 }
@@ -417,5 +486,42 @@ mod tests {
         let plain = Settings { auth: AuthSettings { issuer: "http://auth.test".into(), allow: vec![] }, ..Settings::default() };
         assert!(plain.auth(Records::files(&dir)).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fix_n9_price_table_hook_loads_from_config_file_and_ships_no_invented_prices() {
+        // Default example settings ship empty prices & empty prices_file (no invented model prices).
+        let example: Settings = serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        assert!(example.prices.is_empty());
+        assert!(example.prices_file.is_empty());
+        let base = price_table(&example);
+        assert!(!base.contains_key("gemini-4-hydrogen-high") && !base.contains_key("antigravity"));
+
+        // External JSON file (both flat and wrapped) + inline override + CLI override precedence.
+        let dir = std::env::temp_dir().join(format!("tm-prices-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("prices.json");
+        std::fs::write(
+            &file_a,
+            r#"{"prices":{"custom-model-high":{"input":2.5,"output":10.0,"cache_read":0.25}}}"#,
+        )
+        .unwrap();
+        let file_cli = dir.join("cli-prices.json");
+        std::fs::write(
+            &file_cli,
+            r#"{"custom-model-high":{"input":3.0,"output":12.0,"cached_input":0.3},"custom-model-low":{"input":0.5,"output":2.0}}"#,
+        )
+        .unwrap();
+
+        let s = Settings { prices_file: "prices.json".into(), ..Default::default() };
+        let loaded = load_price_table(&s, &dir, None).unwrap();
+        let p = loaded["custom-model-high"];
+        assert_eq!((p.input, p.output, p.cached_input), (2.5, 10.0, Some(0.25)));
+
+        let with_cli = load_price_table(&s, &dir, Some(&file_cli)).unwrap();
+        assert_eq!(with_cli["custom-model-high"].input, 3.0);
+        assert_eq!(with_cli["custom-model-low"].output, 2.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

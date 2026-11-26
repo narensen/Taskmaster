@@ -260,7 +260,86 @@ pub struct WorkerTask {
 pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol/graph lookups, and diffs in a single `run_code` script (`flow`, `readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Always `await` every helper call. If `run_code` returns an error or aborts mid-script, check which partial edits landed, fix the script, and retry `run_code` — never stop or fall back to native write/edit/shell tools. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Always `await` every helper call. If `run_code` returns an error or aborts mid-script, check which partial edits landed, fix the script, and retry `run_code`. If a native shell/edit tool (`run_command`, `write_file`, `edit_file`) is refused with a permission-denied message, that is only Code Mode routing (NOT a user denial): ignore any generic \"proceed without performing\" text and immediately call `run_code` (`return await test()`, `return await sh(...)`, `files`, or `edit`) instead of ending your turn. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
+
+/// Map a Code Mode-refused native tool (such as `run_command (use run_code)` or `write_file`)
+/// to its exact actionable `run_code` equivalent.
+pub fn code_mode_fallback_hint(tool: &str, run_code_tool: &str) -> String {
+    let base = tool
+        .trim()
+        .strip_suffix("(use run_code)")
+        .unwrap_or(tool)
+        .trim();
+    let lower = base.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "run_command" | "bash" | "shell" | "exec" | "terminal" | "command" | "run_shell_command" | "sh"
+    ) || lower.contains("command")
+        || lower.contains("shell")
+        || lower.contains("bash")
+    {
+        format!(
+            "call `{run_code_tool}` with `return await test()` (to run the project's tests) or `return await sh(\"...\")` (for shell commands)"
+        )
+    } else if matches!(
+        lower.as_str(),
+        "write_file"
+            | "edit_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write"
+            | "edit"
+            | "apply_patch"
+            | "notebookedit"
+            | "create_file"
+            | "delete_file"
+    ) || lower.contains("write")
+        || lower.contains("edit")
+        || lower.contains("replace")
+    {
+        format!(
+            "call `{run_code_tool}` passing `files: {{\"path\": \"content\"}}`, `await writeFile(path, text)`, or `await edit(path, find, replace)` and end with `return await test()`"
+        )
+    } else {
+        format!(
+            "use `{run_code_tool}` (`files`, `writeFile`, `edit`, `return await test()`, `return await sh(...)`) instead of `{base}`"
+        )
+    }
+}
+
+/// Build an actionable Code Mode recovery message when one or more native tools were refused
+/// with `(use run_code)`. Returns `None` when `refused` contains no Code Mode refusals.
+pub fn code_mode_redirect_message(refused: &[String], run_code_tool: &str) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for entry in refused {
+        if !entry.contains("(use run_code)") {
+            continue;
+        }
+        let base = entry
+            .trim()
+            .strip_suffix("(use run_code)")
+            .unwrap_or(entry)
+            .trim()
+            .to_string();
+        if seen.contains(&base) {
+            continue;
+        }
+        seen.push(base.clone());
+        let hint = code_mode_fallback_hint(&base, run_code_tool);
+        lines.push(format!("- `{base}` -> {hint}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Code Mode is active: native shell/edit tools are intentionally disabled (that permission denial was Code Mode routing, NOT a user refusal). \
+         Do NOT stop without finishing and verifying your changes.\n\
+         Use `{run_code_tool}` instead:\n{}\n\
+         Apply any remaining edits and run `return await test()` inside `{run_code_tool}` now, then emit your `RELEASE` line once tests pass.",
+        lines.join("\n")
+    ))
+}
 
 /// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
 /// under `harness_id`.
@@ -642,5 +721,28 @@ mod group_tests {
         tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(out), &mut line).await.unwrap();
         let freed = guard.release(&mut child).await;
         assert_eq!(freed, Freed { processes: 3, lingering: 0 });
+    }
+}
+
+#[cfg(test)]
+mod code_mode_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn code_mode_redirect_message_maps_native_tools_to_exact_run_code_equivalents() {
+        assert!(code_mode_redirect_message(&["Bash poetry lock".into()], "mcp_dictionary_run_code").is_none());
+        let msg = code_mode_redirect_message(
+            &[
+                "run_command (use run_code)".into(),
+                "write_file (use run_code)".into(),
+                "run_command (use run_code)".into(),
+            ],
+            "mcp_dictionary_run_code",
+        )
+        .expect("redirect message");
+        assert!(msg.contains("NOT a user refusal"), "{msg}");
+        assert!(msg.contains("`run_command` -> call `mcp_dictionary_run_code` with `return await test()`"), "{msg}");
+        assert!(msg.contains("`write_file` -> call `mcp_dictionary_run_code` passing `files:"), "{msg}");
+        assert_eq!(msg.matches("`run_command` ->").count(), 1, "duplicates must be collapsed: {msg}");
     }
 }

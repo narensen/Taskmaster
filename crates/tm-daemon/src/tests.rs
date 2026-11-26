@@ -12510,7 +12510,7 @@ async fn fix_n8_run_code_error_triggers_automatic_warm_followup_turn() {
     cfg.browser = false;
 
     assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
-    let fups = followups.lock().unwrap();
+    let fups = followups.lock().unwrap().clone();
     assert_eq!(fups.len(), 1, "expected 1 automatic warm follow-up turn after run_code error: {fups:?}");
     assert!(
         fups[0].contains("mcp_dictionary_run_code") && fups[0].contains("errored before completing"),
@@ -12520,5 +12520,171 @@ async fn fix_n8_run_code_error_triggers_automatic_warm_followup_turn() {
     assert!(
         read(&tmp.0.join("pkg/storage.py")).contains("def add_column"),
         "warm follow-up must land the edit into the branch"
+    );
+}
+
+#[tokio::test]
+async fn fix_n8_refused_native_run_command_in_code_mode_triggers_actionable_followup_instead_of_silent_pass() {
+    let tmp = seeded("n8-code-mode-refusal");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/storage.py"), "def old():\n    return 1\n").unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "baseline"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        summary: "Add add_column to storage.py".into(),
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "pkg/storage.py".into(),
+            brief: "Implement add_column in pkg/storage.py".into(),
+            done: "add_column exists".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Case 1: worker hits native `run_command (use run_code)` refusal and stops -> daemon sends
+    // actionable warm follow-up pointing to `mcp_dictionary_run_code` + `return await test()` ->
+    // worker applies its edit on the follow-up turn and unit passes.
+    let followups: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct WarmRefusalSession {
+        cwd: PathBuf,
+        followups: Arc<Mutex<Vec<String>>>,
+        apply_fix: bool,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmRefusalSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.followups.lock().unwrap().push(text);
+            if self.apply_fix {
+                std::fs::write(
+                    self.cwd.join("pkg/storage.py"),
+                    "def old():\n    return 1\n\ndef add_column():\n    return True\n",
+                )?;
+            } else {
+                let _ = events
+                    .send(HarnessEvent::PermissionDecided {
+                        tool: "run_command (use run_code)".into(),
+                        allowed: false,
+                    })
+                    .await;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct RefusalHarness {
+        followups: Arc<Mutex<Vec<String>>>,
+        apply_fix: bool,
+        calls: Mutex<usize>,
+    }
+    #[async_trait]
+    impl Harness for RefusalHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            unreachable!("run_kept is used")
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            *self.calls.lock().unwrap() += 1;
+            let _ = events
+                .send(HarnessEvent::PermissionDecided {
+                    tool: "run_command (use run_code)".into(),
+                    allowed: false,
+                })
+                .await;
+            let _ = events.send(HarnessEvent::Text { text: "stopping after denial".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(WarmRefusalSession {
+                cwd: task.cwd,
+                followups: self.followups.clone(),
+                apply_fix: self.apply_fix,
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                Some(sess),
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(RefusalHarness {
+        followups: followups.clone(),
+        apply_fix: true,
+        calls: Mutex::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 1);
+    cfg.run_id = "n8-fix2".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = true;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let fups = followups.lock().unwrap().clone();
+    assert_eq!(fups.len(), 1, "expected 1 Code Mode refusal follow-up: {fups:?}");
+    assert!(
+        fups[0].contains("mcp_dictionary_run_code") && fups[0].contains("return await test()") && fups[0].contains("NOT a user refusal"),
+        "follow-up must point directly to run_code + test():\n{}",
+        fups[0]
+    );
+    assert!(read(&tmp.0.join("pkg/storage.py")).contains("def add_column"));
+
+    // Case 2: if a worker STILL changes nothing after a `(use run_code)` refusal, judge_inner must
+    // NOT count it as done silently; it must fail the unit and retry with the redirect guidance.
+    let tmp2 = seeded("n8-code-mode-refusal-noop");
+    std::fs::create_dir_all(tmp2.0.join("pkg")).unwrap();
+    std::fs::write(tmp2.0.join("pkg/storage.py"), "def old():\n    return 1\n").unwrap();
+    git_out(&tmp2.0, &["add", "."]);
+    git_out(&tmp2.0, &["commit", "-m", "baseline"]);
+    let fups2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let h2 = Arc::new(RefusalHarness {
+        followups: fups2.clone(),
+        apply_fix: false,
+        calls: Mutex::new(0),
+    });
+    let h2_dyn: Arc<dyn Harness> = h2.clone();
+    let harnesses2 = Harnesses {
+        master: h2_dyn.clone(),
+        mid: h2_dyn.clone(),
+        worker: h2_dyn.clone(),
+        reviewer: h2_dyn.clone(),
+        verifier: h2_dyn,
+    };
+    let mut cfg2 = config(&tmp2.0, plan, true, 1);
+    cfg2.run_id = "n8-fix2-noop".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = true;
+    cfg2.browser = false;
+    assert_eq!(
+        drive(cfg2, harnesses2).await.unwrap(),
+        Outcome::Finished { ok: false },
+        "no-change unit after (use run_code) refusal must fail rather than silently pass"
+    );
+    let fups2 = fups2.lock().unwrap().clone();
+    assert!(
+        fups2.len() >= 2 && fups2.iter().any(|m| m.contains("mcp_dictionary_run_code")),
+        "must retry with actionable run_code redirect instead of silently passing: {fups2:?}"
     );
 }

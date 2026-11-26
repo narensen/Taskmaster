@@ -477,6 +477,8 @@ struct Driver {
     release_nudged: BTreeSet<String>,
     /// Agents already sent an automatic recovery follow-up turn after a `run_code` error.
     code_error_followed_up: BTreeSet<String>,
+    /// Agents already sent an automatic redirect follow-up turn after a Code Mode refusal.
+    code_refusal_followed_up: BTreeSet<String>,
     /// Pages currently racing multiple providers (W3 Best-of-N): maps page -> candidate count.
     race_pages: HashMap<PageId, usize>,
     /// Loaded `taskmaster.yaml` worktree config from the project root (O1).
@@ -829,6 +831,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         web_access: loaded_settings.web_access,
         release_nudged: BTreeSet::new(),
         code_error_followed_up: BTreeSet::new(),
+        code_refusal_followed_up: BTreeSet::new(),
         race_pages: HashMap::new(),
         project_config,
         setup_artifacts: HashMap::new(),
@@ -2796,14 +2799,16 @@ impl Driver {
             WorkerJob::Finished(product) => {
                 let mut product = *product;
                 self.charge(&product.bill, &product.answer)?;
-                // Recovery follow-up when a Code Mode worker ends right after a `run_code` error,
-                // then W1 release gate if it changed files and skipped running tests.
+                // Recovery follow-ups when a Code Mode worker ends right after a `run_code` error
+                // or a refused native tool (`(use run_code)`), then W1 release gate if it changed
+                // files and skipped running tests.
                 if !self.is_stale(&page)
                     && !self.race_pages.contains_key(&page)
                     && product.answer.ok
                     && reply::parse_flag(&product.answer.text).is_none()
                 {
                     self.maybe_run_code_error_followup(&page, index, &mut product).await?;
+                    self.maybe_code_mode_refusal_followup(&page, index, &mut product).await?;
                     self.maybe_release_gate_nudge(&page, index, &mut product).await?;
                 }
                 self.batches.entry(page.clone()).or_default().push((index, product));
@@ -3072,6 +3077,53 @@ impl Driver {
         eprintln!("taskmaster: sending run_code error recovery follow-up to {agent_id}");
         let _ = self
             .send_worker_followup(page, index, product, &agent_id, &msg, "run_code error follow-up")
+            .await?;
+        Ok(())
+    }
+
+    /// If a Code Mode worker called a refused native tool (such as `run_command` or `write_file`,
+    /// reported as `<tool> (use run_code)`) and ended its turn without running a successful
+    /// `run_code` call afterward (or without modifying any owned files), send one automatic
+    /// actionable follow-up pointing to the exact `run_code` equivalent on the same warm session.
+    async fn maybe_code_mode_refusal_followup(
+        &mut self,
+        page: &str,
+        index: usize,
+        product: &mut Product,
+    ) -> anyhow::Result<()> {
+        if self.code.is_none() {
+            return Ok(());
+        }
+        let agent_id = product
+            .bill
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.agent_id(page, None));
+        if self.code_refusal_followed_up.contains(&agent_id) {
+            return Ok(());
+        }
+        let tier = match product.bill.role {
+            Role::Mid => Tier::Mid,
+            Role::Master => Tier::Master,
+            _ => Tier::Worker,
+        };
+        let run_code_tool = tm_harness::run_code_tool_name(self.harness_for(tier).id(), "dictionary");
+        let Some(redirect) = tm_harness::code_mode_redirect_message(&product.answer.refused, &run_code_tool) else {
+            return Ok(());
+        };
+        self.live.flush(&self.id);
+        let (_, entries) = self.live.read(&self.id, 0);
+        let has_changes = git::worktree_changes(&product.worktree)
+            .unwrap_or_default()
+            .iter()
+            .any(|c| !tm_verify::is_flow_path(&c.path));
+        if has_changes && !code_mode_refusal_ended_turn(&entries, &agent_id) {
+            return Ok(());
+        }
+        self.code_refusal_followed_up.insert(agent_id.clone());
+        eprintln!("taskmaster: sending Code Mode refusal redirect follow-up to {agent_id}");
+        let _ = self
+            .send_worker_followup(page, index, product, &agent_id, &redirect, "Code Mode refusal follow-up")
             .await?;
         Ok(())
     }
@@ -3996,6 +4048,13 @@ impl Driver {
                 )));
             }
             let ok = products.iter().all(|(_, p)| p.answer.ok);
+            let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
+            let run_code_tool = tm_harness::run_code_tool_name(self.harness_for(tier).id(), "dictionary");
+            if let Some(redirect) = tm_harness::code_mode_redirect_message(&refused, &run_code_tool) {
+                return Ok(failed(format!(
+                    "The last attempt changed none of your owned files after a native tool was refused in Code Mode.\n{redirect}"
+                )));
+            }
             // The files were already right, from an earlier run, the plan, or a template: the
             // unit is done. Its tests and the project's checks still run at verify. A run told
             // to rebuild every page (an eval's baseline) still expects each to be written.
@@ -4006,7 +4065,6 @@ impl Driver {
                 }
                 return Ok(WorkerOutcome::Passed);
             }
-            let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
             // A refused shell command or fetch is refused again next time, on any tier: retrying
             // only spends the same tokens again. Say what it needed instead.
             let needs: Vec<&String> = refused.iter().filter(|r| needs_capability(r)).collect();
@@ -8015,6 +8073,38 @@ fn last_run_code_error_needs_followup(entries: &[serde_json::Value], agent_id: &
         }
     }
     last_err
+}
+
+/// True when the agent's latest `(use run_code)` permission refusal since its latest `"start"`
+/// event was NOT followed by a successful `run_code` call (i.e. the refusal effectively ended
+/// its turn before it used `run_code` to finish or run tests).
+fn code_mode_refusal_ended_turn(entries: &[serde_json::Value], agent_id: &str) -> bool {
+    let start_idx = entries
+        .iter()
+        .rposition(|e| e["agent"]["id"].as_str() == Some(agent_id) && e["kind"] == "start")
+        .unwrap_or(0);
+    let mut refused_after_last_ok = false;
+    for entry in &entries[start_idx..] {
+        if entry["agent"]["id"].as_str() != Some(agent_id) {
+            continue;
+        }
+        match entry["kind"].as_str() {
+            Some("permission")
+                if entry["allowed"] == false
+                    && entry["tool"].as_str().is_some_and(|t| t.contains("(use run_code)")) =>
+            {
+                refused_after_last_ok = true;
+            }
+            Some("mcp_reply")
+                if tm_dictionary::strip_dict_prefix(entry["tool"].as_str().unwrap_or("")) == "run_code"
+                    && entry["is_error"] != true =>
+            {
+                refused_after_last_ok = false;
+            }
+            _ => {}
+        }
+    }
+    refused_after_last_ok
 }
 
 /// How an agent with Code Mode is told to work, in the shared prefix.

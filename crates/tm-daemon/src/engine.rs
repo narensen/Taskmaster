@@ -5726,9 +5726,9 @@ impl Driver {
         brief.push_str(&if errors.is_some() {
             format!("Read only the files you own that you are fixing, and what the failure output names; do not list or search the whole directory. {graph_hint}\n")
         } else if inline || contracts.is_empty() {
-            format!("This brief is your whole context: do not list or walk other directories. {graph_hint} Write your files directly.\n")
+            format!("This brief is your whole context: do not list, search or read other files. {graph_hint} Write your files directly.\n")
         } else {
-            format!("This brief is your whole context: read only the contracts you use, do not list or walk other directories. {graph_hint} Then write your files.\n")
+            format!("This brief is your whole context: read only the contracts you use, do not list or search the directory. {graph_hint} Then write your files.\n")
         });
         Ok(brief)
     }

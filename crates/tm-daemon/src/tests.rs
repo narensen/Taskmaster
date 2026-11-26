@@ -476,6 +476,16 @@ fn repo(name: &str) -> Tmp {
     Tmp(dir)
 }
 
+#[cfg(unix)]
+fn socket_temp_dir() -> PathBuf {
+    let temp = std::env::temp_dir();
+    if temp.as_os_str().len() > 50 && Path::new("/tmp").is_dir() {
+        PathBuf::from("/tmp")
+    } else {
+        temp
+    }
+}
+
 /// A repository that already has a commit, so a run gets a branch of its own.
 fn seeded(name: &str) -> Tmp {
     let tmp = repo(name);
@@ -2135,7 +2145,7 @@ mod http {
     async fn h3_the_next_daemon_takes_a_handed_off_run_over_by_itself() {
         let tmp = seeded("h3-server");
         choose_roles(&tmp.0);
-        let side = std::env::temp_dir().join(format!("tm-h3-server-{}", std::process::id()));
+        let side = socket_temp_dir().join(format!("tm-h3-server-{}", std::process::id()));
         let (bin, go, started) = fake_claude(&side);
         let holder = tm_harness::hold::in_process(&side.join("hold")).unwrap();
         let options = |holder: tm_harness::hold::Holder| {
@@ -3780,7 +3790,7 @@ mod http {
         let (status, opened) = client.post("/api/open", json!({ "path": "app/home/page.tsx", "line": 3 })).await;
         assert_eq!(status, 202, "{opened}");
         for _ in 0..200 {
-            if log.is_file() {
+            if std::fs::read_to_string(&log).is_ok_and(|s| s.contains('\n')) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -6597,6 +6607,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
         fresh_briefs: Mutex<Vec<String>>,
         resumed_calls: Mutex<Vec<(String, String)>>,
         interrupt_once: std::sync::atomic::AtomicBool,
+        cancelled: Arc<tokio::sync::Notify>,
     }
     #[async_trait]
     impl Harness for ResumingHarness {
@@ -6614,8 +6625,9 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
                 .send(HarnessEvent::SessionStarted { session_id: "sess-h2-restart".into() })
                 .await;
             if self.interrupt_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                // Simulate daemon crash/restart mid-turn right after recording the session id.
-                tokio::time::sleep(Duration::from_millis(80)).await;
+                // Wait for the test to observe `sess-h2-restart` and cancel the first drive,
+                // instead of racing a fixed sleep against the 50ms transcript flush interval.
+                let _ = tokio::time::timeout(Duration::from_secs(5), self.cancelled.notified()).await;
                 anyhow::bail!("simulated daemon restart mid-worker");
             }
             let page_file = task.cwd.join("app/a/page.ts");
@@ -6655,10 +6667,12 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
         }
     }
 
+    let cancelled = Arc::new(tokio::sync::Notify::new());
     let rh = Arc::new(ResumingHarness {
         fresh_briefs: Mutex::new(Vec::new()),
         resumed_calls: Mutex::new(Vec::new()),
         interrupt_once: std::sync::atomic::AtomicBool::new(true),
+        cancelled: cancelled.clone(),
     });
     let h: Arc<dyn Harness> = rh.clone();
     let harnesses = Harnesses {
@@ -6688,6 +6702,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
         let (_, entries) = live_check.read("r-h2", 0);
         if entries.iter().any(|e| e.get("session_id").and_then(|v| v.as_str()) == Some("sess-h2-restart")) {
             let _ = cancel_tx.send(true);
+            cancelled.notify_one();
             break;
         }
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -7332,7 +7347,7 @@ impl Harness for Plain {
 #[tokio::test]
 async fn h3_a_builder_handed_off_mid_turn_goes_on_in_the_next_daemon_without_starting_again() {
     let tmp = repo("h3-handoff");
-    let side = std::env::temp_dir().join(format!("tm-h3-side-{}", std::process::id()));
+    let side = socket_temp_dir().join(format!("tm-h3-side-{}", std::process::id()));
     let (bin, go, started) = fake_claude(&side);
     let plain: Arc<dyn Harness> = Arc::new(Plain);
     let worker: Arc<dyn Harness> = Arc::new(tm_harness::claude::ClaudeCode { binary: bin.display().to_string(), sandbox: None });

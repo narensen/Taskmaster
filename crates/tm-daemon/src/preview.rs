@@ -163,8 +163,10 @@ impl Previews {
         // If this start returns before the process is recorded, free the slot.
         let mut claim = ClearClaim { previews: self, run, live: true };
         // Held until the server is chosen: the static server serves on it, so no other
-        // process can take the port in between.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        // process can take the port in between. Pick outside the OS ephemeral port range so
+        // concurrent `bind("127.0.0.1:0")` callers cannot steal the port after we drop it for
+        // an external dev server.
+        let listener = reserve_port().await?;
         let port = listener.local_addr()?.port();
         let proj = self.project();
         let loaded_yaml = crate::project_config::load(&proj).ok().flatten();
@@ -485,6 +487,25 @@ impl Drop for ClearClaim<'_> {
     }
 }
 
+/// Pick a free loopback port outside Linux's default ephemeral range (`32768..60999`) using a
+/// monotonic cursor so concurrent preview starts and `bind("127.0.0.1:0")` callers do not steal
+/// the port between `drop(listener)` and the dev server binding it.
+async fn reserve_port() -> std::io::Result<tokio::net::TcpListener> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 11_000;
+    static CURSOR: AtomicU16 = AtomicU16::new(0);
+    let seed = ((std::process::id() as u16).wrapping_mul(137)) % SPAN;
+    for _ in 0..64 {
+        let offset = CURSOR.fetch_add(1, Ordering::Relaxed);
+        let port = BASE + (seed.wrapping_add(offset) % SPAN);
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            return Ok(listener);
+        }
+    }
+    tokio::net::TcpListener::bind("127.0.0.1:0").await
+}
+
 /// Ask a process group to end, and make sure it does.
 fn kill_group(pid: u32) {
     #[cfg(unix)]
@@ -499,4 +520,20 @@ fn kill_group(pid: u32) {
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reserve_port_returns_distinct_non_ephemeral_ports() {
+        let a = reserve_port().await.unwrap();
+        let b = reserve_port().await.unwrap();
+        let pa = a.local_addr().unwrap().port();
+        let pb = b.local_addr().unwrap().port();
+        assert_ne!(pa, pb);
+        assert!((20_000..31_000).contains(&pa), "unexpected port {pa}");
+        assert!((20_000..31_000).contains(&pb), "unexpected port {pb}");
+    }
 }

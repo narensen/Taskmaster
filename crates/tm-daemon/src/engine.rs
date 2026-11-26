@@ -9191,11 +9191,18 @@ pub(crate) fn body_duplicated_in(body: &str, contracts: &[&str]) -> bool {
 /// (e.g. `mcp_dictionary_run_code` on Antigravity) so agents call the real tool on their first try.
 pub(crate) fn code_mode_guide(harness_id: &str) -> String {
     let tool = tm_harness::run_code_tool_name(harness_id, "dictionary");
-    if tool == "run_code" {
+    let mut guide = if tool == "run_code" {
         CODE_MODE_GUIDE.to_string()
     } else {
         CODE_MODE_GUIDE.replace("run_code", &tool)
+    };
+    if matches!(harness_id, "grok" | "grok-build") {
+        let fq = tm_harness::mcp_tool_name(harness_id, "dictionary", "flow_query");
+        guide.push_str(&format!(
+            "- Tool discovery: call `search_tool` once for `{tool}` and use `await flow(...)` inside it instead of searching separately for `{fq}`.\n"
+        ));
     }
+    guide
 }
 
 /// Environment variable overriding the per-agent silence/stall timeout in seconds.

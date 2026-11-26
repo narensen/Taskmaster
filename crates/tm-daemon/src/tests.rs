@@ -14506,3 +14506,29 @@ async fn tb18_brownfield_scout_runs_above_threshold_writes_scope_json_and_falls_
     assert!(calls_err[1].4.contains("## Repository summary (.flow)"), "deterministic summary must still be present");
     assert!(!calls_err[1].4.contains("## Brownfield scope brief"), "failed scout must not inject partial brief");
 }
+
+#[test]
+fn tb18_grok_code_mode_guide_includes_single_search_tool_hint() {
+    for id in ["grok", "grok-build"] {
+        let guide = crate::engine::code_mode_guide(id);
+        assert!(
+            guide.contains("call `search_tool` once for `dictionary__run_code`"),
+            "{id} guide must instruct a single search_tool lookup: {guide}"
+        );
+        assert!(
+            guide.contains("await flow(...)"),
+            "{id} guide must point Grok at flow() inside run_code: {guide}"
+        );
+        assert!(
+            guide.contains("instead of searching separately for `dictionary__flow_query`"),
+            "{id} guide must discourage redundant flow_query discovery: {guide}"
+        );
+    }
+    for other in ["antigravity", "claude", "codex", "opencode"] {
+        let guide = crate::engine::code_mode_guide(other);
+        assert!(
+            !guide.contains("search_tool"),
+            "non-Grok harness `{other}` must not get Grok-only search_tool hint: {guide}"
+        );
+    }
+}

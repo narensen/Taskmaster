@@ -21,8 +21,9 @@ pub use model::{
     git_blob_sha, is_flow_path, lang_prefix, sig_hash, symbol_node_id, unit_node_id,
 };
 pub use query::{
-    Direction, EdgeView, FindResult, FlowQuery, MAX_QUERY_CHARS, MAX_QUERY_NODES, NeighborsResult,
-    NodeDetail, QueryOutput, SourceSlice, execute_op,
+    Direction, EdgeView, FindResult, FlowQuery, MAX_BATCH_CHARS, MAX_BATCH_QUERIES,
+    MAX_QUERY_CHARS, MAX_QUERY_NODES, NeighborsResult, NodeDetail, QueryOutput, SourceSlice,
+    execute_batch, execute_op,
 };
 pub use render::{
     DEFAULT_UNIT_MAP_BUDGET, REPAIR_UNIT_MAP_BUDGET, is_integrator_unit, preinjected_context,

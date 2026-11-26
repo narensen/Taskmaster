@@ -5609,10 +5609,11 @@ impl Driver {
         out.push_str(&format!(
             "\nDocumentation & code graph:\n\
              - Call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages.\n\
-             - Query the `.flow` code graph with `{flow_tool}` instead of reading whole files outside your unit (capped at 40 nodes / 6 KB). Examples:\n\
+             - Query the `.flow` code graph with `{flow_tool}` instead of reading whole files outside your unit. Examples:\n\
                1. Find symbols: `{flow_tool}({{\"op\": \"find\", \"query\": \"StorageEngine\"}})`\n\
                2. Inspect callers / 1-hop neighbors: `{flow_tool}({{\"op\": \"neighbors\", \"id\": \"py:pkg/mod.py#Class.method\", \"k\": 1, \"dir\": \"in\"}})`\n\
-               3. Read only one symbol's source span: `{flow_tool}({{\"op\": \"source\", \"id\": \"py:pkg/mod.py#Class.method\"}})`"
+               3. Read a symbol's full source body: `{flow_tool}({{\"op\": \"source\", \"id\": \"py:pkg/mod.py#Class.method\"}})`\n\
+               4. Batch several queries in ONE call (avoid serial one-by-one fishing): `{flow_tool}({{\"op\": \"batch\", \"queries\": [{{\"op\": \"find\", \"query\": \"Foo\"}}, {{\"op\": \"source\", \"id\": \"...\"}}]}})` (or pass `ids: [...]` to `node`/`source`)."
         ));
         if self.web_access.enabled {
             let mut extra = Vec::new();
@@ -5841,9 +5842,19 @@ impl Driver {
             task_text.push('\n');
             task_text.push_str(err);
         }
+        let no_deps = split
+            .as_ref()
+            .map_or(page.depends_on.is_empty(), |u| u.depends_on.is_empty() && page.depends_on.is_empty());
+        let wave1_independent = errors.is_none() && no_deps && owned.is_empty();
         let pre_cap = (budget * 45) / 100;
-        let preinjected = tm_flow::preinjected_context(&self.tree, page_id, owned, &task_text, pre_cap)
-            .unwrap_or_default();
+        let preinjected = if wave1_independent {
+            // Independent wave-1 units with no depends_on build purely against locked contracts;
+            // skip injecting peer symbols that may have landed concurrently and tempt fishing.
+            String::new()
+        } else {
+            tm_flow::preinjected_context(&self.tree, page_id, owned, &task_text, pre_cap)
+                .unwrap_or_default()
+        };
         let map_budget = if preinjected.is_empty() {
             budget
         } else {
@@ -6013,13 +6024,17 @@ impl Driver {
                 }
             ));
         }
-        let graph_hint = if self.code.is_some() {
+        let graph_hint = if wave1_independent {
             format!(
-                "If you need an outside symbol, signature, or caller, query `.flow` with `flow(...)` inside `{tier_run_code_tool}` or `{tier_flow_tool}` instead of reading whole files."
+                "This unit has no upstream dependencies (`depends_on: []`): rely on the locked contracts above and do NOT query peer units with `{tier_flow_tool}` (peers are built in parallel)."
+            )
+        } else if self.code.is_some() {
+            format!(
+                "If you need outside symbols, signatures, or callers, batch them into ONE `.flow` query (`flow(\"batch\", {{ queries: [...] }})` inside `{tier_run_code_tool}` or `{tier_flow_tool}`) instead of serial calls or reading whole files."
             )
         } else {
             format!(
-                "If you need an outside symbol, signature, or caller, query `.flow` with `{tier_flow_tool}` instead of reading whole files."
+                "If you need outside symbols, signatures, or callers, batch them into ONE `{tier_flow_tool}({{\"op\":\"batch\",\"queries\":[...]}})` call instead of serial calls or reading whole files."
             )
         };
         brief.push_str(&if errors.is_some() {

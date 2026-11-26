@@ -11793,3 +11793,90 @@ async fn tok7_warm_session_reuses_clean_session_across_waves_and_enforces_contex
     assert_eq!(fups3.len(), 1, "only u1's own repair should use follow_up");
     assert!(fups3[0].contains("The checks failed after your last turn"));
 }
+
+#[tokio::test]
+async fn tok8_wave1_independent_unit_suppresses_peer_fishing_and_dependent_unit_gets_batch_hint() {
+    let tmp = seeded("tok8-flow-fishing");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: "class ProtocolA:\n    def run(self) -> int: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "peer_a".into(),
+                owned_glob: "pkg/a.py".into(),
+                brief: "Implement AlphaWorker for ProtocolA.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "peer_b".into(),
+                owned_glob: "pkg/b.py".into(),
+                brief: "Implement BetaWorker independent of AlphaWorker.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "integrator".into(),
+                owned_glob: "pkg/app.py".into(),
+                brief: "Wire AlphaWorker and BetaWorker.".into(),
+                depends_on: vec!["peer_a".into(), "peer_b".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs = Arc::new(Mutex::new(std::collections::BTreeMap::<String, String>::new()));
+    struct Capture(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+    #[async_trait]
+    impl Harness for Capture {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("x")
+                .to_string();
+            self.0.lock().unwrap().insert(unit.clone(), task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            match unit.as_str() {
+                "peer_a" => std::fs::write(task.cwd.join("pkg/a.py"), "class AlphaWorker:\n    def run(self) -> int:\n        return 1\n")?,
+                "peer_b" => std::fs::write(task.cwd.join("pkg/b.py"), "class BetaWorker:\n    def run(self) -> int:\n        return 2\n")?,
+                _ => std::fs::write(task.cwd.join("pkg/app.py"), "from pkg.a import AlphaWorker\nfrom pkg.b import BetaWorker\n")?,
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(Capture(briefs.clone()));
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    // parallel=1 forces peer_a to merge into `.flow` before peer_b starts, proving peer_b still
+    // does not get peer_a pre-injected and is explicitly told not to fish peers!
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let got = briefs.lock().unwrap().clone();
+    let b_brief = got.get("peer_b").expect("peer_b brief");
+    assert!(b_brief.contains("do NOT query peer units"), "missing anti-fishing guidance:\n{b_brief}");
+    assert!(!b_brief.contains("Pre-injected flow context"), "independent wave-1 unit must not receive peer pre-injection:\n{b_brief}");
+
+    let app_brief = got.get("integrator").expect("integrator brief");
+    assert!(app_brief.contains("\"op\":\"batch\""), "dependent unit must get batched flow_query hint:\n{app_brief}");
+    assert!(app_brief.contains("AlphaWorker"), "dependent unit should still receive built upstream symbols:\n{app_brief}");
+}

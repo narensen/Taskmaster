@@ -15,6 +15,10 @@ use crate::store::{FlowDb, read_meta};
 pub const MAX_QUERY_NODES: usize = 40;
 /// Hard cap on formatted characters returned by any single query call (~1.5k tokens).
 pub const MAX_QUERY_CHARS: usize = 6_000;
+/// Maximum sub-queries accepted in a single `batch` call.
+pub const MAX_BATCH_QUERIES: usize = 10;
+/// Hard cap on formatted characters returned by a batched `flow_query` call.
+pub const MAX_BATCH_CHARS: usize = 9_000;
 /// Maximum BFS hop depth for `neighbors`.
 pub const MAX_HOPS: usize = 3;
 
@@ -320,8 +324,119 @@ impl<'a> FlowQuery<'a> {
 }
 
 /// Dispatch one `flow_query` / Code Mode `flow(op, args)` operation with strict caps.
+///
+/// Supports `find`, `node`, `neighbors` (and `callers`/`callees`), `source` (always returning
+/// full symbol bodies by default), and `batch` (running several ops in one call via `queries`).
+/// `node` and `source` also accept `ids: [...]` to fetch several nodes in one call.
 pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOutput> {
     let q = FlowQuery::open(tree)?;
+    let norm = op.trim().to_ascii_lowercase();
+    if norm == "batch" || (norm.is_empty() && args.get("queries").is_some()) {
+        let queries = args
+            .get("queries")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("`batch` requires a non-empty `queries` array"))?;
+        return execute_batch_with(&q, queries);
+    }
+    execute_single(&q, &norm, args)
+}
+
+/// Run several `flow_query` operations against one opened `.flow` handle in a single call.
+pub fn execute_batch(tree: &Path, queries: &[Value]) -> anyhow::Result<QueryOutput> {
+    let q = FlowQuery::open(tree)?;
+    execute_batch_with(&q, queries)
+}
+
+fn execute_batch_with(q: &FlowQuery<'_>, queries: &[Value]) -> anyhow::Result<QueryOutput> {
+    if queries.is_empty() {
+        bail!("`batch` requires at least one entry in `queries`");
+    }
+    let total = queries.len();
+    let take = total.min(MAX_BATCH_QUERIES);
+    let mut results = Vec::with_capacity(take);
+    let mut text = String::new();
+    let mut text_truncated = false;
+    for (idx, item) in queries.iter().take(take).enumerate() {
+        let sub_op = item
+            .get("op")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if sub_op.is_empty() || sub_op == "batch" {
+            let err_msg = if sub_op == "batch" {
+                "nested `batch` is not allowed"
+            } else {
+                "batch item missing `op`"
+            };
+            results.push(json!({ "ok": false, "op": sub_op, "error": err_msg }));
+            let section = format!("[{}/{take}] error: {err_msg}\n", idx + 1);
+            append_batch_section(&mut text, &section, &mut text_truncated);
+            continue;
+        }
+        match execute_single(q, &sub_op, item) {
+            Ok(out) => {
+                results.push(json!({ "ok": true, "op": sub_op, "result": out.json }));
+                let section = format!("[{}/{take} {sub_op}]\n{}\n", idx + 1, out.text.trim_end());
+                append_batch_section(&mut text, &section, &mut text_truncated);
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                results.push(json!({ "ok": false, "op": sub_op, "error": msg }));
+                let section = format!("[{}/{take} {sub_op}] error: {msg}\n", idx + 1);
+                append_batch_section(&mut text, &section, &mut text_truncated);
+            }
+        }
+    }
+    if total > take {
+        let note = format!("... (+{} more queries capped at {MAX_BATCH_QUERIES})\n", total - take);
+        if text.len() + note.len() <= MAX_BATCH_CHARS {
+            text.push_str(&note);
+        }
+    }
+    Ok(QueryOutput {
+        json: json!({
+            "results": results,
+            "truncated": total > take || text_truncated,
+        }),
+        text,
+    })
+}
+
+fn append_batch_section(buf: &mut String, section: &str, truncated: &mut bool) {
+    if *truncated {
+        return;
+    }
+    let sep = if buf.is_empty() { "" } else { "---\n" };
+    let reserve = 36;
+    if buf.len() + sep.len() + section.len() <= MAX_BATCH_CHARS.saturating_sub(reserve) {
+        buf.push_str(sep);
+        buf.push_str(section);
+    } else {
+        let room = MAX_BATCH_CHARS.saturating_sub(buf.len() + sep.len() + reserve);
+        if room > 24 {
+            buf.push_str(sep);
+            let (clipped, _) = clip_chars(section, room);
+            buf.push_str(clipped.trim_end());
+            buf.push('\n');
+        }
+        buf.push_str("... (batch output capped)\n");
+        *truncated = true;
+    }
+}
+
+fn string_list(val: Option<&Value>) -> Vec<String> {
+    val.and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn execute_single(q: &FlowQuery<'_>, op: &str, args: &Value) -> anyhow::Result<QueryOutput> {
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -329,7 +444,7 @@ pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOu
         .unwrap_or(MAX_QUERY_NODES)
         .clamp(1, MAX_QUERY_NODES);
 
-    match op.trim().to_ascii_lowercase().as_str() {
+    match op {
         "find" => {
             let query = args
                 .get("query")
@@ -346,12 +461,17 @@ pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOu
             })
         }
         "node" => {
+            let ids = string_list(args.get("ids"));
+            if !ids.is_empty() {
+                let sub: Vec<Value> = ids.into_iter().map(|id| json!({ "op": "node", "id": id })).collect();
+                return execute_batch_with(q, &sub);
+            }
             let id = args
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("`node` requires a non-empty `id`"))?;
+                .ok_or_else(|| anyhow::anyhow!("`node` requires a non-empty `id` or `ids`"))?;
             let res = q.node(id)?;
             match res {
                 Some(detail) => {
@@ -380,10 +500,9 @@ pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOu
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(1);
-            let op_lower = op.trim().to_ascii_lowercase();
-            let dir = if op_lower == "callers" {
+            let dir = if op == "callers" {
                 Direction::In
-            } else if op_lower == "callees" {
+            } else if op == "callees" {
                 Direction::Out
             } else {
                 args.get("dir")
@@ -391,7 +510,7 @@ pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOu
                     .map(Direction::parse)
                     .unwrap_or(Direction::Both)
             };
-            let parsed_kinds: Option<Vec<EdgeKind>> = if op_lower == "callers" || op_lower == "callees" {
+            let parsed_kinds: Option<Vec<EdgeKind>> = if op == "callers" || op == "callees" {
                 Some(vec![EdgeKind::Calls])
             } else {
                 parse_kinds_arg(args.get("kinds"))
@@ -404,12 +523,17 @@ pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOu
             })
         }
         "source" => {
+            let ids = string_list(args.get("ids"));
+            if !ids.is_empty() {
+                let sub: Vec<Value> = ids.into_iter().map(|id| json!({ "op": "source", "id": id })).collect();
+                return execute_batch_with(q, &sub);
+            }
             let id = args
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("`source` requires a non-empty `id`"))?;
+                .ok_or_else(|| anyhow::anyhow!("`source` requires a non-empty `id` or `ids`"))?;
             match q.source(id)? {
                 Some(slice) => {
                     let text = format_source(&slice);
@@ -424,7 +548,7 @@ pub fn execute_op(tree: &Path, op: &str, args: &Value) -> anyhow::Result<QueryOu
                 }),
             }
         }
-        other => bail!("unknown flow op `{other}` (use find, node, neighbors, or source)"),
+        other => bail!("unknown flow op `{other}` (use find, node, neighbors, source, or batch)"),
     }
 }
 
@@ -685,6 +809,53 @@ mod tests {
         assert_eq!(capped.json["nodes"].as_array().unwrap().len(), 2);
         assert_eq!(capped.json["truncated"], true);
         assert!(capped.text.len() <= MAX_QUERY_CHARS);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_and_multi_id_queries_run_in_one_call_and_source_keeps_full_bodies() {
+        let dir = fixture_repo("batch");
+        let batched = execute_op(
+            &dir,
+            "batch",
+            &json!({
+                "queries": [
+                    { "op": "find", "query": "Storage" },
+                    { "op": "node", "id": "py:pkg/engine.py#Engine.commit" },
+                    { "op": "source", "id": "py:pkg/engine.py#Engine.commit" }
+                ]
+            }),
+        )
+        .unwrap();
+        let results = batched.json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r["ok"] == true), "{results:#?}");
+        assert!(batched.text.contains("[1/3 find]"), "{}", batched.text);
+        assert!(batched.text.contains("[2/3 node]"), "{}", batched.text);
+        assert!(batched.text.contains("[3/3 source]"), "{}", batched.text);
+        // `source` must continue returning full function bodies, never signature-only by default.
+        assert!(batched.text.contains("self.store.save(row)"), "{}", batched.text);
+        assert!(batched.text.len() <= MAX_BATCH_CHARS);
+
+        // Multi-id `source` shorthand fetches full bodies for multiple symbols in one call.
+        let multi_src = execute_op(
+            &dir,
+            "source",
+            &json!({ "ids": ["py:pkg/storage.py#Storage.save", "py:pkg/cli.py#main"] }),
+        )
+        .unwrap();
+        assert_eq!(multi_src.json["results"].as_array().unwrap().len(), 2);
+        assert!(multi_src.text.contains("def save(self, row: dict)"));
+        assert!(multi_src.text.contains("eng.commit({'id': 1})"));
+
+        // Batch cap enforces MAX_BATCH_QUERIES.
+        let many: Vec<Value> = (0..(MAX_BATCH_QUERIES + 3))
+            .map(|_| json!({ "op": "find", "query": "Storage", "limit": 1 }))
+            .collect();
+        let capped = execute_batch(&dir, &many).unwrap();
+        assert_eq!(capped.json["results"].as_array().unwrap().len(), MAX_BATCH_QUERIES);
+        assert_eq!(capped.json["truncated"], true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

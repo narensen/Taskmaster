@@ -13794,3 +13794,230 @@ async fn fix_n9_price_table_hook_prices_unpriced_harness_calls_and_estimates() {
     let cost = row.cost_usd.expect("priced from external table");
     assert!((cost - 0.23).abs() < 1e-6, "expected $0.23, got {cost}");
 }
+
+#[tokio::test]
+async fn fix_n9_skips_flaky_rerun_on_deterministic_pytest_assertion() {
+    let npm = std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("npm").is_file()));
+    if !npm {
+        eprintln!("npm is missing; skipping");
+        return;
+    }
+    let tmp = seeded("n9-det-assert");
+    let count_file = tmp.0.join(".test-invocations");
+    std::fs::write(
+        tmp.0.join("package.json"),
+        r#"{"name":"det-assert","private":true,"scripts":{"test":"sh det.sh"}}"#,
+    )
+    .unwrap();
+    // Script records every invocation outside the worktree (using an absolute path), fails with a
+    // deterministic pytest AssertionError naming `app/a/page.ts` until `app/a/page.ts` contains
+    // `FIXED`, then passes.
+    std::fs::write(
+        tmp.0.join("det.sh"),
+        format!(
+            "echo x >> '{}'\n\
+             if grep -q FIXED app/a/page.ts 2>/dev/null; then exit 0; fi\n\
+             cat >&2 <<'EOF'\n\
+             F\n\
+             app/a/page.ts:1: AssertionError\n\
+             E   AssertionError: assert '# Todo\\n' == '# Todo\\n<!-- next-id: 4 -->\\n'\n\
+             FAILED tests/test_acceptance_contract.py::test_header - AssertionError\n\
+             EOF\n\
+             exit 1\n",
+            count_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(tmp.0.join(".gitignore"), "node_modules/\n.test-invocations\n").unwrap();
+    std::fs::create_dir_all(tmp.0.join("node_modules")).unwrap();
+    git(&tmp.0, &["add", "-A"]);
+    git(&tmp.0, &["commit", "-q", "-m", "deterministic failing test"]);
+
+    struct FixOnRepairHarness {
+        attempts: Arc<AtomicUsize>,
+        runs_seen_on_repair: Arc<AtomicUsize>,
+        count_file: PathBuf,
+    }
+    #[async_trait]
+    impl Harness for FixOnRepairHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            std::fs::create_dir_all(task.cwd.join("app/a"))?;
+            if n == 1 {
+                std::fs::write(task.cwd.join("app/a/page.ts"), "export const a = 1;\n")?;
+            } else {
+                let runs = std::fs::read_to_string(&self.count_file)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                self.runs_seen_on_repair.store(runs, Ordering::SeqCst);
+                std::fs::write(task.cwd.join("app/a/page.ts"), "// FIXED\nexport const a = 2;\n")?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE page:a\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let runs_seen_on_repair = Arc::new(AtomicUsize::new(0));
+    let h: Arc<dyn Harness> = Arc::new(FixOnRepairHarness {
+        attempts: Arc::new(AtomicUsize::new(0)),
+        runs_seen_on_repair: runs_seen_on_repair.clone(),
+        count_file: count_file.clone(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan(&[("a", &[])]), true, 1);
+    cfg.checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    // First verify failed with AssertionError -> must NOT run a flaky rerun (only 1 test run before repair).
+    assert_eq!(
+        runs_seen_on_repair.load(Ordering::SeqCst),
+        1,
+        "deterministic AssertionError must skip the flaky-test rerun"
+    );
+    let total_runs = std::fs::read_to_string(&count_file).unwrap().lines().count();
+    assert_eq!(total_runs, 2, "expected 1 failing verify + 1 passing verify after repair, got {total_runs}");
+}
+
+#[tokio::test]
+async fn fix_n9_independent_disjoint_units_share_wave_and_overlapping_units_serialize() {
+    struct WaveOverlapHarness {
+        wave2_barrier: Arc<tokio::sync::Barrier>,
+        inflight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for WaveOverlapHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            if matches!(unit.as_str(), "b" | "d" | "e") {
+                tokio::time::timeout(Duration::from_secs(5), self.wave2_barrier.wait())
+                    .await
+                    .expect("independent disjoint units b, d, e must all share wave 2 concurrently");
+            }
+            let file = task.cwd.join(format!("pkg/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. `parallel = 3` with an interface contract + hard concrete dependencies:
+    //    `a` -> (`b`, `d`, `e`), and `b` -> `c`.
+    //    `b`, `d`, and `e` are independent of each other with disjoint owned files and MUST all 3
+    //    run concurrently in wave 2 (never starved by blocked `c` occupying a slot).
+    let tmp = repo("n9-wave-share");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: "class Base: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan { id: "a".into(), owned_glob: "pkg/a.py".into(), brief: "Implement pkg/a.py.".into(), ..Default::default() },
+            PagePlan { id: "b".into(), owned_glob: "pkg/b.py".into(), brief: "Import pkg/a.py directly.".into(), depends_on: vec!["a".into()], ..Default::default() },
+            PagePlan { id: "c".into(), owned_glob: "pkg/c.py".into(), brief: "Import pkg/b.py directly.".into(), depends_on: vec!["b".into()], ..Default::default() },
+            PagePlan { id: "d".into(), owned_glob: "pkg/d.py".into(), brief: "Import pkg/a.py directly.".into(), depends_on: vec!["a".into()], ..Default::default() },
+            PagePlan { id: "e".into(), owned_glob: "pkg/e.py".into(), brief: "Import pkg/a.py directly.".into(), depends_on: vec!["a".into()], ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let h = Arc::new(WaveOverlapHarness {
+        wave2_barrier: Arc::new(tokio::sync::Barrier::new(3)),
+        inflight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h.clone() };
+    let mut cfg = config(&tmp.0, p, true, 3);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(h.peak.load(Ordering::SeqCst), 3, "b, d, and e must reach peak concurrency 3 in wave 2");
+
+    // 2. Two units with NO depends_on edge that share an owned file (`pkg/shared.py`) must serialize (peak == 1).
+    struct SleepPeakHarness {
+        inflight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for SleepPeakHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let file = task.cwd.join(format!("pkg/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let tmp2 = repo("n9-wave-overlap");
+    let overlap = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan { id: "u1".into(), owned_glob: "{pkg/u1.py,pkg/shared.py}".into(), brief: "Write u1.".into(), ..Default::default() },
+            PagePlan { id: "u2".into(), owned_glob: "{pkg/shared.py,pkg/u2.py}".into(), brief: "Write u2.".into(), ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let h2 = Arc::new(SleepPeakHarness {
+        inflight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let harnesses2 = Harnesses { master: h2.clone(), mid: h2.clone(), worker: h2.clone(), reviewer: h2.clone(), verifier: h2.clone() };
+    let mut cfg2 = config(&tmp2.0, overlap, true, 2);
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(h2.peak.load(Ordering::SeqCst), 1, "units sharing owned files must not run concurrently");
+}

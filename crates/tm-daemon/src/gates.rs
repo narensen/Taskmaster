@@ -563,7 +563,7 @@ pub fn review_plan_structure_for_slots(plan: &Plan, slots: Option<usize>) -> Vec
         for j in (i + 1)..plan.pages.len() {
             let a = &plan.pages[i];
             let b = &plan.pages[j];
-            if globs_likely_overlap(&a.owned_glob, &b.owned_glob) {
+            if tm_core::owned_globs_overlap(&a.owned_glob, &b.owned_glob) {
                 findings.push(PlanReviewFinding {
                     severity: "error".into(),
                     category: "overlap".into(),
@@ -905,31 +905,6 @@ fn extract_declared_symbols(content: &str) -> Vec<String> {
     out
 }
 
-fn globs_likely_overlap(a: &str, b: &str) -> bool {
-    let a = a.trim().trim_start_matches("./");
-    let b = b.trim().trim_start_matches("./");
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    if a == b || a == "**" || b == "**" {
-        return true;
-    }
-    fn prefix(g: &str) -> &str {
-        g.split('*').next().unwrap_or(g).trim_end_matches('/')
-    }
-    let pa = prefix(a);
-    let pb = prefix(b);
-    if !pa.is_empty() && !pb.is_empty() {
-        if a.contains('*') && (pb == pa || pb.starts_with(&format!("{pa}/"))) {
-            return true;
-        }
-        if b.contains('*') && (pa == pb || pa.starts_with(&format!("{pb}/"))) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Auto-fix mechanical findings from a plan review (narrowing overlapping globs and
 /// raising miscalibrated `easy` difficulty on heavily dependent units).
 pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
@@ -937,7 +912,7 @@ pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
     let mut overlapping: BTreeSet<usize> = BTreeSet::new();
     for i in 0..plan.pages.len() {
         for j in (i + 1)..plan.pages.len() {
-            if globs_likely_overlap(&plan.pages[i].owned_glob, &plan.pages[j].owned_glob) {
+            if tm_core::owned_globs_overlap(&plan.pages[i].owned_glob, &plan.pages[j].owned_glob) {
                 overlapping.insert(i);
                 overlapping.insert(j);
             }

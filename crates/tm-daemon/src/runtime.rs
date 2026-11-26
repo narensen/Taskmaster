@@ -693,6 +693,112 @@ pub fn attribute(output: &str, owners: &Owners, routes: &[(PageId, String)]) -> 
     (pages, rest.trim().to_string())
 }
 
+/// True when a test step's failure output clearly points to a deterministic assertion, logic,
+/// import, syntax, or compile error rather than a transient/flaky failure (such as a timeout,
+/// connection reset, port collision, or lock contention). Used to skip wasteful flaky-test reruns.
+pub fn is_deterministic_test_failure(output: &str) -> bool {
+    if output.trim().is_empty() {
+        return false;
+    }
+    let lower = output.to_ascii_lowercase();
+    const TRANSIENT_MARKERS: &[&str] = &[
+        "timeout",
+        "timed out",
+        "deadline exceeded",
+        "econnrefused",
+        "econnreset",
+        "etimedout",
+        "ehostunreach",
+        "enetunreach",
+        "eaddrinuse",
+        "eaddrnotavail",
+        "epipe",
+        "eagain",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "connectionerror",
+        "broken pipe",
+        "socket hang up",
+        "address already in use",
+        "port already in use",
+        "temporarily unavailable",
+        "service unavailable",
+        "too many requests",
+        "rate limit",
+        "http 429",
+        "http 503",
+        "502 bad gateway",
+        "504 gateway",
+        "deadlock",
+        "database is locked",
+        "sqlite_busy",
+        "getaddrinfo",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "segmentation fault",
+        "segfault",
+        "sigkill",
+        "sigterm",
+    ];
+    if TRANSIENT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    const DETERMINISTIC_MARKERS: &[&str] = &[
+        // Python / pytest / JS / Java
+        "AssertionError",
+        "SyntaxError",
+        "IndentationError",
+        "TabError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "NameError",
+        "TypeError",
+        "AttributeError",
+        "KeyError",
+        "IndexError",
+        "ValueError",
+        "ZeroDivisionError",
+        "UnboundLocalError",
+        "NotImplementedError",
+        "RecursionError",
+        // JS / TS
+        "ReferenceError",
+        "RangeError",
+        "Cannot find module",
+        "ERR_MODULE_NOT_FOUND",
+        "ERR_ASSERTION",
+        // Rust
+        "assertion failed",
+        "assertion `left == right` failed",
+        "assertion left == right failed",
+        "panicked at",
+        "error[E",
+        // Go
+        "[build failed]",
+        "compilation failed",
+    ];
+    if DETERMINISTIC_MARKERS.iter().any(|m| output.contains(m)) {
+        return true;
+    }
+    // Pytest short-traceback assertion lines (`E   assert ...`).
+    if output.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("E ")
+            .is_some_and(|rest| rest.trim_start().starts_with("assert "))
+    }) {
+        return true;
+    }
+    // Jest / Vitest expectation diff (`Expected:` + `Received:`).
+    if output.contains("Expected:") && output.contains("Received:") {
+        return true;
+    }
+    // C / C++ assert macro (`Assertion `...` failed`).
+    output.contains("Assertion `") && output.contains("` failed")
+}
+
 // The browser.
 
 /// A Chrome or Chromium to drive: `$TASKMASTER_CHROME`, or one on `PATH`.
@@ -1267,6 +1373,34 @@ mod tests {
         setup_step.setup = true;
         assert!(!is_pytest_step(&setup_step));
         assert!(!is_pytest_step(&Step::new("test", "cargo", &["test", "--quiet"])));
+    }
+
+    #[test]
+    fn fix_n9_deterministic_test_failure_detection() {
+        // Real pytest AssertionError output from tb15-mdtodo-tmhcode.
+        let pytest_assert = concat!(
+            "F\n",
+            "=================================== FAILURES ===================================\n",
+            "tests/test_acceptance_contract.py:44: in test_storage_format_and_core_commands\n",
+            "    assert todo.read_text(encoding=\"utf-8\") == expected_md\n",
+            "E   AssertionError: assert '# Todo\\n- [ ' == '# Todo\\n<!-- next-id: 4 -->\\n'\n",
+            "FAILED tests/test_acceptance_contract.py::test_storage_format_and_core_commands - AssertionError\n",
+        );
+        assert!(is_deterministic_test_failure(pytest_assert));
+        assert!(is_deterministic_test_failure("E   assert 1 == 2\n1 failed in 0.05s"));
+        assert!(is_deterministic_test_failure("ModuleNotFoundError: No module named 'mdtodo'"));
+        assert!(is_deterministic_test_failure("SyntaxError: invalid syntax"));
+        assert!(is_deterministic_test_failure("thread 'main' panicked at 'assertion `left == right` failed'"));
+        assert!(is_deterministic_test_failure("ReferenceError: foo is not defined"));
+        assert!(is_deterministic_test_failure("Expected: 42\nReceived: 41"));
+
+        // Transient / flaky failures must still return false so the flaky rerun stays active.
+        assert!(!is_deterministic_test_failure("timeout waiting for port 3000"));
+        assert!(!is_deterministic_test_failure("Error: connect ECONNREFUSED 127.0.0.1:8080"));
+        assert!(!is_deterministic_test_failure("OSError: [Errno 98] Address already in use"));
+        assert!(!is_deterministic_test_failure("AssertionError: timed out waiting for server"));
+        assert!(!is_deterministic_test_failure(""));
+        assert!(!is_deterministic_test_failure("exit status 1"));
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

@@ -298,6 +298,26 @@ fn glob_alternatives(glob: &str) -> Vec<String> {
     vec![glob.to_string()]
 }
 
+/// True when two unit `owned_glob` patterns may match the same file, expanding top-level
+/// `{a,b}` brace groups and checking literal/wildcard overlap. Empty globs never overlap.
+pub fn owned_globs_overlap(a: &str, b: &str) -> bool {
+    let norm = |g: &str| -> Vec<String> {
+        glob_alternatives(g)
+            .into_iter()
+            .map(|s| s.trim().trim_start_matches("./").to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let alts_a = norm(a);
+    let alts_b = norm(b);
+    if alts_a.is_empty() || alts_b.is_empty() {
+        return false;
+    }
+    alts_a
+        .iter()
+        .any(|x| alts_b.iter().any(|y| globs_may_overlap(x, y)))
+}
+
 /// Conservative: true unless the two globs are provably disjoint by literal prefix, or by
 /// being two different literal paths.
 fn globs_may_overlap(a: &str, b: &str) -> bool {

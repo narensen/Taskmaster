@@ -1169,7 +1169,8 @@ impl Driver {
     /// Index of the highest-priority ready `SpawnWorker` command in the leading contiguous
     /// `SpawnWorker` prefix (so ordering barriers like checks/merge are never bypassed).
     /// A unit is ready when its `depends_on` upstream units have passed or are satisfied by a
-    /// locked interface contract. Among ready units, picks the one with the longest downstream
+    /// locked interface contract, and its `owned_glob` does not overlap any unit currently
+    /// running in this wave. Among ready units, picks the one with the longest downstream
     /// dependency chain, tie-breaking by estimated unit size then queue position.
     fn next_ready_spawn(&self) -> Option<usize> {
         let plan = self.run.plan.as_ref();
@@ -1193,7 +1194,16 @@ impl Driver {
                     None => true,
                 }
             });
-            if ready {
+            let overlaps_running = unit.is_some_and(|u| {
+                self.running.iter().any(|running_cmd| {
+                    let Command::SpawnWorker { page: running_page, .. } = running_cmd else {
+                        return false;
+                    };
+                    plan.and_then(|p| p.pages.iter().find(|r| r.id == *running_page))
+                        .is_some_and(|r| tm_core::owned_globs_overlap(&u.owned_glob, &r.owned_glob))
+                })
+            });
+            if ready && !overlaps_running {
                 let chain = downstream
                     .as_ref()
                     .and_then(|m| m.get(page))
@@ -4940,8 +4950,17 @@ impl Driver {
             other => other,
         };
         // A test step that fails once and passes when run again is flaky, not broken: say so,
-        // and spend no repair on it. A step that ran out of time is not run twice.
+        // and spend no repair on it. A step that ran out of time or hit a deterministic
+        // assertion/syntax/import/compile error is not run twice.
         let failed = match (failed, steps.iter().find(|step| step.name == "test")) {
+            (Some(failure), Some(step))
+                if failure.step == "test"
+                    && !timed_out
+                    && runtime::is_deterministic_test_failure(&failure.output) =>
+            {
+                eprintln!("taskmaster: `{}` failed with a deterministic assertion/error; skipping flaky rerun", step.line());
+                Some(failure)
+            }
             (Some(failure), Some(step)) if failure.step == "test" && !timed_out => {
                 eprintln!("taskmaster: `{}` failed; running it once more to rule out a flaky test", step.line());
                 let (again_timed, again) = runtime::run_steps(&self.tree, std::slice::from_ref(step), checks::STEP_TIMEOUT).await;

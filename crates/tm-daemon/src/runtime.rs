@@ -325,9 +325,7 @@ pub fn env_facts_from_steps(steps: &[Step], venv: &Path) -> Option<tm_flow::EnvF
     if test_cmd.is_empty() {
         return None;
     }
-    let is_pytest = test_step.program.ends_with("pytest")
-        || test_step.program.ends_with("pytest.exe")
-        || test_step.args.iter().any(|a| a == "pytest");
+    let is_pytest = is_pytest_step(test_step);
     let runner = if is_pytest {
         if matches!(test_step.program.as_str(), "poetry" | "uv" | "hatch") {
             test_step.program.clone()
@@ -533,10 +531,7 @@ pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {
         if step.name != "test" {
             continue;
         }
-        let is_pytest = step.program.ends_with("pytest")
-            || step.program.ends_with("pytest.exe")
-            || step.args.iter().any(|a| a == "pytest");
-        if is_pytest {
+        if is_pytest_step(step) {
             for path in ignore_paths {
                 let flag = format!("--ignore={path}");
                 if !step.args.contains(&flag) {
@@ -1260,6 +1255,18 @@ mod tests {
         assert!(!clipped.contains(&noise), "noisy prefix must be dropped");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_pytest_step_matches_runners_and_ignores_setup_steps() {
+        assert!(is_pytest_step(&Step::new("test", "/venv/bin/python", &["-m", "pytest", "-q"])));
+        assert!(is_pytest_step(&Step::new("test", "pytest", &["-q"])));
+        assert!(is_pytest_step(&Step::new("test", "C:\\venv\\Scripts\\pytest.exe", &["-q"])));
+        assert!(is_pytest_step(&Step::new("test", "uv", &["run", "pytest", "-q"])));
+        let mut setup_step = Step::new("setup", "/venv/bin/python", &["-m", "pip", "install", "pytest"]);
+        setup_step.setup = true;
+        assert!(!is_pytest_step(&setup_step));
+        assert!(!is_pytest_step(&Step::new("test", "cargo", &["test", "--quiet"])));
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

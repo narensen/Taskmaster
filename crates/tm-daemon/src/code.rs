@@ -322,7 +322,7 @@ impl CodeTools {
     /// `None` when Node is not installed: there is nothing to run scripts with.
     pub fn new(browsers: Option<Arc<crate::browser::PageBrowsers>>) -> Option<Arc<CodeTools>> {
         let node = tm_harness::sandbox::resolve_binary("node").ok()?;
-        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| bwrap_works() && tm_harness::sandbox::bwrap_usable());
+        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| tm_harness::sandbox::bwrap_usable());
         Some(Arc::new(CodeTools {
             node,
             bwrap,
@@ -1534,16 +1534,6 @@ fn find_hunk_pos(lines: &[String], expected: &[&str], hint: isize) -> Option<usi
         }
     }
     None
-}
-
-/// Whether bubblewrap can make a sandbox here; some containers forbid user namespaces.
-fn bwrap_works() -> bool {
-    std::process::Command::new("bwrap")
-        .args(["--ro-bind", "/", "/", "--unshare-net", "--die-with-parent", "true"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 /// Accept both the canonical MCP name (`run_code`) and harness-prefixed aliases

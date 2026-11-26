@@ -2934,7 +2934,7 @@ impl Driver {
                 .collect();
             (diff, files)
         });
-        let outcome = match self.judge(&page, tier, &errors, products) {
+        let outcome = match self.judge(&page, tier, &errors, products).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 if let Some(cmd) = cmd {
@@ -3731,8 +3731,8 @@ impl Driver {
         Ok(fixed)
     }
 
-    fn judge(&mut self, page: &str, tier: Tier, errors: &Option<String>, products: Vec<(usize, Product)>) -> anyhow::Result<WorkerOutcome> {
-        let outcome = self.judge_inner(page, tier, errors, &products);
+    async fn judge(&mut self, page: &str, tier: Tier, errors: &Option<String>, products: Vec<(usize, Product)>) -> anyhow::Result<WorkerOutcome> {
+        let outcome = self.judge_inner(page, tier, errors, &products).await;
         if let Ok(outcome) = &outcome {
             for (_, product) in &products {
                 self.note_attempt(page, tier, errors.as_deref(), product, outcome);
@@ -3927,7 +3927,7 @@ impl Driver {
         }
     }
 
-    fn judge_inner(
+    async fn judge_inner(
         &mut self,
         page: &str,
         tier: Tier,
@@ -4055,10 +4055,50 @@ impl Driver {
                     "The last attempt changed none of your owned files after a native tool was refused in Code Mode.\n{redirect}"
                 )));
             }
-            // The files were already right, from an earlier run, the plan, or a template: the
-            // unit is done. Its tests and the project's checks still run at verify. A run told
-            // to rebuild every page (an eval's baseline) still expects each to be written.
             if ok && self.config.incremental && self.owned_files_exist(page) {
+                // Never accept a no-change unit blindly when it ended on an unrecovered `run_code` error.
+                self.live.flush(&self.id);
+                let (_, live_entries) = self.live.read(&self.id, 0);
+                for (_, p) in products {
+                    let aid = p.bill.agent.clone().unwrap_or_else(|| self.agent_id(page, None));
+                    if let Some(err) = last_run_code_error_needs_followup(&live_entries, &aid) {
+                        return Ok(failed(format!(
+                            "The last attempt changed none of your owned files after `{run_code_tool}` errored ({err}). \
+                             Fix the script, implement the required changes, and verify tests pass."
+                        )));
+                    }
+                }
+                // Run the unit's own / acceptance tests before accepting a no-change unit as done.
+                let check_dir = products
+                    .first()
+                    .map(|(_, p)| p.worktree.as_path())
+                    .unwrap_or(self.tree.as_path());
+                if let Some(test_err) = self.check_no_change_unit(page, check_dir).await {
+                    eprintln!("taskmaster: {page} changed nothing and its checks failed; sending it back for repair");
+                    return Ok(failed(format!(
+                        "The last attempt changed none of your owned files, and checks failed:\n{test_err}\n\
+                         Implement the required changes in your owned files and verify tests pass."
+                    )));
+                }
+                // On an initial brownfield build whose owned files pre-existed before this run,
+                // never count a zero-diff turn as done when the task clearly asks for concrete edits
+                // to those existing owned files (as opposed to an already-satisfied placeholder or
+                // catch-all agent follow-up).
+                let unit_plan = self.page(page)?;
+                let existing_owned = self.owned_files(page, 0, 1, &self.tree);
+                if errors.is_none()
+                    && !self.page_was_built_in_run(page)
+                    && self.existing_files() > 0
+                    && task_requires_brownfield_changes(unit_plan, &existing_owned)
+                {
+                    eprintln!("taskmaster: {page} is a brownfield edit whose task requires changes, but its agent changed nothing; sending it back");
+                    return Ok(failed(format!(
+                        "The last attempt changed none of your owned files (`{}`), even though your task requires implementing changes: {}. \
+                         Edit your owned files directly and verify tests pass before releasing.",
+                        unit_plan.owned_glob,
+                        clip(unit_plan.brief.trim(), 240)
+                    )));
+                }
                 eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
                 if errors.is_some() {
                     self.noop_repairs.insert(page.to_string());
@@ -5850,6 +5890,88 @@ impl Driver {
         let matcher = glob.compile_matcher();
         let locked = self.locked_files();
         git::tracked_files(&self.tree).unwrap_or_default().iter().any(|f| matcher.is_match(f) && !locked.contains(f))
+    }
+
+    /// True when `page` has already merged at least one build or repair commit during this run.
+    fn page_was_built_in_run(&self, page: &str) -> bool {
+        self.changes.iter().any(|entry| {
+            entry.page.as_deref() == Some(page)
+                && matches!(entry.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired)
+        })
+    }
+
+    /// Run a focused test check before accepting a no-change unit as done. Returns `Some(errors)`
+    /// when its own tests or applicable acceptance/contract tests fail.
+    async fn check_no_change_unit(&self, page: &str, worktree: &Path) -> Option<String> {
+        if !self.config.runtime_checks {
+            return None;
+        }
+        if !runtime::has_tests(worktree) && !runtime::python_tests(worktree) {
+            return None;
+        }
+        let mut steps = runtime::steps(worktree, &self.verify_venv());
+        if !steps.iter().any(|s| !s.setup) {
+            return None;
+        }
+        let later_tests = self.later_phase_test_contracts();
+        runtime::deselect_test_paths(&mut steps, &later_tests);
+        // When sibling units in the current phase have not landed yet, scope pytest to this unit's
+        // own test files + locked contract tests (if any) so we check what this unit is responsible for
+        // without blaming it for unbuilt peers.
+        if let Ok(plan) = self.plan()
+            && let Ok(unit) = self.page(page)
+            && let Ok(glob) = globset::Glob::new(&unit.owned_glob)
+        {
+            let matcher = glob.compile_matcher();
+            let unbuilt_siblings = plan.pages.iter().any(|p| {
+                p.id != page
+                    && p.phase == unit.phase
+                    && self
+                        .run
+                        .pages
+                        .get(&p.id)
+                        .is_some_and(|st| st.state != tm_core::PageState::Passed)
+            });
+            if unbuilt_siblings {
+                let mut targets: Vec<String> = git::tracked_files(worktree)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|f| matcher.is_match(f) && tm_core::is_test_path(f))
+                    .collect();
+                // Include locked contract tests only when this unit has no unbuilt dependencies.
+                let deps_landed = unit.depends_on.iter().all(|dep| {
+                    self.run
+                        .pages
+                        .get(dep)
+                        .is_some_and(|st| st.state == tm_core::PageState::Passed)
+                });
+                if deps_landed {
+                    for c in &plan.contracts {
+                        if tm_core::is_test_path(&c.path)
+                            && !later_tests.contains(&c.path)
+                            && worktree.join(&c.path).is_file()
+                            && !targets.contains(&c.path)
+                        {
+                            targets.push(c.path.clone());
+                        }
+                    }
+                }
+                if !targets.is_empty() {
+                    for step in &mut steps {
+                        if runtime::is_pytest_step(step) {
+                            step.args.extend(targets.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+        let (_, failure) = runtime::run_steps(
+            worktree,
+            &steps,
+            checks::STEP_TIMEOUT.min(Duration::from_secs(90)),
+        )
+        .await;
+        failure.map(|f| format!("`{}` failed:\n{}", f.step, clip(&f.output, 2500)))
     }
 
     /// The id a builder of `page` runs under: `page:` for a page a browser shows, `unit:` for
@@ -8105,6 +8227,75 @@ fn code_mode_refusal_ended_turn(entries: &[serde_json::Value], agent_id: &str) -
         }
     }
     refused_after_last_ok
+}
+
+/// True when a brownfield unit's brief/context/done clearly specifies concrete edits to its
+/// existing owned files (naming an edit action plus an owned file path/filename or target symbol),
+/// rather than a generic placeholder or catch-all agent follow-up (`**`) whose files may already
+/// be complete.
+fn task_requires_brownfield_changes(unit: &tm_core::PagePlan, existing_owned: &[String]) -> bool {
+    if existing_owned.is_empty() || unit.owned_glob.trim() == "**" {
+        return false;
+    }
+    let raw = format!("{} {} {}", unit.brief, unit.context, unit.done);
+    let lower = raw.to_ascii_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if ["no change", "no edit", "verify only", "check only", "audit only", "if needed"]
+        .iter()
+        .any(|p| trimmed.contains(p))
+    {
+        return false;
+    }
+    const EDIT_VERBS: [&str; 24] = [
+        "implement",
+        "add ",
+        "update",
+        "extend",
+        "modify",
+        "fix ",
+        "change",
+        "refactor",
+        "rename",
+        "remove",
+        "delete",
+        "replace",
+        "rewrite",
+        "migrate",
+        "support ",
+        "introduce",
+        "create ",
+        "write ",
+        "wire ",
+        "integrate",
+        "enforce",
+        "persist",
+        "validate",
+        "document",
+    ];
+    if !EDIT_VERBS.iter().any(|v| trimmed.contains(v)) {
+        return false;
+    }
+    // Require concrete targeting of an existing owned file (path or filename) or an explicit
+    // symbol (`Class.method` / `snake_case`) so generic stubs like "Implement a." keep their
+    // existing already-done behavior.
+    let names_owned_file = existing_owned.iter().any(|path| {
+        if raw.contains(path.as_str()) {
+            return true;
+        }
+        Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|fname| fname.len() >= 4 && raw.contains(fname))
+    });
+    let names_symbol = raw.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).any(|tok| {
+        let tok = tok.trim_matches('.');
+        (tok.contains('.') && tok.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
+            || (tok.contains('_') && tok.len() >= 5 && tok.chars().any(|c| c.is_ascii_alphabetic()))
+    });
+    names_owned_file || names_symbol
 }
 
 /// How an agent with Code Mode is told to work, in the shared prefix.

@@ -12688,3 +12688,125 @@ async fn fix_n8_refused_native_run_command_in_code_mode_triggers_actionable_foll
         "must retry with actionable run_code redirect instead of silently passing: {fups2:?}"
     );
 }
+
+#[tokio::test]
+async fn fix_n8_no_change_brownfield_unit_is_checked_and_sent_back_for_repair() {
+    // Case 1: Brownfield unit with pre-existing owned files and failing acceptance/unit tests.
+    // Attempt 1 changes nothing -> check_no_change_unit runs tests, sees failure, and sends the
+    // unit back for repair instead of counting it as done; Attempt 2 implements the fix and passes.
+    let tmp = seeded("n8-noop-brownfield-tests");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp.0.join("pkg/storage.py"), "class Store:\n    pass\n").unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_storage.py"),
+        "from pkg.storage import Store\n\ndef test_has_add_column():\n    assert hasattr(Store, 'add_column')\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "brownfield baseline"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        summary: "Add add_column to Store".into(),
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "{pkg/storage.py,tests/test_storage.py}".into(),
+            brief: "Implement Store.add_column in pkg/storage.py.".into(),
+            done: "pytest passes with Store.add_column implemented".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct NoopThenFixHarness {
+        attempts: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for NoopThenFixHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = {
+                let mut log = self.attempts.lock().unwrap();
+                log.push(task.brief.clone());
+                log.len()
+            };
+            if n >= 2 {
+                std::fs::write(
+                    task.cwd.join("pkg/storage.py"),
+                    "class Store:\n    def add_column(self, name: str) -> None:\n        pass\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h = Arc::new(NoopThenFixHarness { attempts: Mutex::new(Vec::new()) });
+    let h_dyn: Arc<dyn Harness> = h.clone();
+    let harnesses = Harnesses {
+        master: h_dyn.clone(),
+        mid: h_dyn.clone(),
+        worker: h_dyn.clone(),
+        reviewer: h_dyn.clone(),
+        verifier: h_dyn,
+    };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 1);
+    cfg.run_id = "n8-fix3-tests".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let attempts = h.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2, "must reject attempt 1 no-op and repair on attempt 2: {attempts:?}");
+    assert!(
+        attempts[1].contains("changed none of your owned files") && attempts[1].contains("test_has_add_column"),
+        "repair brief must include the failing test check:\n{}",
+        attempts[1]
+    );
+    assert!(read(&tmp.0.join("pkg/storage.py")).contains("def add_column"));
+
+    // Case 2: Even with runtime_checks disabled, a brownfield initial build whose task clearly
+    // requires implementing changes must NOT be accepted with 0 edits.
+    let tmp2 = seeded("n8-noop-brownfield-brief");
+    std::fs::create_dir_all(tmp2.0.join("pkg")).unwrap();
+    std::fs::write(tmp2.0.join("pkg/storage.py"), "class Store:\n    pass\n").unwrap();
+    git_out(&tmp2.0, &["add", "."]);
+    git_out(&tmp2.0, &["commit", "-m", "brownfield baseline"]);
+
+    let h2 = Arc::new(NoopThenFixHarness { attempts: Mutex::new(Vec::new()) });
+    let h2_dyn: Arc<dyn Harness> = h2.clone();
+    let harnesses2 = Harnesses {
+        master: h2_dyn.clone(),
+        mid: h2_dyn.clone(),
+        worker: h2_dyn.clone(),
+        reviewer: h2_dyn.clone(),
+        verifier: h2_dyn,
+    };
+    let mut cfg2 = config(&tmp2.0, plan, true, 1);
+    cfg2.run_id = "n8-fix3-brief".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+
+    assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
+    let attempts2 = h2.attempts.lock().unwrap().clone();
+    assert_eq!(attempts2.len(), 2, "brownfield no-op requiring changes must be sent back: {attempts2:?}");
+    assert!(
+        attempts2[1].contains("requires implementing changes"),
+        "repair brief must explain why no-op was rejected:\n{}",
+        attempts2[1]
+    );
+    assert!(read(&tmp2.0.join("pkg/storage.py")).contains("def add_column"));
+}

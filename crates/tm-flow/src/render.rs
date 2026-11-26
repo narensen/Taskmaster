@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::model::{Edge, EdgeKind, Node, NodeKind, NodeStatus, normalize_rel_path};
+use crate::query::{EdgeView, FlowQuery};
 use crate::store::{FlowDb, read_plan_seed};
 use crate::update::ensure_fresh;
 
@@ -365,6 +366,345 @@ pub fn unit_map(
     Ok(out)
 }
 
+const MAX_PREINJECT_TARGETS: usize = 16;
+
+/// Pre-inject concise `flow_query` results (`node` + `1-hop neighbors` + `callers`) when a unit
+/// edits existing code (brownfield runs, repairs, or later-wave units referencing already-built
+/// symbols). Returns an empty string when no existing built symbols apply (e.g. wave-1 greenfield).
+/// Output is strictly capped at `budget_chars`.
+pub fn preinjected_context(
+    tree: &Path,
+    _unit_id: &str,
+    owned_files: &[String],
+    task_text: &str,
+    budget_chars: usize,
+) -> anyhow::Result<String> {
+    if budget_chars < 96 {
+        return Ok(String::new());
+    }
+    if !owned_files.is_empty() {
+        let _ = ensure_fresh(tree, owned_files);
+    }
+    let db = FlowDb::open_or_rebuild(tree)?;
+    let all_nodes = db.all_nodes()?;
+    let node_by_id: BTreeMap<&str, &Node> = all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let owned_file_set: BTreeSet<String> = owned_files.iter().map(|p| normalize_rel_path(p)).collect();
+
+    // 1. Existing built symbols in this unit's owned files.
+    let mut owned_syms: Vec<&Node> = all_nodes
+        .iter()
+        .filter(|n| {
+            n.status == NodeStatus::Built
+                && n.kind != NodeKind::File
+                && n.kind != NodeKind::Unit
+                && !n.path.is_empty()
+                && owned_file_set.contains(&n.path)
+        })
+        .collect();
+    owned_syms.sort_by(|a, b| {
+        let a_test = tm_core::is_test_path(&a.path);
+        let b_test = tm_core::is_test_path(&b.path);
+        a_test
+            .cmp(&b_test)
+            .then_with(|| (!a.exported).cmp(&(!b.exported)))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.span[0].cmp(&b.span[0]))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    // 2. Existing built non-test symbols explicitly mentioned in the unit's task/error text.
+    let mut bare_name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for n in &all_nodes {
+        if n.status == NodeStatus::Built
+            && n.kind != NodeKind::File
+            && n.kind != NodeKind::Unit
+            && !tm_core::is_test_path(&n.path)
+        {
+            *bare_name_counts.entry(n.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut mentioned_syms: Vec<&Node> = if task_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        all_nodes
+            .iter()
+            .filter(|n| {
+                n.status == NodeStatus::Built
+                    && n.kind != NodeKind::File
+                    && n.kind != NodeKind::Unit
+                    && !tm_core::is_test_path(&n.path)
+                    && !owned_file_set.contains(&n.path)
+                    && symbol_mentioned_in_text(n, task_text, bare_name_counts.get(n.name.as_str()).copied().unwrap_or(0))
+            })
+            .collect()
+    };
+    mentioned_syms.sort_by(|a, b| {
+        a.parent
+            .is_some()
+            .cmp(&b.parent.is_some())
+            .then_with(|| (!a.exported).cmp(&(!b.exported)))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.span[0].cmp(&b.span[0]))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut targets: Vec<&Node> = Vec::new();
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+    for n in owned_syms.into_iter().chain(mentioned_syms) {
+        if targets.len() >= MAX_PREINJECT_TARGETS {
+            break;
+        }
+        if seen_ids.insert(n.id.as_str()) {
+            targets.push(n);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(String::new());
+    }
+
+    let q = FlowQuery::open(tree)?;
+    let header = "## Pre-injected flow context (existing code)\n";
+    let mut out = String::with_capacity(budget_chars.min(4096));
+    out.push_str(header);
+    let mut written = 0usize;
+
+    for target in &targets {
+        let Some(detail) = q.node(&target.id)? else {
+            continue;
+        };
+        let block = format_preinjected_node(&detail.node, &detail.incoming, &detail.outgoing, &node_by_id);
+        let remaining_after = targets.len().saturating_sub(written + 1);
+        let reserve = if remaining_after > 0 { 28 } else { 0 };
+        if out.len() + block.len() + reserve > budget_chars {
+            // Try fitting just the primary node line if nothing has been written yet.
+            if written == 0
+                && let Some(first_line) = block.lines().next()
+            {
+                let mut trimmed = format!("{first_line}\n");
+                if out.len() + trimmed.len() > budget_chars {
+                    let max_line = budget_chars.saturating_sub(out.len() + 1);
+                    trimmed = format!("{}\n", clip_inline(first_line, max_line));
+                }
+                if out.len() + trimmed.len() <= budget_chars {
+                    out.push_str(&trimmed);
+                    written += 1;
+                }
+            }
+            break;
+        }
+        out.push_str(&block);
+        written += 1;
+    }
+
+    if written == 0 {
+        return Ok(String::new());
+    }
+    if written < targets.len() {
+        let omitted = targets.len() - written;
+        let note = format!("... (+{omitted} more symbols)\n");
+        if out.len() + note.len() <= budget_chars {
+            out.push_str(&note);
+        }
+    }
+    if out.len() > budget_chars {
+        while out.len() > budget_chars {
+            if let Some(pos) = out[..out.len().saturating_sub(1)].rfind('\n') {
+                out.truncate(pos + 1);
+            } else {
+                let mut end = budget_chars;
+                while end > 0 && !out.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.truncate(end);
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn format_preinjected_node(
+    node: &Node,
+    incoming: &[EdgeView],
+    outgoing: &[EdgeView],
+    node_by_id: &BTreeMap<&str, &Node>,
+) -> String {
+    let owner = node.owner.as_deref().unwrap_or("-");
+    let loc = if node.span == [0, 0] {
+        node.path.clone()
+    } else {
+        format!("{}:{}-{}", node.path, node.span[0], node.span[1])
+    };
+    let mut block = format!(
+        "- node {} ({}, {}, owner: {}) {}",
+        node.id,
+        node.kind.as_str(),
+        node.status.as_str(),
+        owner,
+        loc,
+    );
+    if !node.sig.is_empty() {
+        block.push_str(" :: ");
+        block.push_str(&clip_inline(&node.sig, 110));
+    }
+    block.push('\n');
+
+    let mut callers: Vec<String> = Vec::new();
+    let mut seen_callers: BTreeSet<&str> = BTreeSet::new();
+    let mut neighbors: Vec<String> = Vec::new();
+    let mut seen_neighbors: BTreeSet<String> = BTreeSet::new();
+
+    for e in incoming {
+        if e.kind == EdgeKind::Owns {
+            continue;
+        }
+        let peer_desc = format_peer_brief(e, node_by_id);
+        if e.kind == EdgeKind::Calls && seen_callers.insert(e.peer_id.as_str()) && callers.len() < 8 {
+            callers.push(peer_desc.clone());
+        }
+        if seen_neighbors.insert(format!("in:{}:{}", e.kind.as_str(), e.peer_id)) && neighbors.len() < 10 {
+            neighbors.push(format!("in:{} {peer_desc}", e.kind.as_str()));
+        }
+    }
+    for e in outgoing {
+        if e.kind == EdgeKind::Owns {
+            continue;
+        }
+        let peer_desc = format_peer_brief(e, node_by_id);
+        if seen_neighbors.insert(format!("out:{}:{}", e.kind.as_str(), e.peer_id)) && neighbors.len() < 10 {
+            neighbors.push(format!("out:{} {peer_desc}", e.kind.as_str()));
+        }
+    }
+
+    if !callers.is_empty() {
+        block.push_str("  callers: ");
+        block.push_str(&callers.join(", "));
+        block.push('\n');
+    }
+    if !neighbors.is_empty() {
+        block.push_str("  neighbors(1-hop): ");
+        block.push_str(&neighbors.join(", "));
+        block.push('\n');
+    }
+    block
+}
+
+fn format_peer_brief(e: &EdgeView, node_by_id: &BTreeMap<&str, &Node>) -> String {
+    let owner = e.peer_owner.as_deref().unwrap_or("-");
+    let label = node_by_id
+        .get(e.peer_id.as_str())
+        .map(|n| qualified_label(n))
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!e.peer_name.is_empty()).then(|| e.peer_name.clone()))
+        .unwrap_or_else(|| e.peer_id.clone());
+    let loc = node_by_id
+        .get(e.peer_id.as_str())
+        .map(|n| format_loc(&n.path, n.span[0]))
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!e.peer_path.is_empty()).then(|| e.peer_path.clone()));
+    match loc {
+        Some(loc) => format!("{owner}:{label} ({loc})"),
+        None => format!("{owner}:{label}"),
+    }
+}
+
+fn symbol_mentioned_in_text(node: &Node, text: &str, bare_count: usize) -> bool {
+    if text.contains(&node.id) {
+        return true;
+    }
+    let qual = qualified_label(node);
+    if qual.contains('.') && contains_ident(text, &qual) {
+        return true;
+    }
+    let name = node.name.as_str();
+    if is_generic_symbol_name(name) {
+        return false;
+    }
+    let min_len = if node.parent.is_none() { 3 } else { 4 };
+    let specific_len = name.len() >= min_len
+        || (node.parent.is_none() && name.len() >= 2 && name.chars().next().is_some_and(char::is_uppercase));
+    if !specific_len {
+        return false;
+    }
+    if node.parent.is_some() && bare_count > 3 {
+        return false;
+    }
+    contains_ident(text, name)
+}
+
+fn is_generic_symbol_name(name: &str) -> bool {
+    matches!(
+        name,
+        "init"
+            | "__init__"
+            | "__repr__"
+            | "__str__"
+            | "__eq__"
+            | "__len__"
+            | "__iter__"
+            | "new"
+            | "default"
+            | "get"
+            | "set"
+            | "run"
+            | "main"
+            | "add"
+            | "put"
+            | "pop"
+            | "len"
+            | "str"
+            | "int"
+            | "key"
+            | "val"
+            | "value"
+            | "data"
+            | "item"
+            | "items"
+            | "list"
+            | "dict"
+            | "self"
+            | "cls"
+            | "test"
+            | "open"
+            | "close"
+            | "read"
+            | "write"
+            | "load"
+            | "save"
+            | "from"
+            | "into"
+            | "type"
+            | "name"
+            | "path"
+            | "file"
+            | "node"
+            | "error"
+            | "result"
+            | "config"
+            | "state"
+    )
+}
+
+fn contains_ident(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut offset = 0;
+    while let Some(pos) = haystack[offset..].find(needle) {
+        let start = offset + pos;
+        let end = start + needle.len();
+        let left_ok = start == 0 || !is_word(bytes[start - 1]);
+        let right_ok = end >= bytes.len() || !is_word(bytes[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
 fn allocate_section_budgets(needs: &[usize; 4], weights: &[usize; 4], total: usize) -> [usize; 4] {
     let mut caps = [0usize; 4];
     let mut active = [false; 4];
@@ -606,6 +946,82 @@ mod tests {
         )
         .unwrap();
         assert!(small.len() <= 240, "map length {} exceeded budget 240:\n{small}", small.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preinjected_context_includes_node_neighbors_and_callers_within_budget() {
+        let dir = temp_repo("preinject");
+        std::fs::write(
+            dir.join("tinydb/codec.py"),
+            "def encode_row(row: dict) -> bytes:\n    return str(row).encode()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tinydb/store.py"),
+            "from tinydb.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        return encode_row(row)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tinydb/api.py"),
+            "from tinydb.store import StoreEngine\n\ndef handle_insert(engine: StoreEngine, row: dict) -> bytes:\n    return engine.persist_row(row)\n",
+        )
+        .unwrap();
+
+        let plan = Plan {
+            kind: ProjectKind::Cli,
+            pages: vec![
+                PagePlan { id: "codec".into(), owned_glob: "tinydb/codec.py".into(), brief: "codec".into(), ..Default::default() },
+                PagePlan { id: "store".into(), owned_glob: "tinydb/store.py".into(), brief: "store".into(), ..Default::default() },
+                PagePlan { id: "api".into(), owned_glob: "tinydb/api.py".into(), brief: "api".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        build(&dir).unwrap();
+        seed_from_plan(&dir, &plan).unwrap();
+
+        // Brownfield / repair case: owned file exists.
+        let pre = preinjected_context(
+            &dir,
+            "store",
+            &["tinydb/store.py".into()],
+            "Fix StoreEngine.persist_row handling",
+            2000,
+        )
+        .unwrap();
+        assert!(pre.contains("## Pre-injected flow context (existing code)"), "{pre}");
+        assert!(pre.contains("node py:tinydb/store.py#StoreEngine.persist_row"), "{pre}");
+        assert!(pre.contains("callers:"), "expected callers line:\n{pre}");
+        assert!(pre.contains("handle_insert"), "expected caller handle_insert:\n{pre}");
+        assert!(pre.contains("neighbors(1-hop):"), "expected 1-hop neighbors:\n{pre}");
+        assert!(pre.contains("encode_row"), "expected outgoing neighbor encode_row:\n{pre}");
+        assert!(pre.len() <= 2000, "len {} exceeded budget 2000", pre.len());
+
+        // Later-wave case: owned file does not exist yet, task mentions existing built symbol.
+        let wave2 = preinjected_context(
+            &dir,
+            "cli",
+            &[],
+            "Wire CLI commands to StoreEngine.persist_row and encode_row",
+            2000,
+        )
+        .unwrap();
+        assert!(wave2.contains("node py:tinydb/store.py#StoreEngine.persist_row"), "{wave2}");
+        assert!(wave2.contains("node py:tinydb/codec.py#encode_row"), "{wave2}");
+        assert!(wave2.contains("callers:"), "{wave2}");
+
+        // Tight budget is strictly respected.
+        let tight = preinjected_context(
+            &dir,
+            "store",
+            &["tinydb/store.py".into()],
+            "Fix StoreEngine",
+            260,
+        )
+        .unwrap();
+        assert!(!tight.is_empty());
+        assert!(tight.len() <= 260, "tight len {} exceeded 260:\n{tight}", tight.len());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -9945,3 +9945,249 @@ async fn flow_env_json_prepared_before_wave1_with_relative_paths_and_shared_venv
     }
     assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
 }
+
+#[tokio::test]
+async fn flow_worker_brief_includes_harness_exact_flow_query_examples_for_every_harness() {
+    struct NamedHarness {
+        id: &'static str,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for NamedHarness {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/mod.py"), "def run_it() -> int:\n    return 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let cases: &[(&'static str, &str, &str, bool)] = &[
+        ("antigravity", "mcp_dictionary_flow_query", "mcp_dictionary_run_code", false),
+        ("claude", "mcp__dictionary__flow_query", "mcp__dictionary__run_code", false),
+        ("grok-build", "dictionary__flow_query", "dictionary__run_code", false),
+        ("opencode", "dictionary_flow_query", "dictionary_run_code", false),
+        ("codex", "flow_query", "run_code", false),
+        ("antigravity", "mcp_dictionary_flow_query", "mcp_dictionary_run_code", true),
+    ];
+
+    for (idx, &(hid, expected_flow, expected_run_code, code_mode)) in cases.iter().enumerate() {
+        let tmp = seeded(&format!("flow-guide-{hid}-{idx}"));
+        let p = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            summary: format!("Flow guide test for {hid}"),
+            pages: vec![PagePlan {
+                id: "core".into(),
+                owned_glob: "pkg/mod.py".into(),
+                brief: "Implement pkg/mod.py".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let briefs = Arc::new(Mutex::new(Vec::new()));
+        let h: Arc<dyn Harness> = Arc::new(NamedHarness { id: hid, briefs: briefs.clone() });
+        let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+        let mut cfg = config(&tmp.0, p, true, 1);
+        cfg.run_id = format!("flow-guide-{idx}");
+        cfg.checks = false;
+        cfg.runtime_checks = false;
+        cfg.code_mode = code_mode;
+        cfg.browser = false;
+
+        let out = drive(cfg, harnesses).await.unwrap();
+        assert_eq!(out, Outcome::Finished { ok: true }, "case {hid} (code_mode={code_mode})");
+
+        let captured = briefs.lock().unwrap().clone();
+        let brief = captured
+            .iter()
+            .find(|b| b.contains("Build unit `core`"))
+            .unwrap_or_else(|| panic!("missing worker brief for {hid}"));
+
+        // Must carry concrete examples using this harness's exact flow_query MCP tool name.
+        assert!(
+            brief.contains(&format!(r#"`{expected_flow}({{"op": "find""#)),
+            "expected find example with `{expected_flow}` for `{hid}`:\n{brief}"
+        );
+        assert!(
+            brief.contains(&format!(r#"`{expected_flow}({{"op": "neighbors""#)),
+            "expected neighbors example with `{expected_flow}` for `{hid}`:\n{brief}"
+        );
+        assert!(
+            brief.contains(&format!(r#"`{expected_flow}({{"op": "source""#)),
+            "expected source example with `{expected_flow}` for `{hid}`:\n{brief}"
+        );
+
+        if code_mode && crate::code::CodeTools::new(None).is_some() {
+            assert!(
+                brief.contains(expected_run_code),
+                "expected `{expected_run_code}` in Code Mode brief for `{hid}`:\n{brief}"
+            );
+            assert!(
+                brief.contains(r#"await flow("find""#)
+                    && brief.contains(r#"await flow("neighbors""#)
+                    && brief.contains(r#"await flow("source""#),
+                "expected concrete Code Mode flow() examples in brief for `{hid}`:\n{brief}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn flow_preinjected_context_included_for_existing_files_and_later_wave_within_budget() {
+    let tmp = seeded("flow-preinject");
+    // Brownfield repo with existing Python files committed BEFORE the run starts.
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/codec.py"),
+        "def encode_row(row: dict) -> bytes:\n    return str(row).encode()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/store.py"),
+        "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        return encode_row(row)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/api.py"),
+        "from pkg.store import StoreEngine\n\ndef handle_insert(engine: StoreEngine, row: dict) -> bytes:\n    return engine.persist_row(row)\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "existing brownfield code"]);
+
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Extend existing StoreEngine and add a wave-2 reporter".into(),
+        pages: vec![
+            PagePlan {
+                id: "store".into(),
+                owned_glob: "pkg/store.py".into(),
+                brief: "Update StoreEngine.persist_row to validate non-empty rows.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "codec".into(),
+                owned_glob: "pkg/codec.py".into(),
+                brief: "Update encode_row to use utf-8 explicitly.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "reporter".into(),
+                owned_glob: "pkg/reporter.py".into(),
+                brief: "Create pkg/reporter.py calling StoreEngine.persist_row to log saved rows.".into(),
+                depends_on: vec!["store".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct PreinjectHarness {
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for PreinjectHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            if task.brief.contains("Build unit `store`") {
+                std::fs::write(
+                    task.cwd.join("pkg/store.py"),
+                    "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        if not row:\n            raise ValueError('empty')\n        return encode_row(row)\n",
+                )?;
+            } else if task.brief.contains("Build unit `codec`") {
+                std::fs::write(
+                    task.cwd.join("pkg/codec.py"),
+                    "def encode_row(row: dict) -> bytes:\n    return str(row).encode('utf-8')\n",
+                )?;
+            } else if task.brief.contains("Build unit `reporter`") {
+                std::fs::write(
+                    task.cwd.join("pkg/reporter.py"),
+                    "from pkg.store import StoreEngine\n\ndef report_insert(engine: StoreEngine, row: dict) -> int:\n    return len(engine.persist_row(row))\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(PreinjectHarness { briefs: briefs.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.run_id = "flow-preinject-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let out = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let all = briefs.lock().unwrap().clone();
+    let store_b = all.iter().find(|b| b.contains("Build unit `store`")).expect("store brief");
+    let codec_b = all.iter().find(|b| b.contains("Build unit `codec`")).expect("codec brief");
+    let reporter_b = all.iter().find(|b| b.contains("Build unit `reporter`")).expect("reporter brief");
+
+    // 1. Shared prefix stays byte-identical across wave-1 units (pre-injected context is strictly after `--- Your task ---`).
+    let (pre_store, task_store) = store_b.split_once("--- Your task ---").unwrap();
+    let (pre_codec, task_codec) = codec_b.split_once("--- Your task ---").unwrap();
+    let (_, task_reporter) = reporter_b.split_once("--- Your task ---").unwrap();
+    assert_eq!(pre_store, pre_codec, "wave-1 shared prefixes must remain byte-identical");
+    assert!(!pre_store.contains("## Pre-injected flow context"), "pre-injected context must not enter shared prefix");
+
+    // 2. Unit `store` (editing existing file) gets pre-injected node + 1-hop neighbors + callers.
+    assert!(task_store.contains("## Pre-injected flow context (existing code)"), "{task_store}");
+    assert!(task_store.contains("node py:pkg/store.py#StoreEngine.persist_row"), "{task_store}");
+    assert!(task_store.contains("callers:") && task_store.contains("handle_insert"), "expected callers in store brief:\n{task_store}");
+    assert!(task_store.contains("neighbors(1-hop):") && task_store.contains("encode_row"), "expected 1-hop neighbors in store brief:\n{task_store}");
+
+    // 3. Unit `codec` (editing existing file) also gets pre-injected node + callers (`StoreEngine.persist_row`).
+    assert!(task_codec.contains("## Pre-injected flow context (existing code)"), "{task_codec}");
+    assert!(task_codec.contains("node py:pkg/codec.py#encode_row"), "{task_codec}");
+    assert!(task_codec.contains("callers:") && task_codec.contains("StoreEngine.persist_row"), "{task_codec}");
+
+    // 4. Wave-2 unit `reporter` (new file referencing wave-1 built symbol) gets pre-injected context too.
+    assert!(task_reporter.contains("## Pre-injected flow context (existing code)"), "{task_reporter}");
+    assert!(task_reporter.contains("node py:pkg/store.py#StoreEngine.persist_row"), "{task_reporter}");
+    assert!(task_reporter.contains("callers:") && task_reporter.contains("handle_insert"), "{task_reporter}");
+
+    // 5. Combined flow map + pre-injected context stays within DEFAULT_UNIT_MAP_BUDGET.
+    let map_start = task_store.find("## Flow unit map (store)").expect("unit map in store brief");
+    let tail = &task_store[map_start..];
+    let end = tail.find("\nYour files that exist now:").unwrap_or(tail.len());
+    assert!(
+        end <= tm_flow::DEFAULT_UNIT_MAP_BUDGET + 4,
+        "combined unit_map + pre-injected context ({end} bytes) exceeded budget {}",
+        tm_flow::DEFAULT_UNIT_MAP_BUDGET
+    );
+}

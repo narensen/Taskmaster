@@ -24,7 +24,10 @@ pub use query::{
     Direction, EdgeView, FindResult, FlowQuery, MAX_QUERY_CHARS, MAX_QUERY_NODES, NeighborsResult,
     NodeDetail, QueryOutput, SourceSlice, execute_op,
 };
-pub use render::{DEFAULT_UNIT_MAP_BUDGET, REPAIR_UNIT_MAP_BUDGET, is_integrator_unit, unit_map};
+pub use render::{
+    DEFAULT_UNIT_MAP_BUDGET, REPAIR_UNIT_MAP_BUDGET, is_integrator_unit, preinjected_context,
+    unit_map,
+};
 pub use store::FlowDb;
 pub use update::{
     BuildReport, SeedReport, UpdateReport, build, discover_source_files, ensure_fresh,

@@ -257,10 +257,10 @@ pub struct WorkerTask {
 }
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a read-only agent.
-pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol lookups, and diffs in a single `run_code` script (`readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
+pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol/graph lookups, and diffs in a single `run_code` script (`flow`, `readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch reads (`readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls. For Python triple quotes or backslashes, pass raw content via the separate `files` or `writeFile` JSON arguments, or use `String.raw` with `write(path, { raw })`.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch graph/file reads (`flow`, `readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls. For Python triple quotes or backslashes, pass raw content via the separate `files` or `writeFile` JSON arguments, or use `String.raw` with `write(path, { raw })`.\n\n";
 
 /// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
 /// under `harness_id`.

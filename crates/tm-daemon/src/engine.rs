@@ -2104,8 +2104,8 @@ impl Driver {
              (`tests/contract/cart.test.ts`, `tests/test_cart_contract.py`): it imports the units it checks and is every worker's primary acceptance check from its first turn. \
              Keep per-module unit tests concise (~100-150 lines per module) focused on module behavior and key edge cases rather than duplicating the locked acceptance test. \
              `units` are the parallel worker assignments; each owns one disjoint glob and may set `difficulty` (`\"easy\"`, `\"normal\"`, or `\"hard\"`) to route easy boilerplate at low effort and hard core modules straight to the stronger mid tier. \
-             `dictionary` holds new entries those units cite; an entry's `kind` is schema, routes, component_api, pattern, or hint. \
-             Every unit, and every part of one, is one worker agent: its `brief` is its task, `context` is the self-contained architectural/integration context it needs (shared interfaces, DOM ids, symbols, conventions, sibling boundaries), and `done` is one line \
+             `dictionary` holds new entries those units cite (omit entries that merely repeat locked `contracts`); an entry's `kind` is schema, routes, component_api, pattern, or hint. \
+             Every unit, and every part of one, is one worker agent: its `brief` is its task, `context` holds only unit-specific integration notes not already in locked `contracts` or cited `dictionary` entries, and `done` is one line \
              saying how it knows it is finished.\n",
         );
         brief.push_str(&crate::small::plan_shape());
@@ -5773,16 +5773,16 @@ impl Driver {
         let adv_tool = tm_harness::mcp_tool_name(wid, "dictionary", "advisories");
         let search_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_search");
         let show_docs = project_has_external_deps(&self.tree) || self.web_access.enabled;
-        out.push_str("\nDocumentation & code graph:\n");
+        out.push_str("\nCode graph");
         if show_docs {
-            out.push_str(&format!("- Call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages.\n"));
+            out.push_str(&format!(" & docs (`{docs_tool}(package, symbol?)` for installed package APIs)"));
         }
         out.push_str(&format!(
-            "- Query the `.flow` code graph with `{flow_tool}` instead of reading whole files outside your unit. Examples:\n\
-               1. Find symbols: `{flow_tool}({{\"op\": \"find\", \"query\": \"StorageEngine\"}})`\n\
-               2. Inspect callers / 1-hop neighbors: `{flow_tool}({{\"op\": \"neighbors\", \"id\": \"py:pkg/mod.py#Class.method\", \"k\": 1, \"dir\": \"in\"}})`\n\
-               3. Read a symbol's full source body: `{flow_tool}({{\"op\": \"source\", \"id\": \"py:pkg/mod.py#Class.method\"}})`\n\
-               4. Batch several queries in ONE call (avoid serial one-by-one fishing): `{flow_tool}({{\"op\": \"batch\", \"queries\": [{{\"op\": \"find\", \"query\": \"Foo\"}}, {{\"op\": \"source\", \"id\": \"...\"}}]}})` (or pass `ids: [...]` to `node`/`source`)."
+            ": use `{flow_tool}` instead of reading whole outside files — \
+             `{flow_tool}({{\"op\": \"find\", \"query\": \"Sym\"}})`, \
+             `{flow_tool}({{\"op\": \"neighbors\", \"id\": \"py:pkg/mod.py#Cls.fn\", \"k\": 1, \"dir\": \"in\"}})`, \
+             `{flow_tool}({{\"op\": \"source\", \"id\": \"py:pkg/mod.py#Cls.fn\"}})` (full body), \
+             or batch: `{flow_tool}({{\"op\": \"batch\", \"queries\": [...]}})` / `ids: [...]`."
         ));
         if self.web_access.enabled {
             let mut extra = Vec::new();
@@ -5936,9 +5936,6 @@ impl Driver {
             "Cite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
             body = page.brief.trim_end(),
         ));
-        if !page.context.trim().is_empty() {
-            brief.push_str(&format!("\nContext from planner:\n{}\n", page.context.trim()));
-        }
         let contract_set: BTreeSet<&str> = contracts.iter().map(|c| c.path.as_str()).collect();
         let non_contract_owned: Vec<String> = owned
             .iter()
@@ -5962,6 +5959,30 @@ impl Driver {
             } else {
                 unit_sigs.push(c);
             }
+        }
+        // Collect already-inlined contract and cited dictionary bodies so planner `context`
+        // does not pay twice for verbatim lines already given in contracts or dictionary entries.
+        let mut inlined_contract_bodies: Vec<&str> = Vec::new();
+        if !partition.shared_truncated {
+            inlined_contract_bodies.extend(partition.shared_full.iter().map(|c| c.content.as_str()));
+        }
+        inlined_contract_bodies.extend(unit_full.iter().map(|c| c.content.as_str()));
+
+        let catalog = self.catalog()?;
+        let mut resolved_cites: Vec<(String, Option<tm_core::DictionaryEntry>)> = Vec::with_capacity(page.cites.len());
+        for key in &page.cites {
+            resolved_cites.push((key.clone(), catalog.resolve(key)?));
+        }
+        let mut dedupe_sources: Vec<&str> = inlined_contract_bodies.clone();
+        dedupe_sources.push(page.brief.as_str());
+        for (_, entry) in &resolved_cites {
+            if let Some(entry) = entry {
+                dedupe_sources.push(entry.content.as_str());
+            }
+        }
+        let deduped_context = dedupe_context_text(&page.context, &dedupe_sources);
+        if !deduped_context.is_empty() {
+            brief.push_str(&format!("\nContext from planner:\n{deduped_context}\n"));
         }
         if !unit_full.is_empty() {
             brief.push_str("\nLocked contracts for this unit (given here in full; never edit them):\n");
@@ -6079,25 +6100,38 @@ impl Driver {
                 "\nThis unit is split across {units} parallel workers who each own different files. You are unit `{}`: build only {}. {}\n",
                 mine.id, mine.owned_glob, mine.brief
             ));
-            if !mine.context.trim().is_empty() {
-                brief.push_str(&format!("Unit context:\n{}\n", mine.context.trim()));
+            let mut split_sources = dedupe_sources.clone();
+            if !deduped_context.is_empty() {
+                split_sources.push(deduped_context.as_str());
             }
-            for other in page.work_units().iter().filter(|u| u.id != mine.id) {
-                brief.push_str(&format!("Unit `{}` (another worker) owns `{}`.\n", other.id, other.owned_glob));
+            let unit_ctx = dedupe_context_text(&mine.context, &split_sources);
+            if !unit_ctx.is_empty() {
+                brief.push_str(&format!("Unit context:\n{unit_ctx}\n"));
             }
-            brief.push_str("Rely only on the locked contracts and Dictionary entries to line up with them; do not write their files.\n");
+            let others: Vec<String> = page
+                .work_units()
+                .iter()
+                .filter(|u| u.id != mine.id)
+                .map(|other| format!("`{}` (`{}`)", other.id, other.owned_glob))
+                .collect();
+            if !others.is_empty() {
+                brief.push_str(&format!(
+                    "Other parts (rely on contracts/Dictionary; do not edit their files): {}.\n",
+                    others.join(", ")
+                ));
+            }
         } else {
             let siblings: Vec<_> = self
                 .plan()?
                 .pages
                 .iter()
                 .filter(|other| other.id != page.id)
-                .map(|other| format!("Unit `{}` (another worker) owns `{}`.", other.id, other.owned_glob))
+                .map(|other| format!("`{}` (`{}`)", other.id, other.owned_glob))
                 .collect();
             if !siblings.is_empty() {
                 brief.push_str(&format!(
-                    "\nOther parallel workers in this run:\n{}\nRely on the locked contracts and planner context to integrate with them; do not write their files.\n",
-                    siblings.join("\n"),
+                    "\nOther units (do not edit their files): {}.\n",
+                    siblings.join(", "),
                 ));
             }
         }
@@ -6130,7 +6164,6 @@ impl Driver {
                 }
             }
         }
-        let catalog = self.catalog()?;
         // A small or split build has its contracts settled by the plan: Commons suggestions
         // would only be more to read.
         let suggest = !self.small && split.is_none();
@@ -6145,19 +6178,27 @@ impl Driver {
                 brief.push_str(&format!("\nCommons `{key}`: {summary}\n{content}\n", key = entry.key, summary = entry.summary, content = entry.content));
             }
         }
-        for key in &page.cites {
-            match catalog.resolve(key)? {
+        for (key, resolved) in &resolved_cites {
+            match resolved {
                 Some(entry) => {
                     let tier = match entry.tier {
                         DictTier::Commons => "commons",
                         DictTier::Local => "local",
                     };
-                    brief.push_str(&format!(
-                        "\nDictionary `{key}` ({tier}, {kind}): {summary}\n{content}\n",
-                        kind = kind_name(entry.kind),
-                        summary = entry.summary,
-                        content = entry.content,
-                    ));
+                    if body_duplicated_in(&entry.content, &inlined_contract_bodies) {
+                        brief.push_str(&format!(
+                            "\nDictionary `{key}` ({tier}, {kind}): {summary} (already in locked contracts above).\n",
+                            kind = kind_name(entry.kind),
+                            summary = entry.summary,
+                        ));
+                    } else {
+                        brief.push_str(&format!(
+                            "\nDictionary `{key}` ({tier}, {kind}): {summary}\n{content}\n",
+                            kind = kind_name(entry.kind),
+                            summary = entry.summary,
+                            content = entry.content,
+                        ));
+                    }
                 }
                 None => brief.push_str(&format!("\nDictionary `{key}` is not published yet.\n")),
             }
@@ -6811,23 +6852,26 @@ impl Driver {
                 }
             })
             .unwrap_or(&self.project);
-        let mut facts = raw_facts.resolve(resolve_base);
-        if let Some(ref venv) = facts.venv
-            && !Path::new(venv).is_dir()
+        let resolved = raw_facts.resolve(resolve_base);
+        let mut display_facts = raw_facts;
+        if let Some(ref abs_venv) = resolved.venv
+            && !Path::new(abs_venv).is_dir()
         {
-            let stale_prefix = venv.clone();
-            facts.venv = None;
-            facts.python = None;
-            if facts.test_cmd.contains(&stale_prefix) {
-                if facts.runner == "pytest" {
-                    facts.test_cmd = "pytest -q".into();
+            let stale_rel = display_facts.venv.clone().unwrap_or_default();
+            display_facts.venv = None;
+            display_facts.python = None;
+            if (!stale_rel.is_empty() && display_facts.test_cmd.contains(&stale_rel))
+                || display_facts.test_cmd.contains(abs_venv)
+            {
+                if display_facts.runner == "pytest" {
+                    display_facts.test_cmd = "pytest -q".into();
                 } else {
                     self.env_hint.clear();
                     return;
                 }
             }
         }
-        self.env_hint = facts.shared_prefix_line();
+        self.env_hint = display_facts.shared_prefix_line();
     }
 
     /// Prepare the run's test/runtime environment right after `lock()`, BEFORE wave 1 starts,
@@ -7852,6 +7896,81 @@ pub(crate) fn project_has_external_deps(tree: &Path) -> bool {
         return true;
     }
     false
+}
+
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Remove redundant lines from planner `context` that already appear verbatim (modulo whitespace)
+/// inside already-inlined locked contracts, cited dictionary entries, or the unit's own brief.
+pub(crate) fn dedupe_context_text(context: &str, sources: &[&str]) -> String {
+    let trimmed = context.trim();
+    if trimmed.is_empty() || sources.is_empty() {
+        return trimmed.to_string();
+    }
+    let normalized_sources: Vec<String> = sources
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| collapse_ws(s))
+        .collect();
+    if normalized_sources.is_empty() {
+        return trimmed.to_string();
+    }
+    let whole_norm = collapse_ws(trimmed);
+    if whole_norm.len() >= 24 && normalized_sources.iter().any(|src| src.contains(&whole_norm)) {
+        return String::new();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for line in trimmed.lines() {
+        let lt = line.trim();
+        if lt.is_empty() {
+            if kept.last().is_some_and(|prev| !prev.trim().is_empty()) {
+                kept.push("");
+            }
+            continue;
+        }
+        let norm = collapse_ws(lt);
+        if norm.len() >= 24 && normalized_sources.iter().any(|src| src.contains(&norm)) {
+            continue;
+        }
+        kept.push(line);
+    }
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    kept.join("\n").trim().to_string()
+}
+
+/// True when a cited dictionary entry's body is already substantially duplicated verbatim inside
+/// the locked contracts already inlined into the brief.
+pub(crate) fn body_duplicated_in(body: &str, contracts: &[&str]) -> bool {
+    let trimmed = body.trim();
+    if trimmed.len() < 24 || contracts.is_empty() {
+        return false;
+    }
+    let normalized_contracts: Vec<String> = contracts
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| collapse_ws(s))
+        .collect();
+    let whole = collapse_ws(trimmed);
+    if normalized_contracts.iter().any(|c| c.contains(&whole)) {
+        return true;
+    }
+    let meaningful: Vec<String> = trimmed
+        .lines()
+        .map(collapse_ws)
+        .filter(|l| l.len() >= 16)
+        .collect();
+    if meaningful.len() < 2 {
+        return false;
+    }
+    let matched = meaningful
+        .iter()
+        .filter(|l| normalized_contracts.iter().any(|c| c.contains(l.as_str())))
+        .count();
+    matched * 10 >= meaningful.len() * 9
 }
 
 /// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`

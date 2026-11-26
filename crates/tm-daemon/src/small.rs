@@ -84,7 +84,7 @@ pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
          and do not collapse a multi-module project into a single mega-unit. \
          Only use `depends_on: [\"id\"]` for concrete implementation imports (never for locked `contracts`), with chains no deeper than 2 for <=6 units. \
          Include a concise `summary`. Every worker runs in isolation and only sees its `brief`, `context`, `done`, locked `contracts`, `design`, and cited Dictionary entries: \
-         give each worker self-contained `brief` + `context` (files, exports, types, DOM ids/selectors, shared interfaces, sibling boundaries).\n"
+         give each worker concise, non-redundant `brief` + `context` (only unit-specific notes and sibling boundaries not already stated in locked `contracts` or cited `dictionary` entries).\n"
     )
 }
 

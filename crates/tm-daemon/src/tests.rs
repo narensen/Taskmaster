@@ -834,7 +834,7 @@ async fn a_page_split_in_units_runs_them_in_parallel_and_merges_once() {
     let logic = calls.iter().find(|c| c.contains("You are unit `logic`")).unwrap();
     assert!(logic.contains("You are done when: clicking add shows a todo."), "{logic}");
     assert!(logic.contains("export type Id = string;"), "{logic}");
-    assert!(logic.contains("Unit `markup` (another worker) owns `app/a/index.html`.") && !logic.contains("The markup."), "{logic}");
+    assert!(logic.contains("`markup` (`app/a/index.html`)") && !logic.contains("The markup."), "{logic}");
     assert!(logic.contains("None of your files exist yet") && logic.contains("do not list, search or read other files"), "{logic}");
     assert!(!logic.contains("Search the Commons"), "{logic}");
     assert!(logic.contains("end your reply with the line `RELEASE page:a/logic`"), "{logic}");
@@ -12149,4 +12149,107 @@ async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_sp
         let spec_len = serde_json::to_string(rc).unwrap().len();
         assert!(spec_len < 1000, "trimmed run_code schema should stay concise (<1000 bytes), got {spec_len} bytes");
     }
+}
+
+#[tokio::test]
+async fn tok12_dedupes_context_dict_contracts_uses_repo_relative_env_and_shortens_help_and_siblings() {
+    let tmp = seeded("tok12-dedupe");
+    // Seed a repo-relative venv in `.flow/env.json` and create the directory so it resolves cleanly.
+    let rel_venv = ".taskmaster/runs/tok12/venv";
+    std::fs::create_dir_all(tmp.0.join(rel_venv).join("bin")).unwrap();
+    std::fs::write(tmp.0.join(rel_venv).join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    let rel_facts = tm_flow::EnvFacts {
+        runner: "pytest".into(),
+        test_cmd: format!("{rel_venv}/bin/python -m pytest -q"),
+        venv: Some(rel_venv.into()),
+        python: Some(format!("{rel_venv}/bin/python")),
+        install_cmd: None,
+    };
+    tm_flow::write_env(&tmp.0, &rel_facts).unwrap();
+    git(&tmp.0, &["add", ".flow/env.json"]);
+    git(&tmp.0, &["commit", "-q", "-m", "env"]);
+
+    // Publish a local dictionary entry whose body duplicates the locked contract verbatim.
+    let contract_body = "class StorageProtocol:\n    def get_item_by_key(self, key: str) -> bytes | None: ...\n    def put_item_by_key(self, key: str, value: bytes) -> None: ...\n";
+    let dict_store = tm_dictionary::LocalStore::open(tmp.0.join(".taskmaster/dictionary")).unwrap();
+    dict_store
+        .publish("storage-api", tm_core::EntryKind::ComponentApi, "Storage protocol", contract_body, "python")
+        .unwrap();
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: contract_body.into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "store".into(),
+                owned_glob: "pkg/store.py".into(),
+                cites: vec!["storage-api".into()],
+                brief: "Implement StorageProtocol.".into(),
+                context: format!("{contract_body}Unique note: use fsync on flush."),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "pkg/cli.py".into(),
+                brief: "Implement CLI.".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs = Arc::new(Mutex::new(std::collections::BTreeMap::<String, String>::new()));
+    struct Capture(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+    #[async_trait]
+    impl Harness for Capture {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task.brief.split("Build unit `").nth(1).and_then(|s| s.split('`').next()).unwrap_or("x").to_string();
+            self.0.lock().unwrap().insert(unit.clone(), task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join(format!("pkg/{unit}.py")), "X = 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(Capture(briefs.clone()));
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 2);
+    cfg.run_id = "tok12".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let got = briefs.lock().unwrap().clone();
+    let store_brief = got.get("store").unwrap();
+    // 1. Contract body appears ONCE (in locked contracts), NOT duplicated in planner context or dict entry!
+    assert_eq!(
+        store_brief.matches("def get_item_by_key(self, key: str)").count(),
+        1,
+        "contract method signature should not be repeated in planner context or duplicate dict entry:\n{store_brief}"
+    );
+    assert!(store_brief.contains("Unique note: use fsync on flush."), "unique planner note must be preserved");
+    assert!(store_brief.contains("Dictionary `storage-api`"));
+    // 2. Repo-relative env hint without repeating the absolute project root path.
+    let (prefix, _) = store_brief.split_once("--- Your task ---").unwrap();
+    assert!(prefix.contains(".taskmaster/runs/tok12/venv/bin/python -m pytest -q"), "{prefix}");
+    assert!(!prefix.contains(&tmp.0.display().to_string()), "env hint should stay repo-relative:\n{prefix}");
+    // 3. Compact sibling list and shorter graph help.
+    assert!(store_brief.contains("Other units (do not edit their files): `cli` (`pkg/cli.py`)."), "{store_brief}");
+    assert!(!store_brief.contains("Other parallel workers in this run:"));
+    assert!(prefix.contains("\nCode graph:"));
 }

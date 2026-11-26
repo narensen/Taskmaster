@@ -141,20 +141,21 @@ impl EnvFacts {
     }
 
     /// One-line hint placed into the shared prefix at run start or phase boundaries.
+    /// Keeps repo-relative paths compact and never repeats the venv path multiple times.
     pub fn shared_prefix_line(&self) -> String {
         if self.test_cmd.trim().is_empty() {
             return String::new();
         }
-        match (&self.venv, &self.python) {
-            (Some(venv), Some(python)) if !venv.is_empty() && !python.is_empty() => format!(
-                "Verified test environment: run tests with `{}` (runner: {}); the shared venv already exists at `{}` (python: `{}`, env `$TASKMASTER_SHARED_VENV`) — reuse it and do NOT create a new venv.",
-                self.test_cmd, self.runner, venv, python
+        match self.venv.as_deref().filter(|v| !v.is_empty()) {
+            Some(venv) if self.test_cmd.contains(venv) => format!(
+                "Verified test environment: run tests with `{}` (reuse it via `$TASKMASTER_SHARED_VENV`; do NOT create a new venv).",
+                self.test_cmd
             ),
-            (Some(venv), _) if !venv.is_empty() => format!(
-                "Verified test environment: run tests with `{}` (runner: {}); the shared venv already exists at `{}` (env `$TASKMASTER_SHARED_VENV`) — reuse it and do NOT create a new venv.",
-                self.test_cmd, self.runner, venv
+            Some(venv) => format!(
+                "Verified test environment: run tests with `{}` (venv `{venv}`, reuse it via `$TASKMASTER_SHARED_VENV`; do NOT create a new venv).",
+                self.test_cmd
             ),
-            _ => format!(
+            None => format!(
                 "Verified test environment: run tests with `{}` (runner: {}).",
                 self.test_cmd, self.runner
             ),

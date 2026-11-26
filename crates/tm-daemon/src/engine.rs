@@ -528,6 +528,12 @@ struct Driver {
     /// Units that started immediately on a contract-only `depends_on` before `dep` landed:
     /// `dep -> {dependent units}` so their integration is re-checked once `dep` lands.
     soft_dep_waiters: BTreeMap<PageId, BTreeSet<PageId>>,
+    /// Active in-flight worker sync handles (`page -> sync handles`) notified whenever a sibling
+    /// lands in `self.tree` so early-started units receive landed siblings safely without races.
+    active_syncs: HashMap<PageId, Vec<Arc<crate::code::WorktreeSync>>>,
+    /// Per-worktree sync handle retained until the worktree is dropped so `judge_inner` and diff
+    /// checks recognize daemon-synced sibling files even if `self.tree` advances again.
+    worktree_syncs: HashMap<PathBuf, Arc<crate::code::WorktreeSync>>,
     /// Wall-clock start of this driver invocation (`SystemTime`).
     started_wall: SystemTime,
     /// Monotonic start of this driver invocation (`Instant`).
@@ -873,6 +879,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         last_gate_findings: BTreeMap::new(),
         waived_gate_findings: BTreeSet::new(),
         soft_dep_waiters: BTreeMap::new(),
+        active_syncs: HashMap::new(),
+        worktree_syncs: HashMap::new(),
         started_wall,
         started_mono,
         mutation_cache,
@@ -1039,6 +1047,8 @@ impl Driver {
         self.pending.clear();
         self.settling.clear();
         self.batch_errors.clear();
+        self.active_syncs.clear();
+        self.worktree_syncs.clear();
         for (_, products) in std::mem::take(&mut self.batches) {
             for (_, product) in products {
                 self.drop_worktree(&product.worktree);
@@ -2709,13 +2719,38 @@ impl Driver {
             if !is_race && units.len() == 1 && matches!(exec, WorkerExec::Fresh) {
                 self.offer_browser(&page, &worktree, &mut request);
             }
-            // Every builder and every repair gets run_code when Code Mode is on.
+            // Every builder and every repair gets run_code when Code Mode is on, plus a race-safe
+            // live sibling sync handle so landed siblings propagate cleanly into active worktrees.
             let scope = if !is_race && units.len() > 1 {
                 format!("{page}/{}", units[unit_idx].id)
             } else {
                 page.clone()
             };
-            self.offer_code(&scope, &worktree, &mut request);
+            let pending_deps: BTreeSet<String> = self
+                .run
+                .plan
+                .as_ref()
+                .and_then(|p| p.pages.iter().find(|u| u.id == page))
+                .map(|u| {
+                    u.depends_on
+                        .iter()
+                        .filter(|dep| {
+                            dep.as_str() != page
+                                && self.run.pages.get(dep.as_str()).is_some_and(|st| st.state != tm_core::PageState::Passed)
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sync = crate::code::WorktreeSync::new(
+                worktree.clone(),
+                self.tree.clone(),
+                units[unit_idx].owned_glob.clone(),
+                pending_deps,
+            );
+            self.active_syncs.entry(page.clone()).or_default().push(sync.clone());
+            self.worktree_syncs.insert(worktree.clone(), sync.clone());
+            self.offer_code_with_sync(&scope, &worktree, &mut request, Some(sync));
             // Code Mode only means something when run_code is there to use (it needs Node).
             request.code_mode = self.code.is_some();
             if let (Some(unit), Some(feed)) = (unit, request.feed.as_mut()) {
@@ -2862,6 +2897,7 @@ impl Driver {
                 self.batches.entry(page.clone()).or_default().push((index, product));
             }
             WorkerJob::Restarted(worktree) => {
+                self.active_syncs.remove(&page);
                 self.drop_worktree(&worktree);
                 self.race_pages.remove(&page);
                 self.batch_errors.remove(&page);
@@ -2907,6 +2943,7 @@ impl Driver {
                 // Stalls, race candidates, and escalatable worker errors settle as failed checks
                 // so a single bad worker does not abort the whole batch or run.
                 if is_limit || self.should_cancel() || (!is_stalled && !can_escalate && !in_race) {
+                    self.active_syncs.remove(&page);
                     self.race_pages.remove(&page);
                     self.batch_errors.remove(&page);
                     if let Some(partial) = self.batches.remove(&page) {
@@ -2930,6 +2967,7 @@ impl Driver {
             return Ok(());
         }
         let mut products = self.batches.remove(&page).unwrap_or_default();
+        self.active_syncs.remove(&page);
         let job_errors = self.batch_errors.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
         let cmd = self.take_running(&page);
@@ -2978,7 +3016,13 @@ impl Driver {
             let diff: String = products.iter().filter_map(|(_, p)| git::worktree_diff(&p.worktree).ok()).collect::<Vec<_>>().join("\n");
             let files: Vec<String> = products
                 .iter()
-                .flat_map(|(_, p)| git::worktree_changes(&p.worktree).unwrap_or_default().into_iter().map(|c| c.path))
+                .flat_map(|(_, p)| {
+                    git::worktree_changes(&p.worktree)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|c| !self.is_synced_or_unchanged(&p.worktree, c))
+                        .map(|c| c.path)
+                })
                 .collect();
             (diff, files)
         });
@@ -3035,7 +3079,8 @@ impl Driver {
         } else {
             page.to_string()
         };
-        self.offer_code(&scope, &product.worktree, &mut req);
+        let existing_sync = self.worktree_syncs.get(&product.worktree).cloned();
+        self.offer_code_with_sync(&scope, &product.worktree, &mut req, existing_sync);
         req.code_mode = self.code.is_some();
         if units.len() > 1
             && let Some(feed) = req.feed.as_mut()
@@ -3109,6 +3154,7 @@ impl Driver {
         let changed_files: Vec<String> = git::worktree_changes(&product.worktree)
             .unwrap_or_default()
             .into_iter()
+            .filter(|c| !self.is_synced_or_unchanged(&product.worktree, c))
             .filter(|c| !tm_verify::is_flow_path(&c.path))
             .map(|c| c.path)
             .collect();
@@ -3298,7 +3344,7 @@ impl Driver {
                 let changes: Vec<git::Change> = git::worktree_changes(&p.worktree)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|c| !git::same_as(&p.worktree, &self.tree, c))
+                    .filter(|c| !self.is_synced_or_unchanged(&p.worktree, c))
                     .filter(|c| !tm_verify::is_flow_path(&c.path))
                     .collect();
                 let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
@@ -3598,18 +3644,35 @@ impl Driver {
         if let (WorkerOutcome::Passed, Some((diff, files))) = (&outcome, review) {
             self.start_check(page, tier, wanted, CheckInput { diff, files, shot, said: text });
         }
-        if let WorkerOutcome::Passed = &outcome
-            && let Some(waiters) = self.soft_dep_waiters.remove(page)
-        {
-            let landed: Vec<String> = waiters
-                .into_iter()
-                .filter(|w| self.run.pages.get(w).is_some_and(|st| st.state == tm_core::PageState::Passed))
-                .collect();
-            if !landed.is_empty() {
-                eprintln!(
-                    "taskmaster: `{page}` landed; soft-dependent unit(s) {} will be re-verified against it",
-                    landed.join(", ")
-                );
+        if let WorkerOutcome::Passed = &outcome {
+            // Propagate newly landed sibling files into every active worker worktree (race-safe:
+            // deferred via `dirty` whenever a `test()`/`sh()` is currently executing in that worktree).
+            for (other_page, syncs) in &self.active_syncs {
+                if other_page == page {
+                    continue;
+                }
+                for sync in syncs {
+                    sync.mark_dep_landed(page);
+                    let updated = sync.mark_dirty_and_try_sync();
+                    if !updated.is_empty() {
+                        eprintln!(
+                            "taskmaster: live-synced {} file(s) from `{page}` into active `{other_page}` worktree",
+                            updated.len()
+                        );
+                    }
+                }
+            }
+            if let Some(waiters) = self.soft_dep_waiters.remove(page) {
+                let landed: Vec<String> = waiters
+                    .into_iter()
+                    .filter(|w| self.run.pages.get(w).is_some_and(|st| st.state == tm_core::PageState::Passed))
+                    .collect();
+                if !landed.is_empty() {
+                    eprintln!(
+                        "taskmaster: `{page}` landed; soft-dependent unit(s) {} will be re-verified against it",
+                        landed.join(", ")
+                    );
+                }
             }
         }
         self.push_event(Event::WorkerFinished { page: page.to_string(), outcome })?;
@@ -3986,8 +4049,15 @@ impl Driver {
     /// Keep what this attempt did, so the next one on this page knows. A change that was
     /// thrown away is kept as a diff, since it is not in the tree.
     fn note_attempt(&self, page: &str, tier: Tier, fixing: Option<&str>, product: &Product, outcome: &WorkerOutcome) {
-        let files: Vec<String> =
-            git::worktree_changes(&product.worktree).map(|changes| changes.into_iter().map(|c| c.path).collect()).unwrap_or_default();
+        let files: Vec<String> = git::worktree_changes(&product.worktree)
+            .map(|changes| {
+                changes
+                    .into_iter()
+                    .filter(|c| !self.is_synced_or_unchanged(&product.worktree, c))
+                    .map(|c| c.path)
+                    .collect()
+            })
+            .unwrap_or_default();
         let (label, failure, diff) = match outcome {
             WorkerOutcome::Passed => ("merged", None, None),
             WorkerOutcome::CheckFailed { errors } => {
@@ -4041,7 +4111,7 @@ impl Driver {
             let ignored = self.setup_artifacts.get(&product.worktree);
             let mut changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
                 .into_iter()
-                .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
+                .filter(|c| !self.is_synced_or_unchanged(&product.worktree, c))
                 .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
                 .filter(|c| !tm_verify::is_flow_path(&c.path))
                 .collect();
@@ -5983,6 +6053,18 @@ impl Driver {
         code.attach(page, cwd, gate_for(request), request.shell.clone());
     }
 
+    fn offer_code_with_sync(
+        &self,
+        page: &str,
+        cwd: &Path,
+        request: &mut AgentRequest,
+        sync: Option<Arc<crate::code::WorktreeSync>>,
+    ) {
+        let Some(code) = &self.code else { return };
+        // How to use it is in the shared prefix (CODE_MODE_GUIDE), the same for every worker.
+        code.attach_with_sync(page, cwd, gate_for(request), request.shell.clone(), sync);
+    }
+
     /// Give a read-only agent (planner, reviewer, verifier) read-only `run_code` (`read`,
     /// `readMany`, `grep`, `ls`, `diff`, `symbols`) so it can explore in one script call.
     fn offer_code_readonly(&self, agent: &str, cwd: &Path, request: &mut AgentRequest) {
@@ -6023,6 +6105,14 @@ impl Driver {
         out
     }
 
+    /// True when `change` in `worktree` is already identical to `self.tree` OR matches the exact
+    /// snapshot live-synced by the daemon into `worktree` (so daemon-synced sibling files are
+    /// never mistaken for worker edits even if `self.tree` moves on again before the worker lands).
+    fn is_synced_or_unchanged(&self, worktree: &Path, change: &git::Change) -> bool {
+        git::same_as(worktree, &self.tree, change)
+            || self.worktree_syncs.get(worktree).is_some_and(|s| s.matches_synced(change))
+    }
+
     /// True when `worktree` contains real file changes relative to `self.tree` (ignoring setup
     /// artifacts and `.flow` metadata), matching [`Self::judge_inner`]'s diff filter.
     fn worktree_has_real_changes(&self, worktree: &Path) -> bool {
@@ -6030,7 +6120,7 @@ impl Driver {
         git::worktree_changes(worktree)
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| !git::same_as(worktree, &self.tree, c))
+            .filter(|c| !self.is_synced_or_unchanged(worktree, c))
             .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
             .any(|c| !tm_verify::is_flow_path(&c.path))
     }
@@ -7678,6 +7768,7 @@ impl Driver {
             crate::project_config::run_archive(path, archive_cmd);
         }
         self.setup_artifacts.remove(path);
+        self.worktree_syncs.remove(path);
         let _ = git::remove_worktree(&self.project, path);
         let _ = fs::remove_dir_all(path);
         self.trees.retain(|have| have != path);

@@ -14021,3 +14021,102 @@ async fn fix_n9_independent_disjoint_units_share_wave_and_overlapping_units_seri
     assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
     assert_eq!(h2.peak.load(Ordering::SeqCst), 1, "units sharing owned files must not run concurrently");
 }
+
+#[tokio::test]
+async fn tb18_early_started_integrator_receives_landed_siblings_and_passes_test() {
+    use std::sync::atomic::AtomicBool;
+    struct LiveSyncHarness {
+        started: Arc<tokio::sync::Barrier>,
+        saw_sibling: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Harness for LiveSyncHarness {
+        fn id(&self) -> &'static str {
+            "tb18-live-sync"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Wait until both units have started in parallel (contract-only early start).
+            tokio::time::timeout(Duration::from_secs(3), self.started.wait())
+                .await
+                .expect("early-started integrator must overlap with sibling");
+            if task.brief.contains("Build unit `parser`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(task.cwd.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:parser\n".into() }).await;
+            } else if task.brief.contains("Build unit `cli`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                // Write our owned file first; live sync must NOT overwrite it.
+                std::fs::write(
+                    task.cwd.join("calcx/cli.py"),
+                    "from calcx.parser import parse\ndef run() -> int:\n    return parse('x')\n",
+                )?;
+                // Poll briefly for `calcx/parser.py` to be live-synced by Driver::settle once `parser` lands.
+                for _ in 0..100 {
+                    if task.cwd.join("calcx/parser.py").is_file() {
+                        let content = std::fs::read_to_string(task.cwd.join("calcx/parser.py"))?;
+                        if content.contains("return 42") {
+                            self.saw_sibling.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // Our owned file must remain intact.
+                assert!(std::fs::read_to_string(task.cwd.join("calcx/cli.py"))?.contains("def run()"));
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let tmp = repo("tb18-live-sync");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+            ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "from typing import Protocol\nclass ParserProtocol(Protocol):\n    def parse(self, expr: str) -> int: ...\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "parser".into(),
+                owned_glob: "calcx/parser.py".into(),
+                brief: "Implement ParserProtocol from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "calcx/cli.py".into(),
+                brief: "Build CLI against ParserProtocol from calcx/contract.py.".into(),
+                depends_on: vec!["parser".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let h = Arc::new(LiveSyncHarness {
+        started: Arc::new(tokio::sync::Barrier::new(2)),
+        saw_sibling: Arc::new(AtomicBool::new(false)),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h.clone() };
+    let mut cfg = config(&tmp.0, plan, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(
+        h.saw_sibling.load(Ordering::SeqCst),
+        "active cli worktree must receive parser.py via live sync when parser lands"
+    );
+}

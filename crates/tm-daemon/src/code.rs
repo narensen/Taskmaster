@@ -26,14 +26,16 @@
 //! The tool is served beside the Dictionary under the page's token, so a page that is not
 //! being built has none.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tm_dictionary::{Extension, Grant};
 use tm_harness::{Decision, PermissionGate, PermissionRequest, ToolKind};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -295,6 +297,134 @@ impl Drop for WarmNode {
     }
 }
 
+/// Race-safe live-sync coordinator shared between [`crate::engine::Driver`] and a worker's
+/// [`CodeTools`] [`Scope`].
+///
+/// Invariant: sibling files are NEVER copied into `worktree` while a sandboxed shell/test process
+/// (`sh`, `test`, `testAffected`) is executing. Sandboxed commands hold a shared `rw.read()` guard;
+/// live sync from `Driver::settle` uses `rw.try_write()` and defers via `dirty = true` when busy,
+/// and `lock_for_exec()` flushes any deferred sync under `rw.write()` before starting the next
+/// command.
+pub struct WorktreeSync {
+    worktree: PathBuf,
+    tree: PathBuf,
+    owned_glob: String,
+    rw: tokio::sync::RwLock<()>,
+    dirty: AtomicBool,
+    snapshots: Mutex<HashMap<String, Option<[u8; 32]>>>,
+    pending_deps: Mutex<BTreeSet<String>>,
+}
+
+impl WorktreeSync {
+    pub fn new(
+        worktree: PathBuf,
+        tree: PathBuf,
+        owned_glob: String,
+        pending_deps: BTreeSet<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            worktree,
+            tree,
+            owned_glob,
+            rw: tokio::sync::RwLock::new(()),
+            dirty: AtomicBool::new(false),
+            snapshots: Mutex::new(HashMap::new()),
+            pending_deps: Mutex::new(pending_deps),
+        })
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Record that an upstream dependency has landed in `self.tree`.
+    pub fn mark_dep_landed(&self, dep: &str) {
+        self.pending_deps.lock().unwrap().remove(dep);
+    }
+
+    /// Upstream dependencies that have not landed yet.
+    pub fn pending_deps(&self) -> Vec<String> {
+        self.pending_deps.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn record_snapshots(&self, report: &crate::git::SyncReport) {
+        let mut map = self.snapshots.lock().unwrap();
+        for snap in &report.snapshots {
+            map.insert(snap.path.clone(), if snap.deleted { None } else { snap.sha256 });
+        }
+    }
+
+    /// Mark the worktree dirty after a sibling lands in `tree`, and copy immediately ONLY if no
+    /// sandboxed command (`test`/`sh`) is currently running in this worktree. When busy, leaves
+    /// `dirty = true` so the next `test()`/`sh()`/read flushes safely before running.
+    pub fn mark_dirty_and_try_sync(&self) -> Vec<String> {
+        self.dirty.store(true, Ordering::Release);
+        let Ok(_write_guard) = self.rw.try_write() else {
+            return Vec::new();
+        };
+        match crate::git::sync_worktree_excluding(&self.worktree, &self.tree, Some(&self.owned_glob)) {
+            Ok(report) => {
+                self.record_snapshots(&report);
+                self.dirty.store(false, Ordering::Release);
+                report.updated
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Flush any deferred sibling sync under the exclusive write lock before a read or exec.
+    pub async fn sync_if_dirty(&self) -> Vec<String> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let _write_guard = self.rw.write().await;
+        if !self.dirty.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let worktree = self.worktree.clone();
+        let tree = self.tree.clone();
+        let glob = self.owned_glob.clone();
+        match tokio::task::spawn_blocking(move || crate::git::sync_worktree_excluding(&worktree, &tree, Some(&glob))).await {
+            Ok(Ok(report)) => {
+                self.record_snapshots(&report);
+                self.dirty.store(false, Ordering::Release);
+                report.updated
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Flush any pending sibling sync, then hold a shared exec guard so no sibling copy can race
+    /// with an in-flight `sh`/`test`/`testAffected` process.
+    pub async fn lock_for_exec(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        let _ = self.sync_if_dirty().await;
+        self.rw.read().await
+    }
+
+    /// True when `change` in `self.worktree` still matches the exact file state last written by
+    /// daemon live sync (protecting against false ownership failures if `tree` later moves on).
+    pub fn matches_synced(&self, change: &crate::git::Change) -> bool {
+        let expected = match self.snapshots.lock().unwrap().get(&change.path) {
+            Some(entry) => *entry,
+            None => return false,
+        };
+        let path = self.worktree.join(&change.path);
+        match expected {
+            None => change.status == 'D' && !path.exists(),
+            Some(hash) => {
+                if change.status == 'D' {
+                    return false;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    return false;
+                };
+                let actual: [u8; 32] = Sha256::digest(&bytes).into();
+                actual == hash
+            }
+        }
+    }
+}
+
 /// What a page's scripts may touch, and through which gate.
 struct Scope {
     cwd: PathBuf,
@@ -303,6 +433,8 @@ struct Scope {
     shell: Option<tm_harness::ShellScope>,
     /// Read-only agents (planners, reviewers, verifiers) may only call read/search/diff/symbols/check.
     read_only: bool,
+    /// Optional race-safe live sibling sync coordinator for active worker worktrees.
+    sync: Option<Arc<WorktreeSync>>,
     /// Persistent warm Node sandbox process, lazily started on first `run_code` call.
     warm: tokio::sync::Mutex<Option<WarmNode>>,
 }
@@ -447,6 +579,17 @@ impl CodeTools {
     }
 
     pub fn attach(&self, page: &str, cwd: &Path, gate: Arc<dyn PermissionGate>, shell: Option<tm_harness::ShellScope>) {
+        self.attach_with_sync(page, cwd, gate, shell, None);
+    }
+
+    pub fn attach_with_sync(
+        &self,
+        page: &str,
+        cwd: &Path,
+        gate: Arc<dyn PermissionGate>,
+        shell: Option<tm_harness::ShellScope>,
+        sync: Option<Arc<WorktreeSync>>,
+    ) {
         self.scopes.lock().unwrap().insert(
             page.to_string(),
             Arc::new(Scope {
@@ -454,6 +597,7 @@ impl CodeTools {
                 gate,
                 shell,
                 read_only: false,
+                sync,
                 warm: tokio::sync::Mutex::new(None),
             }),
         );
@@ -468,6 +612,7 @@ impl CodeTools {
                 gate,
                 shell: None,
                 read_only: true,
+                sync: None,
                 warm: tokio::sync::Mutex::new(None),
             }),
         );
@@ -589,6 +734,12 @@ impl CodeTools {
         let (Some(_), Some(shell)) = (&self.bwrap, &scope.shell) else {
             bail!("refused: sh needs the sandbox, and this agent has none");
         };
+        // Flush any deferred sibling sync cleanly before running, and hold the read guard for
+        // the entire subprocess so live sibling sync never mutates files mid-test or mid-sh.
+        let _exec_guard = match &scope.sync {
+            Some(sync) => Some(sync.lock_for_exec().await),
+            None => None,
+        };
         let sh = std::fs::canonicalize("/bin/sh").context("no /bin/sh")?;
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
@@ -608,6 +759,9 @@ impl CodeTools {
     /// and `testAffected` so bare `test()` always runs the full suite (preserving acceptance
     /// checks) while targeted calls run only the requested/affected test paths.
     async fn execute_test_steps(&self, scope: &Scope, targets: &[String], record_env: bool) -> anyhow::Result<Value> {
+        if let Some(sync) = &scope.sync {
+            let _ = sync.sync_if_dirty().await;
+        }
         let (venv, raw_steps) = select_test_steps(scope).await;
         if !raw_steps.iter().any(|step| !step.setup) {
             return Ok(json!({
@@ -626,7 +780,18 @@ impl CodeTools {
             .find(|s| s.name == "test" && !s.setup)
             .map(|s| s.program.clone());
         let command = test_command(&steps);
-        let (code, text) = self.sandboxed(scope, &command).await?;
+        let (code, mut text) = self.sandboxed(scope, &command).await?;
+        let pending_upstreams = scope
+            .sync
+            .as_ref()
+            .map(|s| s.pending_deps())
+            .unwrap_or_default();
+        if code != Some(0) && !pending_upstreams.is_empty() {
+            text.push_str(&format!(
+                "\nNote: upstream unit(s) still building: {}. Their files will sync into this worktree automatically once they land; do not reimplement them inline.",
+                pending_upstreams.join(", ")
+            ));
+        }
         if record_env && code == Some(0) {
             let flow_root = self.flow_root.lock().unwrap().clone();
             let rel_base = self
@@ -651,6 +816,9 @@ impl CodeTools {
         });
         if let Some(interp) = interpreter {
             out["interpreter"] = json!(interp);
+        }
+        if !pending_upstreams.is_empty() {
+            out["pendingUpstreams"] = json!(pending_upstreams);
         }
         Ok(out)
     }
@@ -677,6 +845,12 @@ impl CodeTools {
             )
         {
             bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, flow, probe.ast, check)");
+        }
+        if matches!(op, "read" | "readMany" | "ls" | "grep" | "symbols" | "probeAst" | "check")
+            && let Some(sync) = &scope.sync
+            && sync.is_dirty()
+        {
+            let _ = sync.sync_if_dirty().await;
         }
         let path = |key: &str| -> anyhow::Result<PathBuf> {
             let raw = args[key].as_str().context("a path is required")?;
@@ -2742,6 +2916,7 @@ mod tests {
             gate: Arc::new(WorktreeGate::new(&dir, vec![])),
             shell: None,
             read_only: false,
+            sync: None,
             warm: tokio::sync::Mutex::new(None),
         };
         tools.attach("home", &dir, scope.gate.clone(), None);
@@ -2936,6 +3111,7 @@ mod tests {
                 env: vec![],
             }),
             read_only: false,
+            sync: None,
             warm: tokio::sync::Mutex::new(None),
         };
 
@@ -3128,5 +3304,52 @@ mod tests {
 
         tools.detach_all();
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tb18_worktree_sync_waits_for_inflight_exec_and_syncs_before_test() {
+        let root = std::env::temp_dir().join(format!("tm-code-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap();
+        crate::git::git(&repo, &["config", "user.name", "Test"]).unwrap();
+        crate::git::git(&repo, &["config", "user.email", "test@example.com"]).unwrap();
+        std::fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        crate::git::git(&repo, &["add", "."]).unwrap();
+        crate::git::git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let h1 = crate::git::head(&repo).unwrap();
+        crate::git::add_worktree(&repo, &wt, &h1).unwrap();
+
+        let pending: BTreeSet<String> = ["parser".to_string()].into_iter().collect();
+        let sync = WorktreeSync::new(wt.clone(), repo.clone(), "pkg/cli.py".into(), pending);
+        std::fs::write(wt.join("pkg/cli.py"), "WIP = 1\n").unwrap();
+
+        // Hold an exec read guard (simulating an in-flight `test()`/`sh()`).
+        let exec_guard = sync.lock_for_exec().await;
+
+        // Sibling lands in `repo` while exec is running.
+        std::fs::write(repo.join("pkg/parser.py"), "VAL = 99\n").unwrap();
+        crate::git::git(&repo, &["add", "pkg/parser.py"]).unwrap();
+        crate::git::git(&repo, &["commit", "-q", "-m", "parser landed"]).unwrap();
+
+        sync.mark_dep_landed("parser");
+        let copied_while_busy = sync.mark_dirty_and_try_sync();
+        assert!(copied_while_busy.is_empty(), "must NOT copy while exec guard is held");
+        assert!(sync.is_dirty(), "deferred sync must remain marked dirty");
+        assert!(!wt.join("pkg/parser.py").exists(), "sibling file must not appear mid-exec");
+        assert!(sync.pending_deps().is_empty());
+
+        // Release exec guard -> next `lock_for_exec()` flushes the deferred sync atomically!
+        drop(exec_guard);
+        let _next_guard = sync.lock_for_exec().await;
+        assert!(!sync.is_dirty(), "dirty flag must clear after flush");
+        assert_eq!(std::fs::read_to_string(wt.join("pkg/parser.py")).unwrap(), "VAL = 99\n");
+        assert_eq!(std::fs::read_to_string(wt.join("pkg/cli.py")).unwrap(), "WIP = 1\n");
+        assert!(sync.matches_synced(&crate::git::Change { status: 'A', path: "pkg/parser.py".into() }));
+
+        let _ = crate::git::remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -763,14 +763,23 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
     let consumer_text = format!("{}\n{}\n{}", consumer.brief, consumer.context, consumer.done);
     let dep_text = format!("{}\n{}\n{}", dep_page.brief, dep_page.context, dep_page.done);
 
-    // If the consumer explicitly references a concrete non-contract file owned by `dep_page`
-    // (e.g. `tinydb/executor.py` or `tinydb.executor`), keep the hard dependency.
+    // If the consumer explicitly references a concrete non-contract file or directory module
+    // owned by `dep_page` (e.g. `tinydb/executor.py`, `tinydb.executor`, or wildcard dir
+    // `calcx/parser/*.py` -> `calcx.parser`), keep the hard dependency.
     let contract_paths: BTreeSet<&str> = interfaces.iter().map(|c| c.path.as_str()).collect();
     for concrete in concrete_paths_in_glob(&dep_page.owned_glob) {
         if contract_paths.contains(concrete.as_str()) || is_test_path(&concrete) {
             continue;
         }
         if text_references_concrete_file(&consumer_text, &concrete) {
+            return false;
+        }
+    }
+    for dir_mod in wildcard_module_prefixes_in_glob(&dep_page.owned_glob) {
+        if is_test_path(&dir_mod) {
+            continue;
+        }
+        if text_references_concrete_file(&consumer_text, &dir_mod) {
             return false;
         }
     }
@@ -789,19 +798,32 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
         dep_tokens.iter().any(|tok| tok.len() >= 3 && low.contains(tok.as_str()))
     });
     let consumer_mentions_contract = interfaces.iter().any(|c| {
-        consumer_text.contains(&c.path)
-            || c.path
-                .strip_suffix(".py")
-                .map(|s| s.replace('/', "."))
-                .is_some_and(|m| !m.is_empty() && consumer_text.contains(&m))
+        !is_package_marker_path(&c.path)
+            && (consumer_text.contains(&c.path)
+                || c.path
+                    .strip_suffix(".py")
+                    .map(|s| s.replace('/', "."))
+                    .is_some_and(|m| !m.is_empty() && consumer_text.contains(&m)))
     }) || contract_symbols.iter().any(|sym| sym.len() >= 3 && consumer_text.contains(sym.as_str()));
 
     if contract_covers_dep && consumer_mentions_contract {
         return true;
     }
 
-    // Both producer and consumer explicitly reference the same locked contract file or symbol.
+    // Real multi-dep integrators and entrypoints (`cli.py`, `__main__.py`, `server.py`, etc.)
+    // whose dependency has no covering interface symbol in the locked contracts are NOT
+    // contract-only merely because both mention a shared types file or package `__init__.py`.
+    if !contract_covers_dep
+        && (consumer.depends_on.len() >= 2 || is_entrypoint_glob(&consumer.owned_glob))
+    {
+        return false;
+    }
+
+    // Both producer and consumer explicitly reference the same non-trivial locked contract file or symbol.
     let shared_contract_path = interfaces.iter().any(|c| {
+        if is_package_marker_path(&c.path) {
+            return false;
+        }
         let mod_name = c.path.strip_suffix(".py").map(|s| s.replace('/', "."));
         let in_dep = dep_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && dep_text.contains(m));
         let in_con = consumer_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && consumer_text.contains(m));
@@ -811,6 +833,52 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
         sym.len() >= 3 && dep_text.contains(sym.as_str()) && consumer_text.contains(sym.as_str())
     });
     shared_contract_path || shared_contract_sym
+}
+
+fn is_package_marker_path(path: &str) -> bool {
+    matches!(
+        Path::new(path).file_name().and_then(|n| n.to_str()),
+        Some("__init__.py" | "mod.rs" | "lib.rs" | "index.ts" | "index.js")
+    )
+}
+
+fn is_entrypoint_glob(glob: &str) -> bool {
+    tm_core::glob_alternatives(glob).into_iter().any(|alt| {
+        let low = alt.trim().to_ascii_lowercase();
+        let name = Path::new(&low).file_name().and_then(|n| n.to_str()).unwrap_or("");
+        matches!(
+            name,
+            "__main__.py"
+                | "cli.py"
+                | "main.py"
+                | "server.py"
+                | "app.py"
+                | "main.rs"
+                | "cli.ts"
+                | "server.ts"
+                | "index.ts"
+        )
+    })
+}
+
+fn wildcard_module_prefixes_in_glob(glob: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for alt in tm_core::glob_alternatives(glob) {
+        let p = alt.trim().trim_start_matches("./");
+        if !p.contains(['*', '?', '[', '{']) {
+            continue;
+        }
+        let prefix: Vec<&str> = p
+            .split('/')
+            .take_while(|seg| !seg.contains(['*', '?', '[', '{']))
+            .collect();
+        // Require at least two segments (e.g. `calcx/parser/*.py` -> `calcx/parser`), avoiding
+        // bare top-level package names like `src` or `calcx`.
+        if prefix.len() >= 2 {
+            out.push(prefix.join("/"));
+        }
+    }
+    out
 }
 
 pub(crate) fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
@@ -823,6 +891,10 @@ pub(crate) fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
 
 fn text_references_concrete_file(text: &str, path: &str) -> bool {
     if text.contains(path) {
+        return true;
+    }
+    let dotted_dir = path.replace('/', ".");
+    if path.contains('/') && !path.contains('.') && text.contains(&dotted_dir) {
         return true;
     }
     if let Some(stem) = path.strip_suffix(".py") {
@@ -2445,5 +2517,98 @@ def test_isolated_and_catches_stub():
         assert!(!q.find("added", 5).unwrap().nodes.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tb18_dependency_is_contract_only_rejects_concrete_integrator_without_contract() {
+        // 1. Multi-dep CLI sharing only data types (Token/Expr) with NO interface covering `evaluator`
+        //    is NOT contract-only.
+        let types_only = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![
+                ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+                ContractFile {
+                    path: "calcx/types.py".into(),
+                    content: "class Token:\n    pass\nclass Expr:\n    pass\n".into(),
+                    phase: 0,
+                },
+            ],
+            pages: vec![
+                PagePlan {
+                    id: "parser".into(),
+                    owned_glob: "calcx/parser/*.py".into(),
+                    brief: "Parse Token into Expr from calcx/types.py.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "evaluator".into(),
+                    owned_glob: "calcx/evaluator.py".into(),
+                    brief: "Evaluate Expr from calcx/types.py.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "calcx/__main__.py".into(),
+                    brief: "Run REPL using Token and Expr from calcx/types.py.".into(),
+                    depends_on: vec!["parser".into(), "evaluator".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!dependency_is_contract_only(&types_only, &types_only.pages[2], "evaluator"));
+        assert!(!dependency_is_contract_only(&types_only, &types_only.pages[2], "parser"));
+
+        // 2. Wildcard glob producer referenced by dotted module path (`calcx.parser`) is NOT contract-only.
+        let wildcard_ref = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "class ParserProtocol:\n    pass\n".into(),
+                phase: 0,
+            }],
+            pages: vec![
+                PagePlan {
+                    id: "parser".into(),
+                    owned_glob: "calcx/parser/*.py".into(),
+                    brief: "Implement ParserProtocol.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "calcx/cli.py".into(),
+                    brief: "Import parse from calcx.parser and use ParserProtocol.".into(),
+                    depends_on: vec!["parser".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!dependency_is_contract_only(&wildcard_ref, &wildcard_ref.pages[1], "parser"));
+
+        // 3. Multi-dep integrator whose dependencies ARE covered by locked interfaces stays
+        //    contract-only (early start WITH live sibling sync).
+        let covered_integrator = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "class ParserProtocol:\n    pass\nclass EvaluatorProtocol:\n    pass\n".into(),
+                phase: 0,
+            }],
+            pages: vec![
+                PagePlan { id: "parser".into(), owned_glob: "calcx/parser.py".into(), brief: "Implement ParserProtocol.".into(), ..Default::default() },
+                PagePlan { id: "evaluator".into(), owned_glob: "calcx/evaluator.py".into(), brief: "Implement EvaluatorProtocol.".into(), ..Default::default() },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "calcx/cli.py".into(),
+                    brief: "Build CLI against ParserProtocol and EvaluatorProtocol from calcx/contract.py.".into(),
+                    depends_on: vec!["parser".into(), "evaluator".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(dependency_is_contract_only(&covered_integrator, &covered_integrator.pages[2], "parser"));
+        assert!(dependency_is_contract_only(&covered_integrator, &covered_integrator.pages[2], "evaluator"));
     }
 }

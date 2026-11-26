@@ -1422,4 +1422,81 @@ sleep 30
             "denied tool call must not permanently suppress stall detection; got: {err:#}"
         );
     }
+
+    #[tokio::test]
+    async fn acp_attaches_dictionary_mcp_and_allows_flow_query_in_code_mode_off_and_on() {
+        let cases: &[(&'static str, &'static str, &str)] = &[
+            ("antigravity", "mcp_{server}_", "mcp_dictionary_flow_query"),
+            ("grok-build", "{server}__", "dictionary__flow_query"),
+            ("opencode", "{server}_", "dictionary_flow_query"),
+        ];
+        for &(hid, prefix, flow_tool) in cases {
+            for code_mode in [false, true] {
+                let capture = std::env::temp_dir().join(format!(
+                    "tm-acp-flow-mcp-{hid}-{code_mode}-{}.txt",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&capture);
+                let script = format!(
+                    r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; printf '%s\n' "$l" > "{}"
+echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l
+echo '{{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{{"toolCall":{{"toolCallId":"t-flow","name":"{flow_tool}","kind":"other","rawInput":{{"op":"find","query":"Store"}}}},"options":[{{"optionId":"allow","kind":"allow_once"}},{{"optionId":"deny","kind":"reject_once"}}]}} }}'
+read perm_flow
+printf '%s\n' "$perm_flow" >> "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+                    capture.display(),
+                    capture.display(),
+                );
+                let harness = AcpHarness {
+                    id: hid,
+                    binary: "sh".into(),
+                    args: vec!["-c".into(), script],
+                    sandbox: None,
+                    mcp_tool_prefix: prefix,
+                    effort_flag: None,
+                };
+                let task = WorkerTask {
+                    brief: "build".into(),
+                    cwd: PathBuf::from("/tmp"),
+                    model: None,
+                    effort: None,
+                    dictionary: Some(crate::DictionaryAccess {
+                        name: "dictionary".into(),
+                        url: "http://127.0.0.1:43210/mcp".into(),
+                        bearer_token: "secret-tok".into(),
+                    }),
+                    timeout: std::time::Duration::from_secs(10),
+                    stall: None,
+                    read_only: false,
+                    code_mode,
+                    shell: None,
+                    permission_mode: None,
+                    hold: None,
+                };
+                let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+                let (tx, _rx) = mpsc::channel(16);
+                let summary = harness.run(task, gate, tx).await.unwrap();
+                assert!(summary.ok, "{hid} code_mode={code_mode}");
+                assert_eq!(summary.denied, 0, "{flow_tool} must be allowed on {hid} (code_mode={code_mode})");
+                let log = std::fs::read_to_string(&capture).unwrap();
+                let _ = std::fs::remove_file(&capture);
+                let mut lines = log.lines();
+                let session_new: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+                let servers = session_new["params"]["mcpServers"].as_array().unwrap();
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0]["name"], "dictionary");
+                assert_eq!(servers[0]["url"], "http://127.0.0.1:43210/mcp");
+                assert_eq!(servers[0]["headers"][0]["value"], "Bearer secret-tok");
+                let perm_reply: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+                assert_eq!(
+                    perm_reply["result"]["outcome"]["optionId"], "allow",
+                    "{flow_tool} must be allowed by permission gate on {hid} (code_mode={code_mode}): {perm_reply}"
+                );
+            }
+        }
+    }
 }

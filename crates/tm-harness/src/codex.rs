@@ -712,4 +712,38 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn codex_attaches_dictionary_mcp_in_code_mode_off_and_on() {
+        let harness = Codex::default();
+        for (read_only, code_mode) in [(false, false), (false, true), (true, false), (true, true)] {
+            let task = WorkerTask {
+                brief: "build".into(),
+                cwd: "/w".into(),
+                model: None,
+                effort: None,
+                dictionary: Some(crate::DictionaryAccess {
+                    name: "dictionary".into(),
+                    url: "http://127.0.0.1:43210/mcp".into(),
+                    bearer_token: "tok-codex".into(),
+                }),
+                timeout: std::time::Duration::from_secs(10),
+                stall: None,
+                read_only,
+                code_mode,
+                shell: None,
+                permission_mode: None,
+                hold: None,
+            };
+            let args = harness.args_with(&task, "build", false, None);
+            assert!(
+                args.iter().any(|a| a == r#"mcp_servers.dictionary.url="http://127.0.0.1:43210/mcp""#),
+                "missing dictionary MCP url for read_only={read_only}, code_mode={code_mode}: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == r#"mcp_servers.dictionary.bearer_token_env_var="TASKMASTER_DICTIONARY_TOKEN""#),
+                "missing dictionary bearer env var for read_only={read_only}, code_mode={code_mode}: {args:?}"
+            );
+        }
+    }
 }

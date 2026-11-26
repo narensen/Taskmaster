@@ -10191,3 +10191,747 @@ async fn flow_preinjected_context_included_for_existing_files_and_later_wave_wit
         tm_flow::DEFAULT_UNIT_MAP_BUDGET
     );
 }
+
+#[tokio::test]
+async fn flow_audit_mcp_tool_listed_and_callable_code_mode_off_and_on() {
+    fn mcp_rpc(url: &str, token: &str, body: serde_json::Value) -> serde_json::Value {
+        let resp = ureq::post(url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_json(body)
+            .expect("HTTP POST /mcp failed");
+        assert_eq!(resp.status(), 200);
+        resp.into_json().expect("invalid MCP JSON reply")
+    }
+
+    #[derive(Clone, Default)]
+    struct McpProbeLog {
+        worker_tools: Vec<String>,
+        flow_query_replies: Vec<(String, String)>,
+        run_code_flow_reply: Option<String>,
+        reviewer_tools: Vec<String>,
+        reviewer_flow_reply: Option<String>,
+        reviewer_brief: Option<String>,
+    }
+
+    struct LiveMcpHarness {
+        log: Arc<Mutex<McpProbeLog>>,
+        code_mode: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for LiveMcpHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let dict = task.dictionary.clone().expect("every worker/reviewer must receive DictionaryAccess");
+            let url = dict.url.clone();
+            let tok = dict.bearer_token.clone();
+            let is_reviewer = task.read_only;
+            let code_mode = self.code_mode;
+            let probe = tokio::task::spawn_blocking(move || {
+                let init = mcp_rpc(
+                    &url,
+                    &tok,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": { "protocolVersion": "2025-11-25" }
+                    }),
+                );
+                assert!(init["result"]["serverInfo"]["name"].as_str().is_some(), "{init}");
+
+                let listed = mcp_rpc(&url, &tok, serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
+                let names: Vec<String> = listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|t| t["name"].as_str().map(str::to_string))
+                    .collect();
+
+                let mut replies = Vec::new();
+                for tool_name in [
+                    "flow_query",
+                    "mcp_dictionary_flow_query",
+                    "mcp__dictionary__flow_query",
+                    "dictionary__flow_query",
+                    "dictionary_flow_query",
+                ] {
+                    let res = mcp_rpc(
+                        &url,
+                        &tok,
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": { "name": tool_name, "arguments": { "op": "find", "query": "Greeter" } }
+                        }),
+                    );
+                    assert_eq!(res["result"]["isError"], false, "{tool_name}: {res}");
+                    let txt = res["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
+                    replies.push((tool_name.to_string(), txt));
+                }
+
+                // Also exercise `node`, `neighbors`, and `source` via `flow_query`.
+                let node_res = mcp_rpc(
+                    &url,
+                    &tok,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                        "params": { "name": "flow_query", "arguments": { "op": "node", "id": "py:pkg/contract.py#Greeter" } }
+                    }),
+                );
+                assert_eq!(node_res["result"]["isError"], false, "{node_res}");
+                let src_res = mcp_rpc(
+                    &url,
+                    &tok,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                        "params": { "name": "flow_query", "arguments": { "op": "source", "id": "py:pkg/contract.py#Greeter" } }
+                    }),
+                );
+                assert_eq!(src_res["result"]["isError"], false, "{src_res}");
+                assert!(
+                    src_res["result"]["content"][0]["text"].as_str().unwrap_or("").contains("class Greeter"),
+                    "{src_res}"
+                );
+
+                let mut rc_reply = None;
+                if code_mode && names.iter().any(|n| n == "run_code") {
+                    let script = r#"
+                        const f = await flow("find", { query: "Greeter" });
+                        const s = await flow("source", { id: "py:pkg/contract.py#Greeter" });
+                        return { count: f.nodes.length, hasClass: s.code.includes("class Greeter") };
+                    "#;
+                    let rc = mcp_rpc(
+                        &url,
+                        &tok,
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                            "params": { "name": "mcp_dictionary_run_code", "arguments": { "code": script } }
+                        }),
+                    );
+                    assert_eq!(rc["result"]["isError"], false, "run_code flow() failed (read_only={is_reviewer}): {rc}");
+                    rc_reply = Some(rc["result"]["content"][0]["text"].as_str().unwrap_or("").to_string());
+                }
+                (names, replies, rc_reply)
+            })
+            .await?;
+
+            {
+                let mut g = self.log.lock().unwrap();
+                if is_reviewer {
+                    g.reviewer_tools = probe.0;
+                    g.reviewer_flow_reply = probe.2.or_else(|| probe.1.first().map(|(_, t)| t.clone()));
+                    g.reviewer_brief = Some(task.brief.clone());
+                } else {
+                    g.worker_tools = probe.0;
+                    g.flow_query_replies = probe.1;
+                    g.run_code_flow_reply = probe.2;
+                }
+            }
+
+            if !is_reviewer {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(
+                    task.cwd.join("pkg/impl.py"),
+                    "from pkg.contract import Greeter\n\nclass RealGreeter(Greeter):\n    def hello(self) -> str:\n        return 'hi'\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            } else {
+                let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let has_node = crate::code::CodeTools::new(None).is_some();
+    for code_mode in [false, true] {
+        let tmp = seeded(&format!("flow-audit-mcp-cm-{code_mode}"));
+        let p = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            summary: "Verify live MCP flow_query in Code Mode off and on".into(),
+            contracts: vec![ContractFile {
+                path: "pkg/contract.py".into(),
+                content: "from typing import Protocol\n\nclass Greeter(Protocol):\n    def hello(self) -> str: ...\n".into(),
+                phase: 0,
+            }],
+            pages: vec![PagePlan {
+                id: "impl".into(),
+                owned_glob: "pkg/impl.py".into(),
+                brief: "Implement Greeter in pkg/impl.py".into(),
+                cites: vec!["greet_api".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dict_dir = tmp.0.join(".taskmaster/dictionary");
+        tm_dictionary::LocalStore::open(&dict_dir)
+            .unwrap()
+            .publish("greet_api", tm_core::EntryKind::Hint, "greeter", "Greeter.hello() -> str", "py")
+            .unwrap();
+
+        let log = Arc::new(Mutex::new(McpProbeLog::default()));
+        let h: Arc<dyn Harness> = Arc::new(LiveMcpHarness { log: log.clone(), code_mode });
+        let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+        let mut cfg = config(&tmp.0, p, true, 1);
+        cfg.run_id = format!("mcp-cm-{code_mode}");
+        cfg.checks = false;
+        cfg.runtime_checks = false;
+        cfg.code_mode = code_mode;
+        cfg.browser = false;
+
+        let out = drive(cfg, harnesses).await.unwrap();
+        assert_eq!(out, Outcome::Finished { ok: true });
+
+        let probed = log.lock().unwrap().clone();
+        assert!(
+            probed.worker_tools.iter().any(|t| t == "flow_query"),
+            "flow_query must be listed for workers (code_mode={code_mode}): {:?}",
+            probed.worker_tools
+        );
+        if !code_mode {
+            assert!(!probed.worker_tools.iter().any(|t| t == "run_code"));
+        } else if has_node {
+            assert!(probed.worker_tools.iter().any(|t| t == "run_code"));
+            let rc = probed.run_code_flow_reply.as_deref().unwrap_or("");
+            assert!(rc.contains("\"hasClass\": true"), "worker Code Mode flow() failed: {rc}");
+        }
+        assert_eq!(probed.flow_query_replies.len(), 5);
+        for (name, txt) in &probed.flow_query_replies {
+            assert!(txt.contains("py:pkg/contract.py#Greeter"), "{name} returned: {txt}");
+        }
+        // Reviewer also got flow_query (and read-only run_code flow() when code_mode=true) and its diff excluded `.flow/`.
+        if !probed.reviewer_tools.is_empty() {
+            assert!(probed.reviewer_tools.iter().any(|t| t == "flow_query"));
+            if code_mode && has_node {
+                assert!(probed.reviewer_tools.iter().any(|t| t == "run_code"));
+                assert!(probed.reviewer_flow_reply.as_deref().unwrap_or("").contains("\"hasClass\": true"));
+            }
+            if let Some(ref rb) = probed.reviewer_brief {
+                assert!(
+                    !rb.contains("diff --git a/.flow/"),
+                    "review_prefix diff must exclude `.flow/` noise:\n{rb}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn flow_audit_staleness_gate_repairs_and_emits_flow_stale_event_in_run() {
+    let tmp = seeded("flow-audit-stale");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Verify staleness gate detects tampering, repairs, and emits flow_stale".into(),
+        pages: vec![
+            PagePlan {
+                id: "alpha".into(),
+                owned_glob: "pkg/alpha.py".into(),
+                brief: "Write pkg/alpha.py".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "beta".into(),
+                owned_glob: "pkg/beta.py".into(),
+                brief: "Write pkg/beta.py".into(),
+                depends_on: vec!["alpha".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct TamperHarness {
+        project: PathBuf,
+        run_id: String,
+    }
+    #[async_trait::async_trait]
+    impl Harness for TamperHarness {
+        fn id(&self) -> &'static str {
+            "fake-stale"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            if task.brief.contains("Build unit `alpha`") {
+                std::fs::write(task.cwd.join("pkg/alpha.py"), "def alpha_fn() -> int:\n    return 1\n")?;
+            } else if task.brief.contains("Build unit `beta`") {
+                std::fs::write(task.cwd.join("pkg/beta.py"), "def beta_fn() -> int:\n    return 2\n")?;
+                // Tamper with alpha's shard in the run's live branch worktree so the staleness gate catches it!
+                let tree = crate::git::worktree_dir(&self.project, &self.run_id, "tree");
+                let shard = tree.join(".flow/files/pkg/alpha.py.json");
+                if shard.is_file() {
+                    let raw = std::fs::read_to_string(&shard)?;
+                    let mut v: serde_json::Value = serde_json::from_str(&raw)?;
+                    v["blob"] = serde_json::json!("0000000000000000000000000000000000000000");
+                    std::fs::write(&shard, serde_json::to_string_pretty(&v)?)?;
+                }
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(TamperHarness {
+        project: tmp.0.clone(),
+        run_id: "stale-gate-1".into(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let live = Arc::new(crate::live::Live::new(Arc::new(crate::store::FileStore::new(
+        tmp.0.join(".taskmaster/runs"),
+    ))));
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.run_id = "stale-gate-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    cfg.live = Some(live.clone());
+
+    let out = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let (_, entries) = live.read("stale-gate-1", 0);
+    let stale_ev = entries
+        .iter()
+        .find(|e| e["kind"].as_str() == Some("flow_stale"))
+        .unwrap_or_else(|| panic!("expected flow_stale event in live transcript; got: {entries:?}"));
+    assert!(stale_ev["count"].as_u64().unwrap_or(0) >= 1, "{stale_ev}");
+    let paths: Vec<&str> = stale_ev["paths"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(paths.contains(&"pkg/alpha.py"), "expected pkg/alpha.py in flow_stale paths: {stale_ev}");
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "post-run .flow must be 100% fresh");
+}
+
+#[tokio::test]
+async fn flow_audit_commit_paths_flag_repair_and_race_merge() {
+    // 1. Flag amendment (`arbitrate`) + unowned repair (`repair_unowned`) keep `.flow` fresh.
+    let tmp = seeded("flow-audit-commits");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Exercise flag amendment and unowned repair commit paths".into(),
+        pages: vec![PagePlan {
+            id: "core".into(),
+            owned_glob: "pkg/core.py".into(),
+            brief: "Write pkg/core.py".into(),
+            cites: vec!["api_rule".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let dict_dir = tmp.0.join(".taskmaster/dictionary");
+    tm_dictionary::LocalStore::open(&dict_dir)
+        .unwrap()
+        .publish("api_rule", tm_core::EntryKind::Hint, "old rule", "return 1", "py")
+        .unwrap();
+
+    // Seed an unowned failing test and a passing unit test so `verify_project` triggers
+    // `repair_unowned`, a broken first repair triggers `rollback`, and the second repair succeeds!
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_unowned.py"),
+        "from pkg.helper import VALUE\ndef test_val():\n    assert VALUE == 42\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_core_check.py"),
+        "from pkg.core import core_val\ndef test_core():\n    assert core_val() == 2\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/helper.py"), "VALUE = 0\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "seed unowned failing helper"]);
+
+    struct FlagAndRepairHarness {
+        flagged: std::sync::atomic::AtomicBool,
+        repair_attempt: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Harness for FlagAndRepairHarness {
+        fn id(&self) -> &'static str {
+            "fake-commits"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("objected to Dictionary entry") {
+                let reply = r#"{"resolution":"amended","kind":"hint","summary":"new rule","content":"return 2","stack":"py"}"#;
+                let _ = events.send(HarnessEvent::Text { text: reply.into() }).await;
+            } else if task.brief.contains("names no file any unit owns") {
+                let attempt = self.repair_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    // Break owned `pkg/core.py` with an exception whose traceback names `pkg/core.py`,
+                    // so Taskmaster attributes the failure to unit `core` and rolls back the repair.
+                    std::fs::write(task.cwd.join("pkg/core.py"), "def core_val() -> int:\n    raise ValueError('broken')\n")?;
+                    std::fs::write(task.cwd.join("pkg/helper.py"), "VALUE = 42\n")?;
+                } else {
+                    std::fs::write(task.cwd.join("pkg/helper.py"), "VALUE = 42\n")?;
+                }
+                let _ = events.send(HarnessEvent::Text { text: "fixed helper".into() }).await;
+            } else if task.brief.contains("Build unit `core`") {
+                if !self.flagged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = events
+                        .send(HarnessEvent::Text {
+                            text: r#"{"flag":{"key":"api_rule","issue":"should return 2"}}"#.into(),
+                        })
+                        .await;
+                } else {
+                    std::fs::write(task.cwd.join("pkg/core.py"), "def core_val() -> int:\n    return 2\n")?;
+                    let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+                }
+            } else {
+                let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(FlagAndRepairHarness {
+        flagged: std::sync::atomic::AtomicBool::new(false),
+        repair_attempt: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.run_id = "audit-commits-1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let out = tokio::time::timeout(Duration::from_secs(40), drive(cfg, harnesses))
+        .await
+        .expect("commits audit run timed out")
+        .unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+    assert_eq!(std::fs::read_to_string(tmp.0.join("pkg/helper.py")).unwrap(), "VALUE = 42\n");
+    assert!(
+        std::fs::read_to_string(tmp.0.join("pkg/core.py")).unwrap().contains("return 2"),
+        "rollback must have restored pkg/core.py"
+    );
+    assert!(log(&tmp.0).contains("roll back a repair that broke core"), "expected rollback commit in log:\n{}", log(&tmp.0));
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "after flag + rollback + repair_unowned, .flow must be fresh");
+    assert!(
+        !git_out(&tmp.0, &["ls-files", ".flow"]).contains("index.sqlite"),
+        "index.sqlite must never be committed"
+    );
+
+    // 2. `race::merge_winner` refreshes `.flow/` when merging a winning branch on top of another commit.
+    let tmp_race = seeded("flow-audit-race");
+    crate::git::ensure_exclude(&tmp_race.0).unwrap();
+    std::fs::create_dir_all(tmp_race.0.join("pkg")).unwrap();
+    std::fs::write(tmp_race.0.join("pkg/base.py"), "def base() -> int:\n    return 1\n").unwrap();
+    tm_flow::build(&tmp_race.0).unwrap();
+    git(&tmp_race.0, &["add", "."]);
+    git(&tmp_race.0, &["commit", "-q", "-m", "base with flow"]);
+
+    let base_sha = git_out(&tmp_race.0, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&tmp_race.0, &["checkout", "-q", "-b", "taskmaster/race-win"]);
+    std::fs::write(tmp_race.0.join("pkg/winner.py"), "def won() -> int:\n    return 7\n").unwrap();
+    tm_flow::update_files(&tmp_race.0, &["pkg/winner.py".into()]).unwrap();
+    git(&tmp_race.0, &["add", "."]);
+    git(&tmp_race.0, &["commit", "-q", "-m", "winner work"]);
+
+    // Advance main with a conflicting `.flow/meta.json` and another file!
+    git(&tmp_race.0, &["checkout", "-q", "-"]);
+    std::fs::write(tmp_race.0.join("pkg/other.py"), "def other() -> int:\n    return 9\n").unwrap();
+    tm_flow::update_files(&tmp_race.0, &["pkg/other.py".into()]).unwrap();
+    git(&tmp_race.0, &["add", "."]);
+    git(&tmp_race.0, &["commit", "-q", "-m", "main moved"]);
+
+    let records = Records::files(&tmp_race.0);
+    records
+        .save_meta(
+            "race-win",
+            &crate::store::Meta {
+                parallel: 1,
+                branch: Some("taskmaster/race-win".into()),
+                base: Some(base_sha),
+                template: None,
+                focused: false,
+            },
+        )
+        .unwrap();
+    let live = crate::live::Live::new(records.store().clone());
+    let _commit = crate::race::merge_winner(&tmp_race.0, &records, &live, "race-win").unwrap();
+    assert!(
+        tm_flow::verify_all(&tmp_race.0).unwrap().is_empty(),
+        "race::merge_winner must refresh `.flow/` so both main and winner shards are present and fresh"
+    );
+    let q = tm_flow::FlowQuery::open(&tmp_race.0).unwrap();
+    assert!(q.node("py:pkg/winner.py#won").unwrap().is_some());
+    assert!(q.node("py:pkg/other.py#other").unwrap().is_some());
+    assert!(!git_out(&tmp_race.0, &["ls-files", ".flow"]).contains("index.sqlite"));
+    assert_eq!(git_out(&tmp_race.0, &["status", "--porcelain"]).trim(), "");
+}
+
+#[tokio::test]
+async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
+    let tmp = seeded("flow-audit-brownfield");
+    // Existing brownfield code committed BEFORE Run 1 starts.
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/base.py"), "def base_val() -> int:\n    return 10\n").unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/service.py"),
+        "from pkg.base import base_val\n\ndef compute() -> int:\n    return base_val() + 1\n",
+    )
+    .unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "initial brownfield code"]);
+
+    let plan1 = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Brownfield run 1 with template, cancel, and resume".into(),
+        contracts: vec![ContractFile {
+            path: "tests/test_bf.py".into(),
+            content: "from pkg.service import compute\nfrom pkg.extra import extra_val\ndef test_all():\n    assert compute() == 12\n    assert extra_val() == 24\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "service".into(),
+                owned_glob: "pkg/service.py".into(),
+                brief: "Update compute() to return base_val() + 2".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "extra".into(),
+                owned_glob: "pkg/extra.py".into(),
+                brief: "Create pkg/extra.py calling compute() from pkg.service to return compute() * 2".into(),
+                depends_on: vec!["service".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let fail_extra = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let seen_briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct BrownfieldHarness {
+        fail_extra: Arc<std::sync::atomic::AtomicBool>,
+        seen_briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for BrownfieldHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen_briefs.lock().unwrap().push(task.brief.clone());
+            if task.brief.contains("Build unit `service`") {
+                std::fs::write(
+                    task.cwd.join("pkg/service.py"),
+                    "from pkg.base import base_val\n\ndef compute() -> int:\n    return base_val() + 2\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+                return Ok(RunSummary {
+                    ok: true,
+                    usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                    cost_usd: Some(0.0),
+                    denied: 0,
+                    freed: None,
+                });
+            }
+            if task.brief.contains("Build unit `extra`") {
+                if self.fail_extra.load(std::sync::atomic::Ordering::SeqCst) {
+                    anyhow::bail!("simulated cancel during wave 2");
+                }
+                std::fs::write(
+                    task.cwd.join("pkg/extra.py"),
+                    "from pkg.service import compute\n\ndef extra_val() -> int:\n    return compute() * 2\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+                return Ok(RunSummary {
+                    ok: true,
+                    usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                    cost_usd: Some(0.0),
+                    denied: 0,
+                    freed: None,
+                });
+            }
+            let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let make_harnesses = || {
+        let h: Arc<dyn Harness> = Arc::new(BrownfieldHarness {
+            fail_extra: fail_extra.clone(),
+            seen_briefs: seen_briefs.clone(),
+        });
+        Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h }
+    };
+
+    let tmpl_dir = std::env::temp_dir().join(format!("tm-bf-tmpl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmpl_dir);
+    std::fs::create_dir_all(tmpl_dir.join("pkg")).unwrap();
+    std::fs::write(tmpl_dir.join("pkg/__init__.py"), "VERSION = '1.0'\n").unwrap();
+
+    // Pass 1: Run 1 builds unit `service` (with template file), then fails/cancels on wave-2 `extra`.
+    let mut cfg1 = config(&tmp.0, plan1.clone(), true, 1);
+    cfg1.run_id = "bf-run-1".into();
+    cfg1.checks = false;
+    cfg1.runtime_checks = true;
+    cfg1.code_mode = false;
+    cfg1.browser = false;
+    cfg1.template = Some(tmpl_dir.display().to_string());
+    let res1 = tokio::time::timeout(Duration::from_secs(40), drive(cfg1, make_harnesses()))
+        .await
+        .expect("bf pass 1 timed out");
+    assert!(res1.is_err(), "expected simulated cancel failure on wave 2");
+    // Branch exists and has no `index.sqlite` tracked; main checkout is still clean and untouched.
+    assert!(git_out(&tmp.0, &["branch", "--list", "taskmaster/bf-run-1"]).contains("bf-run-1"));
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    assert!(
+        !git_out(&tmp.0, &["ls-tree", "-r", "--name-only", "taskmaster/bf-run-1", ".flow"]).contains("index.sqlite")
+    );
+
+    // Pass 2: Resume Run 1 cleanly with `resume_cancelled = true` -> wave-2 `extra` completes & merges!
+    fail_extra.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut cfg1_resume = config(&tmp.0, plan1, true, 1);
+    cfg1_resume.run_id = "bf-run-1".into();
+    cfg1_resume.resume_cancelled = true;
+    cfg1_resume.checks = false;
+    cfg1_resume.runtime_checks = true;
+    cfg1_resume.code_mode = false;
+    cfg1_resume.browser = false;
+    let out1 = tokio::time::timeout(Duration::from_secs(40), drive(cfg1_resume, make_harnesses()))
+        .await
+        .expect("bf resume timed out")
+        .unwrap();
+    assert_eq!(out1, Outcome::Finished { ok: true });
+
+    // Check every committed `.flow` artifact after Run 1 lands.
+    let flow_tracked = git_out(&tmp.0, &["ls-files", ".flow"]);
+    assert!(flow_tracked.contains(".flow/.gitignore"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/meta.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/plan.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/env.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/__init__.py.json"), "template file must be sharded: {flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/base.py.json"), "brownfield file must be sharded: {flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/service.py.json"), "{flow_tracked}");
+    assert!(flow_tracked.contains(".flow/files/pkg/extra.py.json"), "{flow_tracked}");
+    assert!(!flow_tracked.contains("index.sqlite"), "index.sqlite must NEVER be committed: {flow_tracked}");
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "post-merge `.flow` must be 100% fresh");
+
+    // Verify resumed wave-2 unit `extra` received both unit map + pre-injected context + verified env hint!
+    let briefs = seen_briefs.lock().unwrap().clone();
+    let extra_brief = briefs.iter().rev().find(|b| b.contains("Build unit `extra`")).expect("extra brief");
+    let (pre_extra, task_extra) = extra_brief.split_once("--- Your task ---").unwrap();
+    assert!(pre_extra.contains("Verified test environment:"), "resumed run must restore env_hint:\n{pre_extra}");
+    assert!(task_extra.contains("## Flow unit map (extra)"), "{task_extra}");
+    assert!(task_extra.contains("## Pre-injected flow context (existing code)"), "{task_extra}");
+    assert!(task_extra.contains("py:pkg/service.py#compute"), "{task_extra}");
+
+    // Run 2 on top of Run 1: modifies existing brownfield `pkg/service.py` to add `v2_helper`.
+    let plan2 = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Brownfield run 2 adding v2_helper".into(),
+        pages: vec![PagePlan {
+            id: "service2".into(),
+            owned_glob: "pkg/service.py".into(),
+            brief: "Add v2_helper() to pkg/service.py".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    struct Run2Harness;
+    #[async_trait::async_trait]
+    impl Harness for Run2Harness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::write(
+                task.cwd.join("pkg/service.py"),
+                "from pkg.base import base_val\n\ndef compute() -> int:\n    return base_val() + 2\n\ndef v2_helper() -> int:\n    return 99\n",
+            )?;
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+    let h2: Arc<dyn Harness> = Arc::new(Run2Harness);
+    let harnesses2 = Harnesses { master: h2.clone(), mid: h2.clone(), worker: h2.clone(), reviewer: h2.clone(), verifier: h2 };
+    let mut cfg2 = config(&tmp.0, plan2, true, 1);
+    cfg2.run_id = "bf-run-2".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    let out2 = drive(cfg2, harnesses2).await.unwrap();
+    assert_eq!(out2, Outcome::Finished { ok: true });
+    assert!(tm_flow::FlowQuery::open(&tmp.0).unwrap().node("py:pkg/service.py#v2_helper").unwrap().is_some());
+
+    // Undo Run 2 (brownfield undo where `.flow/meta.json` STILL exists): SQLite must immediately drop `v2_helper`!
+    let records = Records::files(&tmp.0);
+    let u2 = crate::undo::undo_run(&tmp.0, &records, "bf-run-2").unwrap();
+    assert!(matches!(u2, crate::undo::Undo::Done { .. }), "{u2:?}");
+    assert!(
+        tm_flow::FlowQuery::open(&tmp.0).unwrap().node("py:pkg/service.py#v2_helper").unwrap().is_none(),
+        "stale v2_helper symbol must not remain in `.flow/index.sqlite` after brownfield undo"
+    );
+    assert!(tm_flow::FlowQuery::open(&tmp.0).unwrap().node("py:pkg/extra.py#extra_val").unwrap().is_some());
+    assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty());
+
+    // Undo Run 1 (removes `.flow/meta.json` completely): `.flow/` and derived `index.sqlite` must be cleaned up!
+    let u1 = crate::undo::undo_run(&tmp.0, &records, "bf-run-1").unwrap();
+    assert!(matches!(u1, crate::undo::Undo::Done { .. }), "{u1:?}");
+    assert!(!tmp.0.join(".flow").exists(), "empty `.flow/` and derived index.sqlite must be removed after full undo");
+    assert!(tmp.0.join("pkg/base.py").is_file(), "pre-existing brownfield file must stay intact");
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+    let _ = std::fs::remove_dir_all(&tmpl_dir);
+}

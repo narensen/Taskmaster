@@ -783,4 +783,26 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn claude_attaches_dictionary_mcp_and_allows_mcp_tools_in_code_mode_off_and_on() {
+        let harness = sandboxed();
+        for (read_only, code_mode) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut t = task(read_only, true, code_mode);
+            t.dictionary = Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:43210/mcp".into(),
+                bearer_token: "tok-claude".into(),
+            });
+            let args = harness.args(&t);
+            assert!(
+                after(&args, "--allowedTools").contains(&"mcp__dictionary"),
+                "mcp__dictionary must be allowed for read_only={read_only}, code_mode={code_mode}: {args:?}"
+            );
+            let cfg_raw = after(&args, "--mcp-config").into_iter().next().expect("missing --mcp-config");
+            let cfg: Value = serde_json::from_str(cfg_raw).unwrap();
+            assert_eq!(cfg["mcpServers"]["dictionary"]["url"], "http://127.0.0.1:43210/mcp");
+            assert_eq!(cfg["mcpServers"]["dictionary"]["headers"]["Authorization"], "Bearer tok-claude");
+        }
+    }
 }

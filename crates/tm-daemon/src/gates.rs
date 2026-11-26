@@ -624,6 +624,15 @@ pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
             });
         }
     }
+    // 5. Soft contract size cap warnings (between CONTRACT_LINES_SOFT and CONTRACT_LINES).
+    for warning in tm_core::plan_warnings(plan) {
+        findings.push(PlanReviewFinding {
+            severity: "warning".into(),
+            category: "contract_size".into(),
+            message: warning,
+            page: None,
+        });
+    }
     findings
 }
 

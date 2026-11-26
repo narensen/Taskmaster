@@ -8612,3 +8612,98 @@ async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildca
     assert_eq!(read(&tmp.0.join("tests/test_contract.py")), contract_body);
     assert!(!tmp.0.join(".env").exists(), "policy-denied .env must never be merged");
 }
+
+#[tokio::test]
+async fn contract_soft_cap_warns_without_repair_while_hard_cap_triggers_repair() {
+    struct CapPlanner {
+        initial_lines: usize,
+        planner_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for CapPlanner {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let reply = if task.brief.contains("Plan this") || task.brief.contains("Repair this plan") {
+                let n = self.planner_calls.fetch_add(1, Ordering::SeqCst);
+                let lines = if n == 0 { self.initial_lines } else { 80 };
+                let body = "def f() -> None: ...\n".repeat(lines);
+                serde_json::json!({
+                    "kind": "library",
+                    "summary": "Small lib",
+                    "contracts": [{ "path": "pkg/contracts.py", "content": body }],
+                    "units": [
+                        { "id": "core", "owned_glob": "pkg/core.py", "brief": "Implement core using pkg/contracts.py.", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string()
+            } else {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/core.py"), "x = 1\n")?;
+                "done\nRELEASE unit:core\n".into()
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    // 1. Soft overrun (125 lines: > 120 soft cap, <= 200 hard cap) -> 1 planner call (no repair), emits warning.
+    let tmp_soft = seeded("c2-soft-cap");
+    let soft_calls = Arc::new(AtomicUsize::new(0));
+    let h_soft: Arc<dyn Harness> = Arc::new(CapPlanner {
+        initial_lines: 125,
+        planner_calls: soft_calls.clone(),
+    });
+    let mut cfg = prompt_config(&tmp_soft.0, "Build a small library package.", true);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h_soft.clone(),
+        mid: h_soft.clone(),
+        worker: h_soft.clone(),
+        reviewer: h_soft.clone(),
+        verifier: h_soft,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(soft_calls.load(Ordering::SeqCst), 1, "125-line contract must not force planner repair");
+    let agents_log = read(&run_directory(&tmp_soft.0, "current").join("agents.jsonl"));
+    assert!(agents_log.contains("\"category\":\"contract_size\""), "soft cap warning should be emitted: {agents_log}");
+
+    // 2. Hard overrun (205 lines: > 200 hard cap) -> rejected and triggers planner repair (2 planner calls).
+    let tmp_hard = seeded("c2-hard-cap");
+    let hard_calls = Arc::new(AtomicUsize::new(0));
+    let h_hard: Arc<dyn Harness> = Arc::new(CapPlanner {
+        initial_lines: 205,
+        planner_calls: hard_calls.clone(),
+    });
+    let mut cfg_hard = prompt_config(&tmp_hard.0, "Build a small library package.", true);
+    cfg_hard.checks = false;
+    cfg_hard.runtime_checks = false;
+    let harnesses_hard = Harnesses {
+        master: h_hard.clone(),
+        mid: h_hard.clone(),
+        worker: h_hard.clone(),
+        reviewer: h_hard.clone(),
+        verifier: h_hard,
+    };
+    let outcome_hard = drive(cfg_hard, harnesses_hard).await.unwrap();
+    assert_eq!(outcome_hard, Outcome::Finished { ok: true });
+    assert_eq!(hard_calls.load(Ordering::SeqCst), 2, "205-line contract must trigger planner repair");
+}

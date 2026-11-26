@@ -1360,6 +1360,10 @@ impl Driver {
         };
         if let Err(found) = check_plan(&checked, &drafts, &existing) {
             errors.extend(found);
+        } else {
+            for warning in tm_core::plan_warnings(&checked) {
+                eprintln!("taskmaster: warning: {warning}");
+            }
         }
         // Plan-vs-prompt consistency check: flag contract constants contradicting the user prompt
         // and require a locked acceptance contract test when the prompt specifies literal I/O examples.

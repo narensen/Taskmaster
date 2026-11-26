@@ -54,6 +54,9 @@ pub struct WorktreeGate {
     /// Extra read-only locations, e.g. the harness's own state directory.
     readable: Vec<PathBuf>,
     read_only: bool,
+    /// Refuse filesystem reads inside the worktree (e.g. brownfield planner already given a `.flow`
+    /// repo summary), while still allowing explicit `readable` harness config directories and MCP.
+    no_file_reads: bool,
     /// The one origin the browser tool may open (`http://127.0.0.1:<port>`). `None` refuses
     /// every browser call.
     browser: Option<String>,
@@ -76,6 +79,7 @@ impl WorktreeGate {
             allowed_tool_prefixes,
             readable: Vec::new(),
             read_only: false,
+            no_file_reads: false,
             browser: None,
             shell: false,
             fetch_hosts: Vec::new(),
@@ -115,6 +119,14 @@ impl WorktreeGate {
     /// Refuse every edit, for reviewers and verifiers.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// Refuse direct filesystem reads inside the worktree (used when the planner already receives
+    /// a `.flow` repository summary and touched-symbol map). Extra `readable` harness directories
+    /// and allowed MCP tool prefixes remain accessible.
+    pub fn without_file_reads(mut self) -> Self {
+        self.no_file_reads = true;
         self
     }
 
@@ -187,7 +199,8 @@ impl WorktreeGate {
 
     fn readable(&self, path: &Path) -> bool {
         let resolved = self.resolve(path);
-        resolved.starts_with(&self.root) || self.readable.iter().any(|r| resolved.starts_with(r))
+        (!self.no_file_reads && resolved.starts_with(&self.root))
+            || self.readable.iter().any(|r| resolved.starts_with(r))
     }
 
     fn resolve(&self, path: &Path) -> PathBuf {
@@ -475,5 +488,19 @@ mod tests {
 
         let read_meta = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/.flow/meta.json"]);
         assert_eq!(g.decide(&read_meta), Decision::Allow);
+    }
+
+    #[test]
+    fn without_file_reads_denies_worktree_reads_but_keeps_harness_state_and_dictionary() {
+        let g = gate()
+            .read_only()
+            .without_file_reads()
+            .with_readable("/nonexistent/home/.claude");
+        let repo_read = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/pkg/store.py"]);
+        let state_read = request("view_file", ToolKind::Read, &["/nonexistent/home/.claude/settings.json"]);
+        let dict_call = request("mcp__dictionary__flow_query", ToolKind::Dictionary, &[]);
+        assert_eq!(g.decide(&repo_read), Decision::Deny);
+        assert_eq!(g.decide(&state_read), Decision::Allow);
+        assert_eq!(g.decide(&dict_call), Decision::Allow);
     }
 }

@@ -12,6 +12,8 @@ use crate::update::ensure_fresh;
 pub const DEFAULT_UNIT_MAP_BUDGET: usize = 6_000;
 /// Larger character budget for repairs and integrator units (~3k tokens).
 pub const REPAIR_UNIT_MAP_BUDGET: usize = 12_000;
+/// Default character budget for a brownfield planner's `.flow` repo summary + touched-symbol map.
+pub const PLANNER_REPO_SUMMARY_BUDGET: usize = 6_000;
 
 /// True when `unit_id` imports or calls symbols from 3 or more distinct other units.
 pub fn is_integrator_unit(tree: &Path, unit_id: &str) -> bool {
@@ -506,6 +508,89 @@ pub fn preinjected_context(
             out.push_str(&note);
         }
     }
+
+    // Append bounded on-disk source snippets for targeted/owned symbols within remaining budget
+    // so brownfield workers can edit directly without calling `read_file` on injected spans.
+    let remaining_for_src = budget_chars.saturating_sub(out.len());
+    if remaining_for_src >= 140 {
+        let mut src_candidates: Vec<(u8, &Node)> = Vec::new();
+        for target in targets.iter().take(written) {
+            if target.span[0] == 0 || target.path.is_empty() {
+                continue;
+            }
+            let is_owned = owned_file_set.contains(&target.path);
+            let is_mentioned = !task_text.trim().is_empty()
+                && symbol_mentioned_in_text(
+                    target,
+                    task_text,
+                    bare_name_counts.get(target.name.as_str()).copied().unwrap_or(0),
+                );
+            if !is_owned && !is_mentioned {
+                continue;
+            }
+            let prio = match (is_owned, is_mentioned) {
+                (true, true) => 0,
+                (false, true) => 1,
+                (true, false) => 2,
+                (false, false) => 3,
+            };
+            src_candidates.push((prio, target));
+        }
+        src_candidates.sort_by(|(pa, a), (pb, b)| {
+            pa.cmp(pb)
+                .then_with(|| a.parent.is_some().cmp(&b.parent.is_some()))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.span[0].cmp(&b.span[0]))
+        });
+        let src_header = "### Target symbol source (already read from disk — do NOT call read_file on these spans):\n";
+        let mut src_buf = String::new();
+        let mut included_parents: BTreeSet<&str> = BTreeSet::new();
+        let mut src_count = 0usize;
+        for (_, target) in src_candidates {
+            if src_count >= 4 {
+                break;
+            }
+            if target.parent.as_deref().is_some_and(|p| included_parents.contains(p)) {
+                continue;
+            }
+            let Ok(Some(slice)) = q.source(&target.id) else {
+                continue;
+            };
+            if slice.code.trim().is_empty() {
+                continue;
+            }
+            let body = if slice.code.len() <= 900 {
+                slice.code
+            } else {
+                let mut end = 900;
+                while end > 0 && !slice.code.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let cut = slice.code[..end].rfind('\n').unwrap_or(end);
+                format!("{}\n... (truncated)", &slice.code[..cut])
+            };
+            let entry = format!(
+                "- {}:{}-{} ({}):\n```\n{}\n```\n",
+                slice.path,
+                slice.span[0],
+                slice.span[1],
+                qualified_label(target),
+                body,
+            );
+            let header_len = if src_buf.is_empty() { src_header.len() } else { 0 };
+            if out.len() + header_len + src_buf.len() + entry.len() > budget_chars {
+                continue;
+            }
+            src_buf.push_str(&entry);
+            included_parents.insert(target.id.as_str());
+            src_count += 1;
+        }
+        if !src_buf.is_empty() {
+            out.push_str(src_header);
+            out.push_str(&src_buf);
+        }
+    }
+
     if out.len() > budget_chars {
         while out.len() > budget_chars {
             if let Some(pos) = out[..out.len().saturating_sub(1)].rfind('\n') {
@@ -521,6 +606,255 @@ pub fn preinjected_context(
         }
     }
     Ok(out)
+}
+
+/// Render a budget-capped `.flow` repository summary + touched-symbol map for brownfield planning.
+///
+/// Gives the planner:
+/// 1. Prompt-matched / touched symbols with signatures, file:span, callers, and 1-hop neighbors.
+/// 2. Compact module & symbol overview across all built files in the repository.
+///
+/// Returns an empty string when `.flow` has no built source files (e.g. greenfield repos or repos
+/// with only unparsed static assets), allowing callers to fall back cleanly to `repomap`.
+pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::Result<String> {
+    if budget_chars < 128 {
+        return Ok(String::new());
+    }
+    let db = FlowDb::open_or_rebuild(tree)?;
+    let all_nodes = db.all_nodes()?;
+    let built_nodes: Vec<&Node> = all_nodes
+        .iter()
+        .filter(|n| n.status == NodeStatus::Built && n.kind != NodeKind::Unit && !n.path.is_empty())
+        .collect();
+    if built_nodes.is_empty() {
+        return Ok(String::new());
+    }
+
+    let node_by_id: BTreeMap<&str, &Node> = all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut bare_name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut files_to_syms: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
+    for &n in &built_nodes {
+        files_to_syms.entry(n.path.as_str()).or_default();
+        if n.kind != NodeKind::File {
+            files_to_syms.entry(n.path.as_str()).or_default().push(n);
+            if !tm_core::is_test_path(&n.path) {
+                *bare_name_counts.entry(n.name.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // 1. Prompt-matched / touched symbols (direct symbol mention first, then file-path mention).
+    let mut touched_candidates: Vec<(u8, &Node)> = Vec::new();
+    if !prompt.trim().is_empty() {
+        for &n in &built_nodes {
+            if n.kind == NodeKind::File || tm_core::is_test_path(&n.path) {
+                continue;
+            }
+            let bare_count = bare_name_counts.get(n.name.as_str()).copied().unwrap_or(0);
+            if symbol_mentioned_in_text(n, prompt, bare_count) {
+                touched_candidates.push((0, n));
+            } else if n.parent.is_none() && path_mentioned_in_text(prompt, &n.path) {
+                touched_candidates.push((1, n));
+            }
+        }
+    }
+    touched_candidates.sort_by(|(pa, a), (pb, b)| {
+        pa.cmp(pb)
+            .then_with(|| (!a.exported).cmp(&(!b.exported)))
+            .then_with(|| a.parent.is_some().cmp(&b.parent.is_some()))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.span[0].cmp(&b.span[0]))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut touched_nodes: Vec<&Node> = Vec::new();
+    let mut seen_touched: BTreeSet<&str> = BTreeSet::new();
+    for (_, n) in touched_candidates {
+        if touched_nodes.len() >= MAX_PREINJECT_TARGETS {
+            break;
+        }
+        if seen_touched.insert(n.id.as_str()) {
+            touched_nodes.push(n);
+        }
+    }
+
+    let q = FlowQuery::open(tree)?;
+    let mut touched_blocks: Vec<String> = Vec::new();
+    for target in &touched_nodes {
+        if let Some(detail) = q.node(&target.id)? {
+            touched_blocks.push(format_preinjected_node(
+                &detail.node,
+                &detail.incoming,
+                &detail.outgoing,
+                &node_by_id,
+            ));
+        }
+    }
+
+    // 2. Repository modules & symbols overview (production files before tests).
+    let mut file_paths: Vec<&str> = files_to_syms.keys().copied().collect();
+    file_paths.sort_by(|a, b| {
+        tm_core::is_test_path(a)
+            .cmp(&tm_core::is_test_path(b))
+            .then_with(|| a.cmp(b))
+    });
+    let mut overview_lines: Vec<String> = Vec::with_capacity(file_paths.len());
+    for path in file_paths {
+        let syms = files_to_syms.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let mut top: Vec<&Node> = syms.iter().copied().filter(|n| n.parent.is_none()).collect();
+        top.sort_by(|a, b| {
+            (!a.exported)
+                .cmp(&(!b.exported))
+                .then_with(|| a.span[0].cmp(&b.span[0]))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if top.is_empty() {
+            overview_lines.push(format!("- {path}\n"));
+        } else {
+            let shown: Vec<String> = top
+                .iter()
+                .take(10)
+                .map(|n| {
+                    if n.span[0] > 0 && n.span[1] >= n.span[0] {
+                        format!("{} (L{}-{})", n.name, n.span[0], n.span[1])
+                    } else {
+                        n.name.clone()
+                    }
+                })
+                .collect();
+            let extra = top.len().saturating_sub(shown.len());
+            let suffix = if extra > 0 {
+                format!(", +{extra} more")
+            } else {
+                String::new()
+            };
+            overview_lines.push(format!("- {path}: {}{suffix}\n", shown.join(", ")));
+        }
+    }
+
+    let header = "## Repository summary (.flow)\n";
+    let touched_title = "Touched / prompt-matched symbols (signatures, callers & 1-hop neighbors):\n";
+    let overview_title = "Modules & symbols:\n";
+    let avail = budget_chars.saturating_sub(header.len());
+    let overview_need: usize = if overview_lines.is_empty() {
+        0
+    } else {
+        overview_title.len() + overview_lines.iter().map(String::len).sum::<usize>()
+    };
+    let touched_need: usize = if touched_blocks.is_empty() {
+        0
+    } else {
+        touched_title.len() + touched_blocks.iter().map(String::len).sum::<usize>()
+    };
+    let touched_cap = if touched_need == 0 {
+        0
+    } else if touched_need + overview_need <= avail {
+        touched_need
+    } else {
+        let min_overview = overview_need.min((avail * 40) / 100);
+        avail.saturating_sub(min_overview).min(touched_need)
+    };
+
+    let mut out = String::with_capacity(budget_chars.min(4096));
+    out.push_str(header);
+
+    if touched_cap >= touched_title.len() && !touched_blocks.is_empty() {
+        let mut sec = String::with_capacity(touched_cap);
+        sec.push_str(touched_title);
+        let mut written = 0usize;
+        for block in &touched_blocks {
+            let remaining_after = touched_blocks.len().saturating_sub(written + 1);
+            let reserve = if remaining_after > 0 { 28 } else { 0 };
+            if sec.len() + block.len() + reserve > touched_cap {
+                if written == 0
+                    && let Some(first_line) = block.lines().next()
+                {
+                    let max_line = touched_cap.saturating_sub(sec.len() + 1);
+                    let trimmed = format!("{}\n", clip_inline(first_line, max_line));
+                    if sec.len() + trimmed.len() <= touched_cap {
+                        sec.push_str(&trimmed);
+                        written += 1;
+                    }
+                }
+                break;
+            }
+            sec.push_str(block);
+            written += 1;
+        }
+        if written > 0 {
+            if written < touched_blocks.len() {
+                let note = format!("... (+{} more symbols)\n", touched_blocks.len() - written);
+                if sec.len() + note.len() <= touched_cap {
+                    sec.push_str(&note);
+                }
+            }
+            out.push_str(&sec);
+        }
+    }
+
+    let overview_cap = budget_chars.saturating_sub(out.len());
+    if overview_cap >= overview_title.len() && !overview_lines.is_empty() {
+        let mut sec = String::with_capacity(overview_cap);
+        sec.push_str(overview_title);
+        let mut written = 0usize;
+        for line in &overview_lines {
+            let remaining_after = overview_lines.len().saturating_sub(written + 1);
+            let reserve = if remaining_after > 0 { 24 } else { 0 };
+            if sec.len() + line.len() + reserve > overview_cap {
+                if written == 0 {
+                    let max_line = overview_cap.saturating_sub(sec.len() + 1);
+                    let trimmed = format!("{}\n", clip_inline(line.trim_end(), max_line));
+                    if sec.len() + trimmed.len() <= overview_cap {
+                        sec.push_str(&trimmed);
+                        written += 1;
+                    }
+                }
+                break;
+            }
+            sec.push_str(line);
+            written += 1;
+        }
+        if written > 0 {
+            if written < overview_lines.len() {
+                let note = format!("... (+{} more files)\n", overview_lines.len() - written);
+                if sec.len() + note.len() <= overview_cap {
+                    sec.push_str(&note);
+                }
+            }
+            out.push_str(&sec);
+        }
+    }
+
+    if out.len() <= header.len() {
+        return Ok(String::new());
+    }
+    if out.len() > budget_chars {
+        while out.len() > budget_chars {
+            if let Some(pos) = out[..out.len().saturating_sub(1)].rfind('\n') {
+                out.truncate(pos + 1);
+            } else {
+                let mut end = budget_chars;
+                while end > 0 && !out.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.truncate(end);
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn path_mentioned_in_text(text: &str, rel_path: &str) -> bool {
+    if text.contains(rel_path) {
+        return true;
+    }
+    let Some(file_name) = Path::new(rel_path).file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if file_name.len() < 4 || matches!(file_name, "__init__.py" | "mod.rs" | "lib.rs" | "index.ts" | "index.js" | "main.py") {
+        return false;
+    }
+    contains_ident(text, file_name)
 }
 
 fn format_preinjected_node(
@@ -996,6 +1330,10 @@ mod tests {
         assert!(pre.contains("handle_insert"), "expected caller handle_insert:\n{pre}");
         assert!(pre.contains("neighbors(1-hop):"), "expected 1-hop neighbors:\n{pre}");
         assert!(pre.contains("encode_row"), "expected outgoing neighbor encode_row:\n{pre}");
+        assert!(
+            pre.contains("### Target symbol source") && pre.contains("return encode_row(row)"),
+            "expected bounded source span for pre-injected target symbol:\n{pre}"
+        );
         assert!(pre.len() <= 2000, "len {} exceeded budget 2000", pre.len());
 
         // Later-wave case: owned file does not exist yet, task mentions existing built symbol.
@@ -1022,6 +1360,48 @@ mod tests {
         .unwrap();
         assert!(!tight.is_empty());
         assert!(tight.len() <= 260, "tight len {} exceeded 260:\n{tight}", tight.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_summary_renders_touched_symbols_and_module_overview_within_budget() {
+        let dir = temp_repo("summary");
+        std::fs::write(
+            dir.join("tinydb/codec.py"),
+            "def encode_row(row: dict) -> bytes:\n    return str(row).encode()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tinydb/store.py"),
+            "from tinydb.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        return encode_row(row)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tinydb/api.py"),
+            "from tinydb.store import StoreEngine\n\ndef handle_insert(engine: StoreEngine, row: dict) -> bytes:\n    return engine.persist_row(row)\n",
+        )
+        .unwrap();
+        build(&dir).unwrap();
+
+        let summary = repo_summary(
+            &dir,
+            "Update StoreEngine.persist_row in store.py to reject empty rows and keep handle_insert callers working.",
+            PLANNER_REPO_SUMMARY_BUDGET,
+        )
+        .unwrap();
+        assert!(summary.contains("## Repository summary (.flow)"), "{summary}");
+        assert!(summary.contains("Touched / prompt-matched symbols"), "{summary}");
+        assert!(summary.contains("py:tinydb/store.py#StoreEngine.persist_row"), "{summary}");
+        assert!(summary.contains("handle_insert"), "{summary}");
+        assert!(summary.contains("Modules & symbols:"), "{summary}");
+        assert!(summary.contains("tinydb/codec.py: encode_row"), "{summary}");
+        assert!(summary.contains("tinydb/store.py: StoreEngine"), "{summary}");
+        assert!(summary.len() <= PLANNER_REPO_SUMMARY_BUDGET, "summary exceeded budget: {}", summary.len());
+
+        let tight = repo_summary(&dir, "Update StoreEngine.persist_row", 280).unwrap();
+        assert!(!tight.is_empty());
+        assert!(tight.len() <= 280, "tight len {} exceeded 280:\n{tight}", tight.len());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

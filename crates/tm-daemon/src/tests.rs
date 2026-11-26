@@ -12253,3 +12253,153 @@ async fn tok12_dedupes_context_dict_contracts_uses_repo_relative_env_and_shorten
     assert!(!store_brief.contains("Other parallel workers in this run:"));
     assert!(prefix.contains("\nCode graph:"));
 }
+
+#[tokio::test]
+async fn tok13_brownfield_planner_gets_flow_summary_without_file_reads_and_workers_get_anti_double_read_preinjection() {
+    use tm_harness::{Decision, PermissionGate, PermissionRequest, ToolKind};
+
+    let tmp = seeded("tok13-brownfield");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/codec.py"),
+        "def encode_row(row: dict) -> bytes:\n    return str(row).encode()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/store.py"),
+        "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        return encode_row(row)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("pkg/api.py"),
+        "from pkg.store import StoreEngine\n\ndef handle_insert(engine: StoreEngine, row: dict) -> bytes:\n    return engine.persist_row(row)\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "brownfield baseline"]);
+
+    let planner_briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_read_denied: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_dict_allowed: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let planner_code_mode: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let worker_briefs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct BrownfieldHarness {
+        planner_briefs: Arc<Mutex<Vec<String>>>,
+        planner_read_denied: Arc<Mutex<Vec<bool>>>,
+        planner_dict_allowed: Arc<Mutex<Vec<bool>>>,
+        planner_code_mode: Arc<Mutex<Vec<bool>>>,
+        worker_briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for BrownfieldHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Plan this") {
+                self.planner_briefs.lock().unwrap().push(task.brief.clone());
+                self.planner_code_mode.lock().unwrap().push(task.code_mode);
+                let repo_read = PermissionRequest {
+                    tool: "read_file".into(),
+                    kind: ToolKind::Read,
+                    paths: vec![task.cwd.join("pkg/store.py")],
+                    command: None,
+                    url: None,
+                };
+                let dict_call = PermissionRequest {
+                    tool: "mcp__dictionary__flow_query".into(),
+                    kind: ToolKind::Dictionary,
+                    paths: vec![],
+                    command: None,
+                    url: None,
+                };
+                self.planner_read_denied
+                    .lock()
+                    .unwrap()
+                    .push(gate.decide(&repo_read) == Decision::Deny);
+                self.planner_dict_allowed
+                    .lock()
+                    .unwrap()
+                    .push(gate.decide(&dict_call) == Decision::Allow);
+                let plan_json = serde_json::json!({
+                    "summary": "Validate empty rows in StoreEngine.persist_row and update encode_row",
+                    "kind": "library",
+                    "contracts": [],
+                    "units": [
+                        {
+                            "id": "store",
+                            "owned_glob": "pkg/store.py",
+                            "brief": "Update StoreEngine.persist_row to reject empty rows.",
+                            "context": "",
+                            "done": "StoreEngine.persist_row validates non-empty rows"
+                        }
+                    ],
+                    "dictionary": []
+                })
+                .to_string();
+                let _ = events.send(HarnessEvent::Text { text: plan_json }).await;
+            } else {
+                self.worker_briefs.lock().unwrap().push(task.brief.clone());
+                std::fs::write(
+                    task.cwd.join("pkg/store.py"),
+                    "from pkg.codec import encode_row\n\nclass StoreEngine:\n    def persist_row(self, row: dict) -> bytes:\n        if not row:\n            raise ValueError('empty')\n        return encode_row(row)\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:store\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(BrownfieldHarness {
+        planner_briefs: planner_briefs.clone(),
+        planner_read_denied: planner_read_denied.clone(),
+        planner_dict_allowed: planner_dict_allowed.clone(),
+        planner_code_mode: planner_code_mode.clone(),
+        worker_briefs: worker_briefs.clone(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "tok13".into();
+    cfg.prompt = Some(
+        "Update StoreEngine.persist_row in pkg/store.py to validate empty rows and add multi-module error handling across storage and codec."
+            .into(),
+    );
+    cfg.yes = true;
+    cfg.parallel = 2;
+    cfg.timeout = Duration::from_secs(30);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = true;
+    cfg.fast_path = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    // 1. Planner received `.flow` repo summary + touched-symbol map instead of file-reading tools.
+    let pbriefs = planner_briefs.lock().unwrap();
+    assert_eq!(pbriefs.len(), 1, "expected 1 planner call");
+    let pbrief = &pbriefs[0];
+    assert!(pbrief.contains("## Repository summary (.flow)"), "{pbrief}");
+    assert!(pbrief.contains("Touched / prompt-matched symbols"), "{pbrief}");
+    assert!(pbrief.contains("py:pkg/store.py#StoreEngine.persist_row"), "{pbrief}");
+    assert!(pbrief.contains("Modules & symbols:"), "{pbrief}");
+    assert!(pbrief.contains("without reading repo files"), "{pbrief}");
+    assert_eq!(*planner_code_mode.lock().unwrap(), vec![false], "brownfield planner with .flow summary must not get read-only Code Mode file tools");
+    assert_eq!(*planner_read_denied.lock().unwrap(), vec![true], "brownfield planner WorktreeGate must deny repo read_file calls");
+    assert_eq!(*planner_dict_allowed.lock().unwrap(), vec![true], "brownfield planner keeps dictionary/flow_query access");
+
+    // 2. Worker received pre-injected target symbol metadata + source AND anti-double-read rule.
+    let wbriefs = worker_briefs.lock().unwrap();
+    assert_eq!(wbriefs.len(), 1, "expected 1 worker call");
+    let wbrief = &wbriefs[0];
+    assert!(wbrief.contains("## Pre-injected flow context (existing code)"), "{wbrief}");
+    assert!(wbrief.contains("py:pkg/store.py#StoreEngine.persist_row"), "{wbrief}");
+    assert!(wbrief.contains("### Target symbol source"), "{wbrief}");
+    assert!(wbrief.contains("return encode_row(row)"), "{wbrief}");
+    assert!(wbrief.contains("Anti-double-read rule:") && wbrief.contains("do NOT call `read_file`"), "{wbrief}");
+}

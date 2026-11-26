@@ -469,21 +469,26 @@ pub fn is_quick_edit(prompt: &str, existing_files: usize) -> bool {
 }
 
 /// Fast single-shot planning brief for scoped edits in an existing repo, powered by the
-/// deterministic repo map so the planner skips slow file-discovery tool calls.
+/// `.flow` repository summary (or deterministic repo map fallback) so the planner skips file-reading turns.
 pub fn quick_edit_brief(
     prompt: &str,
-    repo_map: &str,
+    repo_summary: &str,
+    uses_flow_summary: bool,
     entries: &[String],
     slots: usize,
     worker_label: Option<&str>,
 ) -> String {
+    let intro = if uses_flow_summary {
+        "Plan this small product quickly. This is a focused edit in an existing repository — the `.flow` repository summary and touched-symbol map below already cover the codebase structure and target symbols; plan directly from it without reading repo files (`read_file`, `ls`, `grep`, and `readMany` are disabled for planning)."
+    } else {
+        "Plan this small product quickly. This is a focused edit in an existing repository — everything you need is in the repository map below; avoid slow exploration tool calls (or batch at most one read-only `run_code` `readMany` call if you must check a specific file)."
+    };
     let mut brief = format!(
-        "Plan this small product quickly. This is a focused edit in an existing repository — everything you need is in the repository map below; \
-         avoid slow exploration tool calls (or batch at most one read-only `run_code` `readMany` call if you must check a specific file).\n\n{}\nRequest:\n{prompt}\n\n",
+        "{intro}\n\n{}\nRequest:\n{prompt}\n\n",
         worker_pool_rule(slots, worker_label),
     );
-    if !repo_map.is_empty() {
-        brief.push_str(repo_map);
+    if !repo_summary.is_empty() {
+        brief.push_str(repo_summary);
         brief.push('\n');
     }
     if !entries.is_empty() {

@@ -152,6 +152,8 @@ struct AgentRequest {
     /// Silence, with no tool running, after which the agent is replaced by a fresh one.
     stall: Option<Duration>,
     read_only: bool,
+    /// Refuse direct filesystem reads inside the worktree (brownfield planner already given a `.flow` summary).
+    no_file_reads: bool,
     /// Where the agent's events go as they arrive, tagged with who it is.
     feed: Option<Feed>,
     /// The page's own preview origin, when the agent has the browser tool.
@@ -1376,9 +1378,15 @@ impl Driver {
         let quick = !self.small && self.quick_edit_pass(prompt);
         let single_phase = !self.small && self.single_phase_pass(prompt);
         let fresh = self.fresh_project(prompt)?;
+        let has_flow_summary = !self.small && !fresh && !self.planner_flow_summary(prompt).is_empty();
         if self.small || fresh {
             // Every stored entry is in the brief, so the master needs no tools.
             request.dictionary = None;
+        } else if has_flow_summary {
+            // Brownfield repo with a `.flow` summary + touched-symbol map: block direct file
+            // reading (`read_file`/`ls`/`grep`/`readMany`) so the planner plans directly from
+            // the graph summary instead of burning turns reading source files.
+            request.no_file_reads = true;
         } else {
             self.offer_code_readonly("master", &cwd, &mut request);
         }
@@ -2033,6 +2041,16 @@ impl Driver {
         }
     }
 
+    /// Render the `.flow` repository summary and touched-symbol map for brownfield planning.
+    /// Returns empty on greenfield runs or repos with no parsed `.flow` source files.
+    fn planner_flow_summary(&self, prompt: &str) -> String {
+        if self.existing_files() == 0 {
+            return String::new();
+        }
+        tm_flow::repo_summary(&self.tree, prompt, tm_flow::PLANNER_REPO_SUMMARY_BUDGET)
+            .unwrap_or_default()
+    }
+
     fn planner_brief_inner(&self, prompt: &str, errors: &[String]) -> anyhow::Result<String> {
         let worker = self.worker_label();
         if self.small_pass(prompt) {
@@ -2047,8 +2065,18 @@ impl Driver {
             }
             return Ok(brief);
         }
+        let flow_summary = self.planner_flow_summary(prompt);
+        let has_flow_summary = !flow_summary.is_empty();
         if self.quick_edit_pass(prompt) {
-            let mut brief = crate::small::quick_edit_brief(prompt, &self.repo_map, &self.entry_listing(prompt)?, self.parallel, Some(&worker));
+            let summary = if has_flow_summary { flow_summary.as_str() } else { self.repo_map.as_str() };
+            let mut brief = crate::small::quick_edit_brief(
+                prompt,
+                summary,
+                has_flow_summary,
+                &self.entry_listing(prompt)?,
+                self.parallel,
+                Some(&worker),
+            );
             if !errors.is_empty() {
                 brief.push_str("\nThe last plan was rejected:\n");
                 for error in errors {
@@ -2061,6 +2089,10 @@ impl Driver {
         let look = if self.fresh_project(prompt)? {
             "The project is empty and every Dictionary entry already stored is listed below, so you need no tools: \
              do not call any, and plan from this brief alone."
+        } else if has_flow_summary {
+            "The `.flow` repository summary and touched-symbol map above already cover the existing codebase and target symbols. \
+             Plan directly from it without reading repo files (`read_file`, `ls`, `grep`, and `readMany` are disabled for planning). \
+             Search the Dictionary before inventing a key."
         } else {
             "Search the Dictionary before inventing a key."
         };
@@ -2070,7 +2102,10 @@ impl Driver {
              {pool}\n\
              Request:\n{prompt}\n\n"
         );
-        if !self.repo_map.is_empty() {
+        if has_flow_summary {
+            brief.push_str(&flow_summary);
+            brief.push('\n');
+        } else if !self.repo_map.is_empty() {
             brief.push_str(&self.repo_map);
             brief.push('\n');
         }
@@ -3444,6 +3479,7 @@ impl Driver {
             timeout: self.config.timeout.min(Duration::from_secs(300)),
             stall: None,
             read_only: true,
+            no_file_reads: false,
             feed: None,
             browser: None,
             code_mode: false,
@@ -4966,6 +5002,7 @@ impl Driver {
             timeout: self.config.timeout,
             stall: None,
             read_only: false,
+            no_file_reads: false,
             feed: None,
             browser: None,
             code_mode: self.code.is_some(),
@@ -5137,6 +5174,7 @@ impl Driver {
             timeout: self.config.timeout,
             stall: None,
             read_only: false,
+            no_file_reads: false,
             feed: None,
             browser: None,
             code_mode: self.code.is_some(),
@@ -5411,6 +5449,7 @@ impl Driver {
             timeout: self.config.timeout,
             stall: None,
             read_only: false,
+            no_file_reads: false,
             feed: None,
             browser: None,
             code_mode: false,
@@ -6070,6 +6109,10 @@ impl Driver {
             if !pre_final.is_empty() {
                 brief.push('\n');
                 brief.push_str(&pre_final);
+                brief.push_str(
+                    "Anti-double-read rule: target symbol signatures, callers, neighbors, and source spans above are already injected from disk — \
+                     do NOT call `read_file` (or `read`/`readMany`) on what was already injected; edit directly or read only lines outside the injected spans.\n",
+                );
             }
         }
         let attached = crate::attachments::prompt_section(&self.project, &self.id);
@@ -6411,6 +6454,7 @@ impl Driver {
             timeout: self.config.timeout,
             stall: None,
             read_only: true,
+            no_file_reads: false,
             feed: None,
             browser: None,
             code_mode: false,
@@ -8788,6 +8832,9 @@ fn gate_for(request: &AgentRequest) -> Arc<dyn PermissionGate> {
     let mut gate = WorktreeGate::new(&request.cwd, dict_prefixes());
     if request.read_only {
         gate = gate.read_only();
+    }
+    if request.no_file_reads {
+        gate = gate.without_file_reads();
     }
     if let Some(origin) = &request.browser {
         gate = gate.with_browser(origin.clone());

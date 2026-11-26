@@ -13184,3 +13184,129 @@ async fn fix_n8_logs_model_requested_and_model_used_in_ledger_and_agents_jsonl()
     assert_eq!(fb_ends[0]["model_requested"], "gemini-4-hydrogen-high");
     assert_eq!(fb_ends[0]["model_used"], "gemini-4-hydrogen-high");
 }
+
+#[tokio::test]
+async fn fix_n9_per_unit_acceptance_test_runs_when_unit_finishes_and_repairs_immediately() {
+    let tmp = seeded("n9-per-unit-acceptance");
+    let core_contract = concat!(
+        "from mdtodo.storage import render_markdown\n\n",
+        "def test_storage_header():\n",
+        "    out = render_markdown(4)\n",
+        "    assert out == '# Todo\\n<!-- next-id: 4 -->\\n'\n",
+    );
+    let cli_contract = concat!(
+        "import subprocess, sys\n\n",
+        "def test_cli_outputs_header():\n",
+        "    r = subprocess.run([sys.executable, '-m', 'mdtodo'], capture_output=True, text=True)\n",
+        "    assert r.returncode == 0\n",
+        "    assert '<!-- next-id: 4 -->' in r.stdout\n",
+    );
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "tests/test_core_contract.py".into(), content: core_contract.into(), phase: 0 },
+            ContractFile { path: "tests/test_acceptance_contract.py".into(), content: cli_contract.into(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "core".into(),
+                owned_glob: "{mdtodo/__init__.py,mdtodo/storage.py}".into(),
+                brief: "Implement mdtodo/storage.py render_markdown.".into(),
+                done: "render_markdown matches contract.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "mdtodo/__main__.py".into(),
+                brief: "Implement mdtodo/__main__.py printing render_markdown(4).".into(),
+                done: "CLI prints rendered markdown.".into(),
+                depends_on: vec!["core".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    // Track exact build/repair sequence: `core` must be repaired BEFORE `cli` ever starts,
+    // proving `tests/test_core_contract.py` ran right when `core` finished (not at final verify),
+    // while `tests/test_acceptance_contract.py` waited for `cli` and did not falsely fail `core`.
+    struct OrderFake {
+        sequence: Arc<Mutex<Vec<String>>>,
+        core_attempts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for OrderFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let is_repair = task.brief.contains("Checks failed last time");
+            self.sequence
+                .lock()
+                .unwrap()
+                .push(format!("{unit}:{}", if is_repair { "repair" } else { "build" }));
+            std::fs::create_dir_all(task.cwd.join("mdtodo"))?;
+            if unit == "core" {
+                std::fs::write(task.cwd.join("mdtodo/__init__.py"), "")?;
+                let attempt = self.core_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    // Missing `<!-- next-id: N -->` header on attempt 1!
+                    std::fs::write(
+                        task.cwd.join("mdtodo/storage.py"),
+                        "def render_markdown(n: int) -> str:\n    return '# Todo\\n'\n",
+                    )?;
+                } else {
+                    assert!(
+                        task.brief.contains("test_core_contract.py") && task.brief.contains("next-id"),
+                        "per-unit acceptance repair brief must include exact failure:\n{}",
+                        task.brief
+                    );
+                    std::fs::write(
+                        task.cwd.join("mdtodo/storage.py"),
+                        "def render_markdown(n: int) -> str:\n    return f'# Todo\\n<!-- next-id: {n} -->\\n'\n",
+                    )?;
+                }
+            } else if unit == "cli" {
+                std::fs::write(
+                    task.cwd.join("mdtodo/__main__.py"),
+                    "from mdtodo.storage import render_markdown\nprint(render_markdown(4), end='')\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let sequence = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(OrderFake {
+        sequence: sequence.clone(),
+        core_attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n9-fix1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let seq = sequence.lock().unwrap().clone();
+    assert_eq!(
+        seq,
+        vec!["core:build", "core:repair", "cli:build"],
+        "core must fail its per-unit acceptance contract test and repair immediately before cli runs"
+    );
+}

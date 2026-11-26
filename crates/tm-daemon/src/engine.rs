@@ -4182,6 +4182,10 @@ impl Driver {
         }
         let _ = self.check_flow_staleness("unit_merge");
         self.commit_flow_update();
+        if let Some(acceptance_err) = self.check_unit_acceptance(page, &self.tree).await {
+            eprintln!("taskmaster: {page} failed acceptance check; sending it back for repair");
+            return Ok(failed(acceptance_err));
+        }
         self.records.mark_merged(&self.id, page, &hash)?;
         Ok(WorkerOutcome::Passed)
     }
@@ -5086,21 +5090,56 @@ impl Driver {
     /// `import_module`, `cargo run`, or script paths), through the invoked entrypoints and their
     /// import closure.
     fn units_reached<'a>(&self, owners: &Owners, tests: impl IntoIterator<Item = &'a str>) -> BTreeSet<PageId> {
-        let Ok(sources) = load_sources(&self.tree) else { return BTreeSet::new() };
+        self.units_reached_in(&self.tree, owners, tests, false)
+    }
+
+    /// Like [`Self::units_reached`], resolved against `root`. When `include_planned` is true,
+    /// concrete file paths from unbuilt units' `owned_glob`s are also considered as dynamic/import
+    /// targets so per-unit acceptance checks do not run a full-stack contract test before all
+    /// sibling units it reaches have landed.
+    fn units_reached_in<'a>(
+        &self,
+        root: &Path,
+        owners: &Owners,
+        tests: impl IntoIterator<Item = &'a str>,
+        include_planned: bool,
+    ) -> BTreeSet<PageId> {
+        let Ok(sources) = load_sources(root) else { return BTreeSet::new() };
         let graph = ImportGraph::build(&sources, "");
         let test_files: Vec<String> = tests.into_iter().map(str::to_string).collect();
         let mut reached = BTreeSet::new();
         let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
         let mut stack: Vec<(String, bool)> = test_files.iter().cloned().map(|f| (f, false)).collect();
 
+        let planned_paths: BTreeSet<String> = if include_planned
+            && let Ok(plan) = self.plan()
+        {
+            plan.pages
+                .iter()
+                .flat_map(|p| crate::gates::concrete_paths_in_glob(&p.owned_glob))
+                .filter(|p| !tm_core::is_test_path(p))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+
         // Discover dynamic/subprocess CLI targets referenced by the contract test files
         // (such as `subprocess.run([sys.executable, "-m", "tinydb", ...])`).
-        let dynamic_targets = extract_dynamic_test_targets(&self.tree, &test_files, &sources);
+        let dynamic_targets = extract_dynamic_test_targets(root, &test_files, &sources, &planned_paths);
         for target in dynamic_targets {
             if let Some(page) = owners.owner(&target) {
                 reached.insert(page.clone());
             }
             stack.push((target, true));
+        }
+        // When checking planned reachability before all sibling units exist on disk, also resolve
+        // direct Python/JS/TS imports in `test_files` against planned concrete source paths.
+        if !planned_paths.is_empty() {
+            for target in extract_planned_import_targets(root, &test_files, &sources, &planned_paths) {
+                if let Some(page) = owners.owner(&target) {
+                    reached.insert(page.clone());
+                }
+            }
         }
 
         while let Some((file, traverse_owned)) = stack.pop() {
@@ -5922,89 +5961,160 @@ impl Driver {
         })
     }
 
+    /// True when `page`'s files have already landed in the run's tree (either passed or merged
+    /// earlier in this run, even if currently queued for repair).
+    fn unit_has_landed(&self, page: &str) -> bool {
+        self.run
+            .pages
+            .get(page)
+            .is_some_and(|st| st.state == tm_core::PageState::Passed)
+            || self.page_was_built_in_run(page)
+    }
+
+    /// Locked contract test files (excluding later-phase tests) that reach `page`'s owned files
+    /// and whose other reached units have already landed in `root`.
+    fn relevant_acceptance_tests(&self, page: &str, root: &Path) -> Vec<String> {
+        let Ok(plan) = self.plan() else { return Vec::new() };
+        let Ok(owners) = Owners::from_plan(plan) else { return Vec::new() };
+        let later_tests = self.later_phase_test_contracts();
+        let mut targets = Vec::new();
+        for c in &plan.contracts {
+            if !tm_core::is_test_path(&c.path)
+                || later_tests.contains(&c.path)
+                || !root.join(&c.path).is_file()
+                || targets.contains(&c.path)
+            {
+                continue;
+            }
+            let reached = self.units_reached_in(root, &owners, [c.path.as_str()], true);
+            if !reached.contains(page) {
+                continue;
+            }
+            let touches_unlanded = reached.iter().any(|u| u != page && !self.unit_has_landed(u));
+            if !touches_unlanded {
+                targets.push(c.path.clone());
+            }
+        }
+        targets
+    }
+
+    /// Run runtime test steps in `root`, scoping pytest steps to `targets` when non-empty.
+    /// Returns `None` when runtime checks are disabled, no test runner applies, or tests pass.
+    async fn run_scoped_tests(&self, root: &Path, targets: &[String]) -> Option<runtime::Failure> {
+        if !self.config.runtime_checks {
+            return None;
+        }
+        if !runtime::has_tests(root) && !runtime::python_tests(root) {
+            return None;
+        }
+        let mut steps = runtime::steps(root, &self.verify_venv());
+        if !steps.iter().any(|s| !s.setup) {
+            return None;
+        }
+        let later_tests = self.later_phase_test_contracts();
+        runtime::deselect_test_paths(&mut steps, &later_tests);
+        if !targets.is_empty() {
+            for step in &mut steps {
+                if runtime::is_pytest_step(step) {
+                    step.args.extend(targets.iter().cloned());
+                }
+            }
+        }
+        let (_, failure) = runtime::run_steps(
+            root,
+            &steps,
+            checks::STEP_TIMEOUT.min(Duration::from_secs(90)),
+        )
+        .await;
+        failure
+    }
+
+    /// Run locked acceptance contract tests that reach `page` as soon as `page` finishes
+    /// (once any other units those tests reach have landed), so contract regressions are caught
+    /// per unit instead of waiting for final verify.
+    async fn check_unit_acceptance(&self, page: &str, root: &Path) -> Option<String> {
+        if !self.config.runtime_checks {
+            return None;
+        }
+        let targets = self.relevant_acceptance_tests(page, root);
+        if targets.is_empty() {
+            return None;
+        }
+        eprintln!("taskmaster: checking {page} against acceptance test(s): {}", targets.join(", "));
+        self.terminal(
+            "command",
+            serde_json::json!({
+                "command": format!("acceptance check for {page}: {}", targets.join(", ")),
+                "cwd": root.display().to_string(),
+            }),
+        );
+        let failure = self.run_scoped_tests(root, &targets).await;
+        match failure {
+            None => {
+                self.terminal(
+                    "output",
+                    serde_json::json!({ "ok": true, "step": "test", "text": format!("acceptance check passed for {page}") }),
+                );
+                None
+            }
+            Some(failure) => {
+                self.terminal(
+                    "output",
+                    serde_json::json!({ "ok": false, "step": failure.step, "text": clip(&failure.output, 2500) }),
+                );
+                // If the traceback exclusively names another unit's owned file (not `page` and not
+                // the contract test itself), let final verify route that bug to its actual owner.
+                if let Ok(plan) = self.plan()
+                    && let Ok(owners) = Owners::from_plan(plan)
+                {
+                    let (pages, rest) = runtime::attribute(&failure.output, &owners, &[]);
+                    if rest.trim().is_empty() && !pages.is_empty() && !pages.contains_key(page) {
+                        return None;
+                    }
+                }
+                let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+                Some(format!(
+                    "`{}` failed on {}:\n{}\n{}",
+                    failure.step,
+                    targets.join(", "),
+                    clip(&failure.output, 2500),
+                    contract_test_note(&refs)
+                ))
+            }
+        }
+    }
+
     /// Run a focused test check before accepting a no-change unit as done. Returns `Some(errors)`
     /// when its own tests or applicable acceptance/contract tests fail.
     async fn check_no_change_unit(&self, page: &str, worktree: &Path) -> Option<String> {
         if !self.config.runtime_checks {
             return None;
         }
-        if !runtime::has_tests(worktree) && !runtime::python_tests(worktree) {
-            return None;
-        }
-        let mut steps = runtime::steps(worktree, &self.verify_venv());
-        if !steps.iter().any(|s| !s.setup) {
-            return None;
-        }
-        let later_tests = self.later_phase_test_contracts();
-        runtime::deselect_test_paths(&mut steps, &later_tests);
-        // When sibling units in the current phase have not landed yet, scope pytest to this unit's
-        // own test files + locked contract tests (if any) so we check what this unit is responsible for
-        // without blaming it for unbuilt peers.
+        let mut targets: Vec<String> = Vec::new();
         if let Ok(plan) = self.plan()
             && let Ok(unit) = self.page(page)
             && let Ok(glob) = globset::Glob::new(&unit.owned_glob)
         {
             let matcher = glob.compile_matcher();
-            let unbuilt_siblings = plan.pages.iter().any(|p| {
-                p.id != page
-                    && p.phase == unit.phase
-                    && self
-                        .run
-                        .pages
-                        .get(&p.id)
-                        .is_some_and(|st| st.state != tm_core::PageState::Passed)
-            });
+            let unbuilt_siblings = plan
+                .pages
+                .iter()
+                .any(|p| p.id != page && p.phase == unit.phase && !self.unit_has_landed(&p.id));
             if unbuilt_siblings {
-                let mut targets: Vec<String> = git::tracked_files(worktree)
+                targets = git::tracked_files(worktree)
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|f| matcher.is_match(f) && tm_core::is_test_path(f))
                     .collect();
-                // Include locked contract tests only when this unit has no unbuilt dependencies
-                // AND the contract test does not also depend on another still-unbuilt sibling.
-                let deps_landed = unit.depends_on.iter().all(|dep| {
-                    self.run
-                        .pages
-                        .get(dep)
-                        .is_some_and(|st| st.state == tm_core::PageState::Passed)
-                });
-                if deps_landed && let Ok(owners) = Owners::from_plan(plan) {
-                    for c in &plan.contracts {
-                        if tm_core::is_test_path(&c.path)
-                            && !later_tests.contains(&c.path)
-                            && worktree.join(&c.path).is_file()
-                            && !targets.contains(&c.path)
-                        {
-                            let touches_unbuilt = self.units_reached(&owners, [c.path.as_str()]).iter().any(|u| {
-                                u != page
-                                    && self
-                                        .run
-                                        .pages
-                                        .get(u)
-                                        .is_some_and(|st| st.state != tm_core::PageState::Passed)
-                            });
-                            if !touches_unbuilt {
-                                targets.push(c.path.clone());
-                            }
-                        }
-                    }
-                }
-                if !targets.is_empty() {
-                    for step in &mut steps {
-                        if runtime::is_pytest_step(step) {
-                            step.args.extend(targets.iter().cloned());
-                        }
+                for test in self.relevant_acceptance_tests(page, worktree) {
+                    if !targets.contains(&test) {
+                        targets.push(test);
                     }
                 }
             }
         }
-        let (_, failure) = runtime::run_steps(
-            worktree,
-            &steps,
-            checks::STEP_TIMEOUT.min(Duration::from_secs(90)),
-        )
-        .await;
-        failure.map(|f| format!("`{}` failed:\n{}", f.step, clip(&f.output, 2500)))
+        let failure = self.run_scoped_tests(worktree, &targets).await?;
+        Some(format!("`{}` failed:\n{}", failure.step, clip(&failure.output, 2500)))
     }
 
     /// The id a builder of `page` runs under: `page:` for a page a browser shows, `unit:` for
@@ -8352,10 +8462,16 @@ fn extract_dynamic_test_targets(
     tree: &Path,
     test_files: &[String],
     sources: &BTreeMap<String, String>,
+    planned_paths: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut targets: BTreeSet<String> = BTreeSet::new();
-    let non_test_sources: Vec<&String> = sources.keys().filter(|p| !tm_core::is_test_path(p)).collect();
-    if non_test_sources.is_empty() {
+    let mut all_non_test: BTreeSet<String> = sources
+        .keys()
+        .filter(|p| !tm_core::is_test_path(p))
+        .cloned()
+        .collect();
+    all_non_test.extend(planned_paths.iter().cloned());
+    if all_non_test.is_empty() {
         return targets;
     }
 
@@ -8388,16 +8504,16 @@ fn extract_dynamic_test_targets(
         }
         let mut matched_entry = false;
         for candidate in [format!("{rel}/__main__.py"), format!("{rel}/__init__.py"), format!("{rel}.py")] {
-            if sources.contains_key(&candidate) {
+            if all_non_test.contains(&candidate) {
                 out.insert(candidate);
                 matched_entry = true;
             }
         }
         if !matched_entry {
             let prefix = format!("{rel}/");
-            for src in &non_test_sources {
+            for src in &all_non_test {
                 if src.starts_with(&prefix) {
-                    out.insert((*src).clone());
+                    out.insert(src.clone());
                 }
             }
         }
@@ -8434,18 +8550,56 @@ fn extract_dynamic_test_targets(
         }
         // 4. `cargo run` -> `src/main.rs`.
         if ((content.contains("cargo") && content.contains("\"run\"")) || content.contains("cargo run"))
-            && sources.contains_key("src/main.rs")
+            && all_non_test.contains("src/main.rs")
         {
             targets.insert("src/main.rs".to_string());
         }
-        // 5. Explicit relative paths to tracked non-test source files referenced in the test.
-        for src in &non_test_sources {
+        // 5. Explicit relative paths to tracked/planned non-test source files referenced in the test.
+        for src in &all_non_test {
             if src.contains('/') && content.contains(src.as_str()) {
-                targets.insert((*src).clone());
+                targets.insert(src.clone());
             }
         }
     }
     targets
+}
+
+/// Resolve direct module imports in `test_files` against `planned_paths` so contract tests that
+/// statically import a module whose unit has not been built yet still report that unit as reached.
+fn extract_planned_import_targets(
+    tree: &Path,
+    test_files: &[String],
+    sources: &BTreeMap<String, String>,
+    planned_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for test_file in test_files {
+        let content = sources
+            .get(test_file)
+            .cloned()
+            .or_else(|| fs::read_to_string(tree.join(test_file)).ok())
+            .unwrap_or_default();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            let mod_name = if let Some(rest) = trimmed.strip_prefix("from ") {
+                rest.split_whitespace().next()
+            } else if let Some(rest) = trimmed.strip_prefix("import ") {
+                rest.split([',', ' ']).next()
+            } else {
+                None
+            };
+            let Some(mod_name) = mod_name.map(|s| s.trim_start_matches('.')).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let rel = mod_name.replace('.', "/");
+            for cand in [format!("{rel}.py"), format!("{rel}/__init__.py")] {
+                if planned_paths.contains(&cand) {
+                    out.insert(cand);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn extract_python_dash_m_modules(text: &str) -> Vec<String> {

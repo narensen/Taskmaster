@@ -813,7 +813,7 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
     shared_contract_path || shared_contract_sym
 }
 
-fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
+pub(crate) fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
     let trimmed = glob.trim();
     let parts: Vec<&str> = if let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
         inner.split(',').map(str::trim).collect()

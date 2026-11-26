@@ -1077,12 +1077,15 @@ impl Driver {
         }
     }
 
-    /// Index of the first leading `SpawnWorker` command whose `depends_on` upstream units have
-    /// already passed or are satisfied by a locked interface contract (ignoring unknown IDs).
-    /// Only scans the leading contiguous `SpawnWorker` prefix so ordering barriers (checks/merge)
-    /// are never bypassed.
+    /// Index of the highest-priority ready `SpawnWorker` command in the leading contiguous
+    /// `SpawnWorker` prefix (so ordering barriers like checks/merge are never bypassed).
+    /// A unit is ready when its `depends_on` upstream units have passed or are satisfied by a
+    /// locked interface contract. Among ready units, picks the one with the longest downstream
+    /// dependency chain, tie-breaking by estimated unit size then queue position.
     fn next_ready_spawn(&self) -> Option<usize> {
         let plan = self.run.plan.as_ref();
+        let downstream = plan.map(tm_core::downstream_chain_lengths);
+        let mut best: Option<(usize, usize, usize)> = None;
         for (idx, cmd) in self.pending.iter().enumerate() {
             let Command::SpawnWorker { page, .. } = cmd else {
                 break;
@@ -1102,10 +1105,22 @@ impl Driver {
                 }
             });
             if ready {
-                return Some(idx);
+                let chain = downstream
+                    .as_ref()
+                    .and_then(|m| m.get(page))
+                    .copied()
+                    .unwrap_or(0);
+                let size = unit.map(tm_core::estimated_unit_size).unwrap_or(0);
+                let better = match best {
+                    None => true,
+                    Some((best_chain, best_size, _)) => (chain, size) > (best_chain, best_size),
+                };
+                if better {
+                    best = Some((chain, size, idx));
+                }
             }
         }
-        None
+        best.map(|(_, _, idx)| idx)
     }
 
     async fn idle(&mut self) -> anyhow::Result<Step> {

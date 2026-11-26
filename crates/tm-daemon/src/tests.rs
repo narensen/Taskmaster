@@ -8707,3 +8707,130 @@ async fn contract_soft_cap_warns_without_repair_while_hard_cap_triggers_repair()
     assert_eq!(outcome_hard, Outcome::Finished { ok: true });
     assert_eq!(hard_calls.load(Ordering::SeqCst), 2, "205-line contract must trigger planner repair");
 }
+
+#[tokio::test]
+async fn scheduling_wave_starts_long_pole_unit_first_under_parallel_limit() {
+    struct OrderRecorder {
+        started: Arc<Mutex<Vec<String>>>,
+        wave1_barrier: Arc<tokio::sync::Barrier>,
+        wave1_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for OrderRecorder {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let slot = self.wave1_count.fetch_add(1, Ordering::SeqCst);
+            self.started.lock().unwrap().push(unit.clone());
+            // Hold the first two wave-1 workers together briefly so both wave-1 slots are clearly observed.
+            if slot < 2 {
+                let _ = tokio::time::timeout(Duration::from_secs(5), self.wave1_barrier.wait()).await;
+            }
+            let file = task.cwd.join(format!("pkg/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            let _ = events.send(HarnessEvent::Text { text: format!("done\nRELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp = repo("c3-wave-order");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contracts.py".into(),
+            content: "class Core: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "short_leaf".into(),
+                owned_glob: "pkg/short_leaf.py".into(),
+                brief: "Tiny.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "small_mid".into(),
+                owned_glob: "pkg/small_mid.py".into(),
+                brief: "Small.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "big_mid".into(),
+                owned_glob: "{pkg/big_mid.py,pkg/big_mid_helper.py,tests/test_big_mid.py}".into(),
+                brief: "Large complex execution unit with joins, grouping, sorting, and error handling.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "root_pole".into(),
+                owned_glob: "pkg/root_pole.py".into(),
+                brief: "Foundation.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "middle".into(),
+                owned_glob: "pkg/middle.py".into(),
+                brief: "Imports pkg/root_pole.py directly.".into(),
+                depends_on: vec!["root_pole".into()],
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "pkg/cli.py".into(),
+                brief: "Imports pkg/middle.py, pkg/big_mid.py, pkg/small_mid.py.".into(),
+                depends_on: vec!["middle".into(), "big_mid".into(), "small_mid".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(OrderRecorder {
+        started: started.clone(),
+        wave1_barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        wave1_count: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let order = started.lock().unwrap().clone();
+    assert_eq!(order.len(), 6, "{order:?}");
+    let mut wave1: Vec<String> = order[..2].to_vec();
+    wave1.sort();
+    assert_eq!(
+        wave1,
+        vec!["big_mid".to_string(), "root_pole".to_string()],
+        "wave 1 (parallel=2) must start root_pole (downstream=2) and big_mid (downstream=1, largest), got full order: {order:?}"
+    );
+}

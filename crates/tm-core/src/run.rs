@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, Plan, ReviewScope};
+use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, PagePlan, Plan, ReviewScope};
 
 /// Repair rounds a page gets on one tier before it escalates.
 pub const MAX_REPAIRS: u8 = 2;
@@ -517,12 +517,39 @@ impl Run {
         }
     }
 
-    /// Start queued pages up to the parallel limit, then advance the phase if nothing is left.
+    /// Start queued pages up to the parallel limit, prioritizing critical-path units (longest
+    /// downstream dependency chain, tie-breaking by estimated size), then advance the phase if
+    /// nothing is left.
     fn settle(&mut self, out: &mut Vec<Command>) {
         let mut running = self.count(PageState::Building);
         // Units of a later phase wait for theirs; a repair of an earlier one may run.
         let order: Vec<PageId> = match &self.plan {
-            Some(plan) => plan.pages.iter().filter(|p| p.phase <= self.phase_at).map(|p| p.id.clone()).collect(),
+            Some(plan) => {
+                let downstream = downstream_chain_lengths(plan);
+                let mut candidates: Vec<(bool, usize, usize, usize, PageId)> = plan
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.phase <= self.phase_at)
+                    .filter(|(_, p)| self.pages.get(&p.id).is_some_and(|st| st.state == PageState::Queued))
+                    .map(|(idx, p)| {
+                        let unblocked = p.depends_on.iter().all(|dep| {
+                            dep == &p.id
+                                || self.pages.get(dep).is_none_or(|st| st.state == PageState::Passed)
+                        });
+                        let chain = downstream.get(&p.id).copied().unwrap_or(0);
+                        let size = estimated_unit_size(p);
+                        (unblocked, chain, size, idx, p.id.clone())
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| b.1.cmp(&a.1))
+                        .then_with(|| b.2.cmp(&a.2))
+                        .then_with(|| a.3.cmp(&b.3))
+                });
+                candidates.into_iter().map(|(_, _, _, _, id)| id).collect()
+            }
             None => return,
         };
         for id in order {
@@ -563,6 +590,83 @@ impl Run {
     fn count(&self, state: PageState) -> usize {
         self.pages.values().filter(|p| p.state == state).count()
     }
+}
+
+/// Longest downstream dependency chain length (in edges) from each unit in `plan`.
+/// A unit with no dependents has length 0; `A <- B` gives `A: 1, B: 0`; `A <- B <- C` gives
+/// `A: 2, B: 1, C: 0`. Cycles are broken safely.
+pub fn downstream_chain_lengths(plan: &Plan) -> BTreeMap<PageId, usize> {
+    let known: BTreeSet<&str> = plan.pages.iter().map(|p| p.id.as_str()).collect();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for page in &plan.pages {
+        for dep in &page.depends_on {
+            if dep.as_str() != page.id.as_str() && known.contains(dep.as_str()) {
+                dependents.entry(dep.as_str()).or_default().push(page.id.as_str());
+            }
+        }
+    }
+    fn longest<'a>(
+        id: &'a str,
+        dependents: &BTreeMap<&'a str, Vec<&'a str>>,
+        visiting: &mut BTreeSet<&'a str>,
+        memo: &mut BTreeMap<&'a str, usize>,
+    ) -> usize {
+        if let Some(&len) = memo.get(id) {
+            return len;
+        }
+        if !visiting.insert(id) {
+            return 0;
+        }
+        let mut best = 0usize;
+        if let Some(children) = dependents.get(id) {
+            for child in children {
+                if !visiting.contains(child) {
+                    best = best.max(1 + longest(child, dependents, visiting, memo));
+                }
+            }
+        }
+        visiting.remove(id);
+        memo.insert(id, best);
+        best
+    }
+    let mut memo = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    plan.pages
+        .iter()
+        .map(|p| {
+            let len = longest(p.id.as_str(), &dependents, &mut visiting, &mut memo);
+            (p.id.clone(), len)
+        })
+        .collect()
+}
+
+/// Estimated work size for tie-breaking critical-path wave scheduling: combines owned file
+/// count (brace alternatives / split sub-units) with specification length (`brief`, `context`,
+/// `done`, and sub-unit specs). Units with identical glob cardinality and empty specs tie.
+pub fn estimated_unit_size(page: &PagePlan) -> usize {
+    let file_count = glob_item_count(&page.owned_glob).max(page.units.len());
+    let spec_len = page.brief.len()
+        + page.context.len()
+        + page.done.len()
+        + page
+            .units
+            .iter()
+            .map(|u| u.brief.len() + u.context.len() + u.done.len())
+            .sum::<usize>();
+    spec_len.saturating_add(file_count.saturating_mul(256))
+}
+
+fn glob_item_count(glob: &str) -> usize {
+    let trimmed = glob.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    if let Some(inner) = trimmed.strip_prefix('{').and_then(|g| g.strip_suffix('}'))
+        && !inner.contains(['{', '}'])
+    {
+        return inner.split(',').filter(|s| !s.trim().is_empty()).count();
+    }
+    1
 }
 
 #[cfg(test)]
@@ -888,5 +992,81 @@ mod tests {
         assert_eq!(run.phase, RunPhase::Building);
         assert_eq!(run.pages["a"].state, PageState::Passed);
         assert_eq!(cmds, vec![spawn("b", Tier::Worker, None), spawn("c", Tier::Worker, None)]);
+    }
+
+    #[test]
+    fn wave_starts_critical_path_and_largest_units_first_under_parallel_limit() {
+        // Mirror the n4 tinydb shape: 4 ready units competing for 2 slots.
+        // - `leaf` has no dependents (downstream = 0) and small brief
+        // - `tokenizer` has 1 dependent (`cli`, downstream = 1) and small brief
+        // - `executor` has 1 dependent (`cli`, downstream = 1) and larger brief + 3 owned files
+        // - `btree` has a 2-hop downstream chain (`btree -> storage -> cli`, downstream = 2)
+        // Declaration order puts the short units first, so without critical-path ordering
+        // `leaf` and `tokenizer` would consume both slots ahead of `btree` and `executor`.
+        let planned = Plan {
+            pages: vec![
+                PagePlan {
+                    id: "leaf".into(),
+                    owned_glob: "tinydb/leaf.py".into(),
+                    brief: "Small helper.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "tokenizer".into(),
+                    owned_glob: "{tinydb/tokenizer.py,tests/test_tokenizer.py}".into(),
+                    brief: "Short lexer.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "executor".into(),
+                    owned_glob: "{tinydb/planner.py,tinydb/executor.py,tests/test_executor.py}".into(),
+                    brief: "Implement full query planner and SQL execution engine with joins, aggregates, sorting, limits, updates, deletes.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "btree".into(),
+                    owned_glob: "{tinydb/btree.py,tests/test_btree.py}".into(),
+                    brief: "Balanced B-tree.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "storage".into(),
+                    owned_glob: "{tinydb/storage.py,tests/test_storage.py}".into(),
+                    brief: "Persistent storage using BTree.".into(),
+                    depends_on: vec!["btree".into()],
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "{tinydb/cli.py,tests/test_cli.py}".into(),
+                    brief: "Wire CLI.".into(),
+                    depends_on: vec!["tokenizer".into(), "executor".into(), "storage".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut run = Run::new(2);
+        run.step(Event::PlanReady(planned));
+        let cmds = run.step(Event::PlanApproved);
+        let spawned: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::SpawnWorker { page, .. } => Some(page.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Wave 1 (2 slots): `btree` (longest downstream chain = 2) and `executor` (downstream = 1, largest size).
+        assert_eq!(spawned, vec!["btree", "executor"], "long-pole units must fill wave 1 first");
+
+        // Once `btree` finishes, `storage` becomes unblocked alongside `tokenizer` and `leaf`.
+        // `storage` (downstream = 1, larger brief than `tokenizer`) beats `tokenizer` and `leaf`.
+        let next = run.step(finished("btree", WorkerOutcome::Passed));
+        assert_eq!(next, vec![spawn("storage", Tier::Worker, None)]);
+
+        // Next slot goes to `tokenizer` (downstream = 1) ahead of `leaf` (downstream = 0).
+        let next = run.step(finished("executor", WorkerOutcome::Passed));
+        assert_eq!(next, vec![spawn("tokenizer", Tier::Worker, None)]);
     }
 }

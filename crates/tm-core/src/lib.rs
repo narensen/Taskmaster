@@ -21,6 +21,8 @@ pub use plan::{
     effective_contract_phase, normalize_plan, plan_warnings, rejections, rules_text,
 };
 pub use playbooks::{Playbook, brief_hash, format_playbooks, match_playbooks};
-pub use run::{Command, Event, PageState, Run, RunPhase, Tier, WorkerOutcome};
+pub use run::{
+    Command, Event, PageState, Run, RunPhase, Tier, WorkerOutcome, downstream_chain_lengths, estimated_unit_size,
+};
 pub use schema::{SCHEMA_VERSION, events_header, migrate_status, unwrap_event_line};
 pub use types::*;

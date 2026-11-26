@@ -414,6 +414,10 @@ struct Driver {
     /// Project memory as it stood when the run started. Lessons learned during the run are
     /// kept for the next one, so the shared prefix stays the same for every agent of this one.
     project_memory: String,
+    /// One-line verified test/venv hint loaded from `.flow/env.json`.
+    /// Refreshed ONLY at run start, phase boundaries (`next_phase`), and new turns (`open_turn`)
+    /// so `shared_prefix()` stays byte-identical across every unit within a phase.
+    env_hint: String,
     /// The next phase's planning call, started while the current phase builds.
     next_plan: Option<NextPlan>,
     /// Builders whose sessions are still open, by agent (`page` or `page/unit`), oldest
@@ -750,6 +754,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         project_md: String::new(),
         repo_map: String::new(),
         project_memory: String::new(),
+        env_hint: String::new(),
         next_plan: None,
         warm: VecDeque::new(),
         hibernated: HashMap::new(),
@@ -780,6 +785,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     if let Err(err) = tm_flow::build(&driver.tree) {
         eprintln!("taskmaster: flow build skipped: {err:#}");
     }
+    driver.refresh_env_hint();
     driver.project_memory = driver.render_project_memory();
     driver.warn_struggling_worker();
     if driver.config.resume_cancelled && driver.run.phase == RunPhase::Failed {
@@ -1436,6 +1442,9 @@ impl Driver {
         eprintln!("taskmaster: phase {} passed", phase);
         self.write_project_md(&format!("taskmaster: phase {phase} landed"))?;
         self.checkpoint(&format!("phase-{phase}"));
+        // Refresh the shared prefix's `.flow/env.json` hint at the phase boundary, before any
+        // unit of the next phase starts, so the prefix remains byte-identical within each phase.
+        self.refresh_env_hint();
         let sketch = self.plan()?.phases.get(phase).cloned().context("no such phase in the sketch")?;
         let goal = format!("Phase {} of the project: {}. {}", phase + 1, sketch.id, sketch.goal);
         let mut answer = match self.next_plan.take() {
@@ -4107,6 +4116,7 @@ impl Driver {
         let later_tests = self.later_phase_test_contracts();
         let later_set: BTreeSet<String> = later_tests.iter().cloned().collect();
         let mut steps = runtime::steps(&self.tree, &self.verify_venv());
+        let raw_steps = steps.clone();
         runtime::deselect_test_paths(&mut steps, &later_tests);
         for step in &steps {
             self.terminal(
@@ -4168,7 +4178,10 @@ impl Driver {
         if !steps.is_empty() {
             match &failed {
                 Some(failure) => self.terminal("output", serde_json::json!({ "ok": false, "step": failure.step, "text": failure.output })),
-                None => self.terminal("output", serde_json::json!({ "ok": true, "text": format!("{} step(s) passed", steps.len()) })),
+                None => {
+                    self.terminal("output", serde_json::json!({ "ok": true, "text": format!("{} step(s) passed", steps.len()) }));
+                    self.record_verified_env(&raw_steps, &self.verify_venv());
+                }
             }
         }
         if let Some(failure) = failed {
@@ -5033,7 +5046,8 @@ impl Driver {
         let at = |dir: &Path| dir.display().to_string();
         // Only package managers' caches move: the agent's own cache (its binaries, its models
         // list) stays where its harness keeps it.
-        let env = vec![
+        let mut readable = Vec::new();
+        let mut env = vec![
             ("TASKMASTER_SCRATCH".to_string(), at(&scratch)),
             ("PIP_CACHE_DIR".into(), at(&cache.join("pip"))),
             ("UV_CACHE_DIR".into(), at(&cache.join("uv"))),
@@ -5045,7 +5059,27 @@ impl Driver {
             ("PYTEST_ADDOPTS".into(), "-p no:cacheprovider".into()),
             ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
         ];
-        Some(ShellScope { writable: vec![scratch, cache], readable: vec![], env })
+        // Mount the run's or `.flow/env.json`'s verified Python venv read-only into the worker's
+        // sandbox so workers can execute pytest directly without recreating a venv per unit.
+        // If no venv exists yet (or the recorded path is gone), workers fall back to $TASKMASTER_SCRATCH/venv.
+        let mut candidate_venvs: Vec<PathBuf> = Vec::new();
+        let verify_venv = self.verify_venv();
+        if verify_venv.is_dir() {
+            candidate_venvs.push(verify_venv);
+        }
+        if let Ok(Some(facts)) = tm_flow::read_env(&self.tree)
+            && let Some(v) = facts.venv.as_deref().filter(|s| !s.is_empty())
+        {
+            let vp = PathBuf::from(v);
+            if vp.is_dir() && !candidate_venvs.contains(&vp) {
+                candidate_venvs.push(vp);
+            }
+        }
+        if let Some(first) = candidate_venvs.first() {
+            env.push(("TASKMASTER_SHARED_VENV".into(), at(first)));
+        }
+        readable.extend(candidate_venvs);
+        Some(ShellScope { writable: vec![scratch, cache], readable, env })
     }
 
     /// Serve the worktree as the page's preview and give the agent the browser on it, when
@@ -5253,6 +5287,11 @@ impl Driver {
             }
         }
         out.push('\n');
+        if !self.env_hint.is_empty() {
+            out.push('\n');
+            out.push_str(self.env_hint.trim_end());
+            out.push('\n');
+        }
         if !self.handed.is_empty() {
             out.push_str("\nThe master decided this after reading the person's notes. Follow it:\n");
             out.push_str(self.handed.trim_end());
@@ -5963,6 +6002,51 @@ impl Driver {
         }
     }
 
+    /// Load `.flow/env.json` into `self.env_hint` for the shared prefix.
+    /// Called ONLY at run start, phase boundaries (`next_phase`), and new turns (`open_turn`)
+    /// so `shared_prefix()` stays byte-identical across units within a phase.
+    /// If a recorded venv path no longer exists on disk, drop the stale venv fields and keep
+    /// only the runner/test command as a sensible fallback.
+    fn refresh_env_hint(&mut self) {
+        let loaded = tm_flow::read_env(&self.tree)
+            .ok()
+            .flatten()
+            .or_else(|| tm_flow::read_env(&self.project).ok().flatten());
+        let Some(mut facts) = loaded else {
+            self.env_hint.clear();
+            return;
+        };
+        if let Some(ref venv) = facts.venv
+            && !Path::new(venv).is_dir()
+        {
+            let stale_prefix = venv.clone();
+            facts.venv = None;
+            facts.python = None;
+            if facts.test_cmd.contains(&stale_prefix) {
+                if facts.runner == "pytest" {
+                    facts.test_cmd = "pytest -q".into();
+                } else {
+                    self.env_hint.clear();
+                    return;
+                }
+            }
+        }
+        self.env_hint = facts.shared_prefix_line();
+    }
+
+    /// Record verified test/venv environment facts into `.flow/env.json` after the first
+    /// successful verify run and commit the `.flow/` update.
+    fn record_verified_env(&self, steps: &[runtime::Step], venv: &Path) {
+        let Some(facts) = runtime::env_facts_from_steps(steps, venv) else {
+            return;
+        };
+        match tm_flow::write_env(&self.tree, &facts) {
+            Ok(true) => self.commit_flow_update(),
+            Ok(false) => {}
+            Err(err) => eprintln!("taskmaster: could not write .flow/env.json: {err:#}"),
+        }
+    }
+
     /// Incrementally refresh `.flow/` against the current tree and commit if any shards/meta changed.
     fn refresh_flow_and_commit(&self) {
         if let Err(err) = tm_flow::build(&self.tree) {
@@ -6273,6 +6357,7 @@ impl Driver {
     /// the master and its workers, as [`crate::turns::turn_mode`] decides.
     fn open_turn(&mut self) -> anyhow::Result<()> {
         self.finalized = false;
+        self.refresh_env_hint();
         let pending: Vec<crate::live::Note> = self.live.notes(&self.id).into_iter().filter(|note| !note.delivered).collect();
         let turn = self.events.iter().filter(|event| matches!(event, Event::FollowUp | Event::AgentTurn { .. })).count() + 2;
         let _ = crate::checkpoints::capture(&self.project, &self.id, turn);

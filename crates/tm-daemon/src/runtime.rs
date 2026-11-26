@@ -305,6 +305,73 @@ pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
     out
 }
 
+/// Derive `.flow/env.json` facts from a set of verified [`Step`]s that just passed.
+pub fn env_facts_from_steps(steps: &[Step], venv: &Path) -> Option<tm_flow::EnvFacts> {
+    let test_step = steps
+        .iter()
+        .rev()
+        .find(|s| s.name == "test" && !s.setup)
+        .or_else(|| steps.iter().rev().find(|s| !s.setup))?;
+    let test_cmd = test_step.line();
+    if test_cmd.is_empty() {
+        return None;
+    }
+    let is_pytest = test_step.program.ends_with("pytest")
+        || test_step.program.ends_with("pytest.exe")
+        || test_step.args.iter().any(|a| a == "pytest");
+    let runner = if is_pytest {
+        if matches!(test_step.program.as_str(), "poetry" | "uv" | "hatch") {
+            test_step.program.clone()
+        } else {
+            "pytest".to_string()
+        }
+    } else if test_step.program == "cargo" {
+        "cargo".to_string()
+    } else if matches!(test_step.program.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+        test_step.program.clone()
+    } else {
+        "custom".to_string()
+    };
+
+    let env_venv = test_step
+        .env
+        .iter()
+        .find(|(k, _)| k == "VIRTUAL_ENV" || k == "UV_PROJECT_ENVIRONMENT")
+        .map(|(_, v)| PathBuf::from(v))
+        .or_else(|| {
+            (is_pytest && venv.join("pyvenv.cfg").is_file()).then(|| venv.to_path_buf())
+        });
+    let venv_str = env_venv
+        .as_ref()
+        .filter(|p| p.is_dir())
+        .map(|p| p.display().to_string());
+
+    let python = env_venv.as_ref().and_then(|v| {
+        let bin = v.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+        if bin.is_file() {
+            Some(bin.display().to_string())
+        } else if test_step.program.contains("python") {
+            Some(test_step.program.clone())
+        } else {
+            None
+        }
+    });
+
+    let install_cmd = steps
+        .iter()
+        .rev()
+        .find(|s| s.setup && !s.args.iter().any(|a| a == "venv"))
+        .map(Step::line);
+
+    Some(tm_flow::EnvFacts {
+        runner,
+        test_cmd,
+        venv: venv_str,
+        python,
+        install_cmd,
+    })
+}
+
 /// Exclude later-phase contract test paths from test runner steps (e.g. pytest `--ignore=<path>`)
 /// so intermediate-phase verify does not execute tests for phases that have not been built yet.
 pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {
@@ -871,6 +938,39 @@ mod tests {
         let (_, failure) = run_steps(&dir, &again, Duration::from_secs(120)).await;
         assert!(failure.is_none(), "{failure:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_facts_extracted_from_python_cargo_and_npm_steps() {
+        let dir = std::env::temp_dir().join(format!("tm-env-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let venv = dir.join("venv");
+        let bin = venv.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let py = bin.join("python");
+        std::fs::write(&py, "#!/bin/sh\n").unwrap();
+
+        let py_step = Step {
+            name: "test".into(),
+            program: py.display().to_string(),
+            args: vec!["-m".into(), "pytest".into(), "-q".into()],
+            env: vec![("VIRTUAL_ENV".into(), venv.display().to_string())],
+            setup: false,
+            stamp: None,
+        };
+        let facts = env_facts_from_steps(&[py_step], &venv).unwrap();
+        assert_eq!(facts.runner, "pytest");
+        assert!(facts.test_cmd.contains("-m pytest -q"), "{}", facts.test_cmd);
+        assert_eq!(facts.venv.as_deref(), Some(venv.to_str().unwrap()));
+        assert_eq!(facts.python.as_deref(), Some(py.to_str().unwrap()));
+
+        let cargo_facts = env_facts_from_steps(&[Step::new("test", "cargo", &["test", "--quiet"])], &venv).unwrap();
+        assert_eq!(cargo_facts.runner, "cargo");
+        assert_eq!(cargo_facts.test_cmd, "cargo test --quiet");
+        assert_eq!(cargo_facts.venv, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

@@ -8744,3 +8744,175 @@ async fn flow_graph_seeds_updates_places_unit_map_after_task_marker_keeps_prefix
     assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
     assert!(tm_flow::verify_all(&tmp.0).unwrap().is_empty(), "all shards must be fresh after run");
 }
+
+#[tokio::test]
+async fn flow_env_json_records_after_verify_injects_stable_prefix_hint_and_shares_venv() {
+    let tmp = seeded("flow-env");
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(tmp.0.join("tests/test_smoke.py"), "def test_ok():\n    assert True\n").unwrap();
+    let _ = crate::git::commit_paths(&tmp.0, "add smoke test", &["tests/test_smoke.py".into()]);
+
+    type SeenCalls = Arc<Mutex<Vec<(String, Option<tm_harness::ShellScope>)>>>;
+    struct EnvHarness {
+        seen: SeenCalls,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for EnvHarness {
+        fn id(&self) -> &'static str {
+            "fake-env"
+        }
+        fn sandboxed_shell(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.seen.lock().unwrap().push((task.brief.clone(), task.shell.clone()));
+            if let Some(page) = task
+                .brief
+                .split("Build page `")
+                .nth(1)
+                .and_then(|rest| rest.split('`').next())
+            {
+                let f = task.cwd.join(format!("app/{page}/page.ts"));
+                std::fs::create_dir_all(f.parent().unwrap())?;
+                std::fs::write(&f, format!("export const {page} = 1;\n"))?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    // 1. First run: runtime_checks succeeds on Python smoke test and writes `.flow/env.json`.
+    let seen1 = Arc::new(Mutex::new(Vec::new()));
+    let h1: Arc<dyn Harness> = Arc::new(EnvHarness { seen: seen1.clone() });
+    let harnesses1 = Harnesses {
+        master: h1.clone(),
+        mid: h1.clone(),
+        worker: h1.clone(),
+        reviewer: h1.clone(),
+        verifier: h1,
+    };
+    let mut cfg1 = config(&tmp.0, plan(&[("a", &[]), ("b", &[])]), true, 2);
+    cfg1.run_id = "env-run-1".into();
+    cfg1.checks = false;
+    cfg1.runtime_checks = true;
+    cfg1.code_mode = false;
+    cfg1.worker_shell = false;
+    cfg1.browser = false;
+
+    let out1 = tokio::time::timeout(Duration::from_secs(30), drive(cfg1, harnesses1))
+        .await
+        .expect("run 1 timed out")
+        .unwrap();
+    assert_eq!(out1, Outcome::Finished { ok: true });
+    let env_facts = tm_flow::read_env(&tmp.0)
+        .unwrap()
+        .expect(".flow/env.json must be written after first passing runtime verify");
+    assert_eq!(env_facts.runner, "pytest");
+    assert!(!env_facts.test_cmd.is_empty());
+    assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
+
+    // 2. Second run: seed a real venv directory in `.flow/env.json` and verify the prefix hint
+    //    is present, byte-identical across units `a` and `b`, and the venv is mounted read-only.
+    let shared_venv = tmp.0.join(".taskmaster/shared-venv-fixture");
+    std::fs::create_dir_all(shared_venv.join("bin")).unwrap();
+    std::fs::write(shared_venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::write(shared_venv.join("bin/python"), "#!/bin/sh\n").unwrap();
+    let seeded_facts = tm_flow::EnvFacts {
+        runner: "pytest".into(),
+        test_cmd: format!("{}/bin/python -m pytest -q", shared_venv.display()),
+        venv: Some(shared_venv.display().to_string()),
+        python: Some(format!("{}/bin/python", shared_venv.display())),
+        install_cmd: None,
+    };
+    tm_flow::write_env(&tmp.0, &seeded_facts).unwrap();
+    let _ = crate::git::commit_paths(&tmp.0, "seed flow env fixture", &[".flow/env.json".into()]);
+
+    let seen2 = Arc::new(Mutex::new(Vec::new()));
+    let h2: Arc<dyn Harness> = Arc::new(EnvHarness { seen: seen2.clone() });
+    let harnesses2 = Harnesses {
+        master: h2.clone(),
+        mid: h2.clone(),
+        worker: h2.clone(),
+        reviewer: h2.clone(),
+        verifier: h2,
+    };
+    let mut cfg2 = config(&tmp.0, plan(&[("c", &[]), ("d", &[])]), true, 2);
+    cfg2.run_id = "env-run-2".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.worker_shell = true;
+    cfg2.browser = false;
+
+    let out2 = tokio::time::timeout(Duration::from_secs(20), drive(cfg2, harnesses2))
+        .await
+        .expect("run 2 timed out")
+        .unwrap();
+    assert_eq!(out2, Outcome::Finished { ok: true });
+
+    let calls2 = seen2.lock().unwrap().clone();
+    let (brief_a, shell_a) = calls2.iter().find(|(b, _)| b.contains("Build page `c`")).expect("c call");
+    let (brief_b, shell_b) = calls2.iter().find(|(b, _)| b.contains("Build page `d`")).expect("d call");
+    let (pre_a, _) = brief_a.split_once("--- Your task ---").expect("marker in a");
+    let (pre_b, _) = brief_b.split_once("--- Your task ---").expect("marker in b");
+    assert_eq!(pre_a, pre_b, "shared prefix must stay byte-identical across units");
+    assert!(
+        pre_a.contains("Verified test environment:") && pre_a.contains(&shared_venv.display().to_string()),
+        "shared prefix should include one-line env hint with venv:\n{pre_a}"
+    );
+    let shell_a = shell_a.as_ref().expect("shell scope for a");
+    let shell_b = shell_b.as_ref().expect("shell scope for b");
+    assert!(shell_a.readable.contains(&shared_venv), "venv must be mounted read-only: {:?}", shell_a.readable);
+    assert!(shell_b.readable.contains(&shared_venv), "venv must be mounted read-only: {:?}", shell_b.readable);
+    assert!(
+        shell_a.env.iter().any(|(k, v)| k == "TASKMASTER_SHARED_VENV" && v == &shared_venv.display().to_string()),
+        "TASKMASTER_SHARED_VENV should be set: {:?}",
+        shell_a.env
+    );
+
+    // 3. Third run: delete the venv directory so `.flow/env.json` points to a stale path ->
+    //    fallback drops the missing venv path from prefix hint and shell mounts cleanly.
+    std::fs::remove_dir_all(&shared_venv).unwrap();
+    let seen3 = Arc::new(Mutex::new(Vec::new()));
+    let h3: Arc<dyn Harness> = Arc::new(EnvHarness { seen: seen3.clone() });
+    let harnesses3 = Harnesses {
+        master: h3.clone(),
+        mid: h3.clone(),
+        worker: h3.clone(),
+        reviewer: h3.clone(),
+        verifier: h3,
+    };
+    let mut cfg3 = config(&tmp.0, plan(&[("e", &[])]), true, 1);
+    cfg3.run_id = "env-run-3".into();
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    cfg3.code_mode = false;
+    cfg3.worker_shell = true;
+    cfg3.browser = false;
+
+    let out3 = tokio::time::timeout(Duration::from_secs(20), drive(cfg3, harnesses3))
+        .await
+        .expect("run 3 timed out")
+        .unwrap();
+    assert_eq!(out3, Outcome::Finished { ok: true });
+
+    let calls3 = seen3.lock().unwrap().clone();
+    let (brief_a3, shell_a3) = calls3.iter().find(|(b, _)| b.contains("Build page `e`")).expect("e call");
+    let (pre_a3, _) = brief_a3.split_once("--- Your task ---").expect("marker in a3");
+    assert!(pre_a3.contains("Verified test environment: run tests with `pytest -q`"), "{pre_a3}");
+    assert!(!pre_a3.contains("shared-venv-fixture"), "stale venv path must be dropped:\n{pre_a3}");
+    let shell_a3 = shell_a3.as_ref().expect("shell scope for a3");
+    assert!(!shell_a3.readable.contains(&shared_venv), "missing venv must not be mounted");
+}

@@ -683,13 +683,48 @@ impl CodeTools {
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
-                let venv = scope.shell.as_ref().and_then(|s| s.writable.first()).map(|scratch| scratch.join("venv")).unwrap_or_else(|| scope.cwd.join(".venv"));
-                let steps = crate::runtime::steps(&scope.cwd, &venv);
+                let fallback_venv = scope
+                    .shell
+                    .as_ref()
+                    .and_then(|s| s.writable.first())
+                    .map(|scratch| scratch.join("venv"))
+                    .unwrap_or_else(|| scope.cwd.join(".venv"));
+                // Prefer an already-prepared shared read-only venv mounted into the worker's sandbox
+                // when it needs zero setup writes; otherwise fall back to the writable scratch venv.
+                let shared_venv = scope
+                    .shell
+                    .as_ref()
+                    .and_then(|s| s.readable.iter().find(|d| d.join("pyvenv.cfg").is_file()))
+                    .cloned();
+                let (venv, steps) = match shared_venv {
+                    Some(shared) => {
+                        let candidate = crate::runtime::steps(&scope.cwd, &shared);
+                        if candidate.iter().any(|s| !s.setup) && !candidate.iter().any(|s| s.setup) {
+                            (shared, candidate)
+                        } else {
+                            let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+                            (fallback_venv, steps)
+                        }
+                    }
+                    None => {
+                        let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+                        (fallback_venv, steps)
+                    }
+                };
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
                 }
                 let command = test_command(&steps);
                 let (code, text) = self.sandboxed(scope, &command).await?;
+                if code == Some(0) {
+                    let flow_root = self.flow_root.lock().unwrap().clone();
+                    if let Some(root) = flow_root
+                        && tm_flow::read_env(&root).ok().flatten().is_none()
+                        && let Some(facts) = crate::runtime::env_facts_from_steps(&steps, &venv)
+                    {
+                        let _ = tm_flow::write_env(&root, &facts);
+                    }
+                }
                 Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, 6000) }))
             }
             "readMany" => {

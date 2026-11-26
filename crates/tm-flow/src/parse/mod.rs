@@ -226,6 +226,7 @@ pub(crate) fn clean_signature(raw: &str) -> String {
 }
 
 /// Extract the first meaningful line from a doc comment or docstring, capped at 160 chars.
+#[cfg(any(feature = "python", feature = "typescript", feature = "rust"))]
 pub(crate) fn clean_doc_line(raw: &str) -> Option<String> {
     for line in raw.lines() {
         let trimmed = line

@@ -9,6 +9,7 @@ pub mod env;
 pub mod model;
 pub mod parse;
 pub mod resolve;
+pub mod store;
 
 pub use env::{EnvFacts, read_env, write_env};
 pub use model::{
@@ -16,3 +17,4 @@ pub use model::{
     NodeKind, NodeStatus, PlanSeed, SCHEMA_VERSION, Shard, UnitSeed, body_hash, file_node_id,
     git_blob_sha, is_flow_path, lang_prefix, sig_hash, symbol_node_id, unit_node_id,
 };
+pub use store::FlowDb;

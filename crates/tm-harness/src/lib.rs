@@ -300,9 +300,19 @@ pub fn code_mode_fallback_hint(tool: &str, run_code_tool: &str) -> String {
         format!(
             "call `{run_code_tool}` passing `files: {{\"path\": \"content\"}}`, `await writeFile(path, text)`, or `await edit(path, find, replace)` and end with `return await test()`"
         )
+    } else if matches!(
+        lower.as_str(),
+        "read_file" | "view_file" | "read" | "grep_search" | "grep" | "list_dir" | "find_by_name" | "glob"
+    ) || lower.contains("read")
+        || lower.contains("grep")
+        || lower.contains("list_dir")
+    {
+        format!(
+            "call `{run_code_tool}` using `await readMany([\"...\"])`, `await read(path)`, `await grep(pattern)`, or `await flow(\"batch\", {{ queries: [...] }})` to batch reads in one call"
+        )
     } else {
         format!(
-            "use `{run_code_tool}` (`files`, `writeFile`, `edit`, `return await test()`, `return await sh(...)`) instead of `{base}`"
+            "use `{run_code_tool}` (`readMany`, `files`, `writeFile`, `edit`, `return await test()`, `return await sh(...)`) instead of `{base}`"
         )
     }
 }
@@ -376,6 +386,11 @@ impl WorkerTask {
             WORKER_RULES
         };
         if self.code_mode {
+            // Avoid duplicating Code Mode write rules when the daemon's `shared_prefix` already
+            // embedded `CODE_MODE_GUIDE` with the harness-exact tool name.
+            if !self.read_only && self.brief.contains("Code Mode is on") {
+                return format!("{rules}{}", self.brief);
+            }
             let template = if self.read_only { CODE_MODE_READ_RULES } else { CODE_MODE_WRITE_RULES };
             let code = if run_code_tool == "run_code" || run_code_tool.is_empty() {
                 template.to_string()

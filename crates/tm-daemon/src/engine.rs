@@ -6834,7 +6834,15 @@ impl Driver {
             )
         };
         brief.push_str(&if errors.is_some() {
-            format!("Read only the files you own that you are fixing, and what the failure output names; do not list or search the whole directory. {graph_hint}\n")
+            if self.code.is_some() {
+                format!(
+                    "Code Mode is active (native file tools see a read-only worktree and fail with `read-only file system`): \
+                     do NOT call native `read_file`, `write_file`, `edit_file`, or `run_command` — batch reading owned files (`readMany`/`read`), \
+                     targeted fixes (`edit`/`patch`/`files`), and `return await test()` inside `{tier_run_code_tool}`. {graph_hint}\n"
+                )
+            } else {
+                format!("Read only the files you own that you are fixing, and what the failure output names; do not list or search the whole directory. {graph_hint}\n")
+            }
         } else if inline || contracts.is_empty() {
             format!("This brief is your whole context: do not list, search or read other files. {graph_hint} Write your files directly.\n")
         } else {
@@ -6864,6 +6872,13 @@ impl Driver {
         brief.push('\n');
         if let Ok(unit_plan) = self.page(page) {
             brief.push_str(&self.todo(unit_plan, true));
+        }
+        if self.code.is_some() {
+            let run_code_tool = tm_harness::run_code_tool_name(self.harnesses.worker.id(), "dictionary");
+            brief.push_str(&format!(
+                "Code Mode is active (native file tools see a read-only worktree): do NOT call native `read_file`/`write_file`/`edit_file`/`run_command` — \
+                 read, edit, and run `return await test()` via `{run_code_tool}`.\n"
+            ));
         }
         brief.push_str(&format!(
             "Once tests pass, stop immediately without trailing `git status` or redundant test re-runs, and end your reply with the line `{RELEASE} {agent}`.\n"
@@ -8757,14 +8772,11 @@ fn leading_quoted_ident(text: &str) -> Option<String> {
 }
 
 /// How an agent with Code Mode is told to work, in the shared prefix.
-const CODE_MODE_GUIDE: &str = "\nCode Mode is on — follow two-call discipline with run_code:\n\
-- Call 1 (write + test in one call): pass all your owned implementation files and concise unit tests via the `files` JSON argument \
-(`{\"path\": \"content\"}`, or `writeFile`, or `String.raw` with `write(path, { raw })` to avoid JS escaping for triple quotes/backslashes) \
-AND set `code` to `return await test()` in the SAME run_code call. Always `await` every helper call. Do NOT burn a call probing Python/venv, listing files, or writing without testing.\n\
-- Call 2 (fix + re-test, only if Call 1 failed): use targeted `edit`/`patch`/`applyPatch` (never rewrite whole files) and end with `return await test()`. \
-If a `run_code` call errors or aborts mid-script, check which partial edits landed, fix the script, and call `run_code` again — NEVER end your turn on a `run_code` error or fall back to native write/edit/shell tools. Only make another call if failures remain.\n\
-- Helpers inside `code`: read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, diff, symbols, sh, test, testAffected, check, browser, and `.flow` (`await flow(\"find\", { query })`, `await flow(\"neighbors\", { id, k: 1, dir: \"in\" })`, `await flow(\"source\", { id })`, or `await flow(\"batch\", { queries })`). \
-If native write/edit/shell tools are off, use run_code from the start. Do not call `update_steps` or run trailing `git status` / redundant re-runs once tests pass. Keep replies short.\n";
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on — use run_code for ALL reads, writes, edits, and tests (two-call discipline):\n\
+- Your worktree is mounted read-only to native file tools (`write_file`/`edit_file` fail with `read-only file system`, and native shell is blocked). Do NOT call native `read_file`, `write_file`, `edit_file`, or `run_command`; if any native tool errors or is refused, immediately use run_code instead of ending your turn.\n\
+- Call 1 (write + test in one call): pass all owned files + concise unit tests via `files` (`{\"path\":\"content\"}`, or `writeFile`, or `String.raw` with `write(path, { raw })`) AND set `code` to `return await test()` in the SAME run_code call. Always `await` every helper call. Skip probing Python/venv or listing files.\n\
+- Call 2 (fix + re-test, only if Call 1 failed): batch `readMany`/`edit`/`patch`/`applyPatch` (no whole-file rewrites) and end with `return await test()`. On any run_code error, inspect partial edits, fix the script, and retry run_code.\n\
+- Helpers inside `code`: read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, diff, symbols, sh, test, testAffected, check, browser, and `.flow` (`await flow(\"find\", { query })`, `await flow(\"neighbors\", { id, k: 1, dir: \"in\" })`, `await flow(\"source\", { id })`, `await flow(\"batch\", { queries })`). Stop once tests pass (no `update_steps` or trailing `git status`).\n";
 
 /// Expand an `owned_glob` (including `{a,b}` brace groups) into worktree-absolute path strings
 /// so harnesses whose native file tools require absolute paths (e.g. Antigravity) can write

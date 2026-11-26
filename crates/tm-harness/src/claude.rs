@@ -72,6 +72,10 @@ impl ClaudeCode {
             // With no edit tools and nobody to approve a prompt, the session can only read.
             vec!["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"]
         } else if task.code_mode {
+            // Code Mode disables Claude's native write/edit/shell tools via `--disallowedTools` so
+            // all mutations and test runs go through `run_code`. Read-only tools (`Read`/`Glob`/
+            // `Grep`) remain available as a low-risk fallback, while prompts steer workers to batch
+            // reads alongside edits inside `run_code`.
             WRITING_TOOLS.to_vec()
         } else if shell {
             Vec::new()

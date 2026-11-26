@@ -94,6 +94,13 @@ impl AcpHarness {
         // When Code Mode is active with the daemon's MCP server attached, writes and shell
         // commands go through `run_code` (which has its own sandboxed worktree access), so the
         // agent's own sandbox stays read-only even for harnesses that edit without asking.
+        //
+        // Note on tool lists: unlike Claude Code (`--disallowedTools`), ACP servers (`agy acp`,
+        // `grok agent stdio`, `opencode acp`) expose no CLI flag to remove built-in native tools
+        // from their schema list, and `agy acp` auto-approves in-worktree `read_file`/`edit_file`
+        // without sending `session/request_permission`. Keeping the bwrap mount read-only guarantees
+        // native writes fail with `EROFS` (`read-only file system`), which `Session::incoming`
+        // converts into a `(use run_code)` refusal to redirect the worker back to `run_code`.
         let enforce_code_mode = task.code_mode && !task.read_only && task.dictionary.is_some();
         let read_only = task.read_only || enforce_code_mode;
         let shell = (!enforce_code_mode).then_some(task.shell.as_ref()).flatten();
@@ -228,6 +235,7 @@ impl AcpHarness {
             denied: 0,
             stall: task.stall,
             tools: BTreeSet::new(),
+            tool_names: std::collections::HashMap::new(),
             id: None,
             model_used: None,
             cost: None,
@@ -474,6 +482,8 @@ struct Session {
     stall: Option<std::time::Duration>,
     /// Tool calls started and not yet finished. A running tool may be silent for a long time.
     tools: BTreeSet<String>,
+    /// Tool call id -> tool name for the active prompt (used to map Code Mode `EROFS` tool results).
+    tool_names: std::collections::HashMap<String, String>,
     /// The ACP session, once `session/new` answered.
     id: Option<String>,
     /// The actual model id selected for this session (after effort routing / catalog check / fallback).
@@ -622,6 +632,7 @@ impl Session {
     /// One turn in the open session.
     async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
         self.tools.clear();
+        self.tool_names.clear();
         self.requests = 0;
         self.saw_tool_finish = false;
         let session_id = self.id.clone().context("the session is not open")?;
@@ -707,7 +718,36 @@ impl Session {
                     let _ = self.events.send(HarnessEvent::RateLimit(report)).await;
                 }
                 for event in update_events(&params["update"]) {
+                    let mut erofs_tool: Option<String> = None;
+                    match &event {
+                        HarnessEvent::ToolCall { id, name, .. } if !id.is_empty() => {
+                            self.tool_names.insert(id.clone(), name.clone());
+                        }
+                        HarnessEvent::ToolResult { id, text, .. }
+                            if self.code_mode && text.to_ascii_lowercase().contains("read-only file system") =>
+                        {
+                            let tool_name = self
+                                .tool_names
+                                .get(id)
+                                .cloned()
+                                .unwrap_or_else(|| "edit_file".to_string());
+                            let is_dict_tool = self
+                                .dictionary_prefix
+                                .as_deref()
+                                .is_some_and(|p| tool_name.starts_with(p));
+                            if !is_dict_tool {
+                                erofs_tool = Some(format!("{tool_name} (use run_code)"));
+                            }
+                        }
+                        _ => {}
+                    }
                     let _ = self.events.send(event).await;
+                    if let Some(tool) = erofs_tool {
+                        let _ = self
+                            .events
+                            .send(HarnessEvent::PermissionDecided { tool, allowed: false })
+                            .await;
+                    }
                 }
             }
             Some("session/request_permission") => {
@@ -2101,5 +2141,61 @@ echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
         let _ = std::fs::remove_file(&capture);
         assert_eq!(perm_reply["result"]["outcome"]["optionId"], "deny");
         let _ = session.close().await;
+    }
+
+    #[tokio::test]
+    async fn fix_n9_code_mode_erofs_tool_result_emits_use_run_code_refusal() {
+        let script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-erofs"}}'
+read l
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"edit_file","rawInput":{"path":"mdtodo/storage.py"}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"failed","content":[{"type":"content","content":{"type":"text","text":"open /tmp/wt/mdtodo/storage.py: read-only file system"}}]}}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "fix storage".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:1/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, mut rx) = mpsc::channel(16);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                HarnessEvent::PermissionDecided { tool, allowed: false } if tool == "edit_file (use run_code)"
+            )),
+            "native edit_file EROFS in Code Mode must emit (use run_code) refusal: {events:?}"
+        );
+        let msg = crate::code_mode_redirect_message(&["edit_file (use run_code)".into()], "mcp_dictionary_run_code")
+            .expect("redirect message");
+        assert!(msg.contains("mcp_dictionary_run_code") && msg.contains("edit"));
     }
 }

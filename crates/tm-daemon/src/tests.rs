@@ -13484,3 +13484,175 @@ async fn fix_n9_noop_repair_reprompts_same_warm_session_and_rejects_failing_gree
         followups[1]
     );
 }
+
+#[tokio::test]
+async fn fix_n9_code_mode_dedupes_prompt_enforces_repair_run_code_and_saves_tokens_over_native() {
+    let has_node = crate::code::CodeTools::new(None).is_some();
+    let run_probe = |tmp: &Tmp, code_mode: bool| {
+        let root = tmp.0.clone();
+        async move {
+            let plan = Plan {
+                kind: tm_core::ProjectKind::Library,
+                pages: vec![PagePlan {
+                    id: "core".into(),
+                    owned_glob: "{pkg/__init__.py,pkg/model.py,pkg/storage.py,tests/test_core.py}".into(),
+                    brief: "Implement pkg/model.py, pkg/storage.py, and tests/test_core.py.".into(),
+                    done: "pytest passes.".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let briefs = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+            let schema_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            struct Probe {
+                briefs: Arc<Mutex<Vec<(String, String)>>>,
+                schema_bytes: Arc<std::sync::atomic::AtomicUsize>,
+                fail_once: std::sync::atomic::AtomicBool,
+            }
+            #[async_trait]
+            impl Harness for Probe {
+                fn id(&self) -> &'static str {
+                    "antigravity"
+                }
+                async fn run(
+                    &self,
+                    task: WorkerTask,
+                    _gate: Arc<dyn PermissionGate>,
+                    events: mpsc::Sender<HarnessEvent>,
+                ) -> anyhow::Result<RunSummary> {
+                    let framed = task.framed_brief_for("mcp_dictionary_run_code");
+                    self.briefs.lock().unwrap().push((task.brief.clone(), framed));
+                    if self.schema_bytes.load(Ordering::SeqCst) == 0
+                        && let Some(dict) = task.dictionary.clone()
+                    {
+                        let bytes = tokio::task::spawn_blocking(move || {
+                            let resp: serde_json::Value = ureq::post(&dict.url)
+                                .set("Authorization", &format!("Bearer {}", dict.bearer_token))
+                                .set("Content-Type", "application/json")
+                                .send_json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+                                .unwrap()
+                                .into_json()
+                                .unwrap();
+                            serde_json::to_string(&resp["result"]["tools"]).unwrap().len()
+                        })
+                        .await?;
+                        self.schema_bytes.store(bytes, Ordering::SeqCst);
+                    }
+                    std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                    std::fs::create_dir_all(task.cwd.join("tests"))?;
+                    if self.fail_once.swap(false, Ordering::SeqCst) {
+                        // Trigger a repair on attempt 1 via an unowned stray file so we also inspect the repair brief.
+                        std::fs::write(task.cwd.join("pkg/stray.py"), "BAD = 1\n")?;
+                    } else {
+                        std::fs::write(task.cwd.join("pkg/__init__.py"), "")?;
+                        std::fs::write(task.cwd.join("pkg/model.py"), "M = 1\n")?;
+                        std::fs::write(task.cwd.join("pkg/storage.py"), "S = 1\n")?;
+                        std::fs::write(task.cwd.join("tests/test_core.py"), "def test_ok(): assert True\n")?;
+                    }
+                    let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+                }
+            }
+            let h: Arc<dyn Harness> = Arc::new(Probe {
+                briefs: briefs.clone(),
+                schema_bytes: schema_bytes.clone(),
+                fail_once: std::sync::atomic::AtomicBool::new(true),
+            });
+            let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+            let mut cfg = config(&root, plan, true, 1);
+            cfg.checks = false;
+            cfg.runtime_checks = false;
+            cfg.code_mode = code_mode;
+            cfg.browser = false;
+            assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+            (briefs.lock().unwrap().clone(), schema_bytes.load(Ordering::SeqCst))
+        }
+    };
+
+    let tmp_off = seeded("n9-cm-off");
+    let (briefs_off, schema_off) = run_probe(&tmp_off, false).await;
+    let tmp_on = seeded("n9-cm-on");
+    let (briefs_on, schema_on) = run_probe(&tmp_on, has_node).await;
+
+    if !has_node {
+        return;
+    }
+
+    // 1. Deduplication: framed_brief_for must NOT prepend duplicate CODE_MODE_WRITE_RULES when
+    //    shared_prefix already includes CODE_MODE_GUIDE ("Code Mode is on").
+    let (raw_on, framed_on) = &briefs_on[0];
+    let (_, framed_off) = &briefs_off[0];
+    assert!(raw_on.contains("Code Mode is on"));
+    assert!(
+        !framed_on.contains("Code Mode is active — use two-call discipline"),
+        "framed_brief_for must not duplicate CODE_MODE_WRITE_RULES when CODE_MODE_GUIDE is present"
+    );
+    let overhead_bytes = framed_on.len().saturating_sub(framed_off.len()) + schema_on.saturating_sub(schema_off);
+    assert!(
+        overhead_bytes < 2_200,
+        "deduplicated Code Mode brief + run_code MCP schema overhead should stay compact, got {overhead_bytes} bytes \
+         (brief {} vs {}, schema {} vs {})",
+        framed_on.len(),
+        framed_off.len(),
+        schema_on,
+        schema_off
+    );
+
+    // 2. Repair brief explicitly warns that native file tools see a read-only worktree and directs
+    //    all reads/edits/tests to `mcp_dictionary_run_code`.
+    let (repair_raw, _) = &briefs_on[1];
+    assert!(
+        repair_raw.contains("read-only worktree")
+            && repair_raw.contains("do NOT call native `read_file`, `write_file`, `edit_file`, or `run_command`")
+            && repair_raw.contains("mcp_dictionary_run_code"),
+        "Code Mode repair brief must enforce run_code and warn about read-only native tools:\n{repair_raw}"
+    );
+
+    // 3. Measure cumulative prompt + schema + turn-history input bytes across a realistic 4-file +
+    //    1-fix unit build:
+    //    - Native tools: 4 write_file + 1 run_command + 1 edit_file + 1 run_command = 7 tool calls (8 model turns).
+    //    - Code Mode two-call: Call 1 (files map + return await test()) + Call 2 (edit + return await test()) = 2 tool calls (3 model turns).
+    //    Even when native harness tools (~14 KB baseline system prompt) remain visible on ACP,
+    //    collapsing 8 turns -> 3 turns cuts cumulative repeated input bytes by >50%.
+    let harness_system_bytes: usize = 14_000;
+    let payload_per_file: usize = 1_200;
+    let test_out_bytes: usize = 400;
+    let fix_patch_bytes: usize = 250;
+
+    // Cumulative input bytes across turns (each turn re-reads system + brief + schema + prior history).
+    let simulate_cumulative_input = |base: usize, turn_additions: &[usize]| -> usize {
+        let mut history = base;
+        let mut total = 0;
+        for &add in turn_additions {
+            total += history;
+            history += add;
+        }
+        total += history; // final assistant reply turn
+        total
+    };
+    let native_base = harness_system_bytes + framed_off.len() + schema_off;
+    let native_total = simulate_cumulative_input(
+        native_base,
+        &[
+            payload_per_file + 80,
+            payload_per_file + 80,
+            payload_per_file + 80,
+            payload_per_file + 80,
+            test_out_bytes,
+            fix_patch_bytes,
+            test_out_bytes,
+        ],
+    );
+    let code_base = harness_system_bytes + framed_on.len() + schema_on;
+    let code_total = simulate_cumulative_input(
+        code_base,
+        &[
+            payload_per_file * 4 + 120 + test_out_bytes, // Call 1: write all 4 files + test
+            fix_patch_bytes + 80 + test_out_bytes,       // Call 2: targeted edit + re-test
+        ],
+    );
+    assert!(
+        code_total * 2 < native_total,
+        "two-call run_code path ({code_total} cumulative input bytes) must save >50% over native 7-call path ({native_total} bytes)"
+    );
+}

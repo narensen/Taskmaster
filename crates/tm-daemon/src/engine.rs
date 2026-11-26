@@ -475,6 +475,8 @@ struct Driver {
     web_access: crate::web_access::WebAccessSettings,
     /// Agents already nudged once by the W1 release gate so we never nudge twice.
     release_nudged: BTreeSet<String>,
+    /// Agents already sent an automatic recovery follow-up turn after a `run_code` error.
+    code_error_followed_up: BTreeSet<String>,
     /// Pages currently racing multiple providers (W3 Best-of-N): maps page -> candidate count.
     race_pages: HashMap<PageId, usize>,
     /// Loaded `taskmaster.yaml` worktree config from the project root (O1).
@@ -826,6 +828,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         mcp_port: addr.port(),
         web_access: loaded_settings.web_access,
         release_nudged: BTreeSet::new(),
+        code_error_followed_up: BTreeSet::new(),
         race_pages: HashMap::new(),
         project_config,
         setup_artifacts: HashMap::new(),
@@ -2793,13 +2796,14 @@ impl Driver {
             WorkerJob::Finished(product) => {
                 let mut product = *product;
                 self.charge(&product.bill, &product.answer)?;
-                // W1: Release gate — if a worker with a shell and available tests released without
-                // running them, send the nudge once as a follow-up turn before judging/checking.
+                // Recovery follow-up when a Code Mode worker ends right after a `run_code` error,
+                // then W1 release gate if it changed files and skipped running tests.
                 if !self.is_stale(&page)
                     && !self.race_pages.contains_key(&page)
                     && product.answer.ok
                     && reply::parse_flag(&product.answer.text).is_none()
                 {
+                    self.maybe_run_code_error_followup(&page, index, &mut product).await?;
                     self.maybe_release_gate_nudge(&page, index, &mut product).await?;
                 }
                 self.batches.entry(page.clone()).or_default().push((index, product));
@@ -2946,6 +2950,132 @@ impl Driver {
         self.settle(&page, outcome, settling)
     }
 
+    /// Send a single recovery/nudge follow-up turn to a worker's warm session (re-attaching
+    /// Code Mode `run_code` for its worktree when active), falling back to a fresh call if no
+    /// warm session was kept.
+    async fn send_worker_followup(
+        &mut self,
+        page: &str,
+        index: usize,
+        product: &mut Product,
+        agent_id: &str,
+        message: &str,
+        label: &str,
+    ) -> anyhow::Result<bool> {
+        let tier = match product.bill.role {
+            Role::Mid => Tier::Mid,
+            Role::Master => Tier::Master,
+            _ => Tier::Worker,
+        };
+        let units = self.page(page).map(|p| p.work_units()).unwrap_or_default();
+        let units_len = units.len().max(1);
+        let unit_idx = index.min(units_len - 1);
+        let mut req = self.worker_request(page, unit_idx, units_len, tier, None, product.worktree.clone())?;
+        // Keep the full original worker brief on `req.brief` so a stalled warm session can
+        // fall back to `ask(req)` with complete context.
+        req.brief.push_str("\n\n");
+        req.brief.push_str(message);
+        let glob = units.get(unit_idx).map(|u| u.owned_glob.as_str());
+        self.tag(&mut req, agent_id, tier_name(tier), Some(page), glob);
+        let scope = if units.len() > 1 {
+            format!("{page}/{}", units[unit_idx].id)
+        } else {
+            page.to_string()
+        };
+        self.offer_code(&scope, &product.worktree, &mut req);
+        req.code_mode = self.code.is_some();
+        if units.len() > 1
+            && let Some(feed) = req.feed.as_mut()
+        {
+            feed.agent["unit"] = serde_json::json!(units[unit_idx].id);
+        }
+        let bill = req.bill(Role::builder(tier), Some(page));
+        let asked = match product.answer.kept.take() {
+            Some(session) => follow(req, session, message.to_string(), false).await,
+            None => ask(req).await,
+        };
+        if let Some(code) = &self.code {
+            code.detach(&scope);
+        }
+        let ans = match asked {
+            Ok(ans) => ans,
+            Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() => return Err(err),
+            Err(err) => {
+                eprintln!("taskmaster: {label} for {agent_id} failed ({err:#}); continuing with existing changes");
+                return Ok(false);
+            }
+        };
+        self.charge(&bill, &ans)?;
+        product.prior_clean = false;
+        product.prev_context = estimate_session_context(product.prev_context, &ans.usage, ans.requests);
+        product.answer.ok = ans.ok;
+        if !ans.text.trim().is_empty() {
+            if !product.answer.text.is_empty() {
+                product.answer.text.push('\n');
+            }
+            product.answer.text.push_str(&ans.text);
+        }
+        product.answer.refused.extend(ans.refused);
+        product.answer.kept = ans.kept;
+        Ok(true)
+    }
+
+    /// If a Code Mode worker ended right after a `run_code` error (such as an aborted script or
+    /// failed edit) with no subsequent successful `run_code` call, send one automatic recovery
+    /// follow-up turn to the same warm session so it can inspect partial edits, fix the script,
+    /// and verify with `return await test()`.
+    async fn maybe_run_code_error_followup(
+        &mut self,
+        page: &str,
+        index: usize,
+        product: &mut Product,
+    ) -> anyhow::Result<()> {
+        if self.code.is_none() {
+            return Ok(());
+        }
+        let agent_id = product
+            .bill
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.agent_id(page, None));
+        if self.code_error_followed_up.contains(&agent_id) {
+            return Ok(());
+        }
+        self.live.flush(&self.id);
+        let (_, entries) = self.live.read(&self.id, 0);
+        let Some(error_detail) = last_run_code_error_needs_followup(&entries, &agent_id) else {
+            return Ok(());
+        };
+        self.code_error_followed_up.insert(agent_id.clone());
+        let tier = match product.bill.role {
+            Role::Mid => Tier::Mid,
+            Role::Master => Tier::Master,
+            _ => Tier::Worker,
+        };
+        let run_code_tool = tm_harness::run_code_tool_name(self.harness_for(tier).id(), "dictionary");
+        let changed_files: Vec<String> = git::worktree_changes(&product.worktree)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| !tm_verify::is_flow_path(&c.path))
+            .map(|c| c.path)
+            .collect();
+        let partial_note = if changed_files.is_empty() {
+            "No owned file edits are currently on disk in your worktree.".to_string()
+        } else {
+            format!("Files currently modified in your worktree: {}.", changed_files.join(", "))
+        };
+        let msg = format!(
+            "Your last `{run_code_tool}` call errored before completing ({error_detail}). {partial_note}\n\
+             Do not stop on a `run_code` error: fix the script (always `await` every helper call; use `edit(path, find, replace)` or `files`/`writeFile`), \
+             apply any missing changes, run `return await test()` inside `{run_code_tool}`, and emit your `RELEASE` line once tests pass."
+        );
+        eprintln!("taskmaster: sending run_code error recovery follow-up to {agent_id}");
+        let _ = self
+            .send_worker_followup(page, index, product, &agent_id, &msg, "run_code error follow-up")
+            .await?;
+        Ok(())
+    }
+
     /// W1: If a worker had a shell (or Code Mode) and tests available, changed files, and
     /// released without running tests, send the release-gate nudge once as a follow-up turn.
     async fn maybe_release_gate_nudge(
@@ -2986,40 +3116,9 @@ impl Driver {
         };
         self.release_nudged.insert(agent_id.clone());
         eprintln!("taskmaster: release gate nudging {agent_id} to run tests once");
-        let units = self.page(page).map(|p| p.work_units()).unwrap_or_default();
-        let units_len = units.len().max(1);
-        let mut req = self.worker_request(page, index.min(units_len - 1), units_len, tier, None, product.worktree.clone())?;
-        // Keep the full original worker brief on `req.brief` so a stalled warm session can
-        // fall back to `ask(req)` with complete context.
-        req.brief.push_str("\n\n");
-        req.brief.push_str(nudge);
-        let glob = units.get(index).map(|u| u.owned_glob.as_str());
-        self.tag(&mut req, &agent_id, tier_name(tier), Some(page), glob);
-        let bill = req.bill(Role::builder(tier), Some(page));
-        let asked = match product.answer.kept.take() {
-            Some(session) => follow(req, session, nudge.to_string(), false).await,
-            None => ask(req).await,
-        };
-        let ans = match asked {
-            Ok(ans) => ans,
-            Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() => return Err(err),
-            Err(err) => {
-                eprintln!("taskmaster: release gate nudge for {agent_id} failed ({err:#}); continuing with existing changes");
-                return Ok(());
-            }
-        };
-        self.charge(&bill, &ans)?;
-        product.prior_clean = false;
-        product.prev_context = estimate_session_context(product.prev_context, &ans.usage, ans.requests);
-        product.answer.ok = ans.ok;
-        if !ans.text.trim().is_empty() {
-            if !product.answer.text.is_empty() {
-                product.answer.text.push('\n');
-            }
-            product.answer.text.push_str(&ans.text);
-        }
-        product.answer.refused.extend(ans.refused);
-        product.answer.kept = ans.kept;
+        let _ = self
+            .send_worker_followup(page, index, product, &agent_id, nudge, "release gate nudge")
+            .await?;
         Ok(())
     }
 
@@ -7863,13 +7962,68 @@ const PROJECT_MARK: &str = "<!-- Written by Taskmaster from the run's sketch and
 /// reply had no plan in it at all, one more full plan).
 const PLAN_ATTEMPTS: usize = 3;
 
+/// Inspect an agent's transcript since its latest `"start"` event and return a concise error
+/// description when its most recent `run_code` call errored without a later successful `run_code`.
+fn last_run_code_error_needs_followup(entries: &[serde_json::Value], agent_id: &str) -> Option<String> {
+    let start_idx = entries
+        .iter()
+        .rposition(|e| e["agent"]["id"].as_str() == Some(agent_id) && e["kind"] == "start")
+        .unwrap_or(0);
+    let mut last_err: Option<String> = None;
+    let mut run_code_call_ids: BTreeSet<String> = BTreeSet::new();
+    for entry in &entries[start_idx..] {
+        if entry["agent"]["id"].as_str() != Some(agent_id) {
+            continue;
+        }
+        match entry["kind"].as_str() {
+            Some("tool_call") => {
+                let name = entry["name"].as_str().unwrap_or("");
+                if tm_dictionary::strip_dict_prefix(name) == "run_code"
+                    && let Some(id) = entry["id"].as_str()
+                {
+                    run_code_call_ids.insert(id.to_string());
+                }
+            }
+            Some("mcp_reply") => {
+                let tool = entry["tool"].as_str().unwrap_or("");
+                if tm_dictionary::strip_dict_prefix(tool) == "run_code" {
+                    if entry["is_error"] == true {
+                        last_err = Some("run_code returned an MCP error".to_string());
+                    } else {
+                        last_err = None;
+                    }
+                }
+            }
+            Some("output") => {
+                let id = entry["id"].as_str().unwrap_or("");
+                if !run_code_call_ids.contains(id) {
+                    continue;
+                }
+                let text = entry["text"].as_str().unwrap_or("").trim();
+                let is_err_output = text.starts_with("Error:")
+                    || text.contains("run_code script aborted")
+                    || text.contains("the script stopped before it finished")
+                    || text.contains("the script had a syntax error")
+                    || text.contains("Unawaited call failed");
+                if is_err_output {
+                    last_err = Some(clip(text, 240));
+                } else if !text.is_empty() {
+                    last_err = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    last_err
+}
+
 /// How an agent with Code Mode is told to work, in the shared prefix.
 const CODE_MODE_GUIDE: &str = "\nCode Mode is on — follow two-call discipline with run_code:\n\
 - Call 1 (write + test in one call): pass all your owned implementation files and concise unit tests via the `files` JSON argument \
 (`{\"path\": \"content\"}`, or `writeFile`, or `String.raw` with `write(path, { raw })` to avoid JS escaping for triple quotes/backslashes) \
-AND set `code` to `return await test()` in the SAME run_code call. Do NOT burn a call probing Python/venv, listing files, or writing without testing.\n\
+AND set `code` to `return await test()` in the SAME run_code call. Always `await` every helper call. Do NOT burn a call probing Python/venv, listing files, or writing without testing.\n\
 - Call 2 (fix + re-test, only if Call 1 failed): use targeted `edit`/`patch`/`applyPatch` (never rewrite whole files) and end with `return await test()`. \
-Only make another call if failures remain.\n\
+If a `run_code` call errors or aborts mid-script, check which partial edits landed, fix the script, and call `run_code` again — NEVER end your turn on a `run_code` error or fall back to native write/edit/shell tools. Only make another call if failures remain.\n\
 - Helpers inside `code`: read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, diff, symbols, sh, test, testAffected, check, browser, and `.flow` (`await flow(\"find\", { query })`, `await flow(\"neighbors\", { id, k: 1, dir: \"in\" })`, `await flow(\"source\", { id })`, or `await flow(\"batch\", { queries })`). \
 If native write/edit/shell tools are off, use run_code from the start. Do not call `update_steps` or run trailing `git status` / redundant re-runs once tests pass. Keep replies short.\n";
 

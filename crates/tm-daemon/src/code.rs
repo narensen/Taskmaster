@@ -55,12 +55,30 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const lines = readline.createInterface({ input: process.stdin });
 const waiting = new Map();
 let next = 1;
-const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
-const call = (op, args) => new Promise((resolve, reject) => {
-  const id = next++;
-  waiting.set(id, { resolve, reject });
-  send({ id, op, args });
+let activeState = null;
+process.on("unhandledRejection", (reason) => {
+  if (activeState) {
+    activeState.unhandled.push(String((reason && reason.stack) || reason).split("\n").slice(0, 4).join("\n"));
+  }
 });
+process.on("uncaughtException", (err) => {
+  if (activeState) {
+    activeState.unhandled.push(String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"));
+  }
+});
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+const call = (op, args) => {
+  let markDone;
+  const done = new Promise((r) => { markDone = r; });
+  if (activeState) {
+    activeState.pending.push(done);
+  }
+  return new Promise((resolve, reject) => {
+    const id = next++;
+    waiting.set(id, { resolve, reject, markDone });
+    send({ id, op, args });
+  });
+};
 const read = (path) => call("read", { path });
 const extractText = (value) => {
   if (value && typeof value === "object") {
@@ -71,7 +89,17 @@ const extractText = (value) => {
 };
 const write = (path, text) => call("write", { path, text: extractText(text) });
 const writeFile = (path, text) => call("write", { path, text: extractText(text) });
-const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
+const edit = (path, find, replace, all = false) => {
+  if (find && typeof find === "object") {
+    return call("edit", {
+      path,
+      find: find.find ?? find.target,
+      replace: find.replace ?? find.replacement ?? "",
+      all: Boolean(find.all),
+    });
+  }
+  return call("edit", { path, find, replace, all });
+};
 const patch = (path, edits) => call("patch", { path, edits });
 const applyPatch = (diff) => call("applyPatch", { diff: String(diff) });
 const tryPatch = (diff) => call("tryPatch", { diff: String(diff) });
@@ -113,15 +141,36 @@ async function runBody(code) {
     send({ done: true, syntaxError: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") });
     return;
   }
+  const state = { pending: [], unhandled: [] };
+  activeState = state;
   try {
     const result = await fn(
       read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow,
       readMany, test, testAffected, probe, diagnostics, outline, definition, references,
       sh, check, browser, status, wait, scopedConsole, require
     );
-    send({ done: true, result: result === undefined ? null : result, logs });
+    if (state.pending.length > 0) {
+      await Promise.all(state.pending);
+      await new Promise((r) => setImmediate(r));
+    }
+    if (state.unhandled.length > 0) {
+      send({
+        done: true,
+        error: "Unawaited call failed (always `await` every helper call):\n" + state.unhandled.join("\n"),
+        logs,
+      });
+    } else {
+      send({ done: true, result: result === undefined ? null : result, logs });
+    }
   } catch (err) {
-    send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"), logs });
+    if (state.pending.length > 0) {
+      await Promise.all(state.pending);
+      await new Promise((r) => setImmediate(r));
+    }
+    const extra = state.unhandled.length > 0 ? "\nUnawaited errors:\n" + state.unhandled.join("\n") : "";
+    send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") + extra, logs });
+  } finally {
+    if (activeState === state) activeState = null;
   }
 }
 
@@ -141,6 +190,7 @@ lines.on("line", (line) => {
   waiting.delete(m.id);
   if (m.error !== undefined) w.reject(new Error(m.error));
   else w.resolve(m.result);
+  w.markDone();
 });
 lines.on("close", () => process.exit(0));
 "#;
@@ -151,6 +201,7 @@ struct WarmNode {
     _guard: tm_harness::GroupGuard,
     stdin: tokio::process::ChildStdin,
     out: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_buf: Arc<Mutex<String>>,
     scratch: PathBuf,
 }
 
@@ -188,11 +239,41 @@ impl WarmNode {
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let (mut child, guard) = tm_harness::spawn_grouped(&mut cmd).context("could not start node")?;
         let stdin = child.stdin.take().context("no stdin")?;
         let out = BufReader::new(child.stdout.take().context("no stdout")?).lines();
-        Ok(WarmNode { child, _guard: guard, stdin, out, scratch })
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let sink = stderr_buf.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stderr;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let piece = String::from_utf8_lossy(&chunk[..n]);
+                            let mut buf = sink.lock().unwrap();
+                            buf.push_str(&piece);
+                            if buf.len() > 4096 {
+                                let trimmed = tail(&buf, 4096);
+                                *buf = trimmed;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Ok(WarmNode { child, _guard: guard, stdin, out, stderr_buf, scratch })
+    }
+
+    fn take_stderr(&self) -> String {
+        let mut buf = self.stderr_buf.lock().unwrap();
+        let out = buf.trim().to_string();
+        buf.clear();
+        out
     }
 
     fn is_alive(&mut self) -> bool {
@@ -429,6 +510,7 @@ impl CodeTools {
     }
 
     async fn drive_warm(&self, grant: &Grant, scope: &Scope, worker: &mut WarmNode, code: &str) -> Result<String, DriveError> {
+        let _ = worker.take_stderr();
         let req = json!({ "exec": true, "code": code });
         worker
             .stdin
@@ -437,32 +519,61 @@ impl CodeTools {
             .context("could not send script to warm node worker")
             .map_err(DriveError::Broken)?;
         let mut calls = 0usize;
+        let mut applied: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         while let Some(line) = worker.out.next_line().await.map_err(|e| DriveError::Broken(e.into()))? {
             let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
             if message["done"] == true {
                 if let Some(syntax) = message["syntaxError"].as_str() {
                     return Err(DriveError::Syntax(syntax.to_string()));
                 }
-                return Ok(summary(&message));
+                let mut text = summary(&message);
+                if message["error"].as_str().is_some() {
+                    if !applied.is_empty() {
+                        text.push_str(&format!(
+                            "\nPartial edits already applied on disk: {}. Inspect/continue from those edits and retry `run_code` rather than ending.",
+                            applied.join(", ")
+                        ));
+                    } else {
+                        text.push_str(
+                            "\nNo file edits were applied by this call. Fix the script error and retry `run_code` (always `await` every helper call) rather than ending.",
+                        );
+                    }
+                    text = tail(&text, MAX_REPLY);
+                }
+                return Ok(text);
             }
             calls += 1;
             let id = message["id"].clone();
+            let op_name = message["op"].as_str().unwrap_or("");
+            let op_args = &message["args"];
             let reply = if calls > MAX_CALLS {
-                json!({ "id": id, "error": format!("more than {MAX_CALLS} calls in one script") })
+                let msg = format!("more than {MAX_CALLS} calls in one script");
+                failed.push(format!("{op_name}: {msg}"));
+                json!({ "id": id, "error": msg })
             } else {
-                match self.op(grant, scope, message["op"].as_str().unwrap_or(""), &message["args"]).await {
-                    Ok(result) => json!({ "id": id, "result": result }),
-                    Err(err) => json!({ "id": id, "error": format!("{err:#}") }),
+                match self.op(grant, scope, op_name, op_args).await {
+                    Ok(result) => {
+                        record_applied_op(&mut applied, op_name, op_args, &result);
+                        json!({ "id": id, "result": result })
+                    }
+                    Err(err) => {
+                        let target = op_args["path"].as_str().map(|p| format!(" {p}")).unwrap_or_default();
+                        failed.push(format!("{op_name}{target}: {err:#}"));
+                        json!({ "id": id, "error": format!("{err:#}") })
+                    }
                 }
             };
-            worker
-                .stdin
-                .write_all(format!("{reply}\n").as_bytes())
-                .await
-                .context("warm node worker stopped accepting replies")
-                .map_err(DriveError::Broken)?;
+            if let Err(err) = worker.stdin.write_all(format!("{reply}\n").as_bytes()).await {
+                return Err(DriveError::Broken(format_aborted_run_code(
+                    worker,
+                    &applied,
+                    &failed,
+                    Some(&format!("worker stopped accepting replies ({err})")),
+                ).await));
+            }
         }
-        Err(DriveError::Broken(anyhow::anyhow!("the script stopped before it finished")))
+        Err(DriveError::Broken(format_aborted_run_code(worker, &applied, &failed, None).await))
     }
 
     /// Run `command` with `sh -c` in the agent's sandbox: the worktree and its scratch are
@@ -1356,6 +1467,69 @@ fn summary(done: &Value) -> String {
         out.push_str(&shown);
     }
     tail(&out, MAX_REPLY)
+}
+
+fn record_applied_op(applied: &mut Vec<String>, op: &str, args: &Value, result: &Value) {
+    let entry = match op {
+        "write" | "edit" | "patch" => args["path"].as_str().map(|p| format!("{op}({p})")),
+        "applyPatch" => result["files"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                let paths: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+                format!("applyPatch({})", paths.join(", "))
+            }),
+        "tryPatch" if result["applied"] == true => result["files"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                let paths: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+                format!("tryPatch({})", paths.join(", "))
+            }),
+        _ => None,
+    };
+    if let Some(item) = entry
+        && !applied.contains(&item)
+    {
+        applied.push(item);
+    }
+}
+
+async fn format_aborted_run_code(
+    worker: &mut WarmNode,
+    applied: &[String],
+    failed: &[String],
+    extra: Option<&str>,
+) -> anyhow::Error {
+    // Give the stderr drain task and child exit status a brief moment to settle.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let status = worker
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map(|s| format!(" (exit {s})"))
+        .unwrap_or_default();
+    let stderr = worker.take_stderr();
+    let mut msg = format!("run_code script aborted before finishing{status} (the script stopped before it finished).");
+    if let Some(reason) = extra {
+        msg.push_str(&format!(" Cause: {reason}."));
+    }
+    if !stderr.is_empty() {
+        msg.push_str(&format!("\nStderr:\n{}", tail(&stderr, 1200)));
+    }
+    if applied.is_empty() {
+        msg.push_str("\nApplied edits on disk before abort: none (worktree unchanged by this call).");
+    } else {
+        msg.push_str(&format!("\nApplied edits on disk before abort: {}.", applied.join(", ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("\nFailed ops before abort:\n- {}", failed.join("\n- ")));
+    }
+    msg.push_str(
+        "\nRecovery: fix the script error and call `run_code` again (always `await` every helper call; use `edit(path, find, replace)` or `files`/`writeFile`, and end with `return await test()`). Do NOT end your turn or switch to native shell/edit tools.",
+    );
+    anyhow::anyhow!(msg)
 }
 
 /// Internal drive failure distinction: syntax errors leave the warm Node worker healthy;
@@ -2680,5 +2854,76 @@ mod tests {
         assert!(kept.len() <= MAX_TOOL_OUTPUT + 4, "kept len {} exceeded 4KB cap", kept.len());
         assert!(kept.starts_with('…'));
         assert!(kept.ends_with(traceback), "must keep trailing traceback: {kept}");
+    }
+
+    #[tokio::test]
+    async fn fix_n8_aborted_run_code_reports_partial_edits_and_unawaited_errors_without_crashing() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("n8-recover");
+        std::fs::write(dir.join("app/a.py"), "x = 1\n").unwrap();
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // 1. Object-arg `edit(path, { target, replacement })` works cleanly.
+        let obj_res = tools
+            .run(
+                &grant(),
+                r#"await edit("app/a.py", { target: "x = 1", replacement: "x = 2" }); return await read("app/a.py");"#,
+            )
+            .await
+            .unwrap();
+        assert!(obj_res.contains("x = 2"), "object-arg edit should apply: {obj_res}");
+
+        // 2. Unawaited failing edit() must NOT kill the warm Node process; it reports a clear error
+        //    and names partial edits that already landed on disk.
+        let unawaited = tools
+            .run(
+                &grant(),
+                r#"
+                await write("app/partial.py", "ok = True\n");
+                edit("app/a.py", "does_not_exist", "x = 3");
+                return "finished";
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            unawaited.contains("Unawaited call failed") && unawaited.contains("does not occur"),
+            "expected actionable unawaited error, got:\n{unawaited}"
+        );
+        assert!(
+            unawaited.contains("Partial edits already applied on disk: write(app/partial.py)"),
+            "expected partial-edit report, got:\n{unawaited}"
+        );
+
+        // 3. Genuine script abort (process.exit(1) after writing a file and failing an op) returns
+        //    an actionable error listing applied edits, failed ops, stderr, and recovery advice,
+        //    and the next run_code call spawns a fresh worker and succeeds.
+        let aborted = tools
+            .run(
+                &grant(),
+                r#"
+                await write("app/before_abort.py", "saved = 1\n");
+                try { await edit("app/a.py", "missing_needle", "y"); } catch (_) {}
+                process.stderr.write("fatal boom\n");
+                process.exit(1);
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(aborted.contains("run_code script aborted before finishing"), "{aborted}");
+        assert!(aborted.contains("write(app/before_abort.py)"), "must list applied edits:\n{aborted}");
+        assert!(
+            aborted.contains("Failed ops before abort") && aborted.contains("does not occur"),
+            "must list failed op:\n{aborted}"
+        );
+        assert!(aborted.contains("fatal boom"), "must surface stderr:\n{aborted}");
+        assert!(aborted.contains("Recovery:"), "{aborted}");
+
+        let recovered = tools.run(&grant(), r#"return await read("app/before_abort.py");"#).await.unwrap();
+        assert!(recovered.contains("saved = 1"), "next run_code call must recover cleanly: {recovered}");
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
     }
 }

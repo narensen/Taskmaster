@@ -260,7 +260,7 @@ pub struct WorkerTask {
 pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol/graph lookups, and diffs in a single `run_code` script (`flow`, `readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Always `await` every helper call. If `run_code` returns an error or aborts mid-script, check which partial edits landed, fix the script, and retry `run_code` — never stop or fall back to native write/edit/shell tools. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
 
 /// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
 /// under `harness_id`.

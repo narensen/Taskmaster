@@ -12403,3 +12403,122 @@ async fn tok13_brownfield_planner_gets_flow_summary_without_file_reads_and_worke
     assert!(wbrief.contains("return encode_row(row)"), "{wbrief}");
     assert!(wbrief.contains("Anti-double-read rule:") && wbrief.contains("do NOT call `read_file`"), "{wbrief}");
 }
+
+#[tokio::test]
+async fn fix_n8_run_code_error_triggers_automatic_warm_followup_turn() {
+    let tmp = seeded("n8-run-code-followup");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/storage.py"), "def old():\n    return 1\n").unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "baseline"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        summary: "Add add_column to storage.py".into(),
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "pkg/storage.py".into(),
+            brief: "Implement add_column in pkg/storage.py".into(),
+            done: "add_column exists".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let followups: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct WarmCodeErrSession {
+        cwd: PathBuf,
+        followups: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmCodeErrSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.followups.lock().unwrap().push(text);
+            std::fs::write(
+                self.cwd.join("pkg/storage.py"),
+                "def old():\n    return 1\n\ndef add_column():\n    return True\n",
+            )?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct CodeErrHarness {
+        followups: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Harness for CodeErrHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            unreachable!("run_kept is used for keep=true workers")
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            // Simulate storage-facade ending right after an aborted run_code call with no edits landed.
+            let _ = events
+                .send(HarnessEvent::ToolCall {
+                    id: "rc1".into(),
+                    name: "mcp_dictionary_run_code".into(),
+                    input: serde_json::json!({ "code": "edit('pkg/storage.py', {})" }),
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolResult {
+                    id: "rc1".into(),
+                    text: "run_code script aborted before finishing (the script stopped before it finished).".into(),
+                    diff: None,
+                })
+                .await;
+            let _ = events.send(HarnessEvent::Text { text: "stopped".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(WarmCodeErrSession {
+                cwd: task.cwd,
+                followups: self.followups.clone(),
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(2) }),
+                Some(sess),
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(CodeErrHarness { followups: followups.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n8-fix1".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = true;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let fups = followups.lock().unwrap();
+    assert_eq!(fups.len(), 1, "expected 1 automatic warm follow-up turn after run_code error: {fups:?}");
+    assert!(
+        fups[0].contains("mcp_dictionary_run_code") && fups[0].contains("errored before completing"),
+        "follow-up must explain run_code error and instruct retry:\n{}",
+        fups[0]
+    );
+    assert!(
+        read(&tmp.0.join("pkg/storage.py")).contains("def add_column"),
+        "warm follow-up must land the edit into the branch"
+    );
+}

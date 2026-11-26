@@ -492,24 +492,38 @@ impl Atlas {
             lines.push(format!("Test map: {}", tmap.join("; ")));
         }
 
-        let mut out = String::new();
-        for line in lines {
-            if out.len() + line.len() + 1 > max_chars {
-                if out.is_empty() {
-                    let mut end = max_chars.saturating_sub(1);
-                    while end > 0 && !line.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    out.push_str(&line[..end]);
-                    out.push('\n');
-                }
-                break;
-            }
-            out.push_str(&line);
-            out.push('\n');
-        }
-        out
+        clip_lines(&lines.join("\n"), max_chars)
     }
+}
+
+/// Trim newline-separated prompt text to at most `max_chars` bytes on line boundaries.
+/// If even the first line exceeds `max_chars`, clips it safely on a UTF-8 character boundary.
+/// Shared by [`Atlas::render_for_planner`] and [`crate::scout`] so bounded prompt sections
+/// never return empty on an oversized first line or panic on multibyte UTF-8.
+pub(crate) fn clip_lines(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 || text.is_empty() {
+        return String::new();
+    }
+    if text.len() <= max_chars {
+        return if text.ends_with('\n') { text.to_string() } else { format!("{text}\n") };
+    }
+    let mut out = String::new();
+    for line in text.lines() {
+        if out.len() + line.len() + 1 > max_chars {
+            if out.is_empty() {
+                let mut end = max_chars.saturating_sub(1);
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.push_str(&line[..end]);
+                out.push('\n');
+            }
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -578,5 +592,15 @@ mod tests {
         assert!(tight.len() <= 180, "tight len {} exceeded 180:\n{tight}", tight.len());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tb18_clip_lines_handles_multibyte_utf8_and_oversized_first_line() {
+        let long_utf8 = "—".repeat(40);
+        let clipped = clip_lines(&long_utf8, 16);
+        assert!(!clipped.is_empty(), "oversized first line must not collapse to empty");
+        assert!(clipped.len() <= 16, "clipped bytes {} exceeded 16", clipped.len());
+        assert!(clipped.ends_with('\n'));
+        assert_eq!(clip_lines("line1\nline2", 64), "line1\nline2\n");
     }
 }

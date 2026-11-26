@@ -846,7 +846,10 @@ impl CodeTools {
         {
             bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, flow, probe.ast, check)");
         }
-        if matches!(op, "read" | "readMany" | "ls" | "grep" | "symbols" | "probeAst" | "check")
+        if matches!(
+            op,
+            "read" | "readMany" | "ls" | "grep" | "symbols" | "probeAst" | "check" | "outline" | "definition" | "references" | "diagnostics"
+        )
             && let Some(sync) = &scope.sync
             && sync.is_dirty()
         {

@@ -1754,6 +1754,14 @@ pub struct SettingsBody {
     settle_idle_days: Option<u32>,
     /// A5 (Labs): suggest the next message after a turn.
     labs_suggest_next: Option<bool>,
+    /// Brownfield scope-scout extractor: `{enabled?, min_files?}`.
+    scout: Option<ScoutBody>,
+}
+
+#[derive(Deserialize)]
+pub struct ScoutBody {
+    enabled: Option<bool>,
+    min_files: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1868,6 +1876,22 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
     }
     if let Some(on) = body.usage_oauth_polling {
         save_setting(&app.project(), "usage", json!({ "oauth_polling": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(scout) = &body.scout {
+        let mut scout_changes = serde_json::Map::new();
+        if let Some(on) = scout.enabled {
+            scout_changes.insert("enabled".into(), json!(on));
+        }
+        if let Some(min_files) = scout.min_files {
+            if !(1..=10_000).contains(&min_files) {
+                return Err(fail(StatusCode::BAD_REQUEST, "scout.min_files is between 1 and 10000"));
+            }
+            scout_changes.insert("min_files".into(), json!(min_files));
+        }
+        if !scout_changes.is_empty() {
+            save_setting(&app.project(), "scout", Value::Object(scout_changes))
+                .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        }
     }
     if !changes.is_empty() {
         save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -2174,5 +2198,14 @@ mod tests {
         let (title, body) = pr_text("r1", Some("\nA bookshop with a cart\nmore"), &plan);
         assert_eq!(title, "A bookshop with a cart");
         assert!(body.contains("| `home` | `/` | `app/home/**` | theme |") && body.contains("`app/types.ts`"), "{body}");
+    }
+
+    #[test]
+    fn tb18_settings_body_accepts_scout_patch_fields() {
+        let parsed: SettingsBody =
+            serde_json::from_str(r#"{"scout":{"enabled":false,"min_files":40}}"#).unwrap();
+        let scout = parsed.scout.expect("scout patch object");
+        assert_eq!(scout.enabled, Some(false));
+        assert_eq!(scout.min_files, Some(40));
     }
 }

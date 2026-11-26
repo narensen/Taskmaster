@@ -177,7 +177,7 @@ pub fn detect_api_spec_hint(tree: &Path, max_chars: usize) -> String {
                     lines.push(format!("- {} {}", verbs.join("/").to_ascii_uppercase(), route));
                 }
             }
-            return clip_lines(&lines.join("\n"), max_chars);
+            return crate::atlas::clip_lines(&lines.join("\n"), max_chars);
         }
         // Lightweight YAML route scan (lines under `paths:` starting with `/`).
         let mut in_paths = false;
@@ -202,7 +202,7 @@ pub fn detect_api_spec_hint(tree: &Path, max_chars: usize) -> String {
         }
         if !routes.is_empty() {
             let header = format!("API spec (`{rel}`):\n{}", routes.join("\n"));
-            return clip_lines(&header, max_chars);
+            return crate::atlas::clip_lines(&header, max_chars);
         }
     }
     String::new()
@@ -464,9 +464,10 @@ pub fn hydrate_for_planner(tree: &Path, scope: &BrownfieldScope, budget_chars: u
         return String::new();
     }
     let joined = format!("{}\n", lines.join("\n"));
-    clip_lines(&joined, budget_chars)
+    crate::atlas::clip_lines(&joined, budget_chars)
 }
 
+/// Collapse whitespace to a single line and clip to `max_chars` Unicode scalars.
 fn clip_inline(text: &str, max_chars: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max_chars {
@@ -475,21 +476,6 @@ fn clip_inline(text: &str, max_chars: usize) -> String {
         let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{cut}…")
     }
-}
-
-fn clip_lines(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for line in text.lines() {
-        if out.len() + line.len() + 1 > max_chars {
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
 }
 
 #[cfg(test)]

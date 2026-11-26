@@ -573,5 +573,7 @@ mod tests {
         assert!(example.web_access.roles.planner.search && example.web_access.roles.planner.fetch);
         assert!(example.web_access.roles.worker.search && example.web_access.roles.worker.fetch);
         assert!(!example.web_access.roles.verifier.search && !example.web_access.roles.verifier.fetch);
+        assert!(example.scout.enabled);
+        assert_eq!(example.scout.min_files, crate::scout::DEFAULT_MIN_FILES);
     }
 }

@@ -123,6 +123,16 @@ struct Product {
     answer: Answer,
     bill: Bill,
     worktree: PathBuf,
+    /// Model requested when this unit's session opened (for cross-unit warm reuse matching).
+    model: Option<String>,
+    /// Effort requested when this unit's session opened (for cross-unit warm reuse matching).
+    effort: Option<String>,
+    /// Dictionary bearer token bound to this session's `mcpServers` at `session/new`.
+    token: Option<String>,
+    /// Context tokens carried into this turn from a prior turn in the same session.
+    prev_context: u64,
+    /// False if the session was repaired, nudged, or otherwise tainted before finishing.
+    prior_clean: bool,
 }
 
 enum WorkerJob {
@@ -473,12 +483,31 @@ struct Driver {
     mutation_cache: BTreeMap<String, crate::gates::MutationVerdict>,
 }
 
+/// Context token guard above which a warm worker session is retired rather than reused for a
+/// subsequent wave's unit (~65k tokens).
+pub(crate) const WARM_REUSE_MAX_CONTEXT: u64 = 65_000;
+
+/// Estimate the active context footprint of a session after a turn finishes, combining the
+/// per-request input+cache size and generated output with the prior carried context.
+pub(crate) fn estimate_session_context(prev_context: u64, usage: &tm_harness::Usage, requests: Option<u32>) -> u64 {
+    let reqs = u64::from(requests.unwrap_or(1).max(1));
+    let avg_in = usage.input.saturating_add(usage.cache_read) / reqs;
+    let turn_peak = avg_in.saturating_add(usage.output);
+    turn_peak.max(prev_context.saturating_add(usage.output))
+}
+
 /// A builder kept open after its turn, with the worktree it worked in.
 struct Warm {
     session: Box<dyn tm_harness::Session>,
     worktree: PathBuf,
     tier: Tier,
     harness: String,
+    model: Option<String>,
+    effort: Option<String>,
+    token: Option<String>,
+    context_tokens: u64,
+    clean: bool,
+    scope: String,
     last_used: Instant,
 }
 
@@ -495,7 +524,7 @@ enum WorkerExec {
     Fresh,
     /// Open warm session: `prompt` is sent as the follow-up turn while `request.brief`
     /// keeps the full original worker brief for fallback if the session stalls.
-    Warm { warm: Warm, prompt: String },
+    Warm { warm: Warm, prompt: String, reused: bool },
     Resume { session_id: String, prompt: String },
     /// H3: the agent a previous daemon handed off, still running in the holder. `said` is what
     /// it had replied so far; `session_id` resumes it the H2 way if it cannot be picked up.
@@ -2247,7 +2276,7 @@ impl Driver {
                     match step {
                         Ok(request) => {
                             let worktree = warm.worktree.clone();
-                            prepared.push((request, worktree, WorkerExec::Warm { warm, prompt: follow_prompt }));
+                            prepared.push((request, worktree, WorkerExec::Warm { warm, prompt: follow_prompt, reused: false }));
                             continue;
                         }
                         Err(err) => {
@@ -2284,6 +2313,68 @@ impl Driver {
                 if let Some(done) = self.reattach_unit(&agent_key, &page, index, units.len(), tier, errors.as_deref()).await {
                     prepared.push(done);
                     continue;
+                }
+                // Cross-wave warm-session reuse: reuse a clean, under-context-guard session from a
+                // previously passed unit on the same tier/harness/model/effort by cleanly resetting
+                // its worktree, rebinding its MCP grant and permission gate, and sending only the
+                // new unit's delta brief.
+                let can_wave_reuse = errors.is_none()
+                    && units.len() == 1
+                    && self.config.warm_reuse_max_context > 0
+                    && !self.plan().is_ok_and(|p| self.page(&page).is_ok_and(|pg| p.is_ui(pg)))
+                    && self
+                        .project_config
+                        .as_ref()
+                        .is_none_or(|c| c.config.setup.as_deref().is_none_or(|s| s.trim().is_empty()));
+                if can_wave_reuse {
+                    let h = self.harness_for(tier);
+                    let model = self.model_for(tier);
+                    let effort = self.worker_effort(&page, h.id(), None);
+                    if let Some(warm) = self.take_reusable_warm(tier, h.id(), &model, &effort) {
+                        let reused_step = git::reset_worktree(&warm.worktree, &self.tree).and_then(|()| {
+                            let yaml_cfg = self.project_config.as_ref().map(|l| &l.config);
+                            crate::project_config::apply_shared_and_copy(&self.project, &warm.worktree, yaml_cfg);
+                            let pre: BTreeSet<String> = git::worktree_changes(&warm.worktree)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|c| c.path)
+                                .collect();
+                            if pre.is_empty() {
+                                self.setup_artifacts.remove(&warm.worktree);
+                            } else {
+                                self.setup_artifacts.insert(warm.worktree.clone(), pre);
+                            }
+                            if let Some(code) = &self.code {
+                                code.detach(&warm.scope);
+                            }
+                            if let Some(tok) = warm.token.clone() {
+                                self.mcp.rebind_grant(
+                                    &tok,
+                                    tm_dictionary::Grant {
+                                        run: self.id.clone(),
+                                        page: page.clone(),
+                                        unit: String::new(),
+                                    },
+                                );
+                                self.tokens.insert(page.clone(), tok);
+                            }
+                            let owned = self.owned_files(&page, index, units.len(), &warm.worktree);
+                            let reuse_prompt = self.wave_reuse_brief(&page, index, units.len(), tier, &owned, &warm.worktree)?;
+                            let request = self.worker_request(&page, index, units.len(), tier, None, warm.worktree.clone())?;
+                            Ok((request, reuse_prompt))
+                        });
+                        match reused_step {
+                            Ok((request, reuse_prompt)) => {
+                                let worktree = warm.worktree.clone();
+                                prepared.push((request, worktree, WorkerExec::Warm { warm, prompt: reuse_prompt, reused: true }));
+                                continue;
+                            }
+                            Err(err) => {
+                                eprintln!("taskmaster: warm session from `{}` could not be reset for {page} ({err:#}); starting fresh", warm.scope);
+                                self.drop_worktree(&warm.worktree);
+                            }
+                        }
+                    }
                 }
                 let step = self.fresh_worktree(&label).and_then(|worktree| {
                     let built = self.worker_request(&page, index, units.len(), tier, errors.as_deref(), worktree.clone());
@@ -2383,13 +2474,35 @@ impl Driver {
             let (page, slots) = (page.clone(), self.slots.clone());
             let mut rx = restart_rx.clone();
             match &exec {
-                WorkerExec::Warm { .. } => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
+                WorkerExec::Warm { reused: true, warm, .. } => {
+                    eprintln!(
+                        "taskmaster: reusing warm session from `{}` for {agent} ({} ctx tokens)",
+                        warm.scope, warm.context_tokens
+                    );
+                }
+                WorkerExec::Warm { reused: false, .. } => eprintln!("taskmaster: sending the repair of {agent} to its open session"),
                 WorkerExec::Resume { session_id, .. } => {
                     eprintln!("taskmaster: resuming {agent} on provider session {session_id}");
                 }
                 WorkerExec::Reattach { .. } => eprintln!("taskmaster: picking {agent} up where the last daemon left it"),
                 WorkerExec::Fresh => {}
             }
+            let (prod_model, prod_effort, prod_token, prev_context, prior_clean) = match &exec {
+                WorkerExec::Warm { warm, reused, .. } => (
+                    warm.model.clone(),
+                    warm.effort.clone(),
+                    warm.token.clone().or_else(|| request.dictionary.as_ref().map(|d| d.bearer_token.clone())),
+                    warm.context_tokens,
+                    *reused && warm.clean,
+                ),
+                _ => (
+                    request.model.clone(),
+                    request.effort.clone(),
+                    request.dictionary.as_ref().map(|d| d.bearer_token.clone()),
+                    0,
+                    true,
+                ),
+            };
             self.jobs.spawn(async move {
                 let permit = slots.acquire_owned().await.ok();
                 let restart_wait = async {
@@ -2404,13 +2517,22 @@ impl Driver {
                 let result = tokio::select! {
                     asked = async {
                         match exec {
-                            WorkerExec::Warm { warm, prompt } => follow(request, warm.session, prompt).await,
+                            WorkerExec::Warm { warm, prompt, reused } => follow(request, warm.session, prompt, reused).await,
                             WorkerExec::Resume { session_id, prompt } => resume_or_ask(request, session_id, prompt).await,
                             WorkerExec::Reattach { said, session_id } => reattach_or_resume(request, said, session_id).await,
                             WorkerExec::Fresh => ask(request).await,
                         }
                     } => match asked {
-                        Ok(answer) => WorkerJob::Finished(Box::new(Product { answer, bill, worktree })),
+                        Ok(answer) => WorkerJob::Finished(Box::new(Product {
+                            answer,
+                            bill,
+                            worktree,
+                            model: prod_model,
+                            effort: prod_effort,
+                            token: prod_token,
+                            prev_context,
+                            prior_clean,
+                        })),
                         Err(err) => WorkerJob::Failed { err, worktree },
                     },
                     _ = restart_wait => WorkerJob::Restarted(worktree),
@@ -2657,7 +2779,7 @@ impl Driver {
         self.tag(&mut req, &agent_id, tier_name(tier), Some(page), glob);
         let bill = req.bill(Role::builder(tier), Some(page));
         let asked = match product.answer.kept.take() {
-            Some(session) => follow(req, session, nudge.to_string()).await,
+            Some(session) => follow(req, session, nudge.to_string(), false).await,
             None => ask(req).await,
         };
         let ans = match asked {
@@ -2669,6 +2791,8 @@ impl Driver {
             }
         };
         self.charge(&bill, &ans)?;
+        product.prior_clean = false;
+        product.prev_context = estimate_session_context(product.prev_context, &ans.usage, ans.requests);
         product.answer.ok = ans.ok;
         if !ans.text.trim().is_empty() {
             if !product.answer.text.is_empty() {
@@ -3253,13 +3377,29 @@ impl Driver {
                 Some(session) if back => {
                     let key = if units.len() > 1 { units.get(index).map_or(page.to_string(), |u| format!("{page}/{}", u.id)) } else { page.to_string() };
                     let harness = crate::usage::canonical_provider(&product.bill.harness);
+                    let context_tokens = estimate_session_context(
+                        product.prev_context,
+                        &product.answer.usage,
+                        product.answer.requests,
+                    );
+                    let clean = errors.is_none()
+                        && matches!(outcome, Ok(WorkerOutcome::Passed))
+                        && product.prior_clean
+                        && self.config.warm_reuse_max_context > 0
+                        && context_tokens < self.config.warm_reuse_max_context;
                     self.keep_warm(
-                        key,
+                        key.clone(),
                         Warm {
                             session,
                             worktree: product.worktree.clone(),
                             tier,
                             harness,
+                            model: product.model.clone(),
+                            effort: product.effort.clone(),
+                            token: product.token.clone(),
+                            context_tokens,
+                            clean,
+                            scope: key,
                             last_used: Instant::now(),
                         },
                     );
@@ -3339,6 +3479,38 @@ impl Driver {
         }
         self.drop_worktree(&warm.worktree);
         None
+    }
+
+    /// Take a clean, under-context-guard idle warm session from a previously passed unit that
+    /// matches `tier`, `harness_id`, `model`, and `effort`, preferring the lowest context footprint.
+    fn take_reusable_warm(
+        &mut self,
+        tier: Tier,
+        harness_id: &str,
+        model: &Option<String>,
+        effort: &Option<String>,
+    ) -> Option<Warm> {
+        self.evict_idle_warm();
+        let max_ctx = self.config.warm_reuse_max_context;
+        if max_ctx == 0 {
+            return None;
+        }
+        let expected_harness = crate::usage::canonical_provider(harness_id);
+        let best = self
+            .warm
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, w))| {
+                w.clean
+                    && w.tier == tier
+                    && w.harness == expected_harness
+                    && w.model == *model
+                    && w.effort == *effort
+                    && w.context_tokens < max_ctx
+            })
+            .min_by_key(|(_, (_, w))| w.context_tokens)
+            .map(|(idx, _)| idx)?;
+        self.warm.remove(best).map(|(_, w)| w)
     }
 
     /// A previously hibernated warm session for `key` on `tier` and matching harness (O7).
@@ -5029,6 +5201,20 @@ impl Driver {
         Ok(Some(text))
     }
 
+    /// Resolve the reasoning effort passed to a worker for `page` on `harness_id`.
+    fn worker_effort(&self, page: &str, harness_id: &str, errors: Option<&str>) -> Option<String> {
+        if !self.config.effort_routing || errors.is_some() {
+            // Repairs and runs with effort routing disabled keep the configured tier/model verbatim.
+            return None;
+        }
+        match self.page(page).ok().and_then(|p| p.effort_hint()) {
+            Some(hint) => Some(hint.to_string()),
+            None if self.small => Some(crate::small::SMALL_EFFORT.to_string()),
+            None if harness_id == "antigravity" => Some("medium".to_string()),
+            None => None,
+        }
+    }
+
     fn worker_request(&mut self, page: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, cwd: PathBuf) -> anyhow::Result<AgentRequest> {
         // A person's notes never land here raw. The master has already read them and
         // written `handed`, which every worker follows.
@@ -5048,17 +5234,7 @@ impl Driver {
         let harness = self.harness_for(tier);
         let label = if units > 1 { format!("{page}-{unit}") } else { page.to_string() };
         let shell = self.shell_for(&harness, &label);
-        let effort = if !self.config.effort_routing || errors.is_some() {
-            // Repairs and runs with effort routing disabled keep the configured tier/model verbatim.
-            None
-        } else {
-            match self.page(page).ok().and_then(|p| p.effort_hint()) {
-                Some(hint) => Some(hint.to_string()),
-                None if self.small => Some(crate::small::SMALL_EFFORT.to_string()),
-                None if harness.id() == "antigravity" => Some("medium".to_string()),
-                None => None,
-            }
-        };
+        let effort = self.worker_effort(page, harness.id(), errors);
         Ok(AgentRequest {
             harness,
             brief,
@@ -5529,6 +5705,18 @@ impl Driver {
     /// the Dictionary entries it cites, what failed last time, and when it is done.
     #[allow(clippy::too_many_arguments)]
     fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String], worktree: &Path) -> anyhow::Result<String> {
+        self.worker_brief_inner(page_id, unit, units, tier, errors, owned, worktree, true)
+    }
+
+    /// Compact delta-only brief sent when a clean warm session is reused for a subsequent wave's
+    /// unit: omits the already-cached shared prefix and sends only the new unit's task details.
+    #[allow(clippy::too_many_arguments)]
+    fn wave_reuse_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, owned: &[String], worktree: &Path) -> anyhow::Result<String> {
+        self.worker_brief_inner(page_id, unit, units, tier, None, owned, worktree, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn worker_brief_inner(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String], worktree: &Path, include_shared_prefix: bool) -> anyhow::Result<String> {
         let page = self.page(page_id)?.clone();
         let plan = self.plan()?;
         let contracts = &plan.contracts;
@@ -5549,7 +5737,14 @@ impl Driver {
         } else {
             format!("Build unit `{}` of this {} project.", page.id, plan.kind.id())
         };
-        let mut brief = self.shared_prefix_with_contracts(Some(&partition))?;
+        let mut brief = if include_shared_prefix {
+            self.shared_prefix_with_contracts(Some(&partition))?
+        } else {
+            String::from(
+                "Your previous unit passed and was merged. Your worktree has been cleanly reset to the latest project commit (containing all units merged so far). \
+                 The shared contracts, workspace rules, and environment from earlier in this session still apply—do not re-read shared contracts.\n\n--- Your next task ---\n",
+            )
+        };
         brief.push_str(&format!(
             "{opening}\nYou may create or edit only files matching `{active_glob}`.\n",
         ));
@@ -7869,17 +8064,22 @@ fn heartbeat(
     )
 }
 
-/// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
-/// transcript under the same agent, and the session stays open for the next repair.
-/// If the open session stalls, closes it and falls back to `ask(request)` with the full
-/// original worker brief preserved in `request.brief`.
+/// Send a repair or next-wave unit to a builder's open session as a follow-up turn.
+/// Rebinds the session's active [`PermissionGate`] to `request`'s gate so reused sessions
+/// enforce the new unit's scope and approvals. If the open session stalls, closes it and
+/// falls back to `ask(request)` with the full original worker brief preserved in `request.brief`.
 async fn follow(
     request: AgentRequest,
     mut session: Box<dyn tm_harness::Session>,
     prompt: String,
+    reused_wave: bool,
 ) -> anyhow::Result<Answer> {
+    session.rebind_gate(gate_for(&request));
     if let Some(feed) = &request.feed {
         let mut start = serde_json::json!({ "brief": prompt, "follow_up": true });
+        if reused_wave {
+            start["reused_wave"] = serde_json::json!(true);
+        }
         if let Some(sid) = session.session_id() {
             start["session_id"] = serde_json::json!(sid);
         }
@@ -7906,6 +8106,9 @@ async fn follow(
         .or_else(|| (collected.inferred_requests > 0).then_some(collected.inferred_requests));
     if let Some(feed) = &request.feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64(), "follow_up": true });
+        if reused_wave {
+            end["reused_wave"] = serde_json::json!(true);
+        }
         if let Some(sid) = &final_sid {
             end["session_id"] = serde_json::json!(sid);
         }

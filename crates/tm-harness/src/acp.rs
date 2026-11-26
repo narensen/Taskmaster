@@ -287,6 +287,10 @@ impl crate::Session for Kept {
         result
     }
 
+    fn rebind_gate(&mut self, gate: Arc<dyn PermissionGate>) {
+        self.session.gate = gate;
+    }
+
     fn session_id(&self) -> Option<&str> {
         self.session.id.as_deref()
     }
@@ -1941,5 +1945,62 @@ read l; echo '{{"jsonrpc":"2.0","id":5,"result":{{"stopReason":"end_turn"}}}}'
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["params"]["modelId"], "gemini-4-neon-low");
         assert_eq!(calls[1]["params"]["modelId"], "gemini-4-neon-high");
+    }
+
+    #[tokio::test]
+    async fn acp_kept_session_rebind_gate_enforces_new_gate_on_follow_up() {
+        let capture = std::env::temp_dir().join(format!("tm-acp-rebind-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+read l
+echo '{{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{{"toolCall":{{"toolCallId":"t1","name":"shell","kind":"execute","rawInput":{{"command":"echo hi"}}}},"options":[{{"optionId":"allow","kind":"allow_once"}},{{"optionId":"deny","kind":"reject_once"}}]}} }}'
+read perm
+printf '%s\n' "$perm" > "{}"
+echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display(),
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "unit 1".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        // Turn 1 gate allows shell; turn 2 rebinds to a read-only gate that denies shell.
+        let allow_gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).with_shell());
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (res1, kept) = harness.run_kept(task, allow_gate, tx1).await;
+        assert!(res1.unwrap().ok);
+        let mut session = kept.expect("session kept");
+        let deny_gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).read_only());
+        session.rebind_gate(deny_gate);
+        let (tx2, _rx2) = mpsc::channel(8);
+        let res2 = session.follow_up("unit 2".into(), tx2, std::time::Duration::from_secs(10)).await.unwrap();
+        assert!(res2.ok);
+        assert_eq!(res2.denied, 1, "rebound read-only gate must deny shell call");
+        let perm_reply: Value = serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert_eq!(perm_reply["result"]["outcome"]["optionId"], "deny");
+        let _ = session.close().await;
     }
 }

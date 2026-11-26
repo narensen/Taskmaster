@@ -11557,3 +11557,239 @@ async fn tok6_effort_routing_routes_antigravity_by_difficulty_keeps_high_for_rep
     assert_eq!(got_off.len(), 3);
     assert!(got_off.iter().all(|c| c.effort.is_none()), "effort_routing=false must pass None effort: {got_off:#?}");
 }
+
+#[tokio::test]
+async fn tok7_warm_session_reuses_clean_session_across_waves_and_enforces_context_and_repair_guards() {
+    let make_plan = || Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contract.py".into(),
+            content: "CONTRACT_SENTINEL = 'SHARED_PREFIX_ONLY_ONCE'\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "u1".into(),
+                owned_glob: "pkg/u1.py".into(),
+                brief: "Write pkg/u1.py implementing u1.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "u2".into(),
+                owned_glob: "pkg/u2.py".into(),
+                brief: "Import pkg.u1 and implement u2.".into(),
+                depends_on: vec!["u1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    #[derive(Default)]
+    struct Stats {
+        fresh_sessions: Mutex<Vec<String>>,
+        follow_ups: Mutex<Vec<String>>,
+        rebind_calls: AtomicUsize,
+        u2_saw_stray: std::sync::atomic::AtomicBool,
+        u2_saw_u1_file: std::sync::atomic::AtomicBool,
+    }
+
+    struct ReuseSession {
+        cwd: PathBuf,
+        stats: Arc<Stats>,
+        usage: Usage,
+        fail_u1_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl tm_harness::Session for ReuseSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.stats.follow_ups.lock().unwrap().push(text.clone());
+            std::fs::create_dir_all(self.cwd.join("pkg"))?;
+            if text.contains("Build unit `u2`") {
+                self.stats
+                    .u2_saw_stray
+                    .store(self.cwd.join(".coverage").exists(), Ordering::SeqCst);
+                self.stats
+                    .u2_saw_u1_file
+                    .store(self.cwd.join("pkg/u1.py").is_file(), Ordering::SeqCst);
+                std::fs::write(self.cwd.join("pkg/u2.py"), "from pkg.u1 import V1\nV2 = V1 + 1\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u2\n".into() }).await;
+            } else {
+                // Repair of u1: remove the stray out-of-glob file and write pkg/u1.py.
+                let _ = std::fs::remove_file(self.cwd.join("pkg/unowned.py"));
+                let _ = self.fail_u1_once.load(Ordering::SeqCst);
+                std::fs::write(self.cwd.join("pkg/u1.py"), "V1 = 1\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u1\n".into() }).await;
+            }
+            Ok(RunSummary {
+                ok: true,
+                usage: self.usage,
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: Some(1),
+            })
+        }
+
+        fn rebind_gate(&mut self, _gate: Arc<dyn PermissionGate>) {
+            self.stats.rebind_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            Some("warm-sid-1")
+        }
+
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct ReuseHarness {
+        stats: Arc<Stats>,
+        usage: Usage,
+        fail_u1_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Harness for ReuseHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            self.stats.fresh_sessions.lock().unwrap().push(unit.clone());
+            let _ = std::fs::create_dir_all(task.cwd.join("pkg"));
+            if unit == "u1" {
+                if self.fail_u1_once.swap(false, Ordering::SeqCst) {
+                    let _ = std::fs::write(task.cwd.join("pkg/unowned.py"), "BAD = 1\n");
+                } else {
+                    let _ = std::fs::write(task.cwd.join("pkg/u1.py"), "V1 = 1\n");
+                    // Leave a stray untracked artifact-excluded/ignored or unowned? Actually
+                    // write a non-owned untracked file ONLY after? No, ownership check would reject
+                    // stray_u1.txt! Instead test clean reset via an untracked .coverage artifact.
+                    let _ = std::fs::write(task.cwd.join(".coverage"), "stale-cov");
+                }
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u1\n".into() }).await;
+            } else {
+                let _ = std::fs::write(task.cwd.join("pkg/u2.py"), "from pkg.u1 import V1\nV2 = V1 + 1\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:u2\n".into() }).await;
+            }
+            let session: Box<dyn tm_harness::Session> = Box::new(ReuseSession {
+                cwd: task.cwd,
+                stats: self.stats.clone(),
+                usage: self.usage,
+                fail_u1_once: self.fail_u1_once.clone(),
+            });
+            let res = Ok(RunSummary {
+                ok: true,
+                usage: self.usage,
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: Some(1),
+            });
+            (res, Some(session))
+        }
+    }
+
+    // 1. Clean wave-1 -> wave-2 reuse under 65k context guard.
+    let tmp1 = seeded("tok7-reuse-ok");
+    let stats1 = Arc::new(Stats::default());
+    let h1: Arc<dyn Harness> = Arc::new(ReuseHarness {
+        stats: stats1.clone(),
+        usage: Usage { input: 12_000, output: 1_500, cache_read: 4_000, cache_write: 0 },
+        fail_u1_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let harnesses1 = Harnesses { master: h1.clone(), mid: h1.clone(), worker: h1.clone(), reviewer: h1.clone(), verifier: h1 };
+    let mut cfg1 = config(&tmp1.0, make_plan(), true, 1);
+    cfg1.run_id = "tok7-ok".into();
+    cfg1.checks = false;
+    cfg1.runtime_checks = false;
+    cfg1.code_mode = false;
+    cfg1.browser = false;
+    assert_eq!(drive(cfg1, harnesses1).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(*stats1.fresh_sessions.lock().unwrap(), vec!["u1".to_string()], "u2 must reuse u1's warm session");
+    let fups1 = stats1.follow_ups.lock().unwrap().clone();
+    assert_eq!(fups1.len(), 1);
+    assert!(fups1[0].contains("Build unit `u2`"));
+    assert!(fups1[0].contains("Your previous unit passed and was merged"));
+    assert!(!fups1[0].contains("SHARED_PREFIX_ONLY_ONCE"), "reused wave brief must omit already-cached shared contracts");
+    assert_eq!(stats1.rebind_calls.load(Ordering::SeqCst), 1, "gate must be rebound before follow_up");
+    assert!(!stats1.u2_saw_stray.load(Ordering::SeqCst), "reset worktree must drop u1's untracked artifacts");
+    assert!(stats1.u2_saw_u1_file.load(Ordering::SeqCst), "reset worktree must contain u1's merged file");
+    let agents_log = std::fs::read_to_string(tmp1.0.join(".taskmaster/runs/tok7-ok/agents.jsonl")).unwrap();
+    assert!(agents_log.contains("\"reused_wave\":true"), "transcript should mark wave reuse");
+
+    // 2. Context guard (>= 65k tokens): u2 must start a fresh session instead of reusing u1's bloated session.
+    let tmp2 = seeded("tok7-ctx-guard");
+    let stats2 = Arc::new(Stats::default());
+    let h2: Arc<dyn Harness> = Arc::new(ReuseHarness {
+        stats: stats2.clone(),
+        usage: Usage { input: 66_000, output: 2_000, cache_read: 0, cache_write: 0 },
+        fail_u1_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let harnesses2 = Harnesses { master: h2.clone(), mid: h2.clone(), worker: h2.clone(), reviewer: h2.clone(), verifier: h2 };
+    let mut cfg2 = config(&tmp2.0, make_plan(), true, 1);
+    cfg2.run_id = "tok7-guard".into();
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    cfg2.code_mode = false;
+    cfg2.browser = false;
+    assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(
+        *stats2.fresh_sessions.lock().unwrap(),
+        vec!["u1".to_string(), "u2".to_string()],
+        "sessions >= 65k context must not be reused across waves"
+    );
+    assert!(stats2.follow_ups.lock().unwrap().is_empty());
+
+    // 3. Repaired session guard: a session that needed a repair on u1 must NEVER be reused for u2.
+    let tmp3 = seeded("tok7-repair-guard");
+    let stats3 = Arc::new(Stats::default());
+    let h3: Arc<dyn Harness> = Arc::new(ReuseHarness {
+        stats: stats3.clone(),
+        usage: Usage { input: 8_000, output: 800, cache_read: 0, cache_write: 0 },
+        fail_u1_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    });
+    let harnesses3 = Harnesses { master: h3.clone(), mid: h3.clone(), worker: h3.clone(), reviewer: h3.clone(), verifier: h3 };
+    let mut cfg3 = config(&tmp3.0, make_plan(), true, 1);
+    cfg3.run_id = "tok7-repair".into();
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    cfg3.code_mode = false;
+    cfg3.browser = false;
+    assert_eq!(drive(cfg3, harnesses3).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(
+        *stats3.fresh_sessions.lock().unwrap(),
+        vec!["u1".to_string(), "u2".to_string()],
+        "repaired u1 session must not be reused for u2"
+    );
+    let fups3 = stats3.follow_ups.lock().unwrap().clone();
+    assert_eq!(fups3.len(), 1, "only u1's own repair should use follow_up");
+    assert!(fups3[0].contains("The checks failed after your last turn"));
+}

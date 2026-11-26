@@ -114,6 +114,18 @@ impl McpState {
         self.tokens.lock().unwrap().insert(token.into(), grant);
     }
 
+    /// Rebind an existing bearer token to a new [`Grant`] when a warm ACP session is reused for
+    /// a subsequent unit in a later wave. Returns `true` if `token` was registered and updated.
+    pub fn rebind_grant(&self, token: &str, grant: Grant) -> bool {
+        let mut tokens = self.tokens.lock().unwrap();
+        if let Some(slot) = tokens.get_mut(token) {
+            *slot = grant;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn revoke(&self, token: &str) {
         self.tokens.lock().unwrap().remove(token);
     }
@@ -495,5 +507,17 @@ mod tests {
         assert_eq!(records[1].tool, "echo");
         assert_eq!(records[1].reply_bytes, "dashboard \"hi\"".len());
         assert!(!records[1].is_error);
+    }
+
+    #[tokio::test]
+    async fn rebind_grant_redirects_existing_token_to_new_unit() {
+        let (state, app) = setup();
+        assert!(!state.rebind_grant("missing-token", Grant { run: "r1".into(), page: "b".into(), unit: String::new() }));
+        assert!(state.rebind_grant("tok-a", Grant { run: "r1".into(), page: "unit_b".into(), unit: String::new() }));
+        let (status, _) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
+        assert_eq!(status, StatusCode::OK);
+        let cites = state.cites();
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].grant.page, "unit_b");
     }
 }

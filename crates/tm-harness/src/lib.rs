@@ -525,6 +525,9 @@ pub trait Session: Send + Sync {
     /// Send one more turn. Events go to `events` until the turn ends.
     async fn follow_up(&mut self, text: String, events: mpsc::Sender<HarnessEvent>, timeout: Duration) -> anyhow::Result<RunSummary>;
 
+    /// Replace the active [`PermissionGate`] before reusing this session for a subsequent unit.
+    fn rebind_gate(&mut self, _gate: Arc<dyn PermissionGate>) {}
+
     /// The provider's resumable session id, if this session can be resumed later by id (H2 / O7).
     fn session_id(&self) -> Option<&str> {
         None

@@ -446,6 +446,9 @@ pub struct Config {
     /// `easy`/`normal`, keeping `-high` for `hard`, repairs, planner, and reviewer). Set `false`
     /// to pin explicit `--worker-model` choices verbatim.
     pub effort_routing: bool,
+    /// Maximum estimated context tokens in a clean warm worker session eligible for reuse on a
+    /// subsequent wave's unit (~65k tokens by default; 0 disables cross-unit warm reuse).
+    pub warm_reuse_max_context: u64,
 }
 
 /// How an active run should stop when cancelled.
@@ -529,6 +532,7 @@ impl Config {
             holder: None,
             stall_timeout: None,
             effort_routing: true,
+            warm_reuse_max_context: crate::engine::WARM_REUSE_MAX_CONTEXT,
         }
     }
 }

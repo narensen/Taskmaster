@@ -2193,6 +2193,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tok11_code_mode_guide_and_two_call_write_then_fix_discipline() {
+        let guide = crate::engine::code_mode_guide("antigravity");
+        assert!(guide.contains("two-call discipline"), "{guide}");
+        assert!(guide.contains("Call 1 (write + test in one call)"), "{guide}");
+        assert!(guide.contains("return await test()"), "{guide}");
+        assert!(guide.contains("Call 2 (fix + re-test"), "{guide}");
+        assert!(guide.contains("mcp_dictionary_run_code"), "{guide}");
+        assert!(!guide.contains(" run_code"), "bare run_code should be rewritten: {guide}");
+
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("two-call discipline"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Call 1"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Call 2"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("return await test()"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("tok11-two-call");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // Call 1: write implementation + unit test via `files` and run script body in ONE call.
+        let call1 = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({
+                    "files": {
+                        "pkg/calc.py": "def add(a, b):\n    return a - b\n",
+                        "tests/test_calc.py": "from pkg.calc import add\ndef test_add(): assert add(2, 3) == 5\n"
+                    },
+                    "code": "return { src: await read('pkg/calc.py'), tst: await read('tests/test_calc.py') };"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call1["isError"], false, "{call1}");
+        assert!(call1["content"][0]["text"].as_str().unwrap().contains("return a - b"));
+
+        // Call 2: targeted `edit` fix in the second call (no whole-file rewrite).
+        let call2 = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({
+                    "code": "await edit('pkg/calc.py', 'return a - b', 'return a + b'); return await read('pkg/calc.py');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call2["isError"], false, "{call2}");
+        assert!(call2["content"][0]["text"].as_str().unwrap().contains("return a + b"));
+
+        tools.detach("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn raw_content_write_handles_python_triple_quotes_and_separate_arguments() {
         assert!(crate::engine::code_mode_guide("antigravity").contains("String.raw"));
         assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("String.raw"));

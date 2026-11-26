@@ -260,7 +260,7 @@ pub struct WorkerTask {
 pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol/graph lookups, and diffs in a single `run_code` script (`flow`, `readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch graph/file reads (`flow`, `readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls. For Python triple quotes or backslashes, pass raw content via the separate `files` or `writeFile` JSON arguments, or use `String.raw` with `write(path, { raw })`.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
 
 /// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
 /// under `harness_id`.

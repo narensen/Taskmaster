@@ -7759,17 +7759,14 @@ const PROJECT_MARK: &str = "<!-- Written by Taskmaster from the run's sketch and
 const PLAN_ATTEMPTS: usize = 3;
 
 /// How an agent with Code Mode is told to work, in the shared prefix.
-const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, \
-diff, symbols, flow, sh, test, check and browser (read-only roles get read, readMany, grep, ls, diff, symbols, flow). Batch your work into \
-a few scripts rather than many single tool calls: one script loads what you need with flow/readMany/symbols and writes or patches \
-your files (prefer edit/patch/applyPatch over rewriting whole files), and every script that changes code ends with `return await test()`, \
-which runs the project's tests and returns the failures. Query `.flow` inside run_code instead of reading whole files, e.g. \
-`await flow(\"find\", { query: \"StorageEngine\" })`, `await flow(\"neighbors\", { id: \"py:pkg/mod.py#Class.method\", k: 1, dir: \"in\" })`, \
-or `await flow(\"source\", { id: \"py:pkg/mod.py#Class.method\" })`. When writing Python or multi-line files with triple quotes or backslashes, pass raw file \
-content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments on run_code, or use `String.raw` with `write(path, { raw })`. \
-Fix what it reports in the next script. If your own write, edit or shell tools \
-are switched off, run_code is the way to write files and run commands: use it from the start. \
-Do not call `update_steps` or run trailing `git status` / redundant re-runs once tests pass. Keep your replies short: the files are the work.\n";
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on — follow two-call discipline with run_code:\n\
+- Call 1 (write + test in one call): pass all your owned implementation files and concise unit tests via the `files` JSON argument \
+(`{\"path\": \"content\"}`, or `writeFile`, or `String.raw` with `write(path, { raw })` to avoid JS escaping for triple quotes/backslashes) \
+AND set `code` to `return await test()` in the SAME run_code call. Do NOT burn a call probing Python/venv, listing files, or writing without testing.\n\
+- Call 2 (fix + re-test, only if Call 1 failed): use targeted `edit`/`patch`/`applyPatch` (never rewrite whole files) and end with `return await test()`. \
+Only make another call if failures remain.\n\
+- Helpers inside `code`: read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, diff, symbols, sh, test, testAffected, check, browser, and `.flow` (`await flow(\"find\", { query })`, `await flow(\"neighbors\", { id, k: 1, dir: \"in\" })`, `await flow(\"source\", { id })`, or `await flow(\"batch\", { queries })`). \
+If native write/edit/shell tools are off, use run_code from the start. Do not call `update_steps` or run trailing `git status` / redundant re-runs once tests pass. Keep replies short.\n";
 
 /// Expand an `owned_glob` (including `{a,b}` brace groups) into worktree-absolute path strings
 /// so harnesses whose native file tools require absolute paths (e.g. Antigravity) can write

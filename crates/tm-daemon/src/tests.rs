@@ -12810,3 +12810,132 @@ async fn fix_n8_no_change_brownfield_unit_is_checked_and_sent_back_for_repair() 
     );
     assert!(read(&tmp2.0.join("pkg/storage.py")).contains("def add_column"));
 }
+
+#[tokio::test]
+async fn fix_n8_subprocess_locked_contract_test_failure_triggers_normal_repair_cycle() {
+    // Reproduces the n8 failure mode: a locked acceptance contract test invokes the CLI via
+    // `subprocess.run([sys.executable, "-m", "tinydb", ...])` with NO static `import tinydb`.
+    // When final verify fails on that locked contract test, Taskmaster must route the failure
+    // through `units_reached` into the normal unit repair cycle (NOT abort immediately via
+    // `repair_shared` refusal with 0 repairs), while keeping the locked contract test untouched.
+    let tmp = seeded("n8-verify-repair");
+    std::fs::create_dir_all(tmp.0.join("tinydb")).unwrap();
+    std::fs::write(
+        tmp.0.join("tinydb/__main__.py"),
+        "import sys\nfrom tinydb import run_cli\nsys.exit(run_cli(sys.argv[1:]))\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tinydb/__init__.py"),
+        "from tinydb.storage import add_column\n\ndef run_cli(args):\n    print(add_column(args[0] if args else ''))\n    return 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tinydb/storage.py"),
+        "def add_column(col: str) -> str:\n    return f'old:{col}'\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "baseline cli"]);
+
+    let contract_test = r#"import subprocess, sys
+
+def test_cli_add_column():
+    res = subprocess.run(
+        [sys.executable, "-m", "tinydb", "tag"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "added:tag", res.stdout
+"#;
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "Implement add_column CLI support".into(),
+        contracts: vec![ContractFile {
+            path: "tests/test_acceptance_contract.py".into(),
+            content: contract_test.into(),
+            phase: 0,
+        }],
+        pages: vec![PagePlan {
+            id: "storage-facade".into(),
+            owned_glob: "{tinydb/storage.py,tinydb/__init__.py}".into(),
+            brief: "Implement add_column returning 'added:<col>' in tinydb/storage.py.".into(),
+            done: "CLI prints added:tag".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct BuggyThenFixedHarness {
+        briefs: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for BuggyThenFixedHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let n = {
+                let mut log = self.briefs.lock().unwrap();
+                log.push(task.brief.clone());
+                log.len()
+            };
+            if n == 1 {
+                // Attempt 1 writes a buggy implementation so unit build merges and reaches final verify.
+                std::fs::write(
+                    task.cwd.join("tinydb/storage.py"),
+                    "def add_column(col: str) -> str:\n    return f'broken:{col}'\n",
+                )?;
+            } else {
+                // Repair triggered by failed final verify fixes the bug!
+                std::fs::write(
+                    task.cwd.join("tinydb/storage.py"),
+                    "def add_column(col: str) -> str:\n    return f'added:{col}'\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:storage-facade\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h = Arc::new(BuggyThenFixedHarness { briefs: Mutex::new(Vec::new()) });
+    let h_dyn: Arc<dyn Harness> = h.clone();
+    let harnesses = Harnesses {
+        master: h_dyn.clone(),
+        mid: h_dyn.clone(),
+        worker: h_dyn.clone(),
+        reviewer: h_dyn.clone(),
+        verifier: h_dyn,
+    };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n8-fix4".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(
+        drive(cfg, harnesses).await.unwrap(),
+        Outcome::Finished { ok: true },
+        "failed subprocess locked contract test must trigger normal worker repair cycle and succeed"
+    );
+    let briefs = h.briefs.lock().unwrap().clone();
+    assert_eq!(briefs.len(), 2, "expected initial build + 1 repair turn after verify failure: {briefs:?}");
+    assert!(
+        briefs[1].contains("test_cli_add_column") && briefs[1].contains("tests/test_acceptance_contract.py"),
+        "repair brief must include the failing acceptance contract test output:\n{}",
+        briefs[1]
+    );
+    assert_eq!(
+        read(&tmp.0.join("tests/test_acceptance_contract.py")),
+        contract_test,
+        "locked contract test must stay unmodified"
+    );
+}

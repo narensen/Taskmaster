@@ -5077,23 +5077,41 @@ impl Driver {
         !named.is_empty() && named.iter().all(|path| later_tests.contains(path))
     }
 
-    /// The units `tests` reach through their imports, directly or through other shared files.
+    /// The units `tests` reach through their imports — and, for CLI/E2E contract tests that run
+    /// the project via subprocess or dynamic module loading (e.g. `python -m <pkg>`, `run_module`,
+    /// `import_module`, `cargo run`, or script paths), through the invoked entrypoints and their
+    /// import closure.
     fn units_reached<'a>(&self, owners: &Owners, tests: impl IntoIterator<Item = &'a str>) -> BTreeSet<PageId> {
         let Ok(sources) = load_sources(&self.tree) else { return BTreeSet::new() };
         let graph = ImportGraph::build(&sources, "");
+        let test_files: Vec<String> = tests.into_iter().map(str::to_string).collect();
         let mut reached = BTreeSet::new();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut stack: Vec<String> = tests.into_iter().map(str::to_string).collect();
-        while let Some(file) = stack.pop() {
-            if !seen.insert(file.clone()) || seen.len() > 256 {
+        let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
+        let mut stack: Vec<(String, bool)> = test_files.iter().cloned().map(|f| (f, false)).collect();
+
+        // Discover dynamic/subprocess CLI targets referenced by the contract test files
+        // (such as `subprocess.run([sys.executable, "-m", "tinydb", ...])`).
+        let dynamic_targets = extract_dynamic_test_targets(&self.tree, &test_files, &sources);
+        for target in dynamic_targets {
+            if let Some(page) = owners.owner(&target) {
+                reached.insert(page.clone());
+            }
+            stack.push((target, true));
+        }
+
+        while let Some((file, traverse_owned)) = stack.pop() {
+            if !seen.insert((file.clone(), traverse_owned)) || seen.len() > 512 {
                 continue;
             }
             for to in graph.edges.get(&file).into_iter().flatten() {
                 match owners.owner(to) {
                     Some(page) => {
                         reached.insert(page.clone());
+                        if traverse_owned {
+                            stack.push((to.clone(), true));
+                        }
                     }
-                    None => stack.push(to.clone()),
+                    None => stack.push((to.clone(), traverse_owned)),
                 }
             }
         }
@@ -5938,21 +5956,32 @@ impl Driver {
                     .into_iter()
                     .filter(|f| matcher.is_match(f) && tm_core::is_test_path(f))
                     .collect();
-                // Include locked contract tests only when this unit has no unbuilt dependencies.
+                // Include locked contract tests only when this unit has no unbuilt dependencies
+                // AND the contract test does not also depend on another still-unbuilt sibling.
                 let deps_landed = unit.depends_on.iter().all(|dep| {
                     self.run
                         .pages
                         .get(dep)
                         .is_some_and(|st| st.state == tm_core::PageState::Passed)
                 });
-                if deps_landed {
+                if deps_landed && let Ok(owners) = Owners::from_plan(plan) {
                     for c in &plan.contracts {
                         if tm_core::is_test_path(&c.path)
                             && !later_tests.contains(&c.path)
                             && worktree.join(&c.path).is_file()
                             && !targets.contains(&c.path)
                         {
-                            targets.push(c.path.clone());
+                            let touches_unbuilt = self.units_reached(&owners, [c.path.as_str()]).iter().any(|u| {
+                                u != page
+                                    && self
+                                        .run
+                                        .pages
+                                        .get(u)
+                                        .is_some_and(|st| st.state != tm_core::PageState::Passed)
+                            });
+                            if !touches_unbuilt {
+                                targets.push(c.path.clone());
+                            }
                         }
                     }
                 }
@@ -8296,6 +8325,160 @@ fn task_requires_brownfield_changes(unit: &tm_core::PagePlan, existing_owned: &[
             || (tok.contains('_') && tok.len() >= 5 && tok.chars().any(|c| c.is_ascii_alphabetic()))
     });
     names_owned_file || names_symbol
+}
+
+/// Discover non-test project files invoked dynamically by `test_files` (e.g. Python
+/// `subprocess.run([sys.executable, "-m", "pkg", ...])`, `python -m pkg`, `run_module("pkg")`,
+/// `import_module("pkg")`, `cargo run`, `pyproject.toml` console scripts, or explicit relative
+/// source paths), so subprocess/CLI contract tests route failures into the normal unit repair cycle.
+fn extract_dynamic_test_targets(
+    tree: &Path,
+    test_files: &[String],
+    sources: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut targets: BTreeSet<String> = BTreeSet::new();
+    let non_test_sources: Vec<&String> = sources.keys().filter(|p| !tm_core::is_test_path(p)).collect();
+    if non_test_sources.is_empty() {
+        return targets;
+    }
+
+    // Collect console-script -> module mappings from `pyproject.toml` if present.
+    let mut py_scripts: Vec<(String, String)> = Vec::new();
+    if let Ok(pyproject) = fs::read_to_string(tree.join("pyproject.toml")) {
+        let mut in_scripts = false;
+        for line in pyproject.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_scripts = trimmed == "[project.scripts]" || trimmed == "[tool.poetry.scripts]";
+                continue;
+            }
+            if in_scripts
+                && let Some((k, v)) = trimmed.split_once('=')
+            {
+                let name = k.trim().trim_matches(['"', '\'']);
+                let mod_spec = v.trim().trim_matches(['"', '\'']).split(':').next().unwrap_or("").trim();
+                if !name.is_empty() && !mod_spec.is_empty() {
+                    py_scripts.push((name.to_string(), mod_spec.to_string()));
+                }
+            }
+        }
+    }
+
+    let add_python_module = |mod_name: &str, out: &mut BTreeSet<String>| {
+        let rel = mod_name.trim().replace('.', "/");
+        if rel.is_empty() {
+            return;
+        }
+        let mut matched_entry = false;
+        for candidate in [format!("{rel}/__main__.py"), format!("{rel}/__init__.py"), format!("{rel}.py")] {
+            if sources.contains_key(&candidate) {
+                out.insert(candidate);
+                matched_entry = true;
+            }
+        }
+        if !matched_entry {
+            let prefix = format!("{rel}/");
+            for src in &non_test_sources {
+                if src.starts_with(&prefix) {
+                    out.insert((*src).clone());
+                }
+            }
+        }
+    };
+
+    for test_file in test_files {
+        let content = sources
+            .get(test_file)
+            .cloned()
+            .or_else(|| fs::read_to_string(tree.join(test_file)).ok())
+            .unwrap_or_default();
+        if content.is_empty() {
+            continue;
+        }
+        // 1. Subprocess/argv Python `-m <module>` (e.g. `"-m", "tinydb"`, `'-m', 'tinydb'`, `python -m tinydb`).
+        for mod_name in extract_python_dash_m_modules(&content) {
+            add_python_module(&mod_name, &mut targets);
+        }
+        // 2. Dynamic Python imports (`import_module("pkg")`, `run_module("pkg")`).
+        for fn_name in ["import_module(", "run_module("] {
+            let mut rest = content.as_str();
+            while let Some(pos) = rest.find(fn_name) {
+                rest = &rest[pos + fn_name.len()..];
+                if let Some(mod_name) = leading_quoted_ident(rest) {
+                    add_python_module(&mod_name, &mut targets);
+                }
+            }
+        }
+        // 3. `pyproject.toml` console script names invoked in quotes.
+        for (script_name, mod_spec) in &py_scripts {
+            if content.contains(&format!("\"{script_name}\"")) || content.contains(&format!("'{script_name}'")) {
+                add_python_module(mod_spec, &mut targets);
+            }
+        }
+        // 4. `cargo run` -> `src/main.rs`.
+        if ((content.contains("cargo") && content.contains("\"run\"")) || content.contains("cargo run"))
+            && sources.contains_key("src/main.rs")
+        {
+            targets.insert("src/main.rs".to_string());
+        }
+        // 5. Explicit relative paths to tracked non-test source files referenced in the test.
+        for src in &non_test_sources {
+            if src.contains('/') && content.contains(src.as_str()) {
+                targets.insert((*src).clone());
+            }
+        }
+    }
+    targets
+}
+
+fn extract_python_dash_m_modules(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // Form A: list arguments `"-m", "pkg"` or `'-m', 'pkg'` (arbitrary whitespace/newlines between).
+    for needle in ["\"-m\"", "'-m'"] {
+        let mut rest = text;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            let after_comma = rest.trim_start();
+            if let Some(after_comma) = after_comma.strip_prefix(',')
+                && let Some(mod_name) = leading_quoted_ident(after_comma)
+                && !out.contains(&mod_name)
+            {
+                out.push(mod_name);
+            }
+        }
+    }
+    // Form B: shell string `python -m pkg` or `python3 -m pkg`.
+    for needle in ["python -m ", "python3 -m "] {
+        let mut rest = text;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            let token: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            if !token.is_empty() && !out.contains(&token) {
+                out.push(token);
+            }
+        }
+    }
+    out
+}
+
+fn leading_quoted_ident(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let quote = trimmed.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after = &trimmed[1..];
+    let end = after.find(quote)?;
+    let inner = after[..end].trim();
+    if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        Some(inner.to_string())
+    } else {
+        None
+    }
 }
 
 /// How an agent with Code Mode is told to work, in the shared prefix.

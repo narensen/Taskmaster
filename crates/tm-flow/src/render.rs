@@ -81,32 +81,48 @@ pub fn unit_map(
     // Identify every node belonging to this unit (by owner or owned_files list).
     // Separate production symbols from owned test-file symbols so unit tests never drown out
     // the unit's own API, referenced contracts, or cross-unit neighbours.
+    let my_unit_node = crate::model::unit_node_id(unit_id);
     let mut unit_node_ids: BTreeSet<&str> = BTreeSet::new();
     let mut prod_nodes: Vec<&Node> = Vec::new();
     let mut own_test_nodes: Vec<&Node> = Vec::new();
+    let mut planned_prod_files: Vec<&Node> = Vec::new();
+    let mut planned_test_files: Vec<&Node> = Vec::new();
     for n in &all_nodes {
         let belongs = n.owner.as_deref() == Some(unit_id)
             || (!n.path.is_empty() && owned_file_set.contains(&n.path));
         if belongs && n.kind != NodeKind::Unit {
             unit_node_ids.insert(n.id.as_str());
-            if n.kind != NodeKind::File {
-                if tm_core::is_test_path(&n.path) {
-                    own_test_nodes.push(n);
-                } else {
-                    prod_nodes.push(n);
+            if n.kind == NodeKind::File {
+                if n.status == NodeStatus::Planned {
+                    if tm_core::is_test_path(&n.path) {
+                        planned_test_files.push(n);
+                    } else {
+                        planned_prod_files.push(n);
+                    }
                 }
+            } else if tm_core::is_test_path(&n.path) {
+                own_test_nodes.push(n);
+            } else {
+                prod_nodes.push(n);
             }
         }
     }
-    let mut unit_nodes: Vec<&Node> = if prod_nodes.is_empty() {
-        std::mem::take(&mut own_test_nodes)
+    let mut unit_nodes: Vec<&Node> = if prod_nodes.is_empty() && planned_prod_files.is_empty() {
+        let mut combined = planned_test_files;
+        combined.extend(std::mem::take(&mut own_test_nodes));
+        combined
     } else {
-        prod_nodes
+        let mut combined = planned_prod_files;
+        combined.extend(prod_nodes);
+        combined
     };
-    // Exported symbols first so budget caps keep public APIs visible before private helpers.
+    // Planned files first, then exported symbols before private helpers, preserving path/line order.
     unit_nodes.sort_by(|a, b| {
-        (!a.exported)
-            .cmp(&(!b.exported))
+        let a_file = a.kind == NodeKind::File;
+        let b_file = b.kind == NodeKind::File;
+        b_file
+            .cmp(&a_file)
+            .then_with(|| (!a.exported).cmp(&(!b.exported)))
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.span[0].cmp(&b.span[0]))
             .then_with(|| a.id.cmp(&b.id))
@@ -134,6 +150,15 @@ pub fn unit_map(
     }
 
     for edge in &all_edges {
+        if edge.to == my_unit_node
+            && edge.kind == EdgeKind::ContractOf
+            && let Some(src) = node_by_id.get(edge.from.as_str()).copied()
+            && is_contract_node(src)
+            && src.kind != NodeKind::File
+        {
+            contract_refs.insert(src.id.as_str(), src);
+            continue;
+        }
         let from_mine = unit_node_ids.contains(edge.from.as_str());
         let to_mine = unit_node_ids.contains(edge.to.as_str());
         if from_mine == to_mine {
@@ -176,7 +201,7 @@ pub fn unit_map(
                 continue;
             }
             if (edge.conf.is_high() || src.status == NodeStatus::Planned)
-                && src.kind != NodeKind::File
+                && (src.kind != NodeKind::File || src.status == NodeStatus::Planned)
                 && seen_cross.insert(format!("in:{}:{}", edge.kind.as_str(), src.id))
             {
                 let my_target = node_by_id
@@ -189,7 +214,7 @@ pub fn unit_map(
     }
 
     // For units with declared `depends_on` (e.g. greenfield integrator units with no files yet),
-    // also include exported built/planned non-test symbols from upstream dependencies as cross-unit context.
+    // also include exported built/planned non-test symbols (or planned files) from upstream dependencies.
     let mut seen_cross_nodes: BTreeSet<String> = all_edges
         .iter()
         .filter(|e| unit_node_ids.contains(e.from.as_str()) && !unit_node_ids.contains(e.to.as_str()))
@@ -199,6 +224,7 @@ pub fn unit_map(
         && let Some(u) = seed.units.iter().find(|u| u.id == unit_id)
     {
         for dep_unit in &u.depends_on {
+            let mut added_sym = false;
             for n in all_nodes.iter().filter(|n| {
                 n.owner.as_deref() == Some(dep_unit.as_str())
                     && n.kind != NodeKind::File
@@ -208,13 +234,38 @@ pub fn unit_map(
             }) {
                 if seen_cross_nodes.insert(n.id.clone()) && seen_cross.insert(format!("dep:{}", n.id)) {
                     cross_lines.push(format_dep_symbol(dep_unit, n));
+                    added_sym = true;
+                }
+            }
+            if !added_sym {
+                for n in all_nodes.iter().filter(|n| {
+                    n.owner.as_deref() == Some(dep_unit.as_str())
+                        && n.kind == NodeKind::File
+                        && n.status == NodeStatus::Planned
+                        && !tm_core::is_test_path(&n.path)
+                }) {
+                    if seen_cross_nodes.insert(n.id.clone()) && seen_cross.insert(format!("dep:{}", n.id)) {
+                        cross_lines.push(format_dep_symbol(dep_unit, n));
+                    }
                 }
             }
         }
     }
 
+    // Deduplicate contract method sub-refs when their parent contract class/Protocol is already listed.
+    let parent_contract_ids: BTreeSet<&str> = contract_refs
+        .values()
+        .filter(|n| n.parent.is_none())
+        .map(|n| n.id.as_str())
+        .collect();
+    let contract_list: Vec<&Node> = contract_refs
+        .values()
+        .copied()
+        .filter(|n| n.parent.as_deref().is_none_or(|p| !parent_contract_ids.contains(p)))
+        .collect();
+
     if unit_nodes.is_empty()
-        && contract_refs.is_empty()
+        && contract_list.is_empty()
         && cross_lines.is_empty()
         && test_nodes.is_empty()
     {
@@ -223,8 +274,8 @@ pub fn unit_map(
 
     let header = format!("## Flow unit map ({unit_id})\n");
     let own_lines: Vec<String> = unit_nodes.iter().map(|n| format_own_node(n)).collect();
-    let contract_lines: Vec<String> = contract_refs
-        .values()
+    let contract_lines: Vec<String> = contract_list
+        .into_iter()
         .map(|n| {
             format!(
                 "- contract {} ({}) {}:{}-{}\n",
@@ -380,14 +431,20 @@ fn qualified_label(node: &Node) -> String {
 }
 
 fn format_own_node(n: &Node) -> String {
+    if n.kind == NodeKind::File {
+        return format!("- file {} [{}]\n", n.path, n.status.as_str());
+    }
+    let loc = if n.span == [0, 0] {
+        n.path.clone()
+    } else {
+        format!("{}:{}-{}", n.path, n.span[0], n.span[1])
+    };
     let mut line = format!(
-        "- {} {} [{}] {}:{}-{}",
+        "- {} {} [{}] {}",
         n.kind.as_str(),
         qualified_label(n),
         n.status.as_str(),
-        n.path,
-        n.span[0],
-        n.span[1]
+        loc,
     );
     if !n.sig.is_empty() {
         line.push_str(" :: ");
@@ -401,49 +458,54 @@ fn format_own_node(n: &Node) -> String {
     line
 }
 
+fn format_loc(path: &str, line: u32) -> String {
+    if line == 0 {
+        path.to_string()
+    } else {
+        format!("{path}:{line}")
+    }
+}
+
 fn format_cross_outgoing(unit_id: &str, edge: &Edge, target: &Node) -> String {
     let other = target.owner.as_deref().unwrap_or("shared");
-    let sig = if target.sig.is_empty() {
+    let sig = if target.sig.is_empty() || target.kind == NodeKind::File {
         String::new()
     } else {
         format!(" :: {}", clip_inline(&target.sig, 100))
     };
     format!(
-        "- {unit_id} ▸ {} {other}:{}{} [{}] {}:{}\n",
+        "- {unit_id} ▸ {} {other}:{}{} [{}] {}\n",
         edge.kind.as_str(),
         qualified_label(target),
         sig,
         target.status.as_str(),
-        target.path,
-        target.span[0]
+        format_loc(&target.path, target.span[0]),
     )
 }
 
 fn format_cross_incoming(unit_id: &str, my_target: &str, edge: &Edge, src: &Node) -> String {
     let other = src.owner.as_deref().unwrap_or("shared");
     format!(
-        "- {other}:{} ▸ {} {unit_id}:{my_target} [{}] {}:{}\n",
+        "- {other}:{} ▸ {} {unit_id}:{my_target} [{}] {}\n",
         qualified_label(src),
         edge.kind.as_str(),
         src.status.as_str(),
-        src.path,
-        src.span[0]
+        format_loc(&src.path, src.span[0]),
     )
 }
 
 fn format_dep_symbol(dep_unit: &str, n: &Node) -> String {
-    let sig = if n.sig.is_empty() {
+    let sig = if n.sig.is_empty() || n.kind == NodeKind::File {
         String::new()
     } else {
         format!(" :: {}", clip_inline(&n.sig, 100))
     };
     format!(
-        "- dep {dep_unit}:{}{} [{}] {}:{}\n",
+        "- dep {dep_unit}:{}{} [{}] {}\n",
         qualified_label(n),
         sig,
         n.status.as_str(),
-        n.path,
-        n.span[0]
+        format_loc(&n.path, n.span[0]),
     )
 }
 

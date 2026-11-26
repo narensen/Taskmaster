@@ -9649,3 +9649,140 @@ async fn planner_json_local_repair_avoids_replan_and_unrepairable_uses_ask_repai
         seen3[1]
     );
 }
+
+#[tokio::test]
+async fn flow_wave1_units_receive_unit_maps_when_contract_test_uses_subprocess_only() {
+    let tmp = seeded("flow-n6-wave1");
+    let contract_src = "\
+from typing import Any, Protocol
+class StorageError(Exception):
+    pass
+class Token:
+    pass
+class BTreeProtocol(Protocol):
+    def insert(self, key: Any, value: Any) -> None: ...
+    def search(self, key: Any) -> Any | None: ...
+";
+    // Subprocess-only acceptance contract test: imports NOTHING from `tinydb`.
+    let test_src = "import subprocess, sys\ndef test_cli():\n    assert subprocess.run([sys.executable, '-m', 'tinydb']).returncode == 0\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "N6-shaped greenfield CLI plan".into(),
+        contracts: vec![
+            ContractFile { path: "tinydb/contract.py".into(), content: contract_src.into(), phase: 0 },
+            ContractFile { path: "tests/test_acceptance_contract.py".into(), content: test_src.into(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "{tinydb/btree.py,tests/test_btree.py}".into(),
+                brief: "Implement B-tree in `tinydb/btree.py` conforming to `BTreeProtocol`.".into(),
+                context: "Locked: `BTreeProtocol` and `StorageError` in `tinydb/contract.py`. Export `class BTree` from `tinydb/btree.py`. Sibling: `tinydb/storage.py` will import `BTree` from `tinydb.btree`.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "frontend".into(),
+                owned_glob: "{tinydb/tokenizer.py,tinydb/parser.py}".into(),
+                brief: "Implement lexer and parser using `Token` from `tinydb/contract.py`.".into(),
+                context: "In `tinydb/tokenizer.py`, export `tokenize(sql: str) -> list[Token]`. In `tinydb/parser.py`, export `parse(sql: str)`. Sibling: `tinydb/storage.py` is separate; never import `tinydb.btree`.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "storage".into(),
+                owned_glob: "tinydb/storage.py".into(),
+                brief: "Implement storage engine using `BTree`.".into(),
+                context: "Import `BTree` from `tinydb.btree` and `parse` from `tinydb.parser`. Export `class StorageEngine`.".into(),
+                depends_on: vec!["btree".into(), "frontend".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct Wave1Harness {
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for Wave1Harness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+            if task.brief.contains("Build unit `btree`") {
+                std::fs::write(
+                    task.cwd.join("tinydb/btree.py"),
+                    "from tinydb.contract import BTreeProtocol\nclass BTree(BTreeProtocol):\n    def insert(self, key, value): pass\n    def search(self, key): return None\n",
+                )?;
+            } else if task.brief.contains("Build unit `frontend`") {
+                std::fs::write(task.cwd.join("tinydb/tokenizer.py"), "def tokenize(sql: str):\n    return []\n")?;
+                std::fs::write(task.cwd.join("tinydb/parser.py"), "def parse(sql: str):\n    return []\n")?;
+            } else if task.brief.contains("Build unit `storage`") {
+                std::fs::write(
+                    task.cwd.join("tinydb/storage.py"),
+                    "from tinydb.btree import BTree\nclass StorageEngine:\n    pass\n",
+                )?;
+            }
+            let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(Wave1Harness { briefs: briefs.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let seen = briefs.lock().unwrap().clone();
+    let btree = seen.iter().find(|b| b.contains("Build unit `btree`")).expect("btree brief");
+    let frontend = seen.iter().find(|b| b.contains("Build unit `frontend`")).expect("frontend brief");
+    let storage = seen.iter().find(|b| b.contains("Build unit `storage`")).expect("storage brief");
+
+    // Shared prefix remains byte-identical across wave-1 and wave-2 units.
+    let (pre_b, post_b) = btree.split_once("--- Your task ---").unwrap();
+    let (pre_f, post_f) = frontend.split_once("--- Your task ---").unwrap();
+    let (pre_s, post_s) = storage.split_once("--- Your task ---").unwrap();
+    assert_eq!(pre_b, pre_f);
+    assert_eq!(pre_b, pre_s);
+
+    // BOTH wave-1 units received non-empty unit maps AFTER `--- Your task ---`!
+    assert!(post_b.contains("## Flow unit map (btree)"), "{post_b}");
+    assert!(post_b.contains("file tinydb/btree.py [planned]"), "{post_b}");
+    assert!(post_b.contains("contract BTreeProtocol"), "{post_b}");
+    assert!(post_b.contains("storage:storage.py ▸ imports btree:BTree [planned]"), "{post_b}");
+
+    assert!(post_f.contains("## Flow unit map (frontend)"), "{post_f}");
+    assert!(post_f.contains("file tinydb/tokenizer.py [planned]"), "{post_f}");
+    assert!(post_f.contains("tokenize [planned]"), "{post_f}");
+    assert!(post_f.contains("contract Token"), "{post_f}");
+    assert!(post_f.contains("storage:storage.py ▸ imports frontend:parse [planned]"), "{post_f}");
+
+    // Wave-2 unit sees btree/frontend flipped to built!
+    assert!(post_s.contains("## Flow unit map (storage)"), "{post_s}");
+    assert!(post_s.contains("btree:BTree") && post_s.contains("[built]"), "{post_s}");
+
+    // After run finishes, all planned symbols that landed have status Built with the exact same IDs.
+    let db = tm_flow::FlowDb::open_or_rebuild(&tmp.0).unwrap();
+    assert_eq!(db.get_node("py:tinydb/btree.py").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
+    assert_eq!(db.get_node("py:tinydb/btree.py#BTree").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
+    assert_eq!(db.get_node("py:tinydb/btree.py#BTree.insert").unwrap().unwrap().status, tm_flow::NodeStatus::Built);
+}

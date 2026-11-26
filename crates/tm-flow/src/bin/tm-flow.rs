@@ -57,8 +57,8 @@ fn run() -> anyhow::Result<ExitCode> {
                 .with_context(|| format!("invalid Plan JSON in {plan_file}"))?;
             let report = tm_flow::seed_from_plan(Path::new(dir), &plan)?;
             println!(
-                "seeded .flow plan at {}: {} contracts, {} units, {} planned nodes",
-                dir, report.contracts, report.units, report.planned_nodes
+                "seeded .flow plan at {}: {} contracts, {} units, {} planned files, {} planned nodes",
+                dir, report.contracts, report.units, report.planned_files, report.planned_nodes
             );
             Ok(ExitCode::SUCCESS)
         }

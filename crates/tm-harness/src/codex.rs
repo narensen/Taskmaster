@@ -104,7 +104,7 @@ impl Codex {
             let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
             stream.emitted = true;
         }
-        let result = match tokio::time::timeout(timeout, stream.read(&mut io, &events)).await {
+        let result = match tokio::time::timeout(timeout, stream.read(&mut io, &events, task.stall)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", timeout)),
         };
@@ -127,9 +127,26 @@ struct Stream {
 }
 
 impl Stream {
-    /// Read the stream to the end of its turn.
-    async fn read(&mut self, io: &mut crate::child::AgentIo, events: &mpsc::Sender<HarnessEvent>) -> anyhow::Result<(RunSummary, Option<String>)> {
-        while let Some(line) = io.next_line().await? {
+    /// Read the stream to the end of its turn, stopping with [`crate::Stalled`] if the stream
+    /// stays completely silent for `stall`.
+    async fn read(
+        &mut self,
+        io: &mut crate::child::AgentIo,
+        events: &mpsc::Sender<HarnessEvent>,
+        stall: Option<std::time::Duration>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        loop {
+            let next = io.next_line();
+            let line = match stall {
+                Some(limit) => match tokio::time::timeout(limit, next).await {
+                    Ok(line) => line?,
+                    Err(_) => return Err(crate::Stalled(limit).into()),
+                },
+                None => next.await?,
+            };
+            let Some(line) = line else {
+                break;
+            };
             if let Some(end) = self.line(&line, Some(events)).await {
                 return end.map(|summary| (summary, self.thread_id.clone()));
             }
@@ -347,7 +364,7 @@ impl Harness for Codex {
         let crate::child::Attached { mut io, proc, keep, .. } = attached;
         let result = match ended {
             Some(end) => end.map(|summary| (summary, stream.thread_id.clone())),
-            None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events)).await {
+            None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events, task.stall)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", task.timeout)),
             },
@@ -659,5 +676,40 @@ mod tests {
         assert!(!target.exists());
         assert!(other.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_codex_stream_is_stopped_as_stalled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tm-codex-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("codex-hang");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let harness = Codex { binary: bin.display().to_string() };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: dir.clone(),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(30),
+            stall: Some(std::time::Duration::from_millis(120)),
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate: Arc<dyn PermissionGate> = Arc::new(crate::gate::WorktreeGate::new(&dir, vec![]));
+        let (tx, _rx) = mpsc::channel(8);
+        let err = harness.run(task, gate, tx).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::Stalled>().is_some(),
+            "expected Stalled error on silent Codex stream, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

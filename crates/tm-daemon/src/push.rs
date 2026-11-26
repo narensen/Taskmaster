@@ -220,6 +220,7 @@ impl Push {
             let url = format!("{}/{}", ntfy.server, ntfy.topic);
             let click = format!("{}{}", base.trim_end_matches('/'), note.path);
             let (title, body, tag) = (note.title.clone(), note.body.clone(), note.tag.clone());
+            #[allow(clippy::result_large_err)] // ureq::Error is large by design; result is consumed right here
             let posted = tokio::task::spawn_blocking(move || {
                 ureq::AgentBuilder::new()
                     .timeout(Duration::from_secs(8))
@@ -271,6 +272,7 @@ async fn web_push(key: &EcdsaKeyPair, sub: &Subscription, payload: &[u8]) -> any
     let body = encrypt(payload, &sub.p256dh, &sub.auth)?;
     let auth = vapid(key, &sub.endpoint)?;
     let endpoint = sub.endpoint.clone();
+    #[allow(clippy::result_large_err)] // ureq::Error is large by design; result is consumed right here
     let answer = tokio::task::spawn_blocking(move || {
         ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(10))

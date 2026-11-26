@@ -6,12 +6,85 @@
 //! time no call and no check covers is shown as idle.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tm_core::{LedgerEntry, Role, totals};
 
 use crate::store::Records;
+
+/// Threshold (in seconds) above which a divergence between wall-clock duration and
+/// monotonic duration is flagged (e.g., host suspend/freeze or NTP jump).
+pub const CLOCK_SKEW_THRESHOLD_SECS: f64 = 30.0;
+
+/// Both wall-clock (`SystemTime`) and monotonic (`Instant`) timing recorded for a run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunTiming {
+    pub wall_started_at: String,
+    pub wall_ended_at: String,
+    pub wall_started_unix_ms: u64,
+    pub wall_ended_unix_ms: u64,
+    pub wall_seconds: f64,
+    pub monotonic_start_ms: u64,
+    pub monotonic_end_ms: u64,
+    pub monotonic_seconds: f64,
+    pub clock_skew_seconds: f64,
+    pub clock_skew_flagged: bool,
+}
+
+impl RunTiming {
+    /// Construct a [`RunTiming`] from explicit wall-clock epoch milliseconds and monotonic
+    /// start/end milliseconds, flagging when `|wall_seconds - monotonic_seconds| > 30s`.
+    pub fn from_unix_ms(
+        wall_started_unix_ms: u64,
+        wall_ended_unix_ms: u64,
+        monotonic_start_ms: u64,
+        monotonic_end_ms: u64,
+    ) -> Self {
+        let wall_ms = wall_ended_unix_ms.saturating_sub(wall_started_unix_ms);
+        let mono_ms = monotonic_end_ms.saturating_sub(monotonic_start_ms);
+        let wall_seconds = wall_ms as f64 / 1000.0;
+        let monotonic_seconds = mono_ms as f64 / 1000.0;
+        let clock_skew_seconds = (wall_seconds - monotonic_seconds).abs();
+        let clock_skew_flagged = clock_skew_seconds > CLOCK_SKEW_THRESHOLD_SECS;
+        Self {
+            wall_started_at: crate::time::rfc3339(wall_started_unix_ms / 1000),
+            wall_ended_at: crate::time::rfc3339(wall_ended_unix_ms / 1000),
+            wall_started_unix_ms,
+            wall_ended_unix_ms,
+            wall_seconds,
+            monotonic_start_ms,
+            monotonic_end_ms,
+            monotonic_seconds,
+            clock_skew_seconds,
+            clock_skew_flagged,
+        }
+    }
+
+    /// Build a [`RunTiming`] from a run's wall-clock start/end and elapsed monotonic duration,
+    /// preserving the original start timestamp and accumulated monotonic time across resumes.
+    pub fn from_bounds(
+        wall_start: SystemTime,
+        wall_end: SystemTime,
+        monotonic_elapsed: Duration,
+        prior: Option<&RunTiming>,
+    ) -> Self {
+        let unix_ms = |t: SystemTime| -> u64 {
+            t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+        };
+        let wall_started_unix_ms = prior
+            .map(|p| p.wall_started_unix_ms)
+            .filter(|&ms| ms > 0)
+            .unwrap_or_else(|| unix_ms(wall_start));
+        let wall_ended_unix_ms = unix_ms(wall_end).max(wall_started_unix_ms);
+        let monotonic_start_ms = prior.map_or(0, |p| p.monotonic_start_ms);
+        let monotonic_end_ms = prior
+            .map_or(0, |p| p.monotonic_end_ms)
+            .saturating_add(monotonic_elapsed.as_millis() as u64);
+        Self::from_unix_ms(wall_started_unix_ms, wall_ended_unix_ms, monotonic_start_ms, monotonic_end_ms)
+    }
+}
 
 /// One row of the stage table.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -31,6 +104,14 @@ pub struct Report {
     pub stages: Vec<Stage>,
     pub planning_share: f64,
     pub total_seconds: f64,
+    pub wall_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monotonic_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_skew_seconds: Option<f64>,
+    pub clock_skew_flagged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<RunTiming>,
     pub idle_seconds: f64,
     pub verify_seconds: f64,
     pub fresh: u64,
@@ -151,12 +232,30 @@ pub fn build(records: &Records, run: &str) -> anyhow::Result<Report> {
     let all_input = sum.input + sum.cache_write + sum.cache_read;
     let cache_hit = if all_input == 0 { 0.0 } else { sum.cache_read as f64 / all_input as f64 };
     let calls: Vec<&Value> = transcript.iter().filter(|e| e["kind"] == "tool_call").collect();
+    let timing: Option<RunTiming> = status
+        .get("timing")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<RunTiming>(v).ok())
+        .map(|mut t| {
+            t.clock_skew_seconds = (t.wall_seconds - t.monotonic_seconds).abs();
+            t.clock_skew_flagged = t.clock_skew_seconds > CLOCK_SKEW_THRESHOLD_SECS;
+            t
+        });
+    let wall_seconds = timing.as_ref().map_or(total_seconds, |t| t.wall_seconds);
+    let monotonic_seconds = timing.as_ref().map(|t| t.monotonic_seconds);
+    let clock_skew_seconds = timing.as_ref().map(|t| t.clock_skew_seconds);
+    let clock_skew_flagged = timing.as_ref().is_some_and(|t| t.clock_skew_flagged);
     Ok(Report {
         run: run.to_string(),
         outcome,
         stages,
         planning_share: if total_seconds > 0.0 { planning_seconds / total_seconds } else { 0.0 },
         total_seconds,
+        wall_seconds,
+        monotonic_seconds,
+        clock_skew_seconds,
+        clock_skew_flagged,
+        timing,
         idle_seconds,
         verify_seconds,
         fresh: sum.fresh,
@@ -180,6 +279,18 @@ pub fn render(report: &Report) -> String {
     }
     out.push_str(&format!("| idle | {:.0}s | | | |\n", report.idle_seconds));
     out.push_str(&format!("| total | {:.0}s | | {} | {} |\n\n", report.total_seconds, report.fresh, report.cache_read));
+    if let Some(timing) = &report.timing {
+        out.push_str(&format!(
+            "Timing: wall {:.1}s, monotonic {:.1}s ({} -> {})\n",
+            timing.wall_seconds, timing.monotonic_seconds, timing.wall_started_at, timing.wall_ended_at
+        ));
+        if timing.clock_skew_flagged {
+            out.push_str(&format!(
+                "WARNING: clock skew detected — wall ({:.1}s) and monotonic ({:.1}s) differ by {:.1}s (>30s; host suspend/freeze suspected)\n",
+                timing.wall_seconds, timing.monotonic_seconds, timing.clock_skew_seconds
+            ));
+        }
+    }
     out.push_str(&format!("Planning share: {:.0}%\n", report.planning_share * 100.0));
     out.push_str(&format!(
         "Tokens: {} fresh ({} in, {} out), {} read from cache; cache-hit ratio {:.2}\n",
@@ -200,5 +311,49 @@ mod tests {
         assert_eq!(covered(vec![]), 0.0);
         assert!((verify_line_seconds("verify: setup 1.7s ok, setup 0.4s ok, test 0.2s ok") - 2.3).abs() < 1e-9);
         assert_eq!(verify_line_seconds("taskmaster: nothing"), 0.0);
+    }
+
+    #[test]
+    fn run_timing_records_monotonic_and_wall_and_flags_skew_over_30s() {
+        // Exactly 30.0s difference is NOT flagged; > 30s IS flagged.
+        let ok = RunTiming::from_unix_ms(1_700_000_000_000, 1_700_000_130_000, 0, 100_000);
+        assert!((ok.wall_seconds - 130.0).abs() < 1e-6);
+        assert!((ok.monotonic_seconds - 100.0).abs() < 1e-6);
+        assert!((ok.clock_skew_seconds - 30.0).abs() < 1e-6);
+        assert!(!ok.clock_skew_flagged, "30.0s skew should not be flagged");
+
+        let skewed = RunTiming::from_unix_ms(1_700_000_000_000, 1_700_000_446_000, 0, 100_000);
+        assert!((skewed.wall_seconds - 446.0).abs() < 1e-6);
+        assert!((skewed.monotonic_seconds - 100.0).abs() < 1e-6);
+        assert!((skewed.clock_skew_seconds - 346.0).abs() < 1e-6);
+        assert!(skewed.clock_skew_flagged, "346s skew must be flagged");
+
+        // Persist into a temporary Records store and verify report::build + report::render.
+        let dir = std::env::temp_dir().join(format!("tm-report-timing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let records = Records::files(&dir);
+
+        records
+            .save_status("skewed", &serde_json::json!({ "ok": true, "phase": "Done", "timing": skewed }))
+            .unwrap();
+        let built_skewed = build(&records, "skewed").unwrap();
+        assert!(built_skewed.clock_skew_flagged);
+        assert!((built_skewed.wall_seconds - 446.0).abs() < 1e-6);
+        assert_eq!(built_skewed.monotonic_seconds, Some(100.0));
+        let rendered_skewed = render(&built_skewed);
+        assert!(rendered_skewed.contains("Timing: wall 446.0s, monotonic 100.0s"), "{rendered_skewed}");
+        assert!(rendered_skewed.contains("WARNING: clock skew detected"), "{rendered_skewed}");
+
+        records
+            .save_status("clean", &serde_json::json!({ "ok": true, "phase": "Done", "timing": ok }))
+            .unwrap();
+        let built_ok = build(&records, "clean").unwrap();
+        assert!(!built_ok.clock_skew_flagged);
+        let rendered_ok = render(&built_ok);
+        assert!(rendered_ok.contains("Timing: wall 130.0s, monotonic 100.0s"), "{rendered_ok}");
+        assert!(!rendered_ok.contains("WARNING: clock skew detected"), "{rendered_ok}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

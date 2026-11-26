@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tm_core::{PageId, Plan};
 
 // ---------------------------------------------------------------------------
@@ -62,17 +63,80 @@ pub fn verify_red_green(
     })
 }
 
+/// Verdict of running a contract test against an unmutated baseline and a stubbed implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationVerdict {
+    /// Baseline ran and passed (with at least one test executed), and stubbing the target made it fail.
+    Caught,
+    /// Baseline ran and passed, and the test still passed after stubbing the target.
+    Vacuous,
+    /// Could not verify non-vacuity (e.g., baseline failed, all tests were skipped, or zero tests passed).
+    Inconclusive,
+}
+
+fn sha256_hex(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Deterministic cache key for a mutation-gate verdict keyed by `(contract hash, target hash, command)`.
+pub fn mutation_cache_key(
+    contract_rel_path: &str,
+    contract_bytes: &[u8],
+    impl_rel_path: &str,
+    target_bytes: &[u8],
+    test_cmd: &[&str],
+) -> String {
+    let contract_hash = sha256_hex(&[contract_rel_path.as_bytes(), contract_bytes]);
+    let target_hash = sha256_hex(&[impl_rel_path.as_bytes(), target_bytes]);
+    let cmd_joined = test_cmd.join("\0");
+    let cmd_hash = sha256_hex(&[cmd_joined.as_bytes()]);
+    format!("{contract_hash}:{target_hash}:{}", &cmd_hash[..16])
+}
+
+/// Cached variant of [`contract_mutation_sanity_with_env`]: returns `(verdict, cache_hit)`.
+/// When `(contract hash, target hash, test_cmd)` is already in `cache`, returns the cached
+/// verdict without copying the tree or spawning the test runner.
+pub fn contract_mutation_sanity_cached(
+    worktree: &Path,
+    contract_rel_path: &str,
+    impl_rel_path: &str,
+    stub_content: &str,
+    test_cmd: &[&str],
+    extra_env: &[(String, String)],
+    cache: &mut BTreeMap<String, MutationVerdict>,
+) -> anyhow::Result<(MutationVerdict, bool)> {
+    let contract_bytes = std::fs::read(worktree.join(contract_rel_path))?;
+    let target_bytes = std::fs::read(worktree.join(impl_rel_path))?;
+    let key = mutation_cache_key(contract_rel_path, &contract_bytes, impl_rel_path, &target_bytes, test_cmd);
+    if let Some(&verdict) = cache.get(&key) {
+        return Ok((verdict, true));
+    }
+    let verdict = contract_mutation_sanity_with_env(worktree, impl_rel_path, stub_content, test_cmd, extra_env)?;
+    cache.insert(key, verdict);
+    Ok((verdict, false))
+}
+
 /// Mutation sanity on a contract test: copy `worktree` into an isolated temporary
-/// directory, replace `impl_rel_path` in the copy with a minimal throwing stub, and run
+/// directory, verify the unmutated baseline runs and passes at least one test, then
+/// replace `impl_rel_path` in the copy with a minimal throwing stub and run
 /// `test_cmd` there so the live shared working tree is never modified.
-/// Returns `Ok(true)` if the contract test catches the broken implementation (fails),
-/// `Ok(false)` if the test is vacuous (still passes with a broken implementation).
 pub fn contract_mutation_sanity(
     worktree: &Path,
     impl_rel_path: &str,
     stub_content: &str,
     test_cmd: &[&str],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<MutationVerdict> {
     contract_mutation_sanity_with_env(worktree, impl_rel_path, stub_content, test_cmd, &[])
 }
 
@@ -85,7 +149,7 @@ pub fn contract_mutation_sanity_with_env(
     stub_content: &str,
     test_cmd: &[&str],
     extra_env: &[(String, String)],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<MutationVerdict> {
     if test_cmd.is_empty() {
         anyhow::bail!("test command cannot be empty");
     }
@@ -113,10 +177,239 @@ pub fn contract_mutation_sanity_with_env(
     std::fs::create_dir_all(&tmp.0)?;
     copy_tree_for_mutation(worktree, &tmp.0)?;
 
+    let is_pytest = is_pytest_cmd(test_cmd);
+    let is_cargo = is_cargo_test_cmd(test_cmd);
+    let augmented = if is_pytest {
+        augment_pytest_cmd(test_cmd)
+    } else {
+        test_cmd.iter().map(|s| (*s).to_string()).collect()
+    };
+    let effective_refs: Vec<&str> = augmented.iter().map(String::as_str).collect();
+
+    // 1. Baseline check on the unmutated copy: if baseline fails or zero tests pass
+    //    (e.g., all tests skipped via skipif), the gate is inconclusive rather than vacuous.
+    let baseline = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    if !baseline.status.success() {
+        return Ok(MutationVerdict::Inconclusive);
+    }
+    if !run_passed_at_least_one_test(&baseline, is_pytest, is_cargo) {
+        return Ok(MutationVerdict::Inconclusive);
+    }
+
+    // 2. Replace target implementation with a failing stub and re-run.
     let target = tmp.0.join(impl_rel_path);
     std::fs::write(&target, stub_content)?;
-    let passed_with_stub = run_cmd_ok_with_env(&tmp.0, test_cmd, extra_env)?;
-    Ok(!passed_with_stub)
+    let mutated = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    if !mutated.status.success() {
+        return Ok(MutationVerdict::Caught);
+    }
+    if !run_passed_at_least_one_test(&mutated, is_pytest, is_cargo) {
+        return Ok(MutationVerdict::Inconclusive);
+    }
+    Ok(MutationVerdict::Vacuous)
+}
+
+fn is_pytest_cmd(cmd: &[&str]) -> bool {
+    let Some(first) = cmd.first() else { return false };
+    let prog = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    if prog == "pytest" || prog == "pytest.exe" {
+        return true;
+    }
+    if matches!(prog, "sh" | "bash" | "cmd" | "cmd.exe" | "powershell") {
+        return false;
+    }
+    cmd.iter().skip(1).any(|a| *a == "pytest")
+}
+
+fn is_cargo_test_cmd(cmd: &[&str]) -> bool {
+    let Some(first) = cmd.first() else { return false };
+    let prog = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    (prog == "cargo" || prog == "cargo.exe") && cmd.get(1) == Some(&"test")
+}
+
+/// Add `-rA -p no:cacheprovider` to a pytest invocation so the summary always reports
+/// executed/skipped counts cleanly without writing `.pytest_cache` in the temp dir.
+fn augment_pytest_cmd(cmd: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let insert_at = out
+        .iter()
+        .position(|a| a == "pytest")
+        .map(|i| i + 1)
+        .unwrap_or(1.min(out.len()));
+    let has_ra = out.iter().any(|a| a == "-rA");
+    let has_nocache = out
+        .windows(2)
+        .any(|w| w[0] == "-p" && w[1] == "no:cacheprovider")
+        || out.iter().any(|a| a == "-pno:cacheprovider");
+    let mut extra = Vec::new();
+    if !has_ra {
+        extra.push("-rA".to_string());
+    }
+    if !has_nocache {
+        extra.push("-p".to_string());
+        extra.push("no:cacheprovider".to_string());
+    }
+    out.splice(insert_at..insert_at, extra);
+    out
+}
+
+fn run_passed_at_least_one_test(output: &std::process::Output, is_pytest: bool, is_cargo: bool) -> bool {
+    if is_pytest {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let passed = parse_pytest_summary_passed(&stdout)
+            .or_else(|| parse_pytest_summary_passed(&stderr));
+        return matches!(passed, Some(n) if n > 0);
+    }
+    if is_cargo {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(n) = parse_cargo_test_passed(&stdout) {
+            return n > 0;
+        }
+    }
+    true
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_pytest_summary_passed(output: &str) -> Option<usize> {
+    let clean = strip_ansi(output);
+    const KNOWN_LABELS: &[&str] = &[
+        "passed",
+        "failed",
+        "skipped",
+        "deselected",
+        "xfailed",
+        "xpassed",
+        "error",
+        "errors",
+        "warning",
+        "warnings",
+        "rerun",
+        "reruns",
+        "subtests",
+    ];
+    for line in clean.lines().rev() {
+        let trimmed = line.trim().trim_matches('=').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((left, right)) = trimmed.rsplit_once(" in ") else {
+            continue;
+        };
+        let right = right.trim();
+        let looks_like_duration = right
+            .split_whitespace()
+            .next()
+            .is_some_and(|tok| tok.ends_with('s') && tok.chars().next().is_some_and(|c| c.is_ascii_digit()));
+        if !looks_like_duration {
+            continue;
+        }
+        let left = left.trim();
+        if left == "no tests ran" {
+            return Some(0);
+        }
+        let mut passed = 0usize;
+        let mut matched_any = false;
+        let mut all_valid = true;
+        for part in left.split(',') {
+            let mut words = part.split_whitespace();
+            let Some(num_str) = words.next() else {
+                all_valid = false;
+                break;
+            };
+            let Some(label) = words.next() else {
+                all_valid = false;
+                break;
+            };
+            let label_rest = words.next();
+            if words.next().is_some() {
+                all_valid = false;
+                break;
+            }
+            let Ok(n) = num_str.parse::<usize>() else {
+                all_valid = false;
+                break;
+            };
+            let known = KNOWN_LABELS.contains(&label)
+                && label_rest.is_none_or(|w| KNOWN_LABELS.contains(&w));
+            if !known {
+                all_valid = false;
+                break;
+            }
+            matched_any = true;
+            if label == "passed" {
+                passed += n;
+            }
+        }
+        if matched_any && all_valid {
+            return Some(passed);
+        }
+    }
+    if let Some((_, after)) = clean.split_once("short test summary info") {
+        let mut passed = 0usize;
+        let mut saw_status = false;
+        for line in after.lines() {
+            let t = line.trim();
+            if t.starts_with("PASSED ") {
+                passed += 1;
+                saw_status = true;
+            } else if t.starts_with("SKIPPED ")
+                || t.starts_with("FAILED ")
+                || t.starts_with("ERROR ")
+                || t.starts_with("XFAIL ")
+                || t.starts_with("XPASS ")
+            {
+                saw_status = true;
+            }
+        }
+        if saw_status {
+            return Some(passed);
+        }
+    }
+    None
+}
+
+fn parse_cargo_test_passed(output: &str) -> Option<usize> {
+    let mut saw_result = false;
+    let mut total_passed = 0usize;
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("test result:") {
+            saw_result = true;
+            for segment in rest.split(';') {
+                let words: Vec<&str> = segment.split_whitespace().collect();
+                if let Some(pos) = words.iter().position(|w| *w == "passed")
+                    && pos > 0
+                    && let Ok(n) = words[pos - 1].parse::<usize>()
+                {
+                    total_passed += n;
+                }
+            }
+        }
+    }
+    saw_result.then_some(total_passed)
 }
 
 /// Copy `src` into an isolated `dst` directory for mutation testing without touching `src`.
@@ -212,10 +505,14 @@ pub fn mutation_test_command(
 }
 
 fn run_cmd_ok(dir: &Path, cmd: &[&str]) -> anyhow::Result<bool> {
-    run_cmd_ok_with_env(dir, cmd, &[])
+    Ok(run_cmd_output_with_env(dir, cmd, &[])?.status.success())
 }
 
-fn run_cmd_ok_with_env(dir: &Path, cmd: &[&str], extra_env: &[(String, String)]) -> anyhow::Result<bool> {
+fn run_cmd_output_with_env(
+    dir: &Path,
+    cmd: &[&str],
+    extra_env: &[(String, String)],
+) -> anyhow::Result<std::process::Output> {
     let mut c = Command::new(cmd[0]);
     c.args(&cmd[1..])
         .current_dir(dir)
@@ -225,8 +522,8 @@ fn run_cmd_ok_with_env(dir: &Path, cmd: &[&str], extra_env: &[(String, String)])
     for (k, v) in extra_env {
         c.env(k, v);
     }
-    let status = c.status()?;
-    Ok(status.success())
+    let output = c.output()?;
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +607,220 @@ pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
             });
         }
     }
+    // 4. Dependency chain depth cap for small-to-medium plans (<= 6 units): chains deeper than 2
+    //    serialize workers unnecessarily when locked contracts already define the interfaces.
+    if plan.pages.len() <= 6 {
+        let depth = max_dependency_chain_depth(plan);
+        if depth > 2 {
+            findings.push(PlanReviewFinding {
+                severity: "warning".into(),
+                category: "deep_dependency_chain".into(),
+                message: format!(
+                    "Plan has {} units with a dependency chain of depth {} (max recommended is 2); rely on locked contracts so units run in parallel.",
+                    plan.pages.len(),
+                    depth
+                ),
+                page: None,
+            });
+        }
+    }
     findings
+}
+
+/// Longest `depends_on` chain length (in nodes) across `plan.pages`.
+/// Independent units have depth 1; `A <- B` has depth 2; `A <- B <- C` has depth 3.
+pub fn max_dependency_chain_depth(plan: &Plan) -> usize {
+    let by_id: BTreeMap<&str, &[String]> = plan
+        .pages
+        .iter()
+        .map(|p| (p.id.as_str(), p.depends_on.as_slice()))
+        .collect();
+    fn depth_of<'a>(
+        id: &'a str,
+        by_id: &BTreeMap<&'a str, &'a [String]>,
+        visiting: &mut BTreeSet<&'a str>,
+        memo: &mut BTreeMap<&'a str, usize>,
+    ) -> usize {
+        if let Some(&d) = memo.get(id) {
+            return d;
+        }
+        if !visiting.insert(id) {
+            return 1;
+        }
+        let mut best = 1usize;
+        if let Some(deps) = by_id.get(id) {
+            for dep in *deps {
+                if dep.as_str() != id && by_id.contains_key(dep.as_str()) {
+                    best = best.max(1 + depth_of(dep.as_str(), by_id, visiting, memo));
+                }
+            }
+        }
+        visiting.remove(id);
+        memo.insert(id, best);
+        best
+    }
+    let mut memo = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    plan.pages
+        .iter()
+        .map(|p| depth_of(p.id.as_str(), &by_id, &mut visiting, &mut memo))
+        .max()
+        .unwrap_or(0)
+}
+
+/// True when `consumer`'s dependency on `dep_id` is satisfied by a locked non-test contract
+/// (so `consumer` can start immediately in parallel and re-verify when `dep_id` lands).
+pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, dep_id: &str) -> bool {
+    let interfaces: Vec<&tm_core::ContractFile> = plan.contracts.iter().filter(|c| !c.is_test()).collect();
+    if interfaces.is_empty() {
+        return false;
+    }
+    let Some(dep_page) = plan.pages.iter().find(|p| p.id == dep_id) else {
+        return true;
+    };
+    let consumer_text = format!("{}\n{}\n{}", consumer.brief, consumer.context, consumer.done);
+    let dep_text = format!("{}\n{}\n{}", dep_page.brief, dep_page.context, dep_page.done);
+
+    // If the consumer explicitly references a concrete non-contract file owned by `dep_page`
+    // (e.g. `tinydb/executor.py` or `tinydb.executor`), keep the hard dependency.
+    let contract_paths: BTreeSet<&str> = interfaces.iter().map(|c| c.path.as_str()).collect();
+    for concrete in concrete_paths_in_glob(&dep_page.owned_glob) {
+        if contract_paths.contains(concrete.as_str()) || is_test_path(&concrete) {
+            continue;
+        }
+        if text_references_concrete_file(&consumer_text, &concrete) {
+            return false;
+        }
+    }
+
+    // Collect declared symbols and paths from locked interface contracts.
+    let mut contract_symbols: BTreeSet<String> = BTreeSet::new();
+    for c in &interfaces {
+        contract_symbols.extend(extract_declared_symbols(&c.content));
+    }
+
+    // Check whether a locked interface contract covers `dep_page` (symbol matching dep id or stem)
+    // or both `dep_page` and `consumer` coordinate through the same locked contract path/symbol.
+    let dep_tokens = dep_identity_tokens(dep_page);
+    let contract_covers_dep = contract_symbols.iter().any(|sym| {
+        let low = sym.to_ascii_lowercase();
+        dep_tokens.iter().any(|tok| tok.len() >= 3 && low.contains(tok.as_str()))
+    });
+    let consumer_mentions_contract = interfaces.iter().any(|c| {
+        consumer_text.contains(&c.path)
+            || c.path
+                .strip_suffix(".py")
+                .map(|s| s.replace('/', "."))
+                .is_some_and(|m| !m.is_empty() && consumer_text.contains(&m))
+    }) || contract_symbols.iter().any(|sym| sym.len() >= 3 && consumer_text.contains(sym.as_str()));
+
+    if contract_covers_dep && consumer_mentions_contract {
+        return true;
+    }
+
+    // Both producer and consumer explicitly reference the same locked contract file or symbol.
+    let shared_contract_path = interfaces.iter().any(|c| {
+        let mod_name = c.path.strip_suffix(".py").map(|s| s.replace('/', "."));
+        let in_dep = dep_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && dep_text.contains(m));
+        let in_con = consumer_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && consumer_text.contains(m));
+        in_dep && in_con
+    });
+    let shared_contract_sym = contract_symbols.iter().any(|sym| {
+        sym.len() >= 3 && dep_text.contains(sym.as_str()) && consumer_text.contains(sym.as_str())
+    });
+    shared_contract_path || shared_contract_sym
+}
+
+fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
+    let trimmed = glob.trim();
+    let parts: Vec<&str> = if let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        inner.split(',').map(str::trim).collect()
+    } else {
+        vec![trimmed]
+    };
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty() && !p.contains(['*', '?', '[', '{']))
+        .map(|p| p.trim_start_matches("./").to_string())
+        .collect()
+}
+
+fn text_references_concrete_file(text: &str, path: &str) -> bool {
+    if text.contains(path) {
+        return true;
+    }
+    if let Some(stem) = path.strip_suffix(".py") {
+        let dotted = stem.replace('/', ".");
+        if !dotted.is_empty() && text.contains(&dotted) {
+            return true;
+        }
+    }
+    for ext in [".ts", ".tsx", ".js", ".jsx", ".rs"] {
+        if let Some(stem) = path.strip_suffix(ext)
+            && !stem.is_empty()
+            && text.contains(stem)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn dep_identity_tokens(page: &tm_core::PagePlan) -> Vec<String> {
+    let mut tokens = vec![page.id.to_ascii_lowercase()];
+    for part in page.id.split(['-', '_']) {
+        if part.len() >= 3 {
+            tokens.push(part.to_ascii_lowercase());
+        }
+    }
+    for path in concrete_paths_in_glob(&page.owned_glob) {
+        if let Some(stem) = Path::new(&path).file_stem().and_then(|s| s.to_str())
+            && stem.len() >= 3
+        {
+            tokens.push(stem.to_ascii_lowercase());
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn extract_declared_symbols(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        for prefix in [
+            "class ",
+            "def ",
+            "async def ",
+            "export interface ",
+            "export type ",
+            "export class ",
+            "export function ",
+            "export const ",
+            "export enum ",
+            "interface ",
+            "type ",
+            "pub trait ",
+            "pub struct ",
+            "pub enum ",
+            "pub fn ",
+            "trait ",
+            "struct ",
+        ] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && !name.starts_with("__") {
+                    out.push(name);
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn globs_likely_overlap(a: &str, b: &str) -> bool {
@@ -361,6 +871,19 @@ pub fn apply_mechanical_plan_fixes(plan: &mut Plan) -> bool {
         {
             page.difficulty = Some("normal".into());
             changed = true;
+        }
+    }
+    // Flatten over-deep dependency chains (depth > 2 on <= 6 units) by dropping contract-only edges.
+    if plan.pages.len() <= 6 && max_dependency_chain_depth(plan) > 2 {
+        let snapshot = plan.clone();
+        for (idx, page) in plan.pages.iter_mut().enumerate() {
+            let before = page.depends_on.len();
+            let page_snapshot = &snapshot.pages[idx];
+            page.depends_on
+                .retain(|dep| !dependency_is_contract_only(&snapshot, page_snapshot, dep));
+            if page.depends_on.len() != before {
+                changed = true;
+            }
         }
     }
     changed
@@ -1399,7 +1922,7 @@ mod tests {
         assert!(valid.ok);
         assert!(valid.failed_on_base && valid.passed_on_candidate);
 
-        // Mutation sanity: stubbing app.py breaks test_add.py -> true (non-vacuous).
+        // Mutation sanity: stubbing app.py breaks test_add.py -> Caught (non-vacuous).
         let caught = contract_mutation_sanity(
             &cand,
             "app.py",
@@ -1407,7 +1930,7 @@ mod tests {
             &["python3", "test_add.py"],
         )
         .unwrap();
-        assert!(caught);
+        assert_eq!(caught, MutationVerdict::Caught);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1418,7 +1941,7 @@ mod tests {
                 PagePlan { id: "a".into(), owned_glob: "src/**".into(), ..Default::default() },
                 PagePlan { id: "b".into(), owned_glob: "src/**".into(), ..Default::default() },
             ],
-            contracts: vec![ContractFile { path: "src/types.ts".into(), content: "export type X = number;".into() }],
+            contracts: vec![ContractFile { path: "src/types.ts".into(), content: "export type X = number;".into(), phase: 0 }],
             ..Default::default()
         };
         let findings = review_plan_structure(&plan);
@@ -1526,6 +2049,7 @@ mod tests {
             contracts: vec![ContractFile {
                 path: "minisql/format.py".into(),
                 content: "SEPARATOR = ' | '\nHEADER_RULE = '-+-'\n".into(),
+                phase: 0,
             }],
             pages: vec![
                 PagePlan { id: "parser".into(), owned_glob: "minisql/parser.py".into(), brief: "Parse SQL.".into(), ..Default::default() },
@@ -1554,10 +2078,12 @@ mod tests {
                 ContractFile {
                     path: "minisql/format.py".into(),
                     content: "SEPARATOR = '|'\n".into(),
+                    phase: 0,
                 },
                 ContractFile {
                     path: "tests/test_acceptance_contract.py".into(),
                     content: "def test_select_output():\n    assert 'id|name\\n1|alice' == 'id|name\\n1|alice'\n".into(),
+                    phase: 0,
                 },
             ],
             pages: vec![
@@ -1622,7 +2148,7 @@ def test_isolated_and_catches_stub():
             &env,
         )
         .unwrap();
-        assert!(caught, "non-vacuous pytest contract test must fail against the stub");
+        assert_eq!(caught, MutationVerdict::Caught, "non-vacuous pytest contract test must fail against the stub");
         let observed = std::fs::read_to_string(&marker).expect("pytest test must have executed");
         assert!(observed.starts_with("same_dir=False\n"), "must run in isolated temp copy, got: {observed}");
         assert!(
@@ -1640,6 +2166,121 @@ def test_isolated_and_catches_stub():
             .expect("expected cargo test command for Rust project");
         assert_eq!(rs_cmd[0], "cargo");
         assert_eq!(rs_cmd[1], "test");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mutation_gate_baseline_red_is_inconclusive() {
+        let root = std::env::temp_dir().join(format!("tm-mut-base-red-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tests_dir = root.join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        std::fs::write(root.join("app.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        std::fs::write(
+            tests_dir.join("test_contract.py"),
+            "import app\n\ndef test_sum():\n    assert app.add(2, 3) == 5\n",
+        )
+        .unwrap();
+
+        let (cmd, env) = mutation_test_command(&root, &root.join(".taskmaster/venv"), "tests/test_contract.py")
+            .expect("expected pytest command");
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let verdict = contract_mutation_sanity_with_env(
+            &root,
+            "app.py",
+            mutation_stub_for("app.py").unwrap(),
+            &refs,
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            verdict,
+            MutationVerdict::Inconclusive,
+            "a contract test that fails on the unmutated baseline must be Inconclusive"
+        );
+
+        // Standalone failing script must also be Inconclusive.
+        std::fs::write(root.join("check_fail.py"), "import app\nassert app.add(2, 3) == 5\n").unwrap();
+        let standalone = contract_mutation_sanity(
+            &root,
+            "app.py",
+            mutation_stub_for("app.py").unwrap(),
+            &["python3", "check_fail.py"],
+        )
+        .unwrap();
+        assert_eq!(standalone, MutationVerdict::Inconclusive);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_pytest_summary_counts_passed_and_skipped() {
+        assert_eq!(parse_pytest_summary_passed("3 skipped in 0.01s\n"), Some(0));
+        assert_eq!(parse_pytest_summary_passed("1 passed, 2 skipped in 0.02s\n"), Some(1));
+        assert_eq!(parse_pytest_summary_passed("==== 2 passed, 1 warning in 0.12s ====\n"), Some(2));
+        assert_eq!(parse_pytest_summary_passed("==== no tests ran in 0.00s ====\n"), Some(0));
+        assert_eq!(parse_pytest_summary_passed("2 passed in 65.10s (0:01:05)\n"), Some(2));
+        assert_eq!(
+            parse_pytest_summary_passed("=== short test summary info ===\nSKIPPED [1] t.py:1: x\n"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_pytest_summary_passed("=== short test summary info ===\nPASSED t.py::test_a\n"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn mutation_gate_verdict_is_cached_per_contract_and_target_hash() {
+        let root = std::env::temp_dir().join(format!("tm-mut-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("app.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        let counter = root.join("invocations.log");
+        let contract = format!(
+            "import os, sys\nwith open({:?}, 'a') as f:\n    f.write('1\\n')\nsys.path.insert(0, os.getcwd())\nimport app\nassert app.add(2, 3) == 5\n",
+            counter.display().to_string()
+        );
+        std::fs::write(root.join("tests/test_contract.py"), &contract).unwrap();
+
+        let stub = mutation_stub_for("app.py").unwrap();
+        let cmd = ["python3", "tests/test_contract.py"];
+        let mut cache: BTreeMap<String, MutationVerdict> = BTreeMap::new();
+
+        // 1. First verify: cache miss, runs baseline + mutated (2 invocations).
+        let (v1, hit1) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v1, MutationVerdict::Caught);
+        assert!(!hit1);
+        let runs_after_1 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_1, 2, "expected baseline + mutated execution on cache miss");
+
+        // 2. Second verify with unchanged contract and target: cache hit, 0 extra invocations!
+        let (v2, hit2) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v2, MutationVerdict::Caught);
+        assert!(hit2);
+        let runs_after_2 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_2, 2, "cached mutation verdict must not re-run test command");
+
+        // 3. Changing the target invalidates the cache and re-runs.
+        std::fs::write(root.join("app.py"), "def add(a, b):\n    return b + a\n").unwrap();
+        let (v3, hit3) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v3, MutationVerdict::Caught);
+        assert!(!hit3);
+        let runs_after_3 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_3, 4, "modifying target must invalidate cache and re-run");
+
+        // 4. Changing the contract test invalidates the cache and re-runs.
+        let vacuous_contract = format!(
+            "with open({:?}, 'a') as f:\n    f.write('1\\n')\nassert True\n",
+            counter.display().to_string()
+        );
+        std::fs::write(root.join("tests/test_contract.py"), vacuous_contract).unwrap();
+        let (v4, hit4) = contract_mutation_sanity_cached(&root, "tests/test_contract.py", "app.py", stub, &cmd, &[], &mut cache).unwrap();
+        assert_eq!(v4, MutationVerdict::Vacuous);
+        assert!(!hit4);
+        let runs_after_4 = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs_after_4, 6, "modifying contract must invalidate cache and re-run");
 
         let _ = std::fs::remove_dir_all(&root);
     }

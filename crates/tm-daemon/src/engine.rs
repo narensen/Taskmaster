@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
 use tm_core::docs::{
@@ -370,6 +370,7 @@ struct Driver {
     commons: PathBuf,
     tokens: HashMap<String, String>,
     reviewer_token: String,
+    security_token: String,
     verifier_token: String,
     master_token: String,
     trees: Vec<PathBuf>,
@@ -442,6 +443,22 @@ struct Driver {
     setup_artifacts: HashMap<PathBuf, BTreeSet<String>>,
     /// Guards [`Driver::finalize`] so end-of-run cleanup/delivery/reporting runs once per turn.
     finalized: bool,
+    /// Pages whose most recent repair produced no diff and was counted as passed.
+    noop_repairs: BTreeSet<PageId>,
+    /// Fingerprints of per-page gate findings emitted in the previous verify pass.
+    last_gate_findings: BTreeMap<PageId, BTreeSet<String>>,
+    /// Gate findings waived after a no-op repair repeated the exact same failure: `(page, fingerprint)`.
+    /// Cleared for a page whenever that page merges an actual file diff.
+    waived_gate_findings: BTreeSet<(PageId, String)>,
+    /// Units that started immediately on a contract-only `depends_on` before `dep` landed:
+    /// `dep -> {dependent units}` so their integration is re-checked once `dep` lands.
+    soft_dep_waiters: BTreeMap<PageId, BTreeSet<PageId>>,
+    /// Wall-clock start of this driver invocation (`SystemTime`).
+    started_wall: SystemTime,
+    /// Monotonic start of this driver invocation (`Instant`).
+    started_mono: Instant,
+    /// Cached mutation-gate verdicts keyed by `(contract hash, target hash, command)`.
+    mutation_cache: BTreeMap<String, crate::gates::MutationVerdict>,
 }
 
 /// A builder kept open after its turn, with the worktree it worked in.
@@ -504,7 +521,7 @@ impl Drop for Driver {
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -513,6 +530,8 @@ impl Drop for AbortOnDrop {
 }
 
 pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outcome> {
+    let started_wall = SystemTime::now();
+    let started_mono = Instant::now();
     let project = config
         .project
         .canonicalize()
@@ -529,6 +548,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         None => Records::files(&project),
     };
     let events = records.events(&id)?;
+    let mutation_cache = records.mutation_cache(&id).unwrap_or_default();
     let meta = load_meta(&records, &project, &config, !events.is_empty(), same_model(&harnesses, &config.models))?;
     let parallel = meta.parallel.max(1);
     let template = meta.template.as_deref().map(template::load).transpose()?;
@@ -583,6 +603,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     });
     let _server = AbortOnDrop(server);
     let reviewer_token = fresh_token()?;
+    let security_token = fresh_token()?;
     let verifier_token = fresh_token()?;
     let master_token = fresh_token()?;
     let run_id = config.run_id.clone();
@@ -643,6 +664,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     extensions.push(web_tools);
     mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
+    mcp.grant(&security_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: "security".into() });
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into(), unit: String::new() });
     mcp.grant(&master_token, Grant { run: run_id, page: "master".into(), unit: String::new() });
 
@@ -703,6 +725,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         commons,
         tokens: held_tokens,
         reviewer_token,
+        security_token,
         verifier_token,
         master_token,
         trees: Vec::new(),
@@ -737,6 +760,13 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         project_config,
         setup_artifacts: HashMap::new(),
         finalized: false,
+        noop_repairs: BTreeSet::new(),
+        last_gate_findings: BTreeMap::new(),
+        waived_gate_findings: BTreeSet::new(),
+        soft_dep_waiters: BTreeMap::new(),
+        started_wall,
+        started_mono,
+        mutation_cache,
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.repo_map = crate::repomap::render(&driver.tree);
@@ -1048,24 +1078,26 @@ impl Driver {
     }
 
     /// Index of the first leading `SpawnWorker` command whose `depends_on` upstream units have
-    /// already passed (ignoring unknown IDs). Only scans the leading contiguous `SpawnWorker`
-    /// prefix so ordering barriers (checks/merge) are never bypassed.
+    /// already passed or are satisfied by a locked interface contract (ignoring unknown IDs).
+    /// Only scans the leading contiguous `SpawnWorker` prefix so ordering barriers (checks/merge)
+    /// are never bypassed.
     fn next_ready_spawn(&self) -> Option<usize> {
         let plan = self.run.plan.as_ref();
         for (idx, cmd) in self.pending.iter().enumerate() {
             let Command::SpawnWorker { page, .. } = cmd else {
                 break;
             };
-            let deps = plan
-                .and_then(|p| p.pages.iter().find(|u| u.id == *page))
-                .map(|u| u.depends_on.as_slice())
-                .unwrap_or(&[]);
+            let unit = plan.and_then(|p| p.pages.iter().find(|u| u.id == *page));
+            let deps = unit.map(|u| u.depends_on.as_slice()).unwrap_or(&[]);
             let ready = deps.iter().all(|dep| {
                 if dep == page {
                     return true;
                 }
                 match self.run.pages.get(dep) {
-                    Some(st) => st.state == tm_core::PageState::Passed,
+                    Some(st) if st.state == tm_core::PageState::Passed => true,
+                    Some(_) => plan
+                        .zip(unit)
+                        .is_some_and(|(p, u)| crate::gates::dependency_is_contract_only(p, u, dep)),
                     None => true,
                 }
             });
@@ -1222,6 +1254,7 @@ impl Driver {
         let mut request = self.read_request(&cwd, brief.clone(), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
         self.small = self.small_pass(prompt);
         let quick = !self.small && self.quick_edit_pass(prompt);
+        let single_phase = !self.small && self.single_phase_pass(prompt);
         let fresh = self.fresh_project(prompt)?;
         if self.small || fresh {
             // Every stored entry is in the brief, so the master needs no tools.
@@ -1229,14 +1262,14 @@ impl Driver {
         } else {
             self.offer_code_readonly("master", &cwd, &mut request);
         }
-        request.effort = if self.small || quick {
+        request.effort = if self.small || quick || single_phase {
             Some(crate::small::SMALL_EFFORT.to_string())
         } else if fresh {
             Some(FRESH_EFFORT.to_string())
         } else {
             None
         };
-        request.commit = Some(self.commit_budget(self.small || fresh || quick));
+        request.commit = Some(self.commit_budget(self.small || fresh || quick || single_phase));
         self.tag(&mut request, "master", "planner", None, None);
         let bill = request.bill(Role::Planner, None);
         let mut asked = ask(request).await;
@@ -1339,6 +1372,19 @@ impl Driver {
             for finding in crate::gates::check_plan_prompt_consistency(&user_prompt, &checked) {
                 if finding.severity == "error" {
                     errors.push(finding.message);
+                }
+            }
+        }
+        if base.is_none() && self.single_phase_pass(prompt) {
+            if plan.phases.len() == 1 {
+                plan.phases.clear();
+            } else if plan.phases.len() >= 2 {
+                let total_delivers: usize = plan.phases.iter().map(|p| p.delivers.len()).sum();
+                if total_delivers <= 12 || (plan.phases.len() <= 2 && plan.pages.len() <= 8) {
+                    errors.push(
+                        "this single-package prompt fits in one phase; put all units in `units` and set `phases` to [] instead of splitting into multiple phases"
+                            .into(),
+                    );
                 }
             }
         }
@@ -1577,6 +1623,7 @@ impl Driver {
         plan.contracts.push(tm_core::ContractFile {
             path: "conftest.py".into(),
             content: "# Puts the project root on the import path, so the tests can import the contracts beside it.\n".into(),
+            phase: 0,
         });
         vec!["a Python contract sits at the project root, so a root conftest.py is locked to make it importable from the tests".into()]
     }
@@ -1613,6 +1660,12 @@ impl Driver {
     /// entries go into its brief in full, so they do not force the slow, tool-driven pass.
     fn small_pass(&self, prompt: &str) -> bool {
         crate::small::is_small_prompt(prompt, self.existing_files())
+    }
+
+    /// Single-package CLI/library prompts that fit in one parallel phase skip phased sketching
+    /// and cap master planning thinking effort.
+    fn single_phase_pass(&self, prompt: &str) -> bool {
+        crate::small::is_single_phase_prompt(prompt, self.existing_files(), self.parallel)
     }
 
     /// Direct / Lite Fast-Path: scoped bug fixes and small edits in existing repos skip
@@ -1780,27 +1833,36 @@ impl Driver {
         );
         brief.push_str(&crate::small::plan_shape());
         brief.push_str(&crate::gates::format_prompt_acceptance_guidance(&crate::gates::extract_prompt_io_examples(prompt)));
-        brief.push_str(crate::small::PHASES_RULE);
+        if self.single_phase_pass(prompt) {
+            brief.push_str(crate::small::SINGLE_PHASE_RULE);
+        } else {
+            brief.push_str(crate::small::PHASES_RULE);
+        }
         brief.push_str(crate::small::DESIGN_RULE);
         brief.push_str(crate::small::DECIDE_RULE);
         brief.push_str(&crate::small::units_rule(self.parallel));
         if self.web_access.planner_can_research() {
+            let mid = self.harnesses.master.id();
+            let docs_tool = tm_harness::mcp_tool_name(mid, "dictionary", "docs");
+            let search_tool = tm_harness::mcp_tool_name(mid, "dictionary", "web_search");
+            let fetch_tool = tm_harness::mcp_tool_name(mid, "dictionary", "web_fetch");
+            let adv_tool = tm_harness::mcp_tool_name(mid, "dictionary", "advisories");
             let search_hint = if self.web_access.is_native_passthrough() && self.web_access.roles.planner.search {
                 "your built-in web search tool".to_string()
             } else if self.web_access.roles.planner.search {
-                format!("`web_search` (up to {} calls)", self.web_access.planner_max_searches)
+                format!("`{search_tool}` (up to {} calls)", self.web_access.planner_max_searches)
             } else {
                 String::new()
             };
             let fetch_hint = if self.web_access.roles.planner.fetch {
                 format!(
-                    "`web_fetch` (up to {} calls), and `advisories(ecosystem, package, version?)`",
+                    "`{fetch_tool}` (up to {} calls), and `{adv_tool}(ecosystem, package, version?)`",
                     self.web_access.planner_max_fetches
                 )
             } else {
                 String::new()
             };
-            let mut tools_list = vec!["`docs(package, symbol?)` (local-first)".to_string()];
+            let mut tools_list = vec![format!("`{docs_tool}(package, symbol?)` (local-first)")];
             if !search_hint.is_empty() {
                 tools_list.push(search_hint);
             }
@@ -2012,6 +2074,26 @@ impl Driver {
             return Err(err);
         }
         let units = self.page(&page)?.work_units();
+        // Record any contract-only dependencies that have not landed yet so we re-check
+        // dependent units once those upstream dependencies pass.
+        if let Some(plan) = self.run.plan.as_ref()
+            && let Some(unit_plan) = plan.pages.iter().find(|u| u.id == page)
+        {
+            let soft_pending: Vec<String> = unit_plan
+                .depends_on
+                .iter()
+                .filter(|dep| {
+                    dep.as_str() != page
+                        && self.run.pages.get(dep.as_str()).is_some_and(|st| st.state != tm_core::PageState::Passed)
+                        && crate::gates::dependency_is_contract_only(plan, unit_plan, dep)
+                })
+                .cloned()
+                .collect();
+            for dep in soft_pending {
+                eprintln!("taskmaster: starting {page} immediately (dependency `{dep}` is covered by locked contracts)");
+                self.soft_dep_waiters.entry(dep).or_default().insert(page.clone());
+            }
+        }
         // W3: Best-of-N on `difficulty: hard` units (off by default, budget-guarded).
         let is_hard = self
             .page(&page)?
@@ -2657,21 +2739,27 @@ impl Driver {
         Ok(None)
     }
 
-    /// W4: Mutation sanity on locked contract tests — temporarily stub the target implementation
+    /// W4: Mutation sanity on locked contract tests — temporarily stub an imported built target
     /// to fail and ensure the contract test actually fails (is not vacuous).
-    fn check_contract_mutations(&self, plan: &Plan, owners: &Owners) -> BTreeMap<PageId, String> {
+    /// Contract tests with no import edge to a built file (e.g. subprocess CLI acceptance tests)
+    /// are skipped instead of falling back to arbitrary built files or `plan.pages.first()`.
+    fn check_contract_mutations(&mut self, plan: &Plan, owners: &Owners) -> BTreeMap<PageId, String> {
         let mut vacuous: BTreeMap<PageId, String> = BTreeMap::new();
         let test_contracts: Vec<&tm_core::ContractFile> = plan
             .contracts
             .iter()
-            .filter(|c| c.is_test() && self.tree.join(&c.path).is_file())
+            .filter(|c| {
+                c.is_test()
+                    && tm_core::effective_contract_phase(c, &plan.phases) <= self.run.phase_at
+                    && self.tree.join(&c.path).is_file()
+            })
             .collect();
         if test_contracts.is_empty() {
             return vacuous;
         }
         let sources = load_sources(&self.tree).ok();
         let graph = sources.as_ref().map(|s| ImportGraph::build(s, ""));
-        let built_files: Vec<String> = self
+        let built_files: BTreeSet<String> = self
             .changes
             .iter()
             .filter(|c| matches!(c.kind, ChangeKind::PageBuilt | ChangeKind::PageRepaired))
@@ -2680,20 +2768,26 @@ impl Driver {
             .collect();
 
         let venv = self.verify_venv();
+        let mut cache_updated = false;
         for contract in test_contracts {
             let Some((cmd, env)) = crate::gates::mutation_test_command(&self.tree, &venv, &contract.path) else {
                 continue;
             };
-            let mut targets: Vec<String> = graph
+            let targets: Vec<String> = graph
                 .as_ref()
                 .and_then(|g| g.edges.get(&contract.path))
                 .into_iter()
                 .flatten()
-                .filter(|f| !crate::gates::is_test_path(f) && self.tree.join(f).is_file())
+                .filter(|f| {
+                    !crate::gates::is_test_path(f)
+                        && built_files.contains(f.as_str())
+                        && owners.owner(f).is_some()
+                        && self.tree.join(f).is_file()
+                })
                 .cloned()
                 .collect();
             if targets.is_empty() {
-                targets = built_files.clone();
+                continue;
             }
             let Some((impl_path, stub)) = targets
                 .into_iter()
@@ -2701,23 +2795,100 @@ impl Driver {
             else {
                 continue;
             };
+            let Some(page) = owners.owner(&impl_path).cloned() else {
+                continue;
+            };
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            if let Ok(false) = crate::gates::contract_mutation_sanity_with_env(&self.tree, &impl_path, stub, &refs, &env) {
-                let author = owners
-                    .owner(&impl_path)
-                    .cloned()
-                    .or_else(|| plan.pages.first().map(|p| p.id.clone()));
-                let msg = format!(
-                    "Contract test `{}` is vacuous: it still passes when `{}` is replaced with a failing stub.",
-                    contract.path, impl_path
-                );
-                eprintln!("taskmaster: {msg}");
-                if let Some(page) = author {
+            if let Ok((verdict, hit)) = crate::gates::contract_mutation_sanity_cached(
+                &self.tree,
+                &contract.path,
+                &impl_path,
+                stub,
+                &refs,
+                &env,
+                &mut self.mutation_cache,
+            ) {
+                if !hit {
+                    cache_updated = true;
+                }
+                if verdict == crate::gates::MutationVerdict::Vacuous {
+                    let msg = format!(
+                        "Contract test `{}` is vacuous: it still passes when `{}` is replaced with a failing stub.",
+                        contract.path, impl_path
+                    );
+                    eprintln!("taskmaster: {msg}");
                     vacuous.insert(page, msg);
                 }
             }
         }
+        if cache_updated {
+            let _ = self.records.save_mutation_cache(&self.id, &self.mutation_cache);
+        }
         vacuous
+    }
+
+    /// Filter per-page gate findings against waived findings and no-op repairs.
+    /// If a page's last repair changed no files and the gate repeats the exact same
+    /// failure fingerprint, waive the finding and record a warning for CHANGES.md instead
+    /// of escalating to the next tier.
+    fn record_gate_findings(
+        &mut self,
+        gate: &str,
+        findings: BTreeMap<PageId, String>,
+        failing: &mut BTreeMap<PageId, String>,
+        next_fingerprints: &mut BTreeMap<PageId, BTreeSet<String>>,
+        waived_entries: &mut Vec<ChangeEntry>,
+    ) {
+        for (page, msg) in findings {
+            let trimmed = msg.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let fp = gate_finding_fingerprint(gate, trimmed);
+            if self.waived_gate_findings.contains(&(page.clone(), fp.clone())) {
+                continue;
+            }
+            let repeated_after_noop = self.noop_repairs.contains(&page)
+                && self
+                    .last_gate_findings
+                    .get(&page)
+                    .is_some_and(|prev| prev.contains(&fp));
+            if repeated_after_noop {
+                self.waived_gate_findings.insert((page.clone(), fp));
+                let summary = format!("waived identical {gate} gate finding after no-op repair: {trimmed}");
+                eprintln!("taskmaster: {page}: {summary}");
+                waived_entries.push(ChangeEntry {
+                    at: rfc3339_now(),
+                    kind: ChangeKind::GateWarning,
+                    page: Some(page),
+                    commit: None,
+                    model: None,
+                    files: vec![],
+                    keys: vec![],
+                    summary,
+                });
+                continue;
+            }
+            next_fingerprints.entry(page.clone()).or_default().insert(fp);
+            let entry = failing.entry(page).or_default();
+            if !entry.is_empty() && !entry.ends_with('\n') {
+                entry.push('\n');
+            }
+            entry.push_str(trimmed);
+        }
+    }
+
+    /// Persist waived gate warnings to `CHANGES.md` and `changes.jsonl`.
+    fn commit_gate_warnings(&mut self, entries: Vec<ChangeEntry>) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if self.commit_entries(entries.clone(), vec![], "taskmaster: record waived gate warning")?.is_none() {
+            self.changes.extend(entries);
+            self.write_docs()?;
+            self.save_changes()?;
+        }
+        Ok(())
     }
 
     /// Log a page's outcome, learn from it, and hand it to the run.
@@ -2744,6 +2915,20 @@ impl Driver {
         }
         if let (WorkerOutcome::Passed, Some((diff, files))) = (&outcome, review) {
             self.start_check(page, tier, wanted, CheckInput { diff, files, shot, said: text });
+        }
+        if let WorkerOutcome::Passed = &outcome
+            && let Some(waiters) = self.soft_dep_waiters.remove(page)
+        {
+            let landed: Vec<String> = waiters
+                .into_iter()
+                .filter(|w| self.run.pages.get(w).is_some_and(|st| st.state == tm_core::PageState::Passed))
+                .collect();
+            if !landed.is_empty() {
+                eprintln!(
+                    "taskmaster: `{page}` landed; soft-dependent unit(s) {} will be re-verified against it",
+                    landed.join(", ")
+                );
+            }
         }
         self.push_event(Event::WorkerFinished { page: page.to_string(), outcome })?;
         self.records.clear_merged(&self.id, page);
@@ -2909,6 +3094,7 @@ impl Driver {
         let started = Instant::now();
         let deadline = started + crate::checker::GRACE;
         let mut lines = Vec::new();
+        let mut checker_findings: BTreeMap<PageId, String> = BTreeMap::new();
         while !self.checks.is_empty() {
             let left = deadline.saturating_duration_since(Instant::now());
             let Ok(Some(joined)) = tokio::time::timeout(left, self.checks.join_next()).await else { break };
@@ -2926,8 +3112,7 @@ impl Driver {
                 crate::checker::Verdict::Pass => lines.push(format!("{page}: pass ({:.1}s)", answer.seconds)),
                 crate::checker::Verdict::Fixes(fixes) => {
                     lines.push(format!("{page}: {} fix{} ({:.1}s)", fixes.len(), if fixes.len() == 1 { "" } else { "es" }, answer.seconds));
-                    fixed = true;
-                    let entry = failing.entry(page).or_default();
+                    let entry = checker_findings.entry(page).or_default();
                     if !entry.is_empty() {
                         entry.push('\n');
                     }
@@ -2935,6 +3120,19 @@ impl Driver {
                 }
             }
         }
+        let mut next_fps: BTreeMap<PageId, BTreeSet<String>> = BTreeMap::new();
+        let mut waived_entries: Vec<ChangeEntry> = Vec::new();
+        let before_count = failing.len();
+        let before_len: usize = failing.values().map(String::len).sum();
+        self.record_gate_findings("checker", checker_findings, failing, &mut next_fps, &mut waived_entries);
+        let after_len: usize = failing.values().map(String::len).sum();
+        if failing.len() > before_count || after_len > before_len {
+            fixed = true;
+        }
+        for (page, fps) in next_fps {
+            self.last_gate_findings.entry(page).or_default().extend(fps);
+        }
+        self.commit_gate_warnings(waived_entries)?;
         let late = self.checks.len();
         self.checks.abort_all();
         let waited = started.elapsed().as_secs_f64();
@@ -3109,6 +3307,7 @@ impl Driver {
         }
         let plan = self.plan()?.clone();
         let owners = Owners::from_plan(&plan)?;
+        let policy = crate::policy::Policy::load(&self.tree);
         let units = self.page(page)?.work_units();
         let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
         let mut seen = BTreeSet::new();
@@ -3151,6 +3350,20 @@ impl Driver {
                     outside.join(", ")
                 )));
             }
+            for change in &changes {
+                if self.is_locked_contract(&change.path) {
+                    return Ok(failed(format!(
+                        "refusing to merge edit to locked contract `{}` (locked contracts are read-only for workers)",
+                        change.path
+                    )));
+                }
+                if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(&change.path) {
+                    return Ok(failed(format!(
+                        "policy denied write to `{}` (matched `{glob}`)",
+                        change.path
+                    )));
+                }
+            }
             for change in changes {
                 if !seen.insert(change.path.clone()) {
                     return Ok(failed(format!("`{}` was changed by two parallel workers and was not merged", change.path)));
@@ -3165,6 +3378,9 @@ impl Driver {
             // to rebuild every page (an eval's baseline) still expects each to be written.
             if ok && self.config.incremental && self.owned_files_exist(page) {
                 eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
+                if errors.is_some() {
+                    self.noop_repairs.insert(page.to_string());
+                }
                 return Ok(WorkerOutcome::Passed);
             }
             let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
@@ -3197,6 +3413,10 @@ impl Driver {
         if let Some(reason) = self.check_red_green_proof(&all)? {
             return Ok(failed(reason));
         }
+        // This page produced a real diff: clear any no-op repair marker and re-evaluate gates fresh.
+        self.noop_repairs.remove(page);
+        self.waived_gate_findings.retain(|(p, _)| p != page);
+        self.last_gate_findings.remove(page);
         let mut files = Vec::new();
         for (worktree, change) in &all {
             let dest = self.tree.join(&change.path);
@@ -3442,9 +3662,11 @@ impl Driver {
         if !security.is_empty() {
             let mut sec_body = security_brief(&security);
             if self.web_access.enabled && self.web_access.roles.reviewer.fetch {
-                sec_body.push_str(
-                    "\nWhen checking added or updated dependencies, you may call `advisories(ecosystem, package, version?)` to query OSV security advisories, or `web_fetch` on advisory hosts.\n",
-                );
+                let adv = tm_harness::mcp_tool_name(self.harnesses.reviewer.id(), "dictionary", "advisories");
+                let fetch = tm_harness::mcp_tool_name(self.harnesses.reviewer.id(), "dictionary", "web_fetch");
+                sec_body.push_str(&format!(
+                    "\nWhen checking added or updated dependencies, you may call `{adv}(ecosystem, package, version?)` to query OSV security advisories, or `{fetch}` on advisory hosts.\n",
+                ));
             }
             let brief = self.with_notes(format!("{prefix}{sec_body}"), &reviewer_notes);
             let mut request = self.read_request(
@@ -3452,9 +3674,9 @@ impl Driver {
                 brief,
                 self.harnesses.reviewer.clone(),
                 self.config.models.reviewer.clone(),
-                &self.reviewer_token.clone(),
+                &self.security_token.clone(),
             )?;
-            self.offer_code_readonly("reviewer", &worktree, &mut request);
+            self.offer_code_readonly("reviewer/security", &worktree, &mut request);
             self.tag(&mut request, "reviewer", "security", None, None);
             let permit = sem.clone();
             let bill = request.bill(Role::Security, None);
@@ -3477,6 +3699,7 @@ impl Driver {
         }
         if let Some(code) = &self.code {
             code.detach("reviewer");
+            code.detach("reviewer/security");
         }
         self.drop_worktree(&worktree);
         if let Some(err) = failure {
@@ -3640,14 +3863,20 @@ impl Driver {
             .filter(|(_, p)| p.state == tm_core::PageState::Passed)
             .map(|(id, _)| id.clone())
             .collect();
+        let mut failing: BTreeMap<PageId, String> = BTreeMap::new();
+        let mut next_fingerprints: BTreeMap<PageId, BTreeSet<String>> = BTreeMap::new();
+        let mut waived_entries: Vec<ChangeEntry> = Vec::new();
         let imports_began = Instant::now();
         let sources = load_sources(&self.tree)?;
-        let mut failing = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
+        let import_findings = ImportGraph::build(&sources, "").cross_page_imports(&owners, &plan, &passed_pages);
+        self.record_gate_findings("imports", import_findings, &mut failing, &mut next_fingerprints, &mut waived_entries);
         if !failing.is_empty() {
             timings.push(Timing::new("imports", imports_began.elapsed(), "failed"));
         }
         // The static checks and the project's own build and tests do not wait for each other.
-        let steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
+        let mut steps = if self.config.runtime_checks { runtime::steps(&self.tree, &self.verify_venv()) } else { Vec::new() };
+        let later_tests = self.later_phase_test_contracts();
+        runtime::deselect_test_paths(&mut steps, &later_tests);
         let (checked, built) = {
             let tree = self.tree.clone();
             let build = async {
@@ -3659,22 +3888,20 @@ impl Driver {
         let mut checked = checked;
         let mut built = built;
         timings.append(&mut checked.timings);
-        if !checked.shared.is_empty() && self.shared_repairs() < MAX_SHARED_REPAIRS {
-            self.repair_shared(&checked.shared).await?;
+        if !checked.shared.is_empty()
+            && self.shared_repairs() < MAX_SHARED_REPAIRS
+            && self.repair_shared(&checked.shared).await?
+        {
             checked = self.mechanical_checks(&owners).await?;
             timings.append(&mut checked.timings);
             if let Some((mut prev_timings, _)) = built.take() {
                 timings.append(&mut prev_timings);
             }
         }
-        for (page, errors) in checked.pages {
-            let text = failing.entry(page).or_default();
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&errors);
-        }
+        self.record_gate_findings("mechanical", checked.pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
         if failing.is_empty() && !checked.shared.is_empty() {
+            self.commit_gate_warnings(waived_entries)?;
+            self.last_gate_findings = next_fingerprints;
             if let Some((mut built_timings, _)) = built.take() {
                 timings.append(&mut built_timings);
             }
@@ -3707,8 +3934,8 @@ impl Driver {
                 if ran.shared.is_empty() {
                     let output = ran.unowned.clone().unwrap_or_default();
                     self.repair_unowned(&output).await?;
-                } else {
-                    self.repair_shared(&ran.shared).await?;
+                } else if !self.repair_shared(&ran.shared).await? {
+                    break;
                 }
                 let earlier = ran;
                 ran = self.runtime_checks(&owners, &routes, None).await?;
@@ -3727,8 +3954,10 @@ impl Driver {
                     }
                 }
             }
-            failing.extend(ran.pages);
+            self.record_gate_findings("runtime", ran.pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
             if failing.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) {
+                self.commit_gate_warnings(waived_entries)?;
+                self.last_gate_findings = next_fingerprints;
                 let mut lines: Vec<String> = ran.shared.iter().map(|(_, line)| line.clone()).filter(|l| !l.is_empty()).collect();
                 lines.extend(ran.unowned.clone());
                 eprintln!(
@@ -3752,6 +3981,8 @@ impl Driver {
             // A project with tests whose tests never ran has not been verified.
             let tested = timings.iter().any(|t| t.name == "test" && matches!(t.status, "ok" | "failed"));
             if failing.is_empty() && !tested && runtime::has_tests(&self.tree) {
+                self.commit_gate_warnings(waived_entries)?;
+                self.last_gate_findings = next_fingerprints;
                 let why = if timings.iter().any(|t| t.name == "test" && t.status == "timeout") {
                     format!("test step timed out after {}s", checks::STEP_TIMEOUT.as_secs())
                 } else {
@@ -3784,36 +4015,37 @@ impl Driver {
         // W4: Contract mutation sanity — stub the implementation and ensure locked contract tests fail.
         if failing.is_empty() {
             let vacuous = self.check_contract_mutations(&plan, &owners);
-            for (page, msg) in vacuous {
-                let entry = failing.entry(page).or_default();
-                if !entry.is_empty() && !entry.ends_with('\n') {
-                    entry.push('\n');
-                }
-                entry.push_str(&msg);
-            }
+            self.record_gate_findings("mutation", vacuous, &mut failing, &mut next_fingerprints, &mut waived_entries);
         }
-        if let Some(note) = self.run_verify_script()? {
+        if let Some(note) = self.run_verify_script().await? {
             let mut attributed = false;
+            let mut script_pages: BTreeMap<PageId, String> = BTreeMap::new();
             for line in note.lines() {
                 let Some(rest) = line.strip_prefix("page:") else { continue };
                 let Some((id, message)) = rest.split_once(':') else { continue };
                 let id = id.trim();
                 if self.run.pages.contains_key(id) && !message.trim().is_empty() {
                     attributed = true;
-                    failing.entry(id.to_string()).or_default().push_str(message.trim());
-                    failing.get_mut(id).unwrap().push('\n');
+                    let entry = script_pages.entry(id.to_string()).or_default();
+                    entry.push_str(message.trim());
+                    entry.push('\n');
                 }
             }
-            if !attributed && failing.is_empty() {
+            if attributed {
+                self.record_gate_findings("verify_script", script_pages, &mut failing, &mut next_fingerprints, &mut waived_entries);
+            } else if failing.is_empty() {
+                self.commit_gate_warnings(waived_entries)?;
+                self.last_gate_findings = next_fingerprints;
                 return Ok((false, BTreeMap::new()));
-            }
-            if !attributed {
+            } else {
                 for errors in failing.values_mut() {
                     errors.push('\n');
                     errors.push_str(note.trim());
                 }
             }
         }
+        self.commit_gate_warnings(waived_entries)?;
+        self.last_gate_findings = next_fingerprints;
         for (page, errors) in &failing {
             let model = self.author(page);
             self.note_mistake_model(&model, errors)?;
@@ -3848,7 +4080,10 @@ impl Driver {
         built: Option<(Vec<Timing>, Option<runtime::Failure>)>,
     ) -> anyhow::Result<Ran> {
         let mut ran = Ran::default();
-        let steps = runtime::steps(&self.tree, &self.verify_venv());
+        let later_tests = self.later_phase_test_contracts();
+        let later_set: BTreeSet<String> = later_tests.iter().cloned().collect();
+        let mut steps = runtime::steps(&self.tree, &self.verify_venv());
+        runtime::deselect_test_paths(&mut steps, &later_tests);
         for step in &steps {
             self.terminal(
                 "command",
@@ -3874,6 +4109,17 @@ impl Driver {
         };
         let timed_out = steps_timed.iter().any(|t| t.name == "test" && t.status == "timeout");
         ran.timings.extend(steps_timed);
+        // Treat a failure that only names later-phase contract tests as expected red, not repairable.
+        let failed = match failed {
+            Some(failure)
+                if !later_set.is_empty()
+                    && self.is_expected_red_later_phase(&failure.output, owners, routes, &later_set) =>
+            {
+                eprintln!("taskmaster: ignoring expected-red failure in later-phase contract test(s)");
+                None
+            }
+            other => other,
+        };
         // A test step that fails once and passes when run again is flaky, not broken: say so,
         // and spend no repair on it. A step that ran out of time is not run twice.
         let failed = match (failed, steps.iter().find(|step| step.name == "test")) {
@@ -3908,8 +4154,15 @@ impl Driver {
             }
             if !rest.is_empty() {
                 let locked = self.locked_files();
-                let named: BTreeSet<String> =
+                let named_all: BTreeSet<String> =
                     rest.lines().flat_map(runtime::paths_in).filter(|path| locked.contains(path)).collect();
+                let (later_named, named): (BTreeSet<String>, BTreeSet<String>) =
+                    named_all.into_iter().partition(|path| later_set.contains(path));
+                if !later_named.is_empty() && named.is_empty() && ran.pages.is_empty() {
+                    let list: Vec<&str> = later_named.iter().map(String::as_str).collect();
+                    eprintln!("taskmaster: ignoring expected-red failure in later-phase contract test(s): {}", list.join(", "));
+                    return Ok(ran);
+                }
                 let text = format!("`{}` failed:\n{rest}", failure.step);
                 // Failing contract tests go to the units they reach, not to the master.
                 let reached = if !named.is_empty() && named.iter().all(|file| tm_core::is_test_path(file)) {
@@ -4047,9 +4300,46 @@ impl Driver {
     }
 
     /// Shared files this run wrote: the contracts and the template.
+    /// Any locked contract of this run's plan (interface or executable contract test).
+    fn is_locked_contract(&self, file: &str) -> bool {
+        self.run.plan.as_ref().is_some_and(|plan| plan.contracts.iter().any(|c| c.path == file))
+    }
+
     /// A locked contract of this run's plan that is an executable test.
     fn is_contract_test(&self, file: &str) -> bool {
         self.run.plan.as_ref().is_some_and(|plan| plan.contracts.iter().any(|c| c.path == file && c.is_test()))
+    }
+
+    /// Locked contract tests belonging to phases strictly after the current phase (`phase > phase_at`).
+    fn later_phase_test_contracts(&self) -> Vec<String> {
+        let Some(plan) = &self.run.plan else { return Vec::new() };
+        plan.contracts
+            .iter()
+            .filter(|c| c.is_test() && tm_core::effective_contract_phase(c, &plan.phases) > self.run.phase_at)
+            .map(|c| c.path.clone())
+            .collect()
+    }
+
+    /// True when `output` attributes no failure to any unit or active shared file, and every
+    /// locked file it names is a test contract belonging to a later phase ("expected red").
+    fn is_expected_red_later_phase(
+        &self,
+        output: &str,
+        owners: &Owners,
+        routes: &[(PageId, String)],
+        later_tests: &BTreeSet<String>,
+    ) -> bool {
+        let (pages, rest) = runtime::attribute(output, owners, routes);
+        if !pages.is_empty() || rest.is_empty() {
+            return false;
+        }
+        let locked = self.locked_files();
+        let named: BTreeSet<String> = rest
+            .lines()
+            .flat_map(runtime::paths_in)
+            .filter(|path| locked.contains(path))
+            .collect();
+        !named.is_empty() && named.iter().all(|path| later_tests.contains(path))
     }
 
     /// The units `tests` reach through their imports, directly or through other shared files.
@@ -4160,8 +4450,9 @@ impl Driver {
         let mut brief = self.shared_prefix().unwrap_or_default();
         brief.push_str(
             "The project's own build or tests fail, and the output names no file any unit owns. Find the cause and fix it. \
-             It may be the project's configuration, a test, a shared file, a missing dependency or a dependency file \
-             (a lockfile, pyproject.toml, package.json). Change as little as you can, and do not rewrite a unit's work \
+             It may be the project's configuration, a shared file, a missing dependency or a dependency file \
+             (a lockfile, pyproject.toml, package.json). Never edit locked contract tests (any edit to a locked contract test is discarded). \
+             Change as little as you can, and do not rewrite a unit's work \
              unless the output shows it is wrong. Taskmaster runs the checks again after you.\n\nOutput:\n",
         );
         brief.push_str(&clip(output, 8000));
@@ -4230,9 +4521,18 @@ impl Driver {
     /// Copy every change the master made in `worktree` into the run's tree, except the
     /// run's own records and anything that is not a plain file inside the project.
     fn merge_any(&self, worktree: &Path) -> anyhow::Result<Vec<String>> {
+        let policy = crate::policy::Policy::load(&self.tree);
         let mut files = Vec::new();
         for change in git::worktree_changes(worktree)? {
             if !git::safe_rel(&change.path) || change.path.starts_with(".taskmaster/") {
+                continue;
+            }
+            if self.is_contract_test(&change.path) {
+                eprintln!("taskmaster: refusing to merge edit to locked contract test `{}`", change.path);
+                continue;
+            }
+            if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(&change.path) {
+                eprintln!("taskmaster: refusing to merge policy-denied file `{}` (matched `{glob}`)", change.path);
                 continue;
             }
             let src = worktree.join(&change.path);
@@ -4258,21 +4558,63 @@ impl Driver {
 
     /// Ask the master to fix shared files the run wrote. Workers may not touch them, and
     /// the master may touch nothing else: any other edit it makes is discarded.
-    async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<()> {
-        let allowed: BTreeSet<String> = errors.iter().map(|(file, _)| file.clone()).filter(|file| !file.is_empty()).collect();
+    /// Locked contract tests are never edited by `repair_shared`; they are flagged instead.
+    /// Returns `Ok(true)` if a master repair ran, or `Ok(false)` when refused (only locked tests).
+    async fn repair_shared(&mut self, errors: &[(String, String)]) -> anyhow::Result<bool> {
+        let mut allowed: BTreeSet<String> = BTreeSet::new();
+        let mut locked_tests: BTreeSet<String> = BTreeSet::new();
+        for (file, _) in errors {
+            if file.is_empty() {
+                continue;
+            }
+            if self.is_contract_test(file) {
+                locked_tests.insert(file.clone());
+            } else {
+                allowed.insert(file.clone());
+            }
+        }
+        if !locked_tests.is_empty() {
+            let list: Vec<String> = locked_tests.iter().cloned().collect();
+            let joined = list.join(", ");
+            eprintln!("taskmaster: refusing to let repair_shared edit locked contract test(s): {joined}; flagging instead");
+            self.live.push(
+                &self.id,
+                &serde_json::json!({ "id": "master", "role": "master" }),
+                "locked_contract_flagged",
+                serde_json::json!({
+                    "files": list,
+                    "reason": "repair_shared refuses to edit locked contract tests",
+                }),
+            );
+            let entry = ChangeEntry {
+                at: rfc3339_now(),
+                kind: ChangeKind::VerifyFailed,
+                page: None,
+                commit: None,
+                model: None,
+                files: list,
+                keys: vec![],
+                summary: format!("flagged locked contract test(s) (repair_shared refuses to edit locked tests): {joined}"),
+            };
+            if self.commit_entries(vec![entry.clone()], vec![], "taskmaster: flag locked contract test failure")?.is_none() {
+                self.changes.push(entry);
+                let _ = self.write_docs();
+                self.save_changes()?;
+            }
+        }
+        if allowed.is_empty() {
+            return Ok(false);
+        }
         eprintln!("taskmaster: asking the master to repair {} shared file(s)", allowed.len());
         let mut brief = self.shared_prefix().unwrap_or_default();
         brief.push_str(
             "Shared files this run wrote fail the project's checks. Fix the errors below.\n\
-             You may edit only these files; any other edit is discarded:\n",
+             You may edit only these files; any other edit is discarded (never edit locked contract tests):\n",
         );
         for file in &allowed {
             brief.push_str(&format!("- `{file}`\n"));
         }
         brief.push_str("\nPages already import these files, so keep every exported name and type that still makes sense.\n");
-        if allowed.iter().any(|file| self.is_contract_test(file)) {
-            brief.push_str("A contract test among them is the acceptance check: fix it only where the test itself is wrong (a bad import or path), never by weakening what it checks.\n");
-        }
         brief.push_str("\nErrors:\n");
         for (_, line) in errors.iter().filter(|(_, line)| !line.is_empty()) {
             brief.push_str(&format!("{line}\n"));
@@ -4339,13 +4681,19 @@ impl Driver {
             self.changes.push(entry);
             self.save_changes()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn merge_shared(&self, worktree: &Path, allowed: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
+        let policy = crate::policy::Policy::load(&self.tree);
         let mut files = Vec::new();
         for change in git::worktree_changes(worktree)? {
-            if !allowed.contains(&change.path) || change.status == 'D' || !git::safe_rel(&change.path) {
+            if !allowed.contains(&change.path)
+                || self.is_contract_test(&change.path)
+                || matches!(policy.check_path(&change.path), crate::policy::PathVerdict::Denied(_))
+                || change.status == 'D'
+                || !git::safe_rel(&change.path)
+            {
                 continue;
             }
             let src = worktree.join(&change.path);
@@ -4376,8 +4724,15 @@ impl Driver {
             return Ok(Checked::default());
         }
         let locked = self.locked_files();
-        // Shared files are checked too: a page can be right and its contract wrong.
-        built.extend(locked.iter().filter(|file| self.tree.join(file).is_file()).cloned());
+        let later_tests: BTreeSet<String> = self.later_phase_test_contracts().into_iter().collect();
+        // Shared files are checked too (a page can be right and its contract wrong),
+        // except test contracts belonging to later phases.
+        built.extend(
+            locked
+                .iter()
+                .filter(|file| !later_tests.contains(*file) && self.tree.join(file).is_file())
+                .cloned(),
+        );
         let (project, files) = (self.tree.clone(), built.into_iter().collect::<Vec<_>>());
         let picked: Vec<&str> = checks::select(&project, &files).into_iter().filter(|c| c.is_static()).map(|c| c.name()).collect();
         if picked.is_empty() {
@@ -4430,6 +4785,9 @@ impl Driver {
                     text.push_str(line);
                     text.push('\n');
                 }
+                None if later_tests.contains(file) => {
+                    eprintln!("taskmaster: ignoring expected-red check on later-phase contract test `{file}`");
+                }
                 None if locked.contains(file) => checked.shared.push((file.clone(), line.clone())),
                 None => eprintln!("taskmaster: {line}"),
             }
@@ -4441,6 +4799,9 @@ impl Driver {
                     let text = checked.pages.entry(page.clone()).or_default();
                     text.push_str(&line);
                     text.push('\n');
+                }
+                None if later_tests.contains(&finding.file) => {
+                    eprintln!("taskmaster: ignoring expected-red check on later-phase contract test `{}`", finding.file);
                 }
                 None if locked.contains(&finding.file) => checked.shared.push((finding.file.clone(), line)),
                 None => {
@@ -4462,7 +4823,7 @@ impl Driver {
 
     /// Run `.taskmaster/verify` when the project already has an executable there.
     /// `Ok(None)` when there is no script or it passed. The text is the combined output.
-    fn run_verify_script(&self) -> anyhow::Result<Option<String>> {
+    async fn run_verify_script(&self) -> anyhow::Result<Option<String>> {
         // A script the project committed is in the run's checkout. One it keeps untracked
         // is only in the project.
         let script = [&self.tree, &self.project]
@@ -4479,10 +4840,20 @@ impl Driver {
             }
         }
         self.terminal("command", serde_json::json!({ "command": script.display().to_string(), "cwd": self.tree.display().to_string() }));
-        let out = std::process::Command::new(&script)
-            .current_dir(&self.tree)
-            .output()
-            .context("failed to run .taskmaster/verify")?;
+        let mut cmd = tokio::process::Command::new(&script);
+        cmd.current_dir(&self.tree)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let (child, _guard) = tm_harness::spawn_grouped(&mut cmd).context("failed to run .taskmaster/verify")?;
+        let out = match tokio::time::timeout(checks::STEP_TIMEOUT, child.wait_with_output()).await {
+            Ok(res) => res.context("failed to wait for .taskmaster/verify")?,
+            Err(_) => {
+                let msg = format!(".taskmaster/verify timed out after {}s", checks::STEP_TIMEOUT.as_secs());
+                self.terminal("output", serde_json::json!({ "ok": false, "text": msg }));
+                return Ok(Some(msg));
+            }
+        };
         let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         self.terminal("output", serde_json::json!({ "ok": out.status.success(), "text": clip(text.trim(), 8000) }));
         if out.status.success() {
@@ -4659,10 +5030,16 @@ impl Driver {
         let route = self.page(page).map(|p| p.route.clone()).unwrap_or_else(|_| "/".into());
         let dev = crate::preview::dev_command(cwd, "", 0).is_some();
         let path = if dev { route } else { "/ (files are served as they are in your worktree, such as /app/index.html)".to_string() };
+        let hid = request.harness.id();
+        let open = tm_harness::mcp_tool_name(hid, "dictionary", "browser_open");
+        let console = tm_harness::mcp_tool_name(hid, "dictionary", "browser_console");
+        let shot = tm_harness::mcp_tool_name(hid, "dictionary", "browser_screenshot");
+        let click = tm_harness::mcp_tool_name(hid, "dictionary", "browser_click");
+        let ty = tm_harness::mcp_tool_name(hid, "dictionary", "browser_type");
         request.brief.push_str(&format!(
             "\nA browser is ready on your own page's preview, {origin}; nothing else opens in it. Before you reply that you are done, \
-             look at what you built: browser_open with path {path}, then browser_console for errors, and browser_screenshot to see it. \
-             Fix what is wrong and look again. Use browser_click and browser_type to try what the page does.\n"
+             look at what you built: {open} with path {path}, then {console} for errors, and {shot} to see it. \
+             Fix what is wrong and look again. Use {click} and {ty} to try what the page does.\n"
         ));
         request.browser = Some(origin);
     }
@@ -4784,7 +5161,18 @@ impl Driver {
                 out.push_str(&format!("- `{}`\n", c.path));
             }
         }
-        let tests: Vec<String> = contracts.iter().filter(|c| c.is_test()).map(|c| format!("`{}`", c.path)).collect();
+        let tests: Vec<String> = contracts
+            .iter()
+            .filter(|c| c.is_test())
+            .map(|c| {
+                let p = tm_core::effective_contract_phase(c, &plan.phases);
+                if p > self.run.phase_at {
+                    format!("`{}` (phase {} — checked in a later phase)", c.path, p + 1)
+                } else {
+                    format!("`{}`", c.path)
+                }
+            })
+            .collect();
         if !tests.is_empty() {
             out.push_str(&format!(
                 "\nThe locked contract tests {} are the acceptance check for every unit: they say what the code must do. \
@@ -4806,22 +5194,27 @@ impl Driver {
              {\"flag\":{\"key\":\"...\",\"issue\":\"...\"}} instead of working around it.\n",
         );
         if self.code.is_some() {
-            out.push_str(CODE_MODE_GUIDE);
+            out.push_str(&code_mode_guide(self.harnesses.worker.id()));
         }
-        out.push_str(
-            "\nDocumentation: call `docs(package, symbol?)` for local-first API docs from installed packages.",
-        );
+        let wid = self.harnesses.worker.id();
+        let docs_tool = tm_harness::mcp_tool_name(wid, "dictionary", "docs");
+        let fetch_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_fetch");
+        let adv_tool = tm_harness::mcp_tool_name(wid, "dictionary", "advisories");
+        let search_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_search");
+        out.push_str(&format!(
+            "\nDocumentation: call `{docs_tool}(package, symbol?)` for local-first API docs from installed packages."
+        ));
         if self.web_access.enabled {
             let mut extra = Vec::new();
             if self.web_access.roles.worker.fetch {
-                extra.push("`web_fetch` (allowed doc domains)");
-                extra.push("`advisories(ecosystem, package, version?)`");
+                extra.push(format!("`{fetch_tool}` (allowed doc domains)"));
+                extra.push(format!("`{adv_tool}(ecosystem, package, version?)`"));
             }
             if self.web_access.roles.worker.search {
                 if self.web_access.is_native_passthrough() {
-                    extra.push("your built-in web search tool");
+                    extra.push("your built-in web search tool".to_string());
                 } else {
-                    extra.push("`web_search`");
+                    extra.push(format!("`{search_tool}`"));
                 }
             }
             if !extra.is_empty() {
@@ -5499,7 +5892,30 @@ impl Driver {
     fn write_status(&self, ok: bool) -> anyhow::Result<()> {
         let spent = totals(&self.records.ledger(&self.id)?);
         let estimate = self.run.plan.as_ref().map(|plan| &plan.estimate);
-        let mut body = serde_json::json!({ "ok": ok, "phase": self.run.phase, "spent": spent, "estimate": estimate });
+        let before = self.records.status(&self.id)?.unwrap_or_default();
+        let prior_timing = before
+            .get("timing")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<crate::report::RunTiming>(v).ok());
+        let timing = crate::report::RunTiming::from_bounds(
+            self.started_wall,
+            SystemTime::now(),
+            self.started_mono.elapsed(),
+            prior_timing.as_ref(),
+        );
+        if timing.clock_skew_flagged {
+            eprintln!(
+                "taskmaster: clock skew warning: wall time ({:.1}s) and monotonic time ({:.1}s) differed by {:.1}s (>30s, likely host suspend/freeze)",
+                timing.wall_seconds, timing.monotonic_seconds, timing.clock_skew_seconds
+            );
+        }
+        let mut body = serde_json::json!({
+            "ok": ok,
+            "phase": self.run.phase,
+            "spent": spent,
+            "estimate": estimate,
+            "timing": timing,
+        });
         match &self.delivery {
             Some((branch, merged)) => {
                 body["branch"] = serde_json::json!(branch);
@@ -5515,7 +5931,6 @@ impl Driver {
             }
             // A finished run that is driven again has nothing new to deliver.
             None => {
-                let before = self.records.status(&self.id)?.unwrap_or_default();
                 for key in ["branch", "merged", "base", "merge_commit", "merged_from", "merged_head", "undone"] {
                     if let Some(value) = before.get(key) {
                         body[key] = value.clone();
@@ -6056,6 +6471,18 @@ fn reported_limit(request: &AgentRequest, hit: reply::ProviderLimit) -> reply::R
     reply::ReportedLimit::new(request.harness.id(), role, hit)
 }
 
+/// Normalized fingerprint for a gate finding so an identical failure after a no-op repair
+/// is recognized even if surrounding whitespace differs.
+pub(crate) fn gate_finding_fingerprint(gate: &str, text: &str) -> String {
+    let normalized: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{gate}:{normalized}")
+}
+
 /// What a unit is told when a locked contract test that reaches its files fails.
 fn contract_test_note(tests: &[&str]) -> String {
     let list: Vec<String> = tests.iter().map(|t| format!("`{t}`")).collect();
@@ -6085,22 +6512,39 @@ const PROJECT_MARK: &str = "<!-- Written by Taskmaster from the run's sketch and
 const PLAN_ATTEMPTS: usize = 3;
 
 /// How an agent with Code Mode is told to work, in the shared prefix.
-const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, edit, patch, applyPatch, grep, ls, \
+const CODE_MODE_GUIDE: &str = "\nCode Mode is on: run_code runs one async JavaScript body with read, readMany, write, writeFile, edit, patch, applyPatch, grep, ls, \
 diff, symbols, sh, test, check and browser (read-only roles get read, readMany, grep, ls, diff, symbols). Batch your work into \
 a few scripts rather than many single tool calls: one script loads what you need with readMany/symbols and writes or patches \
 your files (prefer edit/patch/applyPatch over rewriting whole files), and every script that changes code ends with `return await test()`, \
-which runs the project's tests and returns the failures. Fix what it reports in the next script. If your own write, edit or shell tools \
+which runs the project's tests and returns the failures. When writing Python or multi-line files with triple quotes or backslashes, pass raw file \
+content via the separate `files` (`{path: content}`) or `writeFile` (`{path, content}`) JSON arguments on run_code, or use `String.raw` with `write(path, { raw })`. \
+Fix what it reports in the next script. If your own write, edit or shell tools \
 are switched off, run_code is the way to write files and run commands: use it from the start. Keep your replies short: the files are the work.\n";
+
+/// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`
+/// (e.g. `mcp_dictionary_run_code` on Antigravity) so agents call the real tool on their first try.
+pub(crate) fn code_mode_guide(harness_id: &str) -> String {
+    let tool = tm_harness::run_code_tool_name(harness_id, "dictionary");
+    if tool == "run_code" {
+        CODE_MODE_GUIDE.to_string()
+    } else {
+        CODE_MODE_GUIDE.replace("run_code", &tool)
+    }
+}
 
 /// Environment variable overriding the per-agent silence/stall timeout in seconds.
 const STALL_ENV: &str = "TASKMASTER_STALL_SECS";
-/// Generous silence window so thinking models are never killed mid-reasoning,
+/// Generous silence window for small prompts so thinking models finish reasoning,
 /// while genuinely hung sockets still recover automatically.
-const SMALL_STALL: Duration = Duration::from_secs(300);
-/// Larger briefs and deep reasoning turns can think quietly for several minutes.
-const STALL: Duration = Duration::from_secs(600);
+const SMALL_STALL: Duration = Duration::from_secs(150);
+/// Default per-agent silence timeout before restarting a fresh agent.
+const STALL: Duration = Duration::from_secs(240);
 /// Fresh agents started after a stall. Every attempt—including the final one—keeps a stall bound.
 const STALL_RESTARTS: usize = 2;
+/// Wall-clock advance past the monotonic clock that indicates a host suspend/freeze.
+pub(crate) const WALL_JUMP_THRESHOLD: Duration = Duration::from_secs(30);
+/// Active monotonic grace window after a detected wall-clock jump before restarting a silent agent.
+pub(crate) const POST_JUMP_GRACE: Duration = Duration::from_secs(30);
 
 /// Resolve the per-agent stall timeout from explicit config, `TASKMASTER_STALL_SECS`, or defaults.
 pub(crate) fn resolve_stall_timeout(configured: Option<Duration>, env_val: Option<&str>, small: bool) -> Duration {
@@ -6357,22 +6801,156 @@ fn who_of(request: &AgentRequest) -> String {
     id.strip_prefix("page:").or_else(|| id.strip_prefix("unit:")).unwrap_or(id).to_string()
 }
 
-/// While an agent's call runs, print a line each time it has been silent for [`QUIET`]:
-/// `calc: no output for 120s`. A stalled agent is visible in the log without waiting for its
-/// time limit. Dropping the guard stops it.
-fn heartbeat(who: String, heard: Arc<std::sync::Mutex<Instant>>) -> AbortOnDrop {
-    AbortOnDrop(tokio::spawn(async move {
-        let mut said: Option<Instant> = None;
+/// Clock source for [`heartbeat_with_clock`] so wall-clock jumps (box suspend/freeze)
+/// can be tested deterministically with an injected clock.
+pub(crate) trait BeatClock: Send + Sync + 'static {
+    fn monotonic(&self) -> Duration;
+    fn wall(&self) -> SystemTime;
+}
+
+struct RealBeatClock {
+    origin: Instant,
+}
+
+impl BeatClock for RealBeatClock {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+    fn wall(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Tuning parameters for [`heartbeat_with_clock`].
+pub(crate) struct HeartbeatConfig {
+    pub tick: Duration,
+    pub jump_threshold: Duration,
+    pub post_jump_grace: Duration,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            tick: Duration::from_secs(10),
+            jump_threshold: WALL_JUMP_THRESHOLD,
+            post_jump_grace: POST_JUMP_GRACE,
+        }
+    }
+}
+
+/// Wait on a heartbeat stall trigger without ever resolving if the sender is simply dropped.
+async fn wait_stall(rx: tokio::sync::oneshot::Receiver<tm_harness::Stalled>) -> tm_harness::Stalled {
+    match rx.await {
+        Ok(stalled) => stalled,
+        Err(_) => std::future::pending().await,
+    }
+}
+
+/// Heartbeat monitor with an injectable [`BeatClock`].
+///
+/// Compares `wall()` deltas against `monotonic()` deltas on every tick. If wall time jumped
+/// more than `jump_threshold` past monotonic time (host suspend/freeze), it invokes `on_nudge`
+/// (without counting the frozen period as agent silence) and watches for `post_jump_grace` of
+/// active monotonic time: if the agent remains silent, it sends `Stalled` on the returned
+/// oneshot channel so the caller cancels and restarts the agent cleanly.
+pub(crate) fn heartbeat_with_clock(
+    who: String,
+    last_heard: Arc<dyn Fn() -> Duration + Send + Sync>,
+    clock: Arc<dyn BeatClock>,
+    cfg: HeartbeatConfig,
+    on_nudge: Option<Arc<dyn Fn(Duration) + Send + Sync>>,
+) -> (AbortOnDrop, tokio::sync::oneshot::Receiver<tm_harness::Stalled>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut said: Option<Duration> = None;
+        let mut prev_mono = clock.monotonic();
+        let mut prev_wall = clock.wall();
+        let mut post_jump: Option<(Duration, Duration)> = None;
+        let mut tx = Some(tx);
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let last = *heard.lock().unwrap();
-            let quiet = last.elapsed();
-            if beat_due(quiet, said.map(|at| (at.elapsed(), at < last))) {
+            tokio::time::sleep(cfg.tick).await;
+            let now_mono = clock.monotonic();
+            let now_wall = clock.wall();
+            let mono_delta = now_mono.saturating_sub(prev_mono);
+            let wall_delta = now_wall.duration_since(prev_wall).unwrap_or(Duration::ZERO);
+            prev_mono = now_mono;
+            prev_wall = now_wall;
+
+            let heard_at = last_heard();
+            let jump = wall_delta.saturating_sub(mono_delta);
+            if jump > cfg.jump_threshold {
+                eprintln!(
+                    "taskmaster: {who}: detected wall-clock jump (+{}s vs monotonic, likely suspend/freeze); waiting {}s for output before restarting",
+                    jump.as_secs(),
+                    cfg.post_jump_grace.as_secs(),
+                );
+                if let Some(nudge) = &on_nudge {
+                    nudge(jump);
+                }
+                said = Some(now_mono);
+                post_jump = Some((now_mono, heard_at));
+                continue;
+            }
+
+            if let Some((jump_mono, heard_before_jump)) = post_jump {
+                if heard_at > heard_before_jump {
+                    eprintln!("taskmaster: {who}: resumed output after wall-clock jump");
+                    post_jump = None;
+                } else if now_mono.saturating_sub(jump_mono) >= cfg.post_jump_grace {
+                    eprintln!(
+                        "taskmaster: {who}: stayed silent for {}s after wall-clock jump; restarting agent",
+                        cfg.post_jump_grace.as_secs(),
+                    );
+                    if let Some(sender) = tx.take() {
+                        let _ = sender.send(tm_harness::Stalled(cfg.post_jump_grace));
+                    }
+                    return;
+                } else {
+                    continue;
+                }
+            }
+
+            let quiet = now_mono.saturating_sub(heard_at);
+            if beat_due(quiet, said.map(|at| (now_mono.saturating_sub(at), at < heard_at))) {
                 eprintln!("taskmaster: {who}: no output for {}s", quiet.as_secs() / 10 * 10);
-                said = Some(Instant::now());
+                said = Some(now_mono);
             }
         }
-    }))
+    });
+    (AbortOnDrop(handle), rx)
+}
+
+/// While an agent's call runs, print a line each time it has been silent for [`QUIET`]:
+/// `calc: no output for 120s`, and detect host suspend/freeze via wall-vs-monotonic jumps
+/// so dead streams recover promptly after wake. Dropping the guard stops it.
+fn heartbeat(
+    who: String,
+    origin: Instant,
+    heard: Arc<std::sync::Mutex<Instant>>,
+    feed: Option<&Feed>,
+) -> (AbortOnDrop, tokio::sync::oneshot::Receiver<tm_harness::Stalled>) {
+    let last_heard: Arc<dyn Fn() -> Duration + Send + Sync> =
+        Arc::new(move || heard.lock().unwrap().saturating_duration_since(origin));
+    let on_nudge: Option<Arc<dyn Fn(Duration) + Send + Sync>> = feed.map(|f| {
+        let live = f.live.clone();
+        let run = f.run.clone();
+        let agent = f.agent.clone();
+        Arc::new(move |jump: Duration| {
+            live.push(
+                &run,
+                &agent,
+                "suspend_detected",
+                serde_json::json!({ "wall_jump_secs": jump.as_secs() }),
+            );
+        }) as Arc<dyn Fn(Duration) + Send + Sync>
+    });
+    heartbeat_with_clock(
+        who,
+        last_heard,
+        Arc::new(RealBeatClock { origin }),
+        HeartbeatConfig::default(),
+        on_nudge,
+    )
 }
 
 /// Send a repair to a builder's open session as a follow-up turn. Its events go to the run's
@@ -6393,11 +6971,14 @@ async fn follow(
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, None, rx, heard.clone());
-    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let run = session.follow_up(prompt, tx, request.timeout).await;
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(&request), started, heard, request.feed.as_ref());
+    let run = tokio::select! {
+        run = session.follow_up(prompt, tx, request.timeout) => run,
+        stalled = wait_stall(stall_rx) => Err(stalled.into()),
+    };
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
     if let Some(feed) = &request.feed {
@@ -6493,11 +7074,14 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, None, rx, heard.clone());
-    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let (run, kept) = request.harness.resume_kept(&session_id, prompt, task, gate, tx).await;
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(&request), started, heard, request.feed.as_ref());
+    let (run, kept) = tokio::select! {
+        res = request.harness.resume_kept(&session_id, prompt, task, gate, tx) => res,
+        stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+    };
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let final_sid = captured_sid
         .or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)))
@@ -6587,11 +7171,14 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
     };
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, None, rx, heard.clone());
-    let _beat = heartbeat(who_of(&request), heard);
     let started = Instant::now();
-    let (run, kept) = request.harness.reattach(task, gate, tx, attached).await;
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, None, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(&request), started, heard, request.feed.as_ref());
+    let (run, kept) = tokio::select! {
+        res = request.harness.reattach(task, gate, tx, attached) => res,
+        stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+    };
     let (text, refused, captured_sid) = collect.await.unwrap_or_default();
     let text = format!("{said}{text}");
     if let Some(feed) = &request.feed {
@@ -6702,18 +7289,24 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     // What a commit budget watches: tool calls, whether the reply has begun, the thoughts.
     let watch = Arc::new(std::sync::Mutex::new(Watched::default()));
     let watching = request.commit.is_some().then(|| watch.clone());
-    let heard = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let collect = collect_events_full(tee, watching, rx, heard.clone());
-    let _beat = heartbeat(who_of(request), heard);
     let started = Instant::now();
+    let heard = Arc::new(std::sync::Mutex::new(started));
+    let collect = collect_events_full(tee, watching, rx, heard.clone());
+    let (_beat, stall_rx) = heartbeat(who_of(request), started, heard, feed.as_ref());
     let mut kept = None;
     let run = match request.commit {
         None if request.keep => {
-            let (run, session) = request.harness.run_kept(task, gate, tx).await;
+            let (run, session) = tokio::select! {
+                res = request.harness.run_kept(task, gate, tx) => res,
+                stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+            };
             kept = session;
             run
         }
-        None => request.harness.run(task, gate, tx).await,
+        None => tokio::select! {
+            run = request.harness.run(task, gate, tx) => run,
+            stalled = wait_stall(stall_rx) => Err(stalled.into()),
+        },
         Some(commit) => {
             let seen = watch.clone();
             let overrun = async move {
@@ -6732,6 +7325,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             tokio::select! {
                 run = request.harness.run(task, gate, tx) => run,
                 why = overrun => Err(anyhow::Error::new(Overrun { why, notes: String::new() })),
+                stalled = wait_stall(stall_rx) => Err(stalled.into()),
             }
         }
     };

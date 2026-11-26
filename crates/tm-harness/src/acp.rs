@@ -377,11 +377,16 @@ impl Session {
 
         let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
         self.id = Some(session_id);
-        self.prompt(task.framed_brief()).await
+        let run_code_tool = match &self.dictionary_prefix {
+            Some(prefix) => format!("{prefix}run_code"),
+            None => "run_code".to_string(),
+        };
+        self.prompt(task.framed_brief_for(&run_code_tool)).await
     }
 
     /// One turn in the open session.
     async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
+        self.tools.clear();
         let session_id = self.id.clone().context("the session is not open")?;
         let prompt = json!({
             "sessionId": session_id,
@@ -464,8 +469,13 @@ impl Session {
                 }
                 let blocked_by_code_mode = self.code_mode && matches!(request.kind, ToolKind::Execute | ToolKind::Edit);
                 let allowed = !blocked_by_code_mode && self.gate.decide_async(&request).await == Decision::Allow;
-                if !allowed && !blocked_by_code_mode {
-                    self.denied += 1;
+                if !allowed {
+                    if let Some(id) = params["toolCall"]["toolCallId"].as_str() {
+                        self.tools.remove(id);
+                    }
+                    if !blocked_by_code_mode {
+                        self.denied += 1;
+                    }
                 }
                 let reported_tool = if blocked_by_code_mode {
                     format!("{} (use run_code)", request.tool)
@@ -614,10 +624,13 @@ fn trace(way: &str, line: &str) {
 }
 
 /// Keep the set of running tool calls current. A call is running from its first report
-/// until an update says it completed or failed.
+/// until an update says it reached any terminal status.
 fn track_tool(tools: &mut BTreeSet<String>, update: &Value) {
     let Some(id) = update["toolCallId"].as_str() else { return };
-    let finished = matches!(update["status"].as_str(), Some("completed" | "failed"));
+    let finished = matches!(
+        update["status"].as_str(),
+        Some("completed" | "failed" | "cancelled" | "canceled" | "rejected" | "denied" | "error")
+    );
     match update["sessionUpdate"].as_str() {
         Some("tool_call" | "tool_call_update") if finished => {
             tools.remove(id);
@@ -1295,6 +1308,118 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 ("write_file (use run_code)".to_string(), false),
                 ("taskmaster__run_code".to_string(), true),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_code_mode_prompt_names_mcp_dictionary_run_code() {
+        assert_eq!(crate::run_code_tool_name("antigravity", "dictionary"), "mcp_dictionary_run_code");
+        assert_eq!(crate::run_code_tool_name("claude", "dictionary"), "mcp__dictionary__run_code");
+        assert_eq!(crate::run_code_tool_name("grok-build", "dictionary"), "dictionary__run_code");
+        assert_eq!(crate::run_code_tool_name("opencode", "dictionary"), "dictionary_run_code");
+
+        let capture = std::env::temp_dir().join(format!("tm-acp-prompt-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; printf '%s\n' "$l" > "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display()
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "implement parser".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:9/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, _rx) = mpsc::channel(16);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        let sent = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert!(
+            sent.contains("mcp_dictionary_run_code"),
+            "expected prompt to name mcp_dictionary_run_code, got: {sent}"
+        );
+        assert!(
+            !sent.contains("`run_code`"),
+            "prompt for antigravity should not tell agent to call bare `run_code`: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_or_cancelled_tool_call_does_not_disable_stall_timer() {
+        let mut tools = BTreeSet::new();
+        for status in ["cancelled", "canceled", "rejected", "denied", "error"] {
+            track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "t1" }));
+            assert!(tools.contains("t1"));
+            track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": status }));
+            assert!(!tools.contains("t1"), "status `{status}` must clear tracked tool");
+        }
+
+        // Agent announces tool_call t-denied, requests permission (which is denied), never emits
+        // a completed update, and hangs silently: the stall timer must still fire!
+        let script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}'
+read l
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t-denied","name":"shell","kind":"execute"}}}'
+echo '{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"t-denied","name":"shell","kind":"execute","rawInput":{"command":"id"}},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}'
+read r
+sleep 30
+"#;
+        let harness = AcpHarness {
+            id: "fake",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "{server}__",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: Some(std::time::Duration::from_millis(150)),
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, _rx) = mpsc::channel(16);
+        let err = harness.run(task, gate, tx).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<Stalled>().is_some(),
+            "denied tool call must not permanently suppress stall detection; got: {err:#}"
         );
     }
 }

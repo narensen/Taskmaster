@@ -179,6 +179,7 @@ pub fn recovered_errors(events: &[Event], page: &str) -> Option<String> {
                 }
             }
             Event::FlagResolved { page: id, .. } if id == page => errors = None,
+            Event::FollowUp | Event::Resumed | Event::AgentTurn { .. } => errors = None,
             _ => {}
         }
     }
@@ -275,6 +276,30 @@ mod tests {
         run.step(event);
         let cmds = reconcile(&run, &events, &[locked()], vec![]).unwrap();
         assert_eq!(cmds, vec![Command::ArbitrateFlag(flag)]);
+    }
+
+    #[test]
+    fn recovered_errors_clears_on_followup_and_resumed() {
+        let mut events = vec![
+            Event::PlanReady(plan(&[("a", &[])])),
+            Event::PlanApproved,
+            Event::WorkerFinished {
+                page: "a".into(),
+                outcome: WorkerOutcome::CheckFailed { errors: "old TS2322".into() },
+            },
+        ];
+        assert_eq!(recovered_errors(&events, "a").as_deref(), Some("old TS2322"));
+        events.push(Event::Cancelled);
+        events.push(Event::Resumed);
+        assert_eq!(recovered_errors(&events, "a"), None);
+
+        events.push(Event::WorkerFinished {
+            page: "a".into(),
+            outcome: WorkerOutcome::CheckFailed { errors: "second error".into() },
+        });
+        assert_eq!(recovered_errors(&events, "a").as_deref(), Some("second error"));
+        events.push(Event::FollowUp);
+        assert_eq!(recovered_errors(&events, "a"), None);
     }
 
     fn locked() -> ChangeEntry {

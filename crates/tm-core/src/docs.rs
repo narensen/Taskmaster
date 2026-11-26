@@ -65,6 +65,7 @@ pub fn render_changes(entries: &[ChangeEntry], limit: usize) -> String {
             ChangeKind::EntryAmended => "entry amended",
             ChangeKind::ReviewFinding => "review finding",
             ChangeKind::VerifyFailed => "verify failed",
+            ChangeKind::GateWarning => "gate warning",
         };
         let _ = write!(out, "\n## {} · {kind}", e.at);
         if let Some(page) = &e.page {
@@ -201,7 +202,7 @@ mod tests {
             ..Default::default()
         };
         Plan {
-            contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new() }],
+            contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: String::new(), phase: 0 }],
             pages: vec![page("dashboard", &["auth", "nav"]), page("settings", &["auth"])],
             ..Default::default()
         }

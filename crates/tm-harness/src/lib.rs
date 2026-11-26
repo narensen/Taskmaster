@@ -257,11 +257,35 @@ pub struct WorkerTask {
 pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol lookups, and diffs in a single `run_code` script (`readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch reads (`readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active: batch reads (`readMany`, `symbols`, `grep`), edits (`applyPatch`, `patch`, `edit`, `write`), checks (`diff`, `check`), and tests (`test()`, `sh`) inside `run_code` scripts instead of individual file or shell tool calls. For Python triple quotes or backslashes, pass raw content via the separate `files` or `writeFile` JSON arguments, or use `String.raw` with `write(path, { raw })`.\n\n";
+
+/// The MCP tool name exposed to an agent for `tool` on MCP server `server` (typically `"dictionary"`)
+/// under `harness_id`.
+pub fn mcp_tool_name(harness_id: &str, server: &str, tool: &str) -> String {
+    match harness_id {
+        "antigravity" | "agy" => format!("mcp_{server}_{tool}"),
+        "claude" => format!("mcp__{server}__{tool}"),
+        "grok-build" | "grok" => format!("{server}__{tool}"),
+        "opencode" => format!("{server}_{tool}"),
+        _ => tool.to_string(),
+    }
+}
+
+/// The MCP tool name exposed to an agent for Code Mode's `run_code` tool on `harness_id`
+/// (with MCP server name `server`, typically `"dictionary"`).
+pub fn run_code_tool_name(harness_id: &str, server: &str) -> String {
+    mcp_tool_name(harness_id, server, "run_code")
+}
 
 impl WorkerTask {
     /// The brief with the standing rules for this kind of task in front of it.
     pub fn framed_brief(&self) -> String {
+        self.framed_brief_for("run_code")
+    }
+
+    /// The brief with the standing rules in front of it, naming `run_code_tool` (e.g.
+    /// `mcp_dictionary_run_code` for Antigravity) when Code Mode is active.
+    pub fn framed_brief_for(&self, run_code_tool: &str) -> String {
         let rules = if self.read_only {
             REVIEWER_RULES
         } else if self.shell.is_some() {
@@ -270,7 +294,12 @@ impl WorkerTask {
             WORKER_RULES
         };
         if self.code_mode {
-            let code = if self.read_only { CODE_MODE_READ_RULES } else { CODE_MODE_WRITE_RULES };
+            let template = if self.read_only { CODE_MODE_READ_RULES } else { CODE_MODE_WRITE_RULES };
+            let code = if run_code_tool == "run_code" || run_code_tool.is_empty() {
+                template.to_string()
+            } else {
+                template.replace("`run_code`", &format!("`{run_code_tool}`"))
+            };
             format!("{code}{rules}{}", self.brief)
         } else {
             format!("{rules}{}", self.brief)

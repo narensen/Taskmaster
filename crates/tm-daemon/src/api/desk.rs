@@ -2146,7 +2146,7 @@ mod tests {
     #[test]
     fn a_pull_request_is_written_from_the_plan() {
         let plan = tm_core::Plan {
-            contracts: vec![tm_core::ContractFile { path: "app/types.ts".into(), content: "x".into() }],
+            contracts: vec![tm_core::ContractFile { path: "app/types.ts".into(), content: "x".into(), phase: 0 }],
             pages: vec![tm_core::PagePlan {
                 id: "home".into(),
                 route: "/".into(),

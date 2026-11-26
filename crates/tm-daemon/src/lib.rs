@@ -440,7 +440,7 @@ pub struct Config {
     /// `None` starts every agent here, as before.
     pub holder: Option<tm_harness::hold::Holder>,
     /// Optional silence timeout before a stalled agent is restarted. Falls back to
-    /// `TASKMASTER_STALL_SECS` and then the built-in default (300s small / 600s normal).
+    /// `TASKMASTER_STALL_SECS` and then the built-in default (150s small / 240s normal).
     pub stall_timeout: Option<Duration>,
 }
 

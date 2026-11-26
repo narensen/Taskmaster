@@ -43,9 +43,16 @@ impl Default for ClaudeCode {
 const WRITING_TOOLS: [&str; 5] = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
 
 impl ClaudeCode {
+    fn run_code_tool(task: &WorkerTask) -> String {
+        match &task.dictionary {
+            Some(dict) => crate::run_code_tool_name("claude", &dict.name),
+            None => "run_code".to_string(),
+        }
+    }
+
     /// The arguments for one stateless task: permissions, tools, model, effort and the Dictionary.
     pub fn args(&self, task: &WorkerTask) -> Vec<String> {
-        self.args_with(task, &task.framed_brief(), false, None)
+        self.args_with(task, &task.framed_brief_for(&Self::run_code_tool(task)), false, None)
     }
 
     /// Arguments for one turn, optionally keeping the session on disk (`persist`) or resuming an
@@ -141,12 +148,12 @@ impl ClaudeCode {
         let (proc, mut io) = crate::child::start(&mut cmd, false, task.hold.as_ref())
             .await
             .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let mut stream = Stream { session_id: resume.map(str::to_string), emitted: false };
+        let mut stream = Stream { session_id: resume.map(str::to_string), emitted: false, tools: Default::default() };
         if let Some(id) = resume {
             let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
             stream.emitted = true;
         }
-        let result = match tokio::time::timeout(timeout, stream.read(&mut io, &events)).await {
+        let result = match tokio::time::timeout(timeout, stream.read(&mut io, &events, task.stall)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", timeout)),
         };
@@ -161,17 +168,36 @@ impl ClaudeCode {
     }
 }
 
-/// What a turn's stream has said so far: its session, and whether that was announced.
+/// What a turn's stream has said so far: its session, whether that was announced,
+/// and any tool calls still awaiting their results.
 #[derive(Default)]
 struct Stream {
     session_id: Option<String>,
     emitted: bool,
+    tools: std::collections::BTreeSet<String>,
 }
 
 impl Stream {
-    /// Read the stream to its result line.
-    async fn read(&mut self, io: &mut crate::child::AgentIo, events: &mpsc::Sender<HarnessEvent>) -> anyhow::Result<(RunSummary, Option<String>)> {
-        while let Some(line) = io.next_line().await? {
+    /// Read the stream to its result line, stopping with [`crate::Stalled`] if the model
+    /// sends nothing for `stall` while no tool call is in flight.
+    async fn read(
+        &mut self,
+        io: &mut crate::child::AgentIo,
+        events: &mpsc::Sender<HarnessEvent>,
+        stall: Option<std::time::Duration>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        loop {
+            let next = io.next_line();
+            let line = match stall.filter(|_| self.tools.is_empty()) {
+                Some(limit) => match tokio::time::timeout(limit, next).await {
+                    Ok(line) => line?,
+                    Err(_) => return Err(crate::Stalled(limit).into()),
+                },
+                None => next.await?,
+            };
+            let Some(line) = line else {
+                break;
+            };
             if let Some(summary) = self.line(&line, Some(events)).await {
                 return Ok((summary, self.session_id.clone()));
             }
@@ -213,6 +239,17 @@ impl Stream {
             }
             _ => None,
         };
+        for event in &out {
+            match event {
+                HarnessEvent::ToolCall { id, .. } if !id.is_empty() => {
+                    self.tools.insert(id.clone());
+                }
+                HarnessEvent::ToolResult { id, .. } => {
+                    self.tools.remove(id);
+                }
+                _ => {}
+            }
+        }
         if let Some(events) = events {
             for event in out {
                 let _ = events.send(event).await;
@@ -322,7 +359,7 @@ impl Harness for ClaudeCode {
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
-        let prompt = task.framed_brief();
+        let prompt = task.framed_brief_for(&Self::run_code_tool(&task));
         match self.execute(&task, &prompt, true, None, events, task.timeout).await {
             Ok((summary, Some(session_id))) if summary.ok => {
                 let kept: Box<dyn crate::Session> = Box::new(ClaudeSession { harness: self.clone(), task, session_id, cleaned: false });
@@ -378,7 +415,7 @@ impl Harness for ClaudeCode {
         let crate::child::Attached { mut io, proc, keep, .. } = attached;
         let result = match ended {
             Some(summary) => Ok((summary, stream.session_id.clone())),
-            None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events)).await {
+            None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events, task.stall)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("claude timed out after {:?}", task.timeout)),
             },
@@ -410,7 +447,7 @@ impl Harness for ClaudeCode {
         _gate: Arc<dyn PermissionGate>,
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
-        let prompt = task.framed_brief();
+        let prompt = task.framed_brief_for(&Self::run_code_tool(&task));
         self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _)| summary)
     }
 }
@@ -720,5 +757,30 @@ mod tests {
         assert!(!proj.join("sess-clean-1").exists());
         assert!(other.exists());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_claude_stream_is_stopped_as_stalled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tm-claude-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude-hang");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let harness = ClaudeCode { binary: bin.display().to_string(), sandbox: None };
+        let mut t = task(false, false, false);
+        t.cwd = dir.clone();
+        t.timeout = std::time::Duration::from_secs(30);
+        t.stall = Some(std::time::Duration::from_millis(120));
+        let gate: Arc<dyn PermissionGate> = Arc::new(crate::gate::WorktreeGate::new(&dir, vec![]));
+        let (tx, _rx) = mpsc::channel(8);
+        let err = harness.run(t, gate, tx).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::Stalled>().is_some(),
+            "expected Stalled error on silent Claude stream, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

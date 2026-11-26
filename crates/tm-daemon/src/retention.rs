@@ -61,7 +61,7 @@ pub fn run_gc(
             }
         }
         // Newest first.
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
         let now = SystemTime::now();
         let cutoff = if policy.max_age_days > 0 {
             now.checked_sub(Duration::from_secs(policy.max_age_days * 86_400))

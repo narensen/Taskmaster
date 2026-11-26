@@ -16,7 +16,7 @@ pub use ledger::{
     LedgerEntry, ModelScore, ModelScorecard, Prices, RECOMMEND_FIRST_PASS, Role, SCORE_MIN_UNITS, STRUGGLING_FIRST_PASS, Shape, Spend, StratifiedScore, Totals, auto_route, forecast,
     scorecard, stratified_scores, totals,
 };
-pub use plan::{DraftEntry, Rejection, Rule, check_plan, normalize_plan, rejections, rules_text};
+pub use plan::{DraftEntry, Rejection, Rule, check_plan, effective_contract_phase, normalize_plan, rejections, rules_text};
 pub use playbooks::{Playbook, brief_hash, format_playbooks, match_playbooks};
 pub use run::{Command, Event, PageState, Run, RunPhase, Tier, WorkerOutcome};
 pub use schema::{SCHEMA_VERSION, events_header, migrate_status, unwrap_event_line};

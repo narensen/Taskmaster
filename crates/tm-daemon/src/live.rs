@@ -1148,7 +1148,7 @@ mod tests {
         let store = tmp("tail");
         store.append("a.jsonl", r#"{"n":1}"#).unwrap();
         let (len1, b1) = store.read_from("a.jsonl", 0).unwrap().unwrap();
-        assert_eq!(b1, br#"{"n":1}"#.iter().copied().chain([b'\n']).collect::<Vec<_>>());
+        assert_eq!(b1, br#"{"n":1}"#.iter().copied().chain(*b"\n").collect::<Vec<_>>());
         // Caught up: zero bytes read.
         let (len_same, b_empty) = store.read_from("a.jsonl", len1).unwrap().unwrap();
         assert_eq!(len_same, len1);
@@ -1157,7 +1157,7 @@ mod tests {
         store.append("a.jsonl", r#"{"n":2}"#).unwrap();
         let (len2, b2) = store.read_from("a.jsonl", len1).unwrap().unwrap();
         assert!(len2 > len1);
-        assert_eq!(b2, br#"{"n":2}"#.iter().copied().chain([b'\n']).collect::<Vec<_>>());
+        assert_eq!(b2, br#"{"n":2}"#.iter().copied().chain(*b"\n").collect::<Vec<_>>());
     }
 
     #[tokio::test]

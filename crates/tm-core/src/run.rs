@@ -365,7 +365,10 @@ impl Run {
                     );
                     plan.pages.push(page);
                 }
-                for contract in added.contracts {
+                for mut contract in added.contracts {
+                    if contract.phase == 0 {
+                        contract.phase = next;
+                    }
                     if !plan.contracts.iter().any(|c| c.path == contract.path) {
                         plan.contracts.push(contract);
                     }

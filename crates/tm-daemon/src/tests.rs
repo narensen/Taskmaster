@@ -436,7 +436,7 @@ fn plan_json(cite: &str, entry: &str) -> String {
 
 fn plan(pages: &[(&str, &[&str])]) -> Plan {
     Plan {
-        contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into() }],
+        contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into(), phase: 0 }],
         pages: pages
             .iter()
             .map(|(id, cites)| PagePlan {
@@ -681,7 +681,7 @@ async fn a_failing_contract_test_goes_to_the_unit_it_imports_not_to_the_master()
 
     let test_source = "import { total } from \"../../app/a/page\";\nexport const checks = total([1, 2]) === 2;\n";
     let mut plan = plan(&[("a", &[])]);
-    plan.contracts.push(ContractFile { path: "tests/contract/a.test.ts".into(), content: test_source.into() });
+    plan.contracts.push(ContractFile { path: "tests/contract/a.test.ts".into(), content: test_source.into(), phase: 0 });
     let world = World::new(Mode::Write);
     let briefs = Arc::new(Mutex::new(Vec::new()));
     let harness: Arc<dyn Harness> = Arc::new(ContractTested { inner: Fake(world.clone()), briefs: briefs.clone() });
@@ -5335,10 +5335,14 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
             _gate: Arc<dyn PermissionGate>,
             _events: mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            self.calls.lock().unwrap().push(task.brief.clone());
+            let attempt = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(task.brief.clone());
+                calls.len()
+            };
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
-            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            std::fs::write(&file, format!("# attempt {attempt}\ndef add(x, y):\n    return x + y\n"))?;
             Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
         }
     }
@@ -5347,7 +5351,8 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
     let mut p = plan(&[("a", &[])]);
     p.contracts.push(ContractFile {
         path: "contracts/test_contract.py".into(),
-        content: "# Vacuous contract test that never exercises app/a/mod.py\nassert 1 + 1 == 2\n".into(),
+        content: "# Imports app.a.mod but swallows stub failures so the check is vacuous\ntry:\n    import app.a.mod\nexcept Exception:\n    pass\nassert 1 + 1 == 2\n".into(),
+        phase: 0,
     });
     let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
     let harnesses = Harnesses {
@@ -5364,12 +5369,469 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
     cfg.worker_shell = false;
 
     let outcome = drive(cfg, harnesses).await.unwrap();
-    // Because the locked contract test stays vacuous, verify rejects it and routes the error back to page `a`.
+    // Because the locked contract test stays vacuous while page `a` keeps changing its file, verify rejects it.
     assert_eq!(outcome, Outcome::Finished { ok: false });
     let calls = h.calls.lock().unwrap();
     assert!(
         calls.iter().any(|b| b.contains("vacuous")),
         "expected vacuous contract test error routed back to page `a`, got calls: {calls:#?}"
+    );
+}
+
+#[tokio::test]
+async fn mutation_gate_without_import_edge_is_skipped() {
+    struct ImplHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for ImplHarness {
+        fn id(&self) -> &'static str {
+            "p0b-no-edge"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0b-no-import-edge");
+    let mut p = plan(&[("a", &[])]);
+    // Subprocess/standalone acceptance contract test with NO import edge to any built file.
+    p.contracts.push(ContractFile {
+        path: "tests/test_acceptance_contract.py".into(),
+        content: "import subprocess\n\ndef test_cli_smoke():\n    assert 1 + 1 == 2\n".into(),
+        phase: 0,
+    });
+    let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = h.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "unit should build once with no vacuous repair: {calls:#?}");
+    assert!(!calls.iter().any(|b| b.contains("vacuous")));
+}
+
+#[tokio::test]
+async fn identical_gate_failure_after_noop_repair_is_waived_not_escalated() {
+    struct CountingNoopHarness {
+        name: &'static str,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for CountingNoopHarness {
+        fn id(&self) -> &'static str {
+            self.name
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            // Always writes identical content: first turn creates the file, repair turn produces no diff.
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    // 1. Mutation gate: vacuous contract test with an import edge triggers 1 repair,
+    //    repair produces no diff, verify #2 sees identical finding -> waived in CHANGES.md,
+    //    never escalates to mid or master.
+    let tmp = repo("p0b-waive-mutation");
+    let mut p = plan(&[("a", &[])]);
+    p.contracts.push(ContractFile {
+        path: "contracts/test_contract.py".into(),
+        content: "try:\n    import app.a.mod\nexcept Exception:\n    pass\nassert 1 + 1 == 2\n".into(),
+        phase: 0,
+    });
+    let worker = Arc::new(CountingNoopHarness { name: "p0b-worker", calls: Mutex::new(Vec::new()) });
+    let mid = Arc::new(CountingNoopHarness { name: "p0b-mid", calls: Mutex::new(Vec::new()) });
+    let master = Arc::new(CountingNoopHarness { name: "p0b-master", calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: worker.clone(),
+        mid: mid.clone(),
+        master: master.clone(),
+        reviewer: worker.clone(),
+        verifier: worker.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let worker_calls = worker.calls.lock().unwrap().clone();
+    let repair_calls: Vec<&String> = worker_calls.iter().filter(|b| b.contains("Checks failed last time")).collect();
+    assert_eq!(repair_calls.len(), 1, "must call repair agent at most once: {worker_calls:#?}");
+    assert!(mid.calls.lock().unwrap().is_empty(), "must not escalate to mid tier");
+    assert!(master.calls.lock().unwrap().is_empty(), "must not escalate to master tier");
+    let changes_md = read(&tmp.0.join(".taskmaster/CHANGES.md"));
+    assert!(
+        changes_md.contains("gate warning") && changes_md.contains("waived identical mutation gate finding"),
+        "expected waived warning in CHANGES.md, got:\n{changes_md}"
+    );
+
+    // 2. General gate (verify script): identical finding after a no-op repair is waived too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp2 = repo("p0b-waive-script");
+        let script = tmp2.0.join(".taskmaster/verify");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "#!/bin/sh\necho 'page:a: advisory gate check failed'\nexit 1\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let worker2 = Arc::new(CountingNoopHarness { name: "p0b-worker2", calls: Mutex::new(Vec::new()) });
+        let mid2 = Arc::new(CountingNoopHarness { name: "p0b-mid2", calls: Mutex::new(Vec::new()) });
+        let master2 = Arc::new(CountingNoopHarness { name: "p0b-master2", calls: Mutex::new(Vec::new()) });
+        let harnesses2 = Harnesses {
+            worker: worker2.clone(),
+            mid: mid2.clone(),
+            master: master2.clone(),
+            reviewer: worker2.clone(),
+            verifier: worker2.clone(),
+        };
+        let mut cfg2 = config(&tmp2.0, plan(&[("a", &[])]), true, 1);
+        cfg2.checks = false;
+        cfg2.runtime_checks = false;
+        cfg2.code_mode = false;
+        cfg2.worker_shell = false;
+
+        let outcome2 = drive(cfg2, harnesses2).await.unwrap();
+        assert_eq!(outcome2, Outcome::Finished { ok: true });
+        let worker2_calls = worker2.calls.lock().unwrap();
+        let repairs2: Vec<&String> = worker2_calls.iter().filter(|b| b.contains("Checks failed last time")).collect();
+        assert_eq!(repairs2.len(), 1, "verify_script gate must call repair agent at most once: {worker2_calls:#?}");
+        assert!(mid2.calls.lock().unwrap().is_empty(), "verify_script gate must not escalate to mid");
+        assert!(master2.calls.lock().unwrap().is_empty(), "verify_script gate must not escalate to master");
+        let changes_md2 = read(&tmp2.0.join(".taskmaster/CHANGES.md"));
+        assert!(
+            changes_md2.contains("gate warning") && changes_md2.contains("advisory gate check failed"),
+            "expected waived verify_script warning in CHANGES.md, got:\n{changes_md2}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mutation_gate_all_skipped_is_inconclusive() {
+    struct ImplHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for ImplHarness {
+        fn id(&self) -> &'static str {
+            "p0a-impl"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            let file = task.cwd.join("app/a/mod.py");
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0a-all-skipped");
+    let skipped_test = "import pytest\n\n\
+        pytestmark = pytest.mark.skipif(True, reason=\"later phase\")\n\n\
+        def test_future_cli():\n    import app.a.mod as m\n    assert m.add(1, 2) == 3\n";
+    let mut p = plan(&[("a", &[])]);
+    p.contracts.push(ContractFile {
+        path: "tests/test_acceptance_contract.py".into(),
+        content: skipped_test.into(),
+        phase: 0,
+    });
+    let h = Arc::new(ImplHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    // An all-skipped pytest contract test must yield Inconclusive, not Vacuous, so verify passes.
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = h.calls.lock().unwrap();
+    assert!(
+        !calls.iter().any(|b| b.contains("vacuous")),
+        "all-skipped contract test must not trigger vacuous repair: {calls:#?}"
+    );
+
+    // Direct check against the built tree confirms MutationVerdict::Inconclusive.
+    let (cmd, env) = crate::gates::mutation_test_command(
+        &tmp.0,
+        &tmp.0.join(".taskmaster/venv"),
+        "tests/test_acceptance_contract.py",
+    )
+    .expect("expected pytest mutation command");
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let verdict = crate::gates::contract_mutation_sanity_with_env(
+        &tmp.0,
+        "app/a/mod.py",
+        crate::gates::mutation_stub_for("app/a/mod.py").unwrap(),
+        &refs,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(verdict, crate::gates::MutationVerdict::Inconclusive);
+}
+
+#[tokio::test]
+async fn intermediate_phase_verify_skips_later_phase_contract_tests() {
+    struct PhasedPyHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for PhasedPyHarness {
+        fn id(&self) -> &'static str {
+            "p0c-phased"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            if task.brief.contains("Plan phase 2 of 2") {
+                let phase2_json = serde_json::json!({
+                    "summary": "Phase 2 CLI",
+                    "contracts": [],
+                    "units": [{
+                        "id": "cli",
+                        "owned_glob": "pkg/cli.py",
+                        "brief": "Implement CLI helper.",
+                        "context": "Provides run_cli().",
+                        "done": "pkg/cli.py passes tests"
+                    }],
+                    "dictionary": []
+                });
+                let _ = _events.send(HarnessEvent::Text { text: phase2_json.to_string() }).await;
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+            }
+            if task.brief.contains("Build unit `core`") {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/core.py"), "def value():\n    return 42\n")?;
+            } else if task.brief.contains("Build unit `cli`") {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/cli.py"), "from pkg.core import value\n\ndef run_cli():\n    return f'ok:{value()}'\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0c-later-phase-test");
+    let acceptance_content = "from pkg.cli import run_cli\n\ndef test_acceptance():\n    assert run_cli() == 'ok:42'\n";
+    let mut p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "pkg/__init__.py".into(), content: "# package\n".into(), phase: 0 },
+            ContractFile {
+                path: "tests/test_core_contract.py".into(),
+                content: "from pkg.core import value\n\ndef test_core():\n    assert value() == 42\n".into(),
+                phase: 0,
+            },
+            // Phase-2 acceptance test left with phase=0 so inference from phases[1].delivers is also tested!
+            ContractFile {
+                path: "tests/test_acceptance_contract.py".into(),
+                content: acceptance_content.into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![PagePlan {
+            id: "core".into(),
+            owned_glob: "pkg/core.py".into(),
+            brief: "Build core".into(),
+            phase: 0,
+            ..Default::default()
+        }],
+        phases: vec![
+            tm_core::PhaseSketch {
+                id: "foundation".into(),
+                goal: "Build core".into(),
+                delivers: vec!["pkg/core.py".into(), "tests/test_core_contract.py".into()],
+                ..Default::default()
+            },
+            tm_core::PhaseSketch {
+                id: "cli".into(),
+                goal: "Build CLI".into(),
+                delivers: vec!["pkg/cli.py".into(), "tests/test_acceptance_contract.py".into()],
+                needs: "results".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        tm_core::effective_contract_phase(&p.contracts[2], &p.phases),
+        1,
+        "acceptance test delivered in phase 2 must infer phase=1"
+    );
+    assert_eq!(
+        tm_core::effective_contract_phase(&p.contracts[1], &p.phases),
+        0,
+        "core contract test delivered in phase 1 must stay phase=0"
+    );
+
+    // Ensure normalize_plan tags phase=1 on the contract too.
+    tm_core::normalize_plan(&mut p, &mut Vec::new());
+    assert_eq!(p.contracts[2].phase, 1);
+
+    let h = Arc::new(PhasedPyHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let calls = h.calls.lock().unwrap();
+    assert!(
+        !calls.iter().any(|b| b.contains("Shared files this run wrote fail")),
+        "intermediate-phase verify must skip phase-2 acceptance test without invoking repair_shared: {calls:#?}"
+    );
+    assert_eq!(read(&tmp.0.join("tests/test_acceptance_contract.py")), acceptance_content);
+}
+
+#[tokio::test]
+async fn repair_shared_refuses_locked_contract_test() {
+    struct WorkerHarness;
+    #[async_trait]
+    impl Harness for WorkerHarness {
+        fn id(&self) -> &'static str {
+            "p0c-worker"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/mod.py"), "def ok():\n    return True\n")?;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    struct MasterWouldSkipHarness {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Harness for MasterWouldSkipHarness {
+        fn id(&self) -> &'static str {
+            "p0c-master"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.lock().unwrap().push(task.brief.clone());
+            // If called, this master would try to patch a skipif into the locked contract test!
+            let test_path = task.cwd.join("tests/test_acceptance_contract.py");
+            if test_path.is_file() {
+                std::fs::write(&test_path, "import pytest\npytestmark = pytest.mark.skipif(True, reason='hack')\ndef test_x(): assert False\n")?;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    let tmp = repo("p0c-refuse-locked-test");
+    let original_test = "def test_always_fails_without_import():\n    assert False, 'cli missing'\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile {
+                path: "tests/test_acceptance_contract.py".into(),
+                content: original_test.into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![PagePlan {
+            id: "a".into(),
+            owned_glob: "pkg/**".into(),
+            brief: "Build pkg".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let worker = Arc::new(WorkerHarness);
+    let master = Arc::new(MasterWouldSkipHarness { calls: Mutex::new(Vec::new()) });
+    let harnesses = Harnesses {
+        worker: worker.clone(),
+        mid: worker.clone(),
+        master: master.clone(),
+        reviewer: worker.clone(),
+        verifier: worker.clone(),
+    };
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: false });
+    assert!(
+        master.calls.lock().unwrap().is_empty(),
+        "repair_shared must refuse to invoke master on locked contract test: {:?}",
+        master.calls.lock().unwrap()
+    );
+    // Locked contract test must remain completely unmodified (no skipif injected!).
+    let content = read(&tmp.0.join("tests/test_acceptance_contract.py"));
+    assert_eq!(content, original_test);
+    let changes = read(&run_directory(&tmp.0, "current").join("changes.jsonl"));
+    assert!(
+        changes.contains("flagged locked contract test(s)"),
+        "expected refusal flag in changes.jsonl, got:\n{changes}"
     );
 }
 
@@ -7523,11 +7985,11 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
     // 1. Resolution precedence: explicit Config > TASKMASTER_STALL_SECS > small/default fallback.
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, None, false),
-        Duration::from_secs(600)
+        Duration::from_secs(240)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, None, true),
-        Duration::from_secs(300)
+        Duration::from_secs(150)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, Some("45"), false),
@@ -7535,11 +7997,11 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, Some("0"), false),
-        Duration::from_secs(600)
+        Duration::from_secs(240)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(None, Some("not-a-number"), true),
-        Duration::from_secs(300)
+        Duration::from_secs(150)
     );
     assert_eq!(
         crate::engine::resolve_stall_timeout(Some(Duration::from_secs(12)), Some("45"), false),
@@ -7608,4 +8070,545 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
         ],
         "expected configured stall on initial/retry attempts and finite bounded stall on final attempt"
     );
+}
+
+#[test]
+fn default_stall_is_240s() {
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, false),
+        Duration::from_secs(240)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, None, true),
+        Duration::from_secs(150)
+    );
+    assert_eq!(
+        crate::engine::resolve_stall_timeout(None, Some("180"), false),
+        Duration::from_secs(180)
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_detects_wall_clock_jump_and_restarts_silent_agents() {
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FakeClock {
+        mono_secs: AtomicU64,
+        wall_secs: AtomicU64,
+    }
+    impl crate::engine::BeatClock for FakeClock {
+        fn monotonic(&self) -> Duration {
+            Duration::from_secs(self.mono_secs.load(Ordering::SeqCst))
+        }
+        fn wall(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(self.wall_secs.load(Ordering::SeqCst))
+        }
+    }
+
+    let clock = Arc::new(FakeClock {
+        mono_secs: AtomicU64::new(0),
+        wall_secs: AtomicU64::new(1_700_000_000),
+    });
+    let heard_secs = Arc::new(AtomicU64::new(0));
+    let nudges = Arc::new(Mutex::new(Vec::<Duration>::new()));
+
+    let heard_reader = heard_secs.clone();
+    let nudges_writer = nudges.clone();
+    let (_guard, mut stall_rx) = crate::engine::heartbeat_with_clock(
+        "parser".into(),
+        Arc::new(move || Duration::from_secs(heard_reader.load(Ordering::SeqCst))),
+        clock.clone(),
+        crate::engine::HeartbeatConfig {
+            tick: Duration::from_millis(5),
+            jump_threshold: crate::engine::WALL_JUMP_THRESHOLD,
+            post_jump_grace: crate::engine::POST_JUMP_GRACE,
+        },
+        Some(Arc::new(move |jump| {
+            nudges_writer.lock().unwrap().push(jump);
+        })),
+    );
+
+    // 1. Normal progression: +10s monotonic, +10s wall -> no nudge, no stall.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(10, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(nudges.lock().unwrap().is_empty(), "normal tick must not trigger suspend nudge");
+    assert!(stall_rx.try_recv().is_err(), "normal tick must not stall");
+
+    // 2. Host freeze of +350s wall while monotonic moves +10s -> nudge fires; agent recovers
+    //    within the 30s grace window, so it must NOT be restarted.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(360, Ordering::SeqCst);
+    for _ in 0..50 {
+        if !nudges.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(nudges.lock().unwrap().len(), 1, "expected suspend nudge on +350s wall jump");
+    assert!(nudges.lock().unwrap()[0] >= Duration::from_secs(340));
+    // Agent emits output 10s after wake -> cancels post-jump restart.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(10, Ordering::SeqCst);
+    heard_secs.store(30, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    // Advance another 40s normally with no further jump -> still alive, no restart from jump #1.
+    clock.mono_secs.fetch_add(40, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(40, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(stall_rx.try_recv().is_err(), "agent that resumed after jump must not be restarted");
+
+    // 3. Second host freeze (+350s wall, +10s mono) where the agent stays silent for >= 30s
+    //    of active monotonic time afterwards -> heartbeat triggers a Stalled restart.
+    clock.mono_secs.fetch_add(10, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(360, Ordering::SeqCst);
+    for _ in 0..50 {
+        if nudges.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(nudges.lock().unwrap().len(), 2, "expected second suspend nudge");
+    // Advance monotonic & wall by 30s with NO output from the agent.
+    clock.mono_secs.fetch_add(30, Ordering::SeqCst);
+    clock.wall_secs.fetch_add(30, Ordering::SeqCst);
+    let stalled = tokio::time::timeout(Duration::from_secs(2), &mut stall_rx)
+        .await
+        .expect("heartbeat must restart agent silent for 30s after wall-clock jump")
+        .expect("stall sender dropped unexpectedly");
+    assert_eq!(stalled, tm_harness::Stalled(Duration::from_secs(30)));
+}
+
+#[tokio::test]
+async fn unit_with_contract_only_dependency_starts_immediately() {
+    struct BarrierOverlapHarness {
+        barrier: Arc<tokio::sync::Barrier>,
+        inflight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for BarrierOverlapHarness {
+        fn id(&self) -> &'static str {
+            "p12-overlap"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            _events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            // Both units MUST start concurrently to pass the barrier before timeout.
+            tokio::time::timeout(Duration::from_secs(3), self.barrier.wait())
+                .await
+                .expect("contract-only dependent unit must start immediately alongside its dependency");
+            if task.brief.contains("Build unit `btree`") {
+                std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+                std::fs::write(task.cwd.join("tinydb/btree.py"), "class BTree:\n    pass\n")?;
+            } else if task.brief.contains("Build unit `storage`") {
+                std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+                std::fs::write(task.cwd.join("tinydb/storage.py"), "from tinydb.contract import BTreeProtocol\nclass Storage:\n    pass\n")?;
+            }
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+        }
+    }
+
+    // 1. `storage` depends_on `btree`, but only through `BTreeProtocol` in locked `tinydb/contract.py`
+    //    -> `storage` starts immediately in parallel with `btree` (peak concurrency == 2).
+    let tmp = repo("p12-contract-dep");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![
+            ContractFile { path: "tinydb/__init__.py".into(), content: "# pkg\n".into(), phase: 0 },
+            ContractFile {
+                path: "tinydb/contract.py".into(),
+                content: "from typing import Protocol\n\nclass BTreeProtocol(Protocol):\n    def get(self, key: str) -> bytes: ...\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "tinydb/btree.py".into(),
+                brief: "Implement BTreeProtocol from tinydb/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "storage".into(),
+                owned_glob: "tinydb/storage.py".into(),
+                brief: "Implement Storage using BTreeProtocol from tinydb/contract.py.".into(),
+                depends_on: vec!["btree".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let h = Arc::new(BarrierOverlapHarness {
+        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        inflight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let harnesses = Harnesses {
+        worker: h.clone(),
+        mid: h.clone(),
+        master: h.clone(),
+        reviewer: h.clone(),
+        verifier: h.clone(),
+    };
+    let mut cfg = config(&tmp.0, p.clone(), true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.worker_shell = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(h.peak.load(Ordering::SeqCst), 2, "storage must run concurrently with btree");
+
+    // 2. Contrast: concrete non-contract dependency (`cli` importing `tinydb/executor.py`) is NOT contract-only.
+    let concrete_plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: p.contracts.clone(),
+        pages: vec![
+            PagePlan {
+                id: "executor".into(),
+                owned_glob: "tinydb/executor.py".into(),
+                brief: "Implement Executor class.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "tinydb/__main__.py".into(),
+                brief: "Wire CLI to tinydb/executor.py (from tinydb.executor import Executor).".into(),
+                depends_on: vec!["executor".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(!crate::gates::dependency_is_contract_only(&concrete_plan, &concrete_plan.pages[1], "executor"));
+
+    // 3. Planner rubric & plan review: dependency chain deeper than 2 on <= 6 units is flagged
+    //    and flattened mechanically when backed by locked contracts.
+    let mut deep = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "tinydb/contract.py".into(),
+            content: "class BTreeProtocol: ...\nclass StorageProtocol: ...\nclass ExecutorProtocol: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan { id: "btree".into(), owned_glob: "tinydb/btree.py".into(), brief: "Implement BTreeProtocol".into(), ..Default::default() },
+            PagePlan { id: "storage".into(), owned_glob: "tinydb/storage.py".into(), brief: "Use BTreeProtocol, implement StorageProtocol".into(), depends_on: vec!["btree".into()], ..Default::default() },
+            PagePlan { id: "executor".into(), owned_glob: "tinydb/executor.py".into(), brief: "Use StorageProtocol, implement ExecutorProtocol".into(), depends_on: vec!["storage".into()], ..Default::default() },
+            PagePlan { id: "cli".into(), owned_glob: "tinydb/cli.py".into(), brief: "Use ExecutorProtocol".into(), depends_on: vec!["executor".into()], ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(crate::gates::max_dependency_chain_depth(&deep), 4);
+    let findings = crate::gates::review_plan_structure(&deep);
+    assert!(
+        findings.iter().any(|f| f.category == "deep_dependency_chain"),
+        "expected deep_dependency_chain warning, got: {findings:#?}"
+    );
+    assert!(crate::gates::apply_mechanical_plan_fixes(&mut deep));
+    assert!(
+        crate::gates::max_dependency_chain_depth(&deep) <= 2,
+        "expected flattened depth <= 2, got {}",
+        crate::gates::max_dependency_chain_depth(&deep)
+    );
+    assert!(crate::small::worker_pool_rule(3, None).contains("no deeper than 2"));
+}
+
+#[tokio::test]
+async fn small_cli_prompt_uses_single_phase_plan() {
+    let prompt = concat!(
+        "Build \"tinydb\", a minimal SQL database engine in Python 3.11 (standard library only).\n\n",
+        "Requirements:\n",
+        "- CLI: `python -m tinydb <dbfile>` opens a REPL; `python -m tinydb <dbfile> -f script.sql` runs a file and prints results.\n",
+        "- SQL support: CREATE TABLE (INTEGER, TEXT, REAL columns, PRIMARY KEY), INSERT, SELECT with WHERE (=, !=, <, >, <=, >=, AND, OR), ",
+        "ORDER BY (ASC/DESC), LIMIT, INNER JOIN on equality, COUNT/SUM/AVG/MIN/MAX with GROUP BY, UPDATE, DELETE, DROP TABLE.\n",
+        "- Storage: data persists to a single file on disk; primary keys are indexed with a B-tree you implement yourself.\n",
+        "- Output: SELECT results print as pipe-separated rows with a header line.\n",
+        "- Errors: invalid SQL or unknown tables/columns print an error line and do not crash the REPL.\n\n",
+        "Structure the code into separate modules (tokenizer, parser, planner/executor, storage, btree). ",
+        "Write a pytest suite covering every feature above. Done = all your tests pass and `pytest` exits 0.\n",
+    );
+    assert!(!crate::small::is_small_prompt(prompt, 0), "tinydb-sized prompt exceeds small_prompt threshold");
+    assert!(crate::small::is_single_phase_prompt(prompt, 0, 3));
+    assert!(!crate::small::is_single_phase_prompt(
+        &format!("Build a product with a shared core and pages on top. {}", "It has many parts. ".repeat(20)),
+        0,
+        3
+    ));
+
+    type PlannerLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
+    let tmp = seeded("p1-3-single-phase");
+    let planner_calls: PlannerLog = Arc::new(Mutex::new(Vec::new()));
+    let worker_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct SinglePhaseHarness {
+        planner_calls: PlannerLog,
+        worker_calls: Arc<Mutex<Vec<String>>>,
+        plan_attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Harness for SinglePhaseHarness {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let reply = if task.brief.contains("Plan this product") || task.brief.contains("Repair this plan") || task.brief.contains("Plan phase ") {
+                self.planner_calls
+                    .lock()
+                    .unwrap()
+                    .push((task.brief.clone(), task.effort.clone()));
+                let attempt = self.plan_attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Simulate a planner trying to split tinydb into 2 phases despite the single-phase rule.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Two-phase attempt",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [
+                            { "id": "foundation", "goal": "core", "delivers": ["tinydb/tokenizer.py", "tinydb/parser.py"], "interfaces": "", "test": "pytest", "needs": "interfaces" },
+                            { "id": "cli", "goal": "cli", "delivers": ["tinydb/cli.py"], "interfaces": "", "test": "pytest", "needs": "interfaces" }
+                        ],
+                        "units": [
+                            { "id": "tokenizer", "owned_glob": "tinydb/tokenizer.py", "brief": "Write tokenizer", "context": "Uses tinydb/contract.py", "done": "done" },
+                            { "id": "parser", "owned_glob": "tinydb/parser.py", "brief": "Write parser", "context": "Uses tinydb/contract.py", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                } else {
+                    // Repair flattens into a single phase with all units and no phases sketch.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Single-phase tinydb plan",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [],
+                        "units": [
+                            { "id": "tokenizer", "owned_glob": "tinydb/tokenizer.py", "brief": "Write tokenizer", "context": "Uses tinydb/contract.py", "done": "done" },
+                            { "id": "parser", "owned_glob": "tinydb/parser.py", "brief": "Write parser", "context": "Uses tinydb/contract.py", "done": "done" },
+                            { "id": "cli", "owned_glob": "tinydb/cli.py", "brief": "Write cli", "context": "Uses tinydb/contract.py", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                }
+            } else {
+                let unit = task
+                    .brief
+                    .split("Build unit `")
+                    .nth(1)
+                    .and_then(|s| s.split('`').next())
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.worker_calls.lock().unwrap().push(unit.clone());
+                let file = task.cwd.join(format!("tinydb/{unit}.py"));
+                std::fs::create_dir_all(file.parent().unwrap())?;
+                std::fs::write(&file, format!("# {unit}\n"))?;
+                format!("done\nRELEASE unit:{unit}\n")
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 50, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let harness: Arc<dyn Harness> = Arc::new(SinglePhaseHarness {
+        planner_calls: planner_calls.clone(),
+        worker_calls: worker_calls.clone(),
+        plan_attempts: AtomicUsize::new(0),
+    });
+    let mut cfg = prompt_config(&tmp.0, prompt, true);
+    cfg.parallel = 3;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: harness.clone(),
+        mid: harness.clone(),
+        worker: harness.clone(),
+        reviewer: harness.clone(),
+        verifier: harness,
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let pcalls = planner_calls.lock().unwrap().clone();
+    assert_eq!(pcalls.len(), 2, "expected initial plan + 1 single-phase repair, got {}", pcalls.len());
+    let (first_brief, first_effort) = &pcalls[0];
+    assert!(
+        first_brief.contains("\"phases\": []"),
+        "expected single-phase rule in planner brief, got:\n{first_brief}"
+    );
+    assert!(
+        !first_brief.contains("Sketch first"),
+        "single-phase CLI prompt must not get PHASES_RULE sketch prompt"
+    );
+    assert_eq!(
+        first_effort.as_deref(),
+        Some(crate::small::SMALL_EFFORT),
+        "single-phase CLI prompt must cap master planning effort to low"
+    );
+    assert!(
+        pcalls[1].0.contains("single-package prompt fits in one phase"),
+        "expected repair brief to reject multi-phase split, got:\n{}",
+        pcalls[1].0
+    );
+    assert!(
+        pcalls.iter().all(|(b, _)| !b.contains("Plan phase ")),
+        "must not spawn any phase-2 planner call"
+    );
+
+    let mut built = worker_calls.lock().unwrap().clone();
+    built.sort();
+    assert_eq!(built, vec!["cli", "parser", "tokenizer"]);
+    let events = read(&run_directory(&tmp.0, "current").join("events.jsonl"));
+    let replayed = Run::replay(3, events.lines().map(|l| serde_json::from_str::<Event>(l).unwrap()));
+    assert!(replayed.plan.unwrap().phases.is_empty(), "accepted plan must have no phases");
+}
+
+#[tokio::test]
+async fn drive_records_monotonic_and_wall_timing_in_status_and_report() {
+    let tmp = seeded("p2-3-timing");
+    let world = World::new(Mode::Write);
+    let outcome = run(config(&tmp.0, plan(&[("a", &[])]), true, 1), &world).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let status: serde_json::Value =
+        serde_json::from_str(&read(&run_directory(&tmp.0, "current").join("status.json"))).unwrap();
+    let timing = &status["timing"];
+    assert!(timing["wall_started_at"].as_str().is_some_and(|s| s.ends_with('Z')), "{timing}");
+    assert!(timing["wall_ended_at"].as_str().is_some_and(|s| s.ends_with('Z')), "{timing}");
+    assert!(timing["wall_seconds"].as_f64().is_some_and(|v| v >= 0.0), "{timing}");
+    assert!(timing["monotonic_seconds"].as_f64().is_some_and(|v| v >= 0.0), "{timing}");
+    assert!(timing["clock_skew_seconds"].as_f64().is_some_and(|v| v <= 30.0), "{timing}");
+    assert_eq!(timing["clock_skew_flagged"], false, "{timing}");
+
+    let records = Records::files(&tmp.0);
+    let report = crate::report::build(&records, "current").unwrap();
+    assert!(report.timing.is_some());
+    assert!(report.monotonic_seconds.is_some());
+    assert!(!report.clock_skew_flagged);
+    let rendered = crate::report::render(&report);
+    assert!(rendered.contains("Timing: wall "), "{rendered}");
+    assert!(rendered.contains("monotonic "), "{rendered}");
+    assert!(!rendered.contains("WARNING: clock skew detected"), "{rendered}");
+}
+
+#[tokio::test]
+async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildcard_glob() {
+    let tmp = seeded("audit-locked-and-policy");
+    let contract_body = "def test_contract():\n    assert True\n";
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "tests/test_contract.py".into(),
+            content: contract_body.into(),
+            phase: 0,
+        }],
+        pages: vec![PagePlan {
+            id: "edit".into(),
+            owned_glob: "**".into(),
+            brief: "Implement src/app.py".into(),
+            done: "done".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct SneakyWorker {
+        attempt: AtomicUsize,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Harness for SneakyWorker {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let n = self.attempt.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(task.cwd.join("src"))?;
+            std::fs::write(task.cwd.join("src/app.py"), "x = 1\n")?;
+            match n {
+                0 => {
+                    // Attempt 1: tries to weaken the locked contract test under `**`.
+                    std::fs::write(task.cwd.join("tests/test_contract.py"), "# weakened\n")?;
+                }
+                1 => {
+                    // Attempt 2: leaves contract alone, tries to write policy-denied `.env`.
+                    std::fs::write(task.cwd.join(".env"), "API_KEY=leaked\n")?;
+                }
+                _ => {
+                    // Attempt 3: clean write to src/app.py only.
+                }
+            }
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:edit\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(SneakyWorker {
+        attempt: AtomicUsize::new(0),
+        briefs: briefs.clone(),
+    });
+    let mut cfg = config(&tmp.0, p, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(20), drive(cfg, harnesses))
+        .await
+        .expect("timed out")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let seen = briefs.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3, "expected 3 attempts (contract refused -> .env refused -> clean pass)");
+    assert!(seen[1].contains("refusing to merge edit to locked contract"), "{}", seen[1]);
+    assert!(seen[2].contains("policy denied write to `.env`"), "{}", seen[2]);
+    assert_eq!(read(&tmp.0.join("tests/test_contract.py")), contract_body);
+    assert!(!tmp.0.join(".env").exists(), "policy-denied .env must never be merged");
 }

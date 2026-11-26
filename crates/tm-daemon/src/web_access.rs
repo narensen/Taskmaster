@@ -2332,7 +2332,7 @@ impl Extension for WebTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        match name {
+        match crate::code::strip_dict_prefix(name) {
             "web_search" => Some(self.handle_search(grant, args).await),
             "web_fetch" => Some(self.handle_fetch(grant, args).await),
             "advisories" => Some(self.handle_advisories(grant, args).await),
@@ -2900,5 +2900,30 @@ mod tests {
         assert!(pinned_resolve("169.254.169.254:443").is_err());
         assert!(pinned_resolve("localhost:443").is_err());
         assert!(pinned_resolve("service.internal:443").is_err());
+    }
+
+    #[tokio::test]
+    async fn prefixed_web_tool_names_dispatch_identically() {
+        let dir = temp_project("prefixed-web");
+        let store = Arc::new(FileStore::in_project(&dir));
+        let live = Arc::new(Live::new(store.clone()));
+        let records = Records::new(store);
+        let cache = WebCache::new(dir.join(".cache-web"), 3600, 1024 * 1024);
+        let tools = WebTools::with_backends(
+            dir.clone(),
+            WebAccessSettings::default(),
+            Arc::new(NativePassthroughProvider),
+            Arc::new(FixtureTransport::new()),
+            cache,
+            live,
+            records,
+        );
+        let worker = Grant { run: "r1".into(), page: "a".into(), unit: String::new() };
+        let res = tools
+            .call(&worker, "mcp_dictionary_docs", &json!({ "package": "nonexistent-pkg-xyz" }))
+            .await
+            .expect("mcp_dictionary_docs must be handled");
+        assert!(res["content"][0]["text"].is_string(), "{res}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

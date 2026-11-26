@@ -413,19 +413,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         && let Ok(project) = args.project.canonicalize()
         && let Ok(settings) = Settings::load(&project)
         && let Ok(records) = settings.records(&project)
-        && let Ok(runs) = records.run_ids()
     {
-        let resumable: Vec<_> = runs
-            .into_iter()
-            .filter(|id| {
-                records
-                    .status(id)
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v["state"].as_str().map(str::to_string))
-                    .is_some_and(|s| matches!(s.as_str(), "running" | "stopped" | "interrupted"))
-            })
-            .collect();
+        let resumable = detect_interrupted_runs(&records);
         if !resumable.is_empty() {
             eprintln!(
                 "taskmaster: --auto-resume detected {} interrupted run(s): {}",
@@ -442,6 +431,31 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     drop(server);
     Ok(())
+}
+
+/// Detect runs interrupted mid-flight by inspecting `status.json` (`phase` or legacy `state`)
+/// and falling back to replaying `events.jsonl` when a crash happened before `status.json` was written.
+fn detect_interrupted_runs(records: &tm_daemon::store::Records) -> Vec<String> {
+    let Ok(runs) = records.run_ids() else { return Vec::new() };
+    runs.into_iter()
+        .filter(|id| {
+            if let Ok(Some(status)) = records.status(id) {
+                if let Some(phase) = status["phase"].as_str() {
+                    return !matches!(phase, "Done" | "Failed" | "done" | "failed");
+                }
+                if let Some(state) = status["state"].as_str() {
+                    return matches!(state, "running" | "stopped" | "interrupted");
+                }
+            }
+            match records.events(id) {
+                Ok(events) if !events.is_empty() => {
+                    let run = tm_core::Run::replay(1, events);
+                    !matches!(run.phase, tm_core::RunPhase::Done | tm_core::RunPhase::Failed)
+                }
+                _ => false,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -912,5 +926,35 @@ mod args_tests {
             Invocation::Serve(args) => assert!(args.auto_resume),
             _ => panic!("expected Serve"),
         }
+    }
+
+    #[test]
+    fn detect_interrupted_runs_finds_in_progress_runs_without_status_state_field() {
+        let dir = std::env::temp_dir().join(format!("tm-auto-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let records = tm_daemon::store::Records::files(&dir);
+
+        // 1. Crashed mid-build with events.jsonl and no status.json yet -> must be detected!
+        let plan = tm_core::Plan {
+            pages: vec![tm_core::PagePlan { id: "a".into(), owned_glob: "a/**".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        records
+            .save_events("in-flight", &[tm_core::Event::PlanReady(plan), tm_core::Event::PlanApproved])
+            .unwrap();
+        // 2. Active status.json using `phase` (the actual field written by write_status) -> detected!
+        records
+            .save_status("verifying", &serde_json::json!({ "ok": false, "phase": "Verifying" }))
+            .unwrap();
+        // 3. Finished run (`phase: "Done"`) -> NOT detected!
+        records
+            .save_status("done", &serde_json::json!({ "ok": true, "phase": "Done" }))
+            .unwrap();
+
+        let mut found = detect_interrupted_runs(&records);
+        found.sort();
+        assert_eq!(found, vec!["in-flight".to_string(), "verifying".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

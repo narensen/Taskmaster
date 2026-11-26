@@ -106,11 +106,16 @@ impl ImportGraph {
                     continue;
                 }
                 let to_phase = pages.get(to_page.as_str()).map(|p| p.phase).unwrap_or(0);
-                if to_phase < from_phase {
-                    if passed_pages.contains(to_page) {
-                        continue;
-                    }
-                } else if to_phase != from_phase {
+                if to_phase < from_phase && passed_pages.contains(to_page) {
+                    continue;
+                }
+                if to_phase > from_phase {
+                    let _ = writeln!(
+                        out.entry(from_page.clone()).or_default(),
+                        "{from} imports {to}, which belongs to later phase {} (page `{to_page}`). \
+                         Earlier phases may not import files from later phases.",
+                        to_phase + 1
+                    );
                     continue;
                 }
                 let _ = writeln!(
@@ -521,6 +526,27 @@ mod tests {
         let unpassed_violations = graph.cross_page_imports(&owners, &plan, &BTreeSet::new());
         assert!(unpassed_violations.contains_key("formatter"), "{unpassed_violations:?}");
         assert!(unpassed_violations.contains_key("sibling-a"));
+    }
+
+    #[test]
+    fn rejects_earlier_phase_importing_later_phase() {
+        let src = sources(&[
+            ("pkg/early.py", "from pkg.late import helper\n"),
+            ("pkg/late.py", "def helper(): return 1\n"),
+        ]);
+        let plan = Plan {
+            pages: vec![
+                PagePlan { id: "early".into(), owned_glob: "pkg/early.py".into(), phase: 0, ..Default::default() },
+                PagePlan { id: "late".into(), owned_glob: "pkg/late.py".into(), phase: 1, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let owners = Owners::from_plan(&plan).unwrap();
+        let graph = ImportGraph::build(&src, "");
+        let passed: BTreeSet<PageId> = ["early".into(), "late".into()].into_iter().collect();
+        let violations = graph.cross_page_imports(&owners, &plan, &passed);
+        assert!(violations.contains_key("early"), "expected backwards phase import to be rejected: {violations:?}");
+        assert!(violations["early"].contains("later phase 2"), "{}", violations["early"]);
     }
 
     #[test]

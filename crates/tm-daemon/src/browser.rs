@@ -579,13 +579,14 @@ impl Extension for PageBrowsers {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if !TOOL_NAMES.contains(&name) {
+        let canonical = crate::code::strip_dict_prefix(name);
+        if !TOOL_NAMES.contains(&canonical) {
             return None;
         }
         let Some(site) = self.site(&grant.page) else {
             return Some(error("there is no preview for this agent".into()));
         };
-        Some(match self.run(&site, name, args).await {
+        Some(match self.run(&site, canonical, args).await {
             Ok(value) => value,
             Err(err) => error(format!("{err:#}")),
         })

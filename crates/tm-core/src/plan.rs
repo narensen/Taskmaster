@@ -318,6 +318,11 @@ pub fn normalize_plan(plan: &mut Plan, drafts: &mut Vec<DraftEntry>) -> Vec<Stri
         if path != contract.path && !path.is_empty() {
             contract.path = path;
         }
+        let inferred = effective_contract_phase(contract, &plan.phases);
+        if contract.phase == 0 && inferred > 0 {
+            notes.push(format!("tagged contract `{}` for phase {}", contract.path, inferred + 1));
+            contract.phase = inferred;
+        }
     }
     // One unit owns everything: a contract inside its files has nobody to share with, so it
     // becomes the starting interface in that unit's brief instead of a locked file.
@@ -352,6 +357,81 @@ pub fn normalize_plan(plan: &mut Plan, drafts: &mut Vec<DraftEntry>) -> Vec<Stri
     notes
 }
 
+/// Effective phase index (0-indexed) of a contract file in a multi-phase plan.
+/// Keeps explicit `contract.phase` when non-zero; otherwise infers from `phases[].delivers`
+/// (exact path/glob match, or for test contracts, references to later-phase deliverables).
+pub fn effective_contract_phase(contract: &ContractFile, phases: &[crate::types::PhaseSketch]) -> usize {
+    if contract.phase > 0 || phases.len() < 2 {
+        return contract.phase;
+    }
+    let tidy = |p: &str| {
+        let mut s = p.trim();
+        while let Some(rest) = s.strip_prefix("./") {
+            s = rest;
+        }
+        s.trim_start_matches('/').to_string()
+    };
+    let path = tidy(&contract.path);
+    for (idx, sketch) in phases.iter().enumerate() {
+        for deliver in &sketch.delivers {
+            let d = tidy(deliver);
+            if d.is_empty() {
+                continue;
+            }
+            if d == path {
+                return idx;
+            }
+            if d.contains(['*', '?', '[', '{'])
+                && globset::Glob::new(&d).is_ok_and(|g| g.compile_matcher().is_match(&path))
+            {
+                return idx;
+            }
+        }
+    }
+    if contract.is_test() {
+        let mut best = 0usize;
+        for (idx, sketch) in phases.iter().enumerate().skip(1) {
+            for deliver in &sketch.delivers {
+                let d = tidy(deliver);
+                if d.is_empty() || d.contains(['*', '?', '[', '{']) {
+                    continue;
+                }
+                if contract_references_deliverable(&contract.content, &d) {
+                    best = best.max(idx);
+                }
+            }
+        }
+        if best > 0 {
+            return best;
+        }
+    }
+    0
+}
+
+fn contract_references_deliverable(content: &str, deliver: &str) -> bool {
+    if content.contains(deliver) {
+        return true;
+    }
+    if let Some(stem) = deliver.strip_suffix(".py") {
+        let dotted = stem.replace('/', ".");
+        if !dotted.is_empty() && content.contains(&dotted) {
+            return true;
+        }
+        if let Some(pkg) = stem.strip_suffix("/__main__") {
+            let pkg_mod = pkg.replace('/', ".");
+            if content.contains(&format!("-m {pkg_mod}"))
+                || content.contains(&format!("\"-m\", \"{pkg_mod}\""))
+                || content.contains(&format!("'-m', '{pkg_mod}'"))
+                || content.contains(&format!("\"-m\", '{pkg_mod}'"))
+                || content.contains(&format!("'-m', \"{pkg_mod}\""))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A relative path that cannot climb out of the project. Globs such as `app/home/**` pass.
 fn safe_rel(path: &str) -> bool {
     let path = Path::new(path);
@@ -376,7 +456,7 @@ mod tests {
     fn plan(cites: &[&str]) -> Plan {
         Plan {
             kind: Default::default(),
-            contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into() }],
+            contracts: vec![ContractFile { path: "contracts/types.ts".into(), content: "export type Id = string;\n".into(), phase: 0 }],
             pages: vec![PagePlan {
                 id: "home".into(),
                 route: "/home".into(),
@@ -415,7 +495,7 @@ mod tests {
             brief: "  ".into(),
             ..Default::default()
         });
-        broken.contracts.push(ContractFile { path: "contracts/types.ts".into(), content: " \n".into() });
+        broken.contracts.push(ContractFile { path: "contracts/types.ts".into(), content: " \n".into(), phase: 0 });
         broken.estimate.usd = -1.0;
         let errors = check_plan(
             &broken,
@@ -448,7 +528,7 @@ mod tests {
     fn a_library_plan_needs_no_routes_and_no_design() {
         let plan = Plan {
             kind: ProjectKind::Library,
-            contracts: vec![ContractFile { path: "tinydb/api.py".into(), content: "def insert(doc: dict) -> int: ...\n".into() }],
+            contracts: vec![ContractFile { path: "tinydb/api.py".into(), content: "def insert(doc: dict) -> int: ...\n".into(), phase: 0 }],
             pages: vec![module("engine", "tinydb/engine.py"), module("readme", "README.md")],
             ..Default::default()
         };
@@ -496,8 +576,8 @@ mod tests {
         let plan = Plan {
             kind: ProjectKind::Library,
             contracts: vec![
-                ContractFile { path: "src/models.py".into(), content: "class Model: ...\n".into() },
-                ContractFile { path: "contracts/big.py".into(), content: long },
+                ContractFile { path: "src/models.py".into(), content: "class Model: ...\n".into(), phase: 0 },
+                ContractFile { path: "contracts/big.py".into(), content: long, phase: 0 },
             ],
             pages: vec![module("models", "src/models.py"), module("api", "src/api/**")],
             ..Default::default()
@@ -510,7 +590,7 @@ mod tests {
         // With a single unit the contract becomes that unit's starting interface instead.
         let mut single = Plan {
             kind: ProjectKind::Library,
-            contracts: vec![ContractFile { path: "src/models.py".into(), content: "class Model: ...\n".into() }],
+            contracts: vec![ContractFile { path: "src/models.py".into(), content: "class Model: ...\n".into(), phase: 0 }],
             pages: vec![module("models", "src/**")],
             ..Default::default()
         };
@@ -531,8 +611,8 @@ mod tests {
         let broken = Plan {
             kind: ProjectKind::Library,
             contracts: vec![
-                ContractFile { path: "../x.py".into(), content: " ".into() },
-                ContractFile { path: "lib/a.py".into(), content: "x\n".repeat(PLAN_CONTRACT_LINES + 1) },
+                ContractFile { path: "../x.py".into(), content: " ".into(), phase: 0 },
+                ContractFile { path: "lib/a.py".into(), content: "x\n".repeat(PLAN_CONTRACT_LINES + 1), phase: 0 },
             ],
             pages: vec![
                 PagePlan { id: "a b".into(), route: "/a".into(), owned_glob: "".into(), brief: " ".into(), cites: vec!["nope".into()], ..Default::default() },

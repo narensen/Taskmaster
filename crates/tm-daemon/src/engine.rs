@@ -1895,7 +1895,8 @@ impl Driver {
              `kind` says what is being built: web, library, cli, server or migration. \
              `contracts` are shared interface files that more than one unit relies on, locked before any unit starts. \
              Where units must agree on behaviour, not only types, add a small executable contract test among them, named so the project's test runner finds it \
-             (`tests/contract/cart.test.ts`, `tests/test_cart_contract.py`): it imports the units it checks and is every worker's acceptance check from its first turn. \
+             (`tests/contract/cart.test.ts`, `tests/test_cart_contract.py`): it imports the units it checks and is every worker's primary acceptance check from its first turn. \
+             Keep per-module unit tests concise (~100-150 lines per module) focused on module behavior and key edge cases rather than duplicating the locked acceptance test. \
              `units` are the parallel worker assignments; each owns one disjoint glob and may set `difficulty` (`\"easy\"`, `\"normal\"`, or `\"hard\"`) to route easy boilerplate at low effort and hard core modules straight to the stronger mid tier. \
              `dictionary` holds new entries those units cite; an entry's `kind` is schema, routes, component_api, pattern, or hint. \
              Every unit, and every part of one, is one worker agent: its `brief` is its task, `context` is the self-contained architectural/integration context it needs (shared interfaces, DOM ids, symbols, conventions, sibling boundaries), and `done` is one line \
@@ -5371,8 +5372,9 @@ impl Driver {
             .collect();
         if !tests.is_empty() {
             out.push_str(&format!(
-                "\nThe locked contract tests {} are the acceptance check for every unit: they say what the code must do. \
-                 Make the ones that reach your files pass. Never edit them, and never weaken what they check.\n",
+                "\nThe locked contract tests {} are the acceptance check for every unit (the main end-to-end check): they say what the code must do. \
+                 Make the ones that reach your files pass. Never edit them, and never weaken what they check. \
+                 Keep your own per-module unit tests concise (~100-150 lines per module, focused on core behavior and key edge cases—do not duplicate the locked acceptance suite or write exhaustive matrices).\n",
                 tests.join(", ")
             ));
         }
@@ -5858,7 +5860,10 @@ impl Driver {
         } else {
             steps.push(format!("write your files for `{}`", page.id));
             if !self.plan().is_ok_and(|p| p.is_ui(page)) {
-                steps.push("write tests for them, beside the project's other tests, unless another unit owns the tests".into());
+                steps.push(
+                    "write concise unit tests (~100-150 lines per module covering core behavior and key edge cases, without duplicating locked acceptance tests), beside the project's other tests, unless another unit owns the tests"
+                        .into(),
+                );
             }
         }
         if can_run {

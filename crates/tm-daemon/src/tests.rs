@@ -11363,3 +11363,64 @@ async fn tok4_single_phase_plan_rejects_oversplit_beyond_parallel_wave_cap() {
     assert_eq!(rep.len(), 1);
     assert!(rep[0].contains("exceeding the single-wave cap of 3"), "got:\n{}", rep[0]);
 }
+
+#[tokio::test]
+async fn tok5_worker_brief_guides_concise_unit_tests_and_keeps_unrestricted_fix_loop() {
+    let tmp = seeded("tok5-concise-tests");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![
+            ContractFile {
+                path: "pkg/contract.py".into(),
+                content: "def add(a: int, b: int) -> int: ...\n".into(),
+                phase: 0,
+            },
+            ContractFile {
+                path: "tests/test_contract.py".into(),
+                content: "from pkg.math import add\ndef test_add(): assert add(1, 2) == 3\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![PagePlan {
+            id: "math".into(),
+            owned_glob: "{pkg/math.py,tests/test_math.py}".into(),
+            brief: "Implement add.".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let seen = Arc::new(Mutex::new(String::new()));
+    struct Capture(Arc<Mutex<String>>);
+    #[async_trait]
+    impl Harness for Capture {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            *self.0.lock().unwrap() = task.brief.clone();
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::create_dir_all(task.cwd.join("tests"))?;
+            std::fs::write(task.cwd.join("pkg/math.py"), "def add(a: int, b: int) -> int:\n    return a + b\n")?;
+            std::fs::write(task.cwd.join("tests/test_math.py"), "from pkg.math import add\ndef test_zero(): assert add(0, 0) == 0\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:math\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+    let h: Arc<dyn Harness> = Arc::new(Capture(seen.clone()));
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let brief = seen.lock().unwrap().clone();
+    assert!(brief.contains("are the acceptance check for every unit (the main end-to-end check)"), "missing acceptance check guidance:\n{brief}");
+    assert!(brief.contains("~100-150 lines per module"), "missing concise unit-test target:\n{brief}");
+    assert!(brief.contains("fix what fails until they pass"), "must not hard-cap test retries:\n{brief}");
+}

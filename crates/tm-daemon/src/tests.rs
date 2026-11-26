@@ -1495,6 +1495,8 @@ fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
         page: Some("a".into()),
         harness: "grok-build".into(),
         model: None,
+        model_requested: None,
+        model_used: None,
         input: 1000,
         output: 100,
         cache_read: 0,
@@ -6508,6 +6510,8 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     role: tm_core::Role::Worker,
                     harness: "claude".into(),
                     model: Some("claude-sonnet".into()),
+                    model_requested: None,
+                    model_used: None,
                     page: Some(format!("p{i}")),
                     ok: true,
                     input: 100,
@@ -6537,6 +6541,8 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     role: tm_core::Role::Worker,
                     harness: "codex".into(),
                     model: Some("gpt-5".into()),
+                    model_requested: None,
+                    model_used: None,
                     page: Some(format!("q{i}")),
                     ok: true,
                     input: 200,
@@ -12938,4 +12944,243 @@ def test_cli_add_column():
         contract_test,
         "locked contract test must stay unmodified"
     );
+}
+
+#[tokio::test]
+async fn fix_n8_logs_model_requested_and_model_used_in_ledger_and_agents_jsonl() {
+    let tmp = seeded("n8-model-logging");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan {
+                id: "easy_u".into(),
+                owned_glob: "pkg/easy.py".into(),
+                brief: "Easy module.".into(),
+                difficulty: Some("easy".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "norm_u".into(),
+                owned_glob: "pkg/norm.py".into(),
+                brief: "Normal module.".into(),
+                difficulty: Some("normal".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "fallback_u".into(),
+                owned_glob: "pkg/fallback.py".into(),
+                brief: "Fallback module.".into(),
+                difficulty: Some("normal".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct WarmModelSession {
+        cwd: PathBuf,
+        model_used: String,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmModelSession {
+        async fn follow_up(
+            &mut self,
+            _text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            let _ = std::fs::remove_file(self.cwd.join("pkg/unowned.py"));
+            std::fs::create_dir_all(self.cwd.join("pkg"))?;
+            std::fs::write(self.cwd.join("pkg/easy.py"), "EASY = 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:easy_u\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some("sess-easy-warm")
+        }
+        fn model_used(&self) -> Option<&str> {
+            Some(&self.model_used)
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct ModelLoggingFake {
+        fail_easy_once: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for ModelLoggingFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let requested = task.model.clone();
+            let catalog = vec![
+                "gemini-4-hydrogen-low".to_string(),
+                "gemini-4-hydrogen-medium".to_string(),
+                "gemini-4-hydrogen-high".to_string(),
+            ];
+            let used = if unit == "fallback_u" {
+                // Simulate live server rejecting `-medium` and falling back to requested `-high`.
+                requested.clone().unwrap_or_else(|| "gemini-4-hydrogen-high".into())
+            } else if let Some(req) = requested.as_deref() {
+                tm_harness::acp::resolve_antigravity_model(req, task.effort.as_deref(), &catalog)
+            } else {
+                "gemini-4-hydrogen-high".into()
+            };
+            let _ = events.send(HarnessEvent::SessionStarted { session_id: format!("sess-{unit}") }).await;
+            let _ = events
+                .send(HarnessEvent::ModelSelected { requested: requested.clone(), used: used.clone() })
+                .await;
+            if let Err(err) = std::fs::create_dir_all(task.cwd.join("pkg")) {
+                return (Err(err.into()), None);
+            }
+            let mut kept: Option<Box<dyn tm_harness::Session>> = None;
+            let write_res = match unit.as_str() {
+                "easy_u" => {
+                    if self.fail_easy_once.swap(false, Ordering::SeqCst) {
+                        kept = Some(Box::new(WarmModelSession { cwd: task.cwd.clone(), model_used: used.clone() }));
+                        // Write outside owned_glob on turn 1 to force a warm follow_up turn on the same session.
+                        std::fs::write(task.cwd.join("pkg/unowned.py"), "BAD = 1\n")
+                    } else {
+                        std::fs::write(task.cwd.join("pkg/easy.py"), "EASY = 1\n")
+                    }
+                }
+                "norm_u" => std::fs::write(task.cwd.join("pkg/norm.py"), "NORM = 1\n"),
+                "fallback_u" => std::fs::write(task.cwd.join("pkg/fallback.py"), "FB = 1\n"),
+                _ => Ok(()),
+            };
+            if let Err(err) = write_res {
+                return (Err(err.into()), None);
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                kept,
+            )
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(ModelLoggingFake {
+        fail_easy_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n8-fix5".into();
+    cfg.models.worker = Some("gemini-4-hydrogen-high".into());
+    cfg.models.mid = Some("gemini-4-hydrogen-high".into());
+    cfg.models.master = Some("gemini-4-hydrogen-high".into());
+    cfg.effort_routing = true;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let run_dir = tmp.0.join(".taskmaster/runs/n8-fix5");
+    let ledger: Vec<tm_core::LedgerEntry> = read(&run_dir.join("ledger.jsonl"))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let by_page = |page: &str| -> Vec<&tm_core::LedgerEntry> {
+        ledger.iter().filter(|e| e.page.as_deref() == Some(page)).collect()
+    };
+
+    let easy_rows = by_page("easy_u");
+    assert_eq!(easy_rows.len(), 2, "expected initial build + warm follow-up for easy_u: {easy_rows:#?}");
+    for row in &easy_rows {
+        assert_eq!(row.model_requested.as_deref(), Some("gemini-4-hydrogen-high"));
+        assert_eq!(row.model_used.as_deref(), Some("gemini-4-hydrogen-low"));
+        assert_eq!(row.model.as_deref(), Some("gemini-4-hydrogen-low"));
+    }
+
+    let norm_rows = by_page("norm_u");
+    assert_eq!(norm_rows.len(), 1);
+    assert_eq!(norm_rows[0].model_requested.as_deref(), Some("gemini-4-hydrogen-high"));
+    assert_eq!(norm_rows[0].model_used.as_deref(), Some("gemini-4-hydrogen-medium"));
+    assert_eq!(norm_rows[0].model.as_deref(), Some("gemini-4-hydrogen-medium"));
+
+    let fb_rows = by_page("fallback_u");
+    assert_eq!(fb_rows.len(), 1);
+    assert_eq!(fb_rows[0].model_requested.as_deref(), Some("gemini-4-hydrogen-high"));
+    assert_eq!(fb_rows[0].model_used.as_deref(), Some("gemini-4-hydrogen-high"));
+    assert_eq!(fb_rows[0].model.as_deref(), Some("gemini-4-hydrogen-high"));
+
+    let agents: Vec<serde_json::Value> = read(&run_dir.join("agents.jsonl"))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let ends_for = |agent_id: &str| -> Vec<&serde_json::Value> {
+        agents
+            .iter()
+            .filter(|e| e["kind"] == "end" && e["agent"]["id"] == agent_id)
+            .collect()
+    };
+    let starts_for = |agent_id: &str| -> Vec<&serde_json::Value> {
+        agents
+            .iter()
+            .filter(|e| e["kind"] == "start" && e["agent"]["id"] == agent_id)
+            .collect()
+    };
+    let models_for = |agent_id: &str| -> Vec<&serde_json::Value> {
+        agents
+            .iter()
+            .filter(|e| e["kind"] == "model" && e["agent"]["id"] == agent_id)
+            .collect()
+    };
+
+    // easy_u: initial start has model_requested + effort; warm follow_up start also carries model_used;
+    // model event and both end events confirm gemini-4-hydrogen-low.
+    let easy_starts = starts_for("unit:easy_u");
+    assert_eq!(easy_starts.len(), 2, "{easy_starts:#?}");
+    assert_eq!(easy_starts[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(easy_starts[0]["effort"], "low");
+    assert_eq!(easy_starts[1]["follow_up"], true);
+    assert_eq!(easy_starts[1]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(easy_starts[1]["model_used"], "gemini-4-hydrogen-low");
+    let easy_models = models_for("unit:easy_u");
+    assert_eq!(easy_models.len(), 1);
+    assert_eq!(easy_models[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(easy_models[0]["model_used"], "gemini-4-hydrogen-low");
+    let easy_ends = ends_for("unit:easy_u");
+    assert_eq!(easy_ends.len(), 2);
+    assert!(easy_ends.iter().all(|e| {
+        e["model_requested"] == "gemini-4-hydrogen-high" && e["model_used"] == "gemini-4-hydrogen-low"
+    }), "{easy_ends:#?}");
+
+    // norm_u: start has model_requested + effort="medium"; model + end confirm gemini-4-hydrogen-medium.
+    let norm_starts = starts_for("unit:norm_u");
+    assert_eq!(norm_starts[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(norm_starts[0]["effort"], "medium");
+    let norm_ends = ends_for("unit:norm_u");
+    assert_eq!(norm_ends[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(norm_ends[0]["model_used"], "gemini-4-hydrogen-medium");
+
+    // fallback_u: start requested high with effort="medium"; end confirms fallback gemini-4-hydrogen-high.
+    let fb_ends = ends_for("unit:fallback_u");
+    assert_eq!(fb_ends[0]["model_requested"], "gemini-4-hydrogen-high");
+    assert_eq!(fb_ends[0]["model_used"], "gemini-4-hydrogen-high");
 }

@@ -565,6 +565,9 @@ pub enum HarnessEvent {
     PermissionDecided { tool: String, allowed: bool },
     /// The provider assigned or resumed a session id for this call (H2 / O7).
     SessionStarted { session_id: String },
+    /// The model requested and the effective model actually selected for this call
+    /// (after effort routing, catalog verification, or fallback).
+    ModelSelected { requested: Option<String>, used: String },
     /// Rate-limit / usage window reported by the provider CLI (O4).
     RateLimit(RateLimitReport),
 }
@@ -609,6 +612,11 @@ pub trait Session: Send + Sync {
 
     /// The provider's resumable session id, if this session can be resumed later by id (H2 / O7).
     fn session_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// The effective model id selected for this session, when known.
+    fn model_used(&self) -> Option<&str> {
         None
     }
 

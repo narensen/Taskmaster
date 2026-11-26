@@ -155,6 +155,7 @@ impl Harness for AcpHarness {
         let mut session = self.session(&task, io, gate, events);
         session.next_id = rebuilt.next_id;
         session.id = rebuilt.session.clone();
+        session.model_used = rebuilt.model_used.or_else(|| task.model.clone());
         session.cost = rebuilt.cost;
         session.tools = rebuilt.tools.clone();
         session.denied = rebuilt.denied;
@@ -228,6 +229,7 @@ impl AcpHarness {
             stall: task.stall,
             tools: BTreeSet::new(),
             id: None,
+            model_used: None,
             cost: None,
             requests: 0,
             saw_tool_finish: false,
@@ -293,6 +295,10 @@ impl crate::Session for Kept {
 
     fn session_id(&self) -> Option<&str> {
         self.session.id.as_deref()
+    }
+
+    fn model_used(&self) -> Option<&str> {
+        self.session.model_used.as_deref()
     }
 
     async fn close(mut self: Box<Self>) -> crate::Freed {
@@ -470,6 +476,8 @@ struct Session {
     tools: BTreeSet<String>,
     /// The ACP session, once `session/new` answered.
     id: Option<String>,
+    /// The actual model id selected for this session (after effort routing / catalog check / fallback).
+    model_used: Option<String>,
     /// The session's running cost, from the agent's `usage_update` events, when it sends one.
     cost: Option<f64>,
     /// Model requests / turns observed in the current `session/prompt`.
@@ -507,8 +515,20 @@ impl Session {
 
         if let Some((session_id, prompt)) = resume {
             let load = json!({ "sessionId": session_id, "cwd": task.cwd, "mcpServers": mcp_servers });
-            self.call("session/load", load).await?;
+            let loaded = self.call("session/load", load).await?;
+            let used = loaded["models"]["currentModelId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| task.model.clone());
+            self.model_used = used.clone();
             let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
+            if let Some(used) = used {
+                let _ = self
+                    .events
+                    .send(HarnessEvent::ModelSelected { requested: task.model.clone(), used })
+                    .await;
+            }
             self.id = Some(session_id);
             return self.prompt(prompt).await;
         }
@@ -519,21 +539,31 @@ impl Session {
             session["sessionId"].as_str().context("session/new returned no sessionId")?.to_string();
 
         let avail = available_models(&session);
+        let mut selected_model = session["models"]["currentModelId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         if let Some(requested_model) = &task.model {
             let effective = if self.harness_id == "antigravity" {
                 resolve_antigravity_model(requested_model, task.effort.as_deref(), &avail)
             } else {
                 requested_model.clone()
             };
-            if let Err(err) = self.select_model(&session, &session_id, &effective).await {
-                if effective != *requested_model {
-                    // The effort-mapped variant was rejected by the live server: fall back cleanly
-                    // to the caller's explicit model so `--worker-model` never breaks.
-                    self.select_model(&session, &session_id, requested_model)
-                        .await
-                        .with_context(|| format!("could not select model `{requested_model}` (after effort variant `{effective}` failed: {err})"))?;
-                } else {
-                    return Err(err).with_context(|| format!("could not select model `{requested_model}`"));
+            match self.select_model(&session, &session_id, &effective).await {
+                Ok(()) => {
+                    selected_model = Some(effective);
+                }
+                Err(err) => {
+                    if effective != *requested_model {
+                        // The effort-mapped variant was rejected by the live server: fall back cleanly
+                        // to the caller's explicit model so `--worker-model` never breaks.
+                        self.select_model(&session, &session_id, requested_model)
+                            .await
+                            .with_context(|| format!("could not select model `{requested_model}` (after effort variant `{effective}` failed: {err})"))?;
+                        selected_model = Some(requested_model.clone());
+                    } else {
+                        return Err(err).with_context(|| format!("could not select model `{requested_model}`"));
+                    }
                 }
             }
         } else if self.harness_id == "antigravity"
@@ -553,13 +583,20 @@ impl Session {
                 }
             } else if let Some(current) = session["models"]["currentModelId"].as_str() {
                 let effective = resolve_antigravity_model(current, Some(effort), &avail);
-                if effective != current {
-                    let _ = self.select_model(&session, &session_id, &effective).await;
+                if effective != current && self.select_model(&session, &session_id, &effective).await.is_ok() {
+                    selected_model = Some(effective);
                 }
             }
         }
+        self.model_used = selected_model.clone();
 
         let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
+        if let Some(used) = selected_model {
+            let _ = self
+                .events
+                .send(HarnessEvent::ModelSelected { requested: task.model.clone(), used })
+                .await;
+        }
         self.id = Some(session_id);
         let run_code_tool = match &self.dictionary_prefix {
             Some(prefix) => format!("{prefix}run_code"),
@@ -744,6 +781,7 @@ struct Rebuilt {
     /// The highest request id this side sent; the next request takes the one after.
     next_id: u64,
     session: Option<String>,
+    model_used: Option<String>,
     cost: Option<f64>,
     /// The running cost when the last turn began.
     cost_before: Option<f64>,
@@ -767,6 +805,7 @@ impl Rebuilt {
         use crate::hold::Logged;
         let mut out = Rebuilt::default();
         let mut sent: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut sent_model: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
         for entry in history {
             let (line, ours) = match entry {
                 Logged::In(line) => (line, true),
@@ -781,6 +820,18 @@ impl Rebuilt {
                     sent.insert(id, method.to_string());
                     match method {
                         "session/load" => out.session = msg["params"]["sessionId"].as_str().map(str::to_string),
+                        "session/set_model" => {
+                            if let Some(model) = msg["params"]["modelId"].as_str().filter(|s| !s.is_empty()) {
+                                sent_model.insert(id, model.to_string());
+                            }
+                        }
+                        "session/set_config_option" => {
+                            if msg["params"]["configId"].as_str() == Some("model")
+                                && let Some(model) = msg["params"]["value"].as_str().filter(|s| !s.is_empty())
+                            {
+                                sent_model.insert(id, model.to_string());
+                            }
+                        }
                         "session/prompt" => {
                             out.prompt = Some(id);
                             out.answered = None;
@@ -818,7 +869,22 @@ impl Rebuilt {
                 (false, None) => {
                     let Some(id) = msg["id"].as_u64() else { continue };
                     match sent.get(&id).map(String::as_str) {
-                        Some("session/new") => out.session = msg["result"]["sessionId"].as_str().map(str::to_string),
+                        Some("session/new") => {
+                            out.session = msg["result"]["sessionId"].as_str().map(str::to_string);
+                            if let Some(model) = msg["result"]["models"]["currentModelId"].as_str().filter(|s| !s.is_empty()) {
+                                out.model_used = Some(model.to_string());
+                            }
+                        }
+                        Some("session/load") if msg.get("error").is_none() => {
+                            if let Some(model) = msg["result"]["models"]["currentModelId"].as_str().filter(|s| !s.is_empty()) {
+                                out.model_used = Some(model.to_string());
+                            }
+                        }
+                        Some("session/set_model" | "session/set_config_option") if msg.get("error").is_none() => {
+                            if let Some(model) = sent_model.get(&id) {
+                                out.model_used = Some(model.clone());
+                            }
+                        }
                         Some("session/prompt") if out.prompt == Some(id) => {
                             out.prompt = None;
                             out.answered = Some(msg["result"].clone());
@@ -1889,9 +1955,27 @@ read l; echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
-        let (tx, _rx) = mpsc::channel(8);
-        let summary = harness.run(task, gate, tx).await.unwrap();
-        assert!(summary.ok);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (summary, kept) = harness.run_kept(task, gate, tx).await;
+        assert!(summary.unwrap().ok);
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                HarnessEvent::SessionStarted { session_id: "s".into() },
+                HarnessEvent::ModelSelected {
+                    requested: Some("gemini-4-neon-high".into()),
+                    used: "gemini-4-neon-medium".into(),
+                },
+            ],
+            "routed ACP effort variant must emit ModelSelected with requested + effective model",
+        );
+        let kept = kept.expect("kept session");
+        assert_eq!(kept.model_used(), Some("gemini-4-neon-medium"));
+        let _ = kept.close().await;
         let sent: Value = serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
         let _ = std::fs::remove_file(&capture);
         assert_eq!(sent["method"], "session/set_model");
@@ -1936,9 +2020,24 @@ read l; echo '{{"jsonrpc":"2.0","id":5,"result":{{"stopReason":"end_turn"}}}}'
             hold: None,
         };
         let gate2 = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
-        let (tx2, _rx2) = mpsc::channel(8);
+        let (tx2, mut rx2) = mpsc::channel(8);
         let summary2 = harness2.run(task2, gate2, tx2).await.unwrap();
         assert!(summary2.ok);
+        let mut events2 = Vec::new();
+        while let Some(ev) = rx2.recv().await {
+            events2.push(ev);
+        }
+        assert_eq!(
+            events2,
+            vec![
+                HarnessEvent::SessionStarted { session_id: "s".into() },
+                HarnessEvent::ModelSelected {
+                    requested: Some("gemini-4-neon-high".into()),
+                    used: "gemini-4-neon-high".into(),
+                },
+            ],
+            "fallback to explicit model must report the fallback model in ModelSelected",
+        );
         let log2 = std::fs::read_to_string(&capture2).unwrap();
         let _ = std::fs::remove_file(&capture2);
         let calls: Vec<Value> = log2.lines().map(|l| serde_json::from_str(l).unwrap()).collect();

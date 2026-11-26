@@ -90,7 +90,7 @@ impl Codex {
         resume: Option<&str>,
         events: mpsc::Sender<HarnessEvent>,
         timeout: std::time::Duration,
-    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+    ) -> anyhow::Result<(RunSummary, Option<String>, Option<String>)> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(self.args_with(task, prompt, persist, resume)).current_dir(&task.cwd);
         if let Some(dict) = &task.dictionary {
@@ -99,7 +99,14 @@ impl Codex {
         let (proc, mut io) = crate::child::start(&mut cmd, false, task.hold.as_ref())
             .await
             .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let mut stream = Stream { thread_id: resume.map(str::to_string), emitted: false, requests: 0, saw_tool: false };
+        let mut stream = Stream {
+            thread_id: resume.map(str::to_string),
+            emitted: false,
+            requested_model: task.model.clone(),
+            model_used: None,
+            requests: 0,
+            saw_tool: false,
+        };
         if let Some(id) = resume {
             let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
             stream.emitted = true;
@@ -110,9 +117,9 @@ impl Codex {
         };
         let freed = proc.release().await;
         match result {
-            Ok((mut summary, thread_id)) => {
+            Ok((mut summary, thread_id, model_used)) => {
                 summary.freed = Some(freed);
-                Ok((summary, thread_id))
+                Ok((summary, thread_id, model_used))
             }
             Err(err) => Err(err),
         }
@@ -124,6 +131,8 @@ impl Codex {
 struct Stream {
     thread_id: Option<String>,
     emitted: bool,
+    requested_model: Option<String>,
+    model_used: Option<String>,
     requests: u32,
     saw_tool: bool,
 }
@@ -136,7 +145,7 @@ impl Stream {
         io: &mut crate::child::AgentIo,
         events: &mpsc::Sender<HarnessEvent>,
         stall: Option<std::time::Duration>,
-    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+    ) -> anyhow::Result<(RunSummary, Option<String>, Option<String>)> {
         loop {
             let next = io.next_line();
             let line = match stall {
@@ -150,7 +159,7 @@ impl Stream {
                 break;
             };
             if let Some(end) = self.line(&line, Some(events)).await {
-                return end.map(|summary| (summary, self.thread_id.clone()));
+                return end.map(|summary| (summary, self.thread_id.clone(), self.model_used.clone()));
             }
         }
         bail!("codex exited without completing its turn")
@@ -170,6 +179,15 @@ impl Stream {
                 out.push(HarnessEvent::SessionStarted { session_id: id.to_string() });
                 self.emitted = true;
             }
+        }
+        if let Some(used) = msg["model"].as_str().filter(|s| !s.is_empty())
+            && self.model_used.as_deref() != Some(used)
+        {
+            self.model_used = Some(used.to_string());
+            out.push(HarnessEvent::ModelSelected {
+                requested: self.requested_model.clone(),
+                used: used.to_string(),
+            });
         }
         if (msg.get("rate_limits").is_some() || msg.get("info").and_then(|i| i.get("rate_limits")).is_some() || msg["type"].as_str() == Some("rate_limit"))
             && let Some(report) = crate::parse_rate_limit_value(&msg, "codex-cli")
@@ -214,6 +232,7 @@ struct CodexSession {
     harness: Codex,
     task: WorkerTask,
     thread_id: String,
+    model_used: Option<String>,
     cleaned: bool,
 }
 
@@ -280,15 +299,23 @@ impl crate::Session for CodexSession {
         events: mpsc::Sender<HarnessEvent>,
         timeout: std::time::Duration,
     ) -> anyhow::Result<RunSummary> {
-        let (summary, next_id) = self.harness.execute(&self.task, &text, true, Some(&self.thread_id), events, timeout).await?;
+        let (summary, next_id, model_used) =
+            self.harness.execute(&self.task, &text, true, Some(&self.thread_id), events, timeout).await?;
         if let Some(id) = next_id {
             self.thread_id = id;
+        }
+        if let Some(model) = model_used {
+            self.model_used = Some(model);
         }
         Ok(summary)
     }
 
     fn session_id(&self) -> Option<&str> {
         Some(&self.thread_id)
+    }
+
+    fn model_used(&self) -> Option<&str> {
+        self.model_used.as_deref().or(self.task.model.as_deref())
     }
 
     fn detach(mut self: Box<Self>) -> Option<String> {
@@ -323,17 +350,23 @@ impl Harness for Codex {
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         let prompt = task.framed_brief();
         match self.execute(&task, &prompt, true, None, events, task.timeout).await {
-            Ok((summary, Some(thread_id))) if summary.ok => {
-                let kept: Box<dyn crate::Session> = Box::new(CodexSession { harness: self.clone(), task, thread_id, cleaned: false });
+            Ok((summary, Some(thread_id), model_used)) if summary.ok => {
+                let kept: Box<dyn crate::Session> = Box::new(CodexSession {
+                    harness: self.clone(),
+                    task,
+                    thread_id,
+                    model_used,
+                    cleaned: false,
+                });
                 (Ok(summary), Some(kept))
             }
-            Ok((summary, Some(thread_id))) => {
+            Ok((summary, Some(thread_id), _)) => {
                 if let Some(root) = codex_home() {
                     cleanup_codex_session(&root, &thread_id);
                 }
                 (Ok(summary), None)
             }
-            Ok((summary, None)) => (Ok(summary), None),
+            Ok((summary, None, _)) => (Ok(summary), None),
             Err(err) => (Err(err), None),
         }
     }
@@ -347,13 +380,18 @@ impl Harness for Codex {
         events: mpsc::Sender<HarnessEvent>,
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         match self.execute(&task, &prompt, true, Some(session_id), events, task.timeout).await {
-            Ok((summary, next_id)) if summary.ok => {
+            Ok((summary, next_id, model_used)) if summary.ok => {
                 let id = next_id.unwrap_or_else(|| session_id.to_string());
-                let kept: Box<dyn crate::Session> =
-                    Box::new(CodexSession { harness: self.clone(), task, thread_id: id, cleaned: false });
+                let kept: Box<dyn crate::Session> = Box::new(CodexSession {
+                    harness: self.clone(),
+                    task,
+                    thread_id: id,
+                    model_used,
+                    cleaned: false,
+                });
                 (Ok(summary), Some(kept))
             }
-            Ok((summary, _)) => (Ok(summary), None),
+            Ok((summary, _, _)) => (Ok(summary), None),
             Err(err) => (Err(err), None),
         }
     }
@@ -367,7 +405,10 @@ impl Harness for Codex {
     ) -> (anyhow::Result<RunSummary>, Option<Box<dyn crate::Session>>) {
         // One-way like Claude Code: the read part gives the thread, and the end when the turn
         // finished before this daemon took over.
-        let mut stream = Stream::default();
+        let mut stream = Stream {
+            requested_model: task.model.clone(),
+            ..Default::default()
+        };
         let mut ended = None;
         for line in attached.outputs() {
             if let Some(end) = stream.line(line, None).await {
@@ -376,7 +417,7 @@ impl Harness for Codex {
         }
         let crate::child::Attached { mut io, proc, keep, .. } = attached;
         let result = match ended {
-            Some(end) => end.map(|summary| (summary, stream.thread_id.clone())),
+            Some(end) => end.map(|summary| (summary, stream.thread_id.clone(), stream.model_used.clone())),
             None => match tokio::time::timeout(task.timeout, stream.read(&mut io, &events, task.stall)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("codex timed out after {:?}", task.timeout)),
@@ -385,10 +426,16 @@ impl Harness for Codex {
         drop(io);
         let freed = proc.release().await;
         match result {
-            Ok((mut summary, thread_id)) => {
+            Ok((mut summary, thread_id, model_used)) => {
                 summary.freed = Some(freed);
                 let kept: Option<Box<dyn crate::Session>> = match thread_id {
-                    Some(thread_id) if keep && summary.ok => Some(Box::new(CodexSession { harness: self.clone(), task, thread_id, cleaned: false })),
+                    Some(thread_id) if keep && summary.ok => Some(Box::new(CodexSession {
+                        harness: self.clone(),
+                        task,
+                        thread_id,
+                        model_used,
+                        cleaned: false,
+                    })),
                     Some(thread_id) if keep => {
                         if let Some(root) = codex_home() {
                             cleanup_codex_session(&root, &thread_id);
@@ -410,7 +457,7 @@ impl Harness for Codex {
         events: mpsc::Sender<HarnessEvent>,
     ) -> anyhow::Result<RunSummary> {
         let prompt = task.framed_brief();
-        self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _)| summary)
+        self.execute(&task, &prompt, false, None, events, task.timeout).await.map(|(summary, _, _)| summary)
     }
 }
 

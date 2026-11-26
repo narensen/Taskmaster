@@ -86,23 +86,36 @@ pub async fn small_call(harness: Arc<dyn Harness>, model: Option<String>, scratc
     let (tx, mut rx) = mpsc::channel::<HarnessEvent>(256);
     let collect = tokio::spawn(async move {
         let mut text = String::new();
+        let mut model_requested: Option<String> = None;
+        let mut model_used: Option<String> = None;
         while let Some(event) = rx.recv().await {
-            if let HarnessEvent::Text { text: chunk } = event {
-                text.push_str(&chunk);
+            match event {
+                HarnessEvent::Text { text: chunk } => text.push_str(&chunk),
+                HarnessEvent::ModelSelected { requested, used } => {
+                    if requested.is_some() {
+                        model_requested = requested;
+                    }
+                    model_used = Some(used);
+                }
+                _ => {}
             }
         }
-        text
+        (text, model_requested, model_used)
     });
     let started = Instant::now();
     let summary = harness.run(task, gate, tx).await;
-    let text = collect.await.unwrap_or_default();
+    let (text, collected_requested, collected_used) = collect.await.unwrap_or_default();
     let Ok(summary) = summary else { return (None, None) };
+    let model_requested = collected_requested.or_else(|| model.clone());
+    let model_used = collected_used.or_else(|| model.clone());
     let entry = LedgerEntry {
         at: crate::time::rfc3339_now(),
         role: Role::Master,
         page: None,
         harness: harness.id().to_string(),
-        model,
+        model: model_used.clone().or_else(|| model_requested.clone()),
+        model_requested,
+        model_used,
         input: summary.usage.input,
         output: summary.usage.output,
         cache_read: summary.usage.cache_read,

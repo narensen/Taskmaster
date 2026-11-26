@@ -1745,6 +1745,8 @@ impl WebTools {
             page: matches!(role, WebRole::Worker).then(|| grant.page.clone()),
             harness: "web-access".into(),
             model: Some(format!("{tool}:{}", self.provider.name())),
+            model_requested: None,
+            model_used: None,
             input: 0,
             output: 0,
             cache_read: 0,

@@ -54,6 +54,10 @@ struct Answer {
     mcp_calls: u32,
     /// Total reply bytes returned by daemon-served MCP tools in this call.
     mcp_reply_bytes: u64,
+    /// Model id requested before effort routing or fallback.
+    model_requested: Option<String>,
+    /// Actual model id selected and used by the harness.
+    model_used: Option<String>,
 }
 
 /// Who a call is charged to in the ledger.
@@ -6974,8 +6978,19 @@ impl Driver {
 
     /// Record one agent call in the run's ledger.
     fn charge(&self, bill: &Bill, answer: &Answer) -> anyhow::Result<()> {
-        // A harness that reports no price is priced from the table, by model, then harness.
-        let table = [bill.model.as_deref(), Some(bill.harness.as_str())].into_iter().flatten().find_map(|key| self.config.prices.get(key).copied());
+        let model_requested = answer.model_requested.clone().or_else(|| bill.model.clone());
+        let model_used = answer.model_used.clone().or_else(|| bill.model.clone());
+        let effective_model = model_used.clone().or_else(|| model_requested.clone());
+        // A harness that reports no price is priced from the table, by actual model used,
+        // then requested model, then harness.
+        let table = [
+            model_used.as_deref(),
+            model_requested.as_deref(),
+            Some(bill.harness.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|key| self.config.prices.get(key).copied());
         let (cost_usd, priced_by) = match (answer.cost_usd, table) {
             (Some(cost), _) => (Some(cost), Some("provider".to_string())),
             (None, Some(prices)) => (Some(prices.cost(answer.usage.input, answer.usage.output, answer.usage.cache_read)), Some("prices".to_string())),
@@ -6986,7 +7001,9 @@ impl Driver {
             role: bill.role,
             page: bill.page.clone(),
             harness: bill.harness.clone(),
-            model: bill.model.clone(),
+            model: effective_model,
+            model_requested,
+            model_used,
             input: answer.usage.input,
             output: answer.usage.output,
             cache_read: answer.usage.cache_read,
@@ -8734,6 +8751,8 @@ struct CollectedEvents {
     text: String,
     refused: Vec<String>,
     session_id: Option<String>,
+    model_requested: Option<String>,
+    model_used: Option<String>,
     tool_calls: u32,
     inferred_requests: u32,
 }
@@ -8765,6 +8784,8 @@ fn collect_events_full(
         let mut asked: HashMap<String, String> = HashMap::new();
         let mut refused: Vec<String> = Vec::new();
         let mut session_id: Option<String> = None;
+        let mut model_requested: Option<String> = None;
+        let mut model_used: Option<String> = None;
         let mut tool_calls = 0u32;
         let mut inferred_requests = 0u32;
         let mut saw_tool_result = false;
@@ -8817,6 +8838,12 @@ fn collect_events_full(
                 }
                 HarnessEvent::SessionStarted { session_id: sid } if !sid.is_empty() => {
                     session_id = Some(sid.clone());
+                }
+                HarnessEvent::ModelSelected { requested, used } if !used.is_empty() => {
+                    if let Some(req) = requested.as_ref().filter(|s| !s.is_empty()) {
+                        model_requested = Some(req.clone());
+                    }
+                    model_used = Some(used.clone());
                 }
                 _ => {}
             }
@@ -8886,6 +8913,14 @@ fn collect_events_full(
                         live.push(run, agent, "session", serde_json::json!({ "session_id": sid }));
                     }
                     HarnessEvent::SessionStarted { .. } => {}
+                    HarnessEvent::ModelSelected { requested, used } if !used.is_empty() => {
+                        let mut fields = serde_json::json!({ "model_used": used });
+                        if let Some(req) = requested.as_ref().filter(|s| !s.is_empty()) {
+                            fields["model_requested"] = serde_json::json!(req);
+                        }
+                        live.push(run, agent, "model", fields);
+                    }
+                    HarnessEvent::ModelSelected { .. } => {}
                     HarnessEvent::RateLimit(report) => {
                         let provider = agent.get("harness").and_then(|v| v.as_str()).unwrap_or("");
                         if !provider.is_empty() {
@@ -8900,7 +8935,7 @@ fn collect_events_full(
                 }
         }
         flush(&mut merging);
-        CollectedEvents { text, refused, session_id, tool_calls, inferred_requests }
+        CollectedEvents { text, refused, session_id, model_requested, model_used, tool_calls, inferred_requests }
     })
 }
 
@@ -9136,6 +9171,7 @@ async fn follow(
     reused_wave: bool,
 ) -> anyhow::Result<Answer> {
     session.rebind_gate(gate_for(&request));
+    let session_model = session.model_used().map(str::to_string);
     if let Some(feed) = &request.feed {
         let mut start = serde_json::json!({ "brief": prompt, "follow_up": true });
         if reused_wave {
@@ -9144,6 +9180,7 @@ async fn follow(
         if let Some(sid) = session.session_id() {
             start["session_id"] = serde_json::json!(sid);
         }
+        apply_start_model_fields(&mut start, &request, session_model.as_deref());
         feed.live.push(&feed.run, &feed.agent, "start", start);
     }
     let (tx, rx) = mpsc::channel(256);
@@ -9159,6 +9196,12 @@ async fn follow(
     let collected = collect.await.unwrap_or_default();
     let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
+    let model_requested = collected.model_requested.or_else(|| request.model.clone());
+    let model_used = collected
+        .model_used
+        .or_else(|| session.model_used().map(str::to_string))
+        .or(session_model)
+        .or_else(|| request.model.clone());
     let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(request.feed.as_ref());
     let requests = run
         .as_ref()
@@ -9173,6 +9216,7 @@ async fn follow(
         if let Some(sid) = &final_sid {
             end["session_id"] = serde_json::json!(sid);
         }
+        apply_end_model_fields(&mut end, model_requested.as_deref(), model_used.as_deref(), request.effort.as_deref());
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         apply_run_end_fields(&mut end, &run, &refused);
         feed.live.push(&feed.run, &feed.agent, "end", end);
@@ -9217,11 +9261,42 @@ async fn follow(
         requests,
         mcp_calls,
         mcp_reply_bytes,
+        model_requested,
+        model_used,
     })
 }
 
 fn take_feed_mcp_stats(feed: Option<&Feed>) -> (u32, u64) {
     feed.and_then(|f| f.agent["call"].as_u64().map(|call| f.live.take_mcp_stats(call))).unwrap_or((0, 0))
+}
+
+fn apply_start_model_fields(start: &mut serde_json::Value, request: &AgentRequest, known_used: Option<&str>) {
+    if let Some(req) = request.model.as_deref().filter(|s| !s.is_empty()) {
+        start["model_requested"] = serde_json::json!(req);
+    }
+    if let Some(used) = known_used.filter(|s| !s.is_empty()) {
+        start["model_used"] = serde_json::json!(used);
+    }
+    if let Some(effort) = request.effort.as_deref().filter(|s| !s.is_empty()) {
+        start["effort"] = serde_json::json!(effort);
+    }
+}
+
+fn apply_end_model_fields(
+    end: &mut serde_json::Value,
+    model_requested: Option<&str>,
+    model_used: Option<&str>,
+    effort: Option<&str>,
+) {
+    if let Some(req) = model_requested.filter(|s| !s.is_empty()) {
+        end["model_requested"] = serde_json::json!(req);
+    }
+    if let Some(used) = model_used.filter(|s| !s.is_empty()) {
+        end["model_used"] = serde_json::json!(used);
+    }
+    if let Some(effort) = effort.filter(|s| !s.is_empty()) {
+        end["effort"] = serde_json::json!(effort);
+    }
 }
 
 fn apply_end_metrics(end: &mut serde_json::Value, requests: Option<u32>, tool_calls: u32, mcp_calls: u32, mcp_reply_bytes: u64) {
@@ -9266,12 +9341,9 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
     let gate = gate_for(&request);
     let task = request.to_worker_task();
     if let Some(feed) = &request.feed {
-        feed.live.push(
-            &feed.run,
-            &feed.agent,
-            "start",
-            serde_json::json!({ "brief": prompt, "session_id": session_id, "resumed": true }),
-        );
+        let mut start = serde_json::json!({ "brief": prompt, "session_id": session_id, "resumed": true });
+        apply_start_model_fields(&mut start, &request, None);
+        feed.live.push(&feed.run, &feed.agent, "start", start);
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = request.feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
@@ -9288,6 +9360,11 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
     let final_sid = captured_sid
         .or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)))
         .unwrap_or(session_id);
+    let model_requested = collected.model_requested.or_else(|| request.model.clone());
+    let model_used = collected
+        .model_used
+        .or_else(|| kept.as_ref().and_then(|s| s.model_used().map(str::to_string)))
+        .or_else(|| request.model.clone());
     let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(request.feed.as_ref());
     let requests = run
         .as_ref()
@@ -9300,6 +9377,7 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
             "session_id": final_sid,
             "resumed": true,
         });
+        apply_end_model_fields(&mut end, model_requested.as_deref(), model_used.as_deref(), request.effort.as_deref());
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         apply_run_end_fields(&mut end, &run, &refused);
         feed.live.push(&feed.run, &feed.agent, "end", end);
@@ -9320,6 +9398,8 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
                 requests,
                 mcp_calls,
                 mcp_reply_bytes,
+                model_requested,
+                model_used,
             })
         }
         Err(err) => {
@@ -9365,6 +9445,11 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
     let collected = collect.await.unwrap_or_default();
     let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let text = format!("{said}{text}");
+    let model_requested = collected.model_requested.or_else(|| request.model.clone());
+    let model_used = collected
+        .model_used
+        .or_else(|| kept.as_ref().and_then(|s| s.model_used().map(str::to_string)))
+        .or_else(|| request.model.clone());
     let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(request.feed.as_ref());
     let requests = run
         .as_ref()
@@ -9376,6 +9461,7 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
         if let Some(sid) = captured_sid.as_ref().or(session_id.as_ref()) {
             end["session_id"] = serde_json::json!(sid);
         }
+        apply_end_model_fields(&mut end, model_requested.as_deref(), model_used.as_deref(), request.effort.as_deref());
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         apply_run_end_fields(&mut end, &run, &refused);
         // A call that could not go on is ended here; the resumed one opens its own block.
@@ -9397,6 +9483,8 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
                 requests,
                 mcp_calls,
                 mcp_reply_bytes,
+                model_requested,
+                model_used,
             })
         }
         Err(err) => {
@@ -9450,7 +9538,9 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let feed = &request.feed;
     if let Some(feed) = &feed {
         // The whole brief: a rejected plan's reasons sit at its end.
-        feed.live.push(&feed.run, &feed.agent, "start", serde_json::json!({ "brief": task.brief }));
+        let mut start = serde_json::json!({ "brief": task.brief });
+        apply_start_model_fields(&mut start, request, None);
+        feed.live.push(&feed.run, &feed.agent, "start", start);
     }
     let (tx, rx) = mpsc::channel(256);
     let tee = feed.as_ref().map(|feed| (feed.live.clone(), feed.run.clone(), feed.agent.clone()));
@@ -9510,6 +9600,11 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
     let collected = collect.await.unwrap_or_default();
     let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let final_sid = captured_sid.or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)));
+    let model_requested = collected.model_requested.or_else(|| request.model.clone());
+    let model_used = collected
+        .model_used
+        .or_else(|| kept.as_ref().and_then(|s| s.model_used().map(str::to_string)))
+        .or_else(|| request.model.clone());
     let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(feed.as_ref());
     let run = run.map_err(|err| match err.downcast::<Overrun>() {
         Ok(over) => {
@@ -9528,6 +9623,7 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         if let Some(sid) = &final_sid {
             end["session_id"] = serde_json::json!(sid);
         }
+        apply_end_model_fields(&mut end, model_requested.as_deref(), model_used.as_deref(), request.effort.as_deref());
         apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         apply_run_end_fields(&mut end, &run, &refused);
         feed.live.push(&feed.run, &feed.agent, "end", end);
@@ -9554,6 +9650,8 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         requests,
         mcp_calls,
         mcp_reply_bytes,
+        model_requested,
+        model_used,
     })
 }
 

@@ -61,6 +61,12 @@ pub struct LedgerEntry {
     pub harness: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// The model id requested for this call (before effort routing, catalog check, or fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_requested: Option<String>,
+    /// The actual model id used for this call (after effort routing, catalog check, or fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
     pub input: u64,
     pub output: u64,
     #[serde(default)]
@@ -630,6 +636,8 @@ mod tests {
             page: None,
             harness: harness.into(),
             model: None,
+            model_requested: None,
+            model_used: None,
             input,
             output,
             cache_read: 0,
@@ -807,14 +815,28 @@ mod tests {
     fn ledger_entry_preserves_instrumentation_fields_and_reads_legacy_rows() {
         let legacy = r#"{"at":"2026-11-26T00:00:00Z","role":"worker","page":"a","harness":"antigravity","input":100,"output":50,"seconds":1.0,"ok":true}"#;
         let parsed: LedgerEntry = serde_json::from_str(legacy).unwrap();
-        assert_eq!((parsed.requests, parsed.mcp_calls, parsed.mcp_reply_bytes), (None, None, None));
+        assert_eq!(
+            (parsed.model_requested, parsed.model_used, parsed.requests, parsed.mcp_calls, parsed.mcp_reply_bytes),
+            (None, None, None, None, None)
+        );
 
         let mut instrumented = entry(Role::Worker, "antigravity", 1200, 400, None);
+        instrumented.model = Some("gemini-4-hydrogen-medium".into());
+        instrumented.model_requested = Some("gemini-4-hydrogen-high".into());
+        instrumented.model_used = Some("gemini-4-hydrogen-medium".into());
         instrumented.requests = Some(4);
         instrumented.mcp_calls = Some(3);
         instrumented.mcp_reply_bytes = Some(2840);
         let json = serde_json::to_string(&instrumented).unwrap();
-        assert!(json.contains("\"requests\":4") && json.contains("\"mcp_calls\":3") && json.contains("\"mcp_reply_bytes\":2840"), "{json}");
+        assert!(
+            json.contains("\"model\":\"gemini-4-hydrogen-medium\"")
+                && json.contains("\"model_requested\":\"gemini-4-hydrogen-high\"")
+                && json.contains("\"model_used\":\"gemini-4-hydrogen-medium\"")
+                && json.contains("\"requests\":4")
+                && json.contains("\"mcp_calls\":3")
+                && json.contains("\"mcp_reply_bytes\":2840"),
+            "{json}"
+        );
         let roundtrip: LedgerEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, instrumented);
     }

@@ -1093,6 +1093,8 @@ impl App {
         config.warm_idle = std::time::Duration::from_secs(saved.agents.warm_idle_secs);
         config.effort_routing = crate::settings::effective_effort_routing(saved.agents.effort_routing);
         config.offline = self.offline || crate::settings::offline_env_enabled();
+        config.brownfield_scout = saved.scout.enabled;
+        config.brownfield_scout_min_files = saved.scout.min_files;
         let policy = crate::policy::Policy::load(&self.project());
         let policy_cap = policy.max_run_cost_usd.filter(|v| v.is_finite() && *v > 0.0);
         let req_or_saved = request

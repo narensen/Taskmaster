@@ -546,6 +546,10 @@ struct Driver {
     started_mono: Instant,
     /// Cached mutation-gate verdicts keyed by `(contract hash, target hash, command)`.
     mutation_cache: BTreeMap<String, crate::gates::MutationVerdict>,
+    /// Ephemeral brownfield scope extracted by the threshold-gated `-low` scout (tb18 #7).
+    brownfield_scope: Option<crate::scout::BrownfieldScope>,
+    /// Deterministically hydrated planner prompt section built from `brownfield_scope` + `.flow`.
+    brownfield_scope_brief: String,
 }
 
 /// Context token guard above which a warm worker session is retired rather than reused for a
@@ -893,6 +897,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         started_wall,
         started_mono,
         mutation_cache,
+        brownfield_scope: None,
+        brownfield_scope_brief: String::new(),
     };
     driver.open_tree(meta.base.as_deref())?;
     driver.flow_tools.set_flow_root(driver.tree.clone());
@@ -1355,6 +1361,10 @@ impl Driver {
             eprintln!("taskmaster: direct fast-path edit (skipped master planning; 1 worker + free checks)");
             return Ok(plan);
         }
+        // Threshold-gated read-only brownfield scope scout: runs after `.flow` build and before
+        // `ask_planner` on repos >= `brownfield_scout_min_files` (default 25). Any error falls
+        // back silently to deterministic `.flow` + Atlas packing.
+        self.run_brownfield_scout(prompt).await;
         let mut full_calls = 0;
         let mut warm_planner: Option<(Box<dyn tm_harness::Session>, Option<PathBuf>)> = None;
         for attempt in 1..=PLAN_ATTEMPTS {
@@ -1447,6 +1457,130 @@ impl Driver {
             }
         }
         bail!("plan is not usable:\n{}", errors.join("\n"))
+    }
+
+    /// Run the cheap, `-low` effort, read-only, offline brownfield scope-scout extractor on repos
+    /// meeting `brownfield_scout_min_files` (default 25). Writes ephemeral `.taskmaster/runs/<id>/scope.json`
+    /// and deterministically hydrates referenced `.flow` node IDs for the planner. Any error,
+    /// timeout, or malformed reply falls back silently to deterministic `.flow` packing.
+    async fn run_brownfield_scout(&mut self, prompt: &str) {
+        if self.small_pass(prompt) || self.quick_edit_pass(prompt) {
+            return;
+        }
+        if self.fresh_project(prompt).unwrap_or(true) {
+            return;
+        }
+        if !crate::scout::should_run(&self.tree, self.config.brownfield_scout, self.config.brownfield_scout_min_files) {
+            return;
+        }
+        if let Some(cached) = crate::scout::load_scope(&self.project, &self.id) {
+            let hydrated = crate::scout::hydrate_for_planner(&self.tree, &cached, crate::scout::SCOUT_HYDRATE_BUDGET);
+            if !hydrated.is_empty() {
+                self.brownfield_scope = Some(cached);
+                self.brownfield_scope_brief = hydrated;
+                return;
+            }
+        }
+        let cwd = match self.planner_dir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                eprintln!("taskmaster: brownfield scope scout skipped ({err:#}); using deterministic .flow packing");
+                return;
+            }
+        };
+        let scratch = cwd != self.tree;
+        let harness = self.harnesses.worker.clone();
+        let brief = crate::scout::scout_brief(&self.tree, prompt, self.code.is_some(), harness.id());
+        // Reuse the strictly-offline verifier grant (`page: "verifier", unit: "scout"`) so web
+        // tools stay disabled while `flow_query` and read-only `run_code` remain available.
+        let scout_token = match fresh_token() {
+            Ok(tok) => tok,
+            Err(err) => {
+                eprintln!("taskmaster: brownfield scope scout skipped ({err:#}); using deterministic .flow packing");
+                return;
+            }
+        };
+        self.mcp.grant(
+            &scout_token,
+            Grant { run: self.id.clone(), page: "verifier".into(), unit: "scout".into() },
+        );
+        self.mcp.set_tool_policy(
+            &scout_token,
+            tm_dictionary::ToolPolicy {
+                dictionary: false,
+                hidden_tools: vec![
+                    "set_status".into(),
+                    "docs".into(),
+                    "advisories".into(),
+                    "web_fetch".into(),
+                    "web_search".into(),
+                ],
+            },
+        );
+        let timeout = if self.config.timeout == Duration::ZERO {
+            Duration::from_secs(crate::scout::SCOUT_TIMEOUT_SECS)
+        } else {
+            self.config.timeout.min(Duration::from_secs(crate::scout::SCOUT_TIMEOUT_SECS))
+        };
+        let mut request = AgentRequest {
+            model: self.config.models.worker.clone(),
+            effort: self.config.effort_routing.then(|| "low".into()),
+            dictionary: Some(self.access(&scout_token)),
+            read_only: true,
+            no_file_reads: false,
+            native_search: false,
+            native_search_cap: None,
+            permission_mode: self.config.permission_mode,
+            commit: Some(Commit {
+                tools: crate::scout::SCOUT_MAX_TOOLS,
+                after: Duration::from_secs(crate::scout::SCOUT_COMMIT_SECS),
+            }),
+            ..AgentRequest::new(harness, cwd.clone(), brief, timeout)
+        };
+        self.offer_code_readonly("verifier/scout", &cwd, &mut request);
+        self.tag(&mut request, "scout", "scout", None, None);
+        let bill = request.bill(Role::Planner, None);
+        let asked = ask_once(&request).await;
+        if let Some(code) = &self.code {
+            code.detach("verifier/scout");
+        }
+        if scratch {
+            self.drop_worktree(&cwd);
+        }
+        let answer = match asked {
+            Ok(ans) => {
+                let _ = self.charge(&bill, &ans);
+                if !ans.ok {
+                    eprintln!("taskmaster: brownfield scope scout did not finish; falling back to deterministic .flow packing");
+                    return;
+                }
+                ans
+            }
+            Err(err) => {
+                eprintln!("taskmaster: brownfield scope scout skipped ({err:#}); falling back to deterministic .flow packing");
+                return;
+            }
+        };
+        match crate::scout::parse_scope(&answer.text) {
+            Ok(scope) => {
+                if let Err(err) = crate::scout::save_scope(&self.project, &self.id, &scope) {
+                    eprintln!("taskmaster: could not write scope.json ({err:#}); continuing");
+                }
+                let hydrated = crate::scout::hydrate_for_planner(&self.tree, &scope, crate::scout::SCOUT_HYDRATE_BUDGET);
+                if !hydrated.is_empty() {
+                    eprintln!(
+                        "taskmaster: brownfield scope scout identified {} modify target(s) and {} interface(s)",
+                        scope.modify_targets.len(),
+                        scope.frozen_interfaces.len()
+                    );
+                    self.brownfield_scope_brief = hydrated;
+                }
+                self.brownfield_scope = Some(scope);
+            }
+            Err(err) => {
+                eprintln!("taskmaster: brownfield scope scout reply unusable ({err:#}); falling back to deterministic .flow packing");
+            }
+        }
     }
 
     /// One full planning call, held to the commit budget. Keeps the session open when supported
@@ -2204,6 +2338,10 @@ impl Driver {
             let atlas_summary = crate::atlas::build_or_load(&self.tree, false).render_for_planner(1_800);
             if !atlas_summary.is_empty() {
                 brief.push_str(&atlas_summary);
+                brief.push('\n');
+            }
+            if !self.brownfield_scope_brief.is_empty() {
+                brief.push_str(&self.brownfield_scope_brief);
                 brief.push('\n');
             }
         }
@@ -6739,6 +6877,13 @@ impl Driver {
             task_text.push('\n');
             task_text.push_str(err);
         }
+        if let Some(scope) = &self.brownfield_scope {
+            let hint = scope.worker_hint_for(owned);
+            if !hint.is_empty() {
+                task_text.push('\n');
+                task_text.push_str(&hint);
+            }
+        }
         let no_deps = split
             .as_ref()
             .map_or(page.depends_on.is_empty(), |u| u.depends_on.is_empty() && page.depends_on.is_empty());
@@ -7154,7 +7299,7 @@ impl Driver {
                     self.web_access.roles.reviewer.search,
                     Some(self.web_access.native_search_max_worker),
                 ),
-                "verifier" | "checker" => (false, None),
+                "verifier" | "checker" | "scout" => (false, None),
                 _ => (
                     self.web_access.roles.worker.search,
                     Some(self.web_access.native_search_max_worker),

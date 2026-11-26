@@ -127,7 +127,7 @@ Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only pla
 Alongside Code Mode, the daemon maintains:
 
 - **Warm LSP pool** — keeps language servers (`typescript-language-server`, `pyright`/`basedpyright`, `rust-analyzer`) warm per run tree for instant `diagnostics`, `outline`, `definition`, and `references`, feeding diagnostics straight back after writes.
-- **Codebase Atlas & context packs** — deterministic repo map and per-unit import-graph context packs keep prompts small and prompt-cache hit rates high.
+- **Codebase Atlas, `.flow` packing & brownfield scope scout** — deterministic `.flow` repo summaries (with exported method signatures and test outlines), relevance-ranked owned-file pre-injection, and a compact Codebase Atlas keep prompts small and prompt-cache hit rates high. On larger brownfield repos (`>= 25` source files, configurable via `scout.enabled` and `scout.min_files`), a cheap, `-low` effort, read-only, offline scope scout writes an ephemeral `.taskmaster/runs/<id>/scope.json` that is deterministically hydrated from `.flow` before planning (falling back silently to deterministic packing on any error).
 - **Difficulty-aware routing & hedging** — easy units run at low effort, hard units can start directly on the Mid tier or race best-of-N within budget, and stalled/repeating repairs escalate immediately.
 
 ## Recursive self-improvement

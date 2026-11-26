@@ -45,6 +45,8 @@ pub struct Settings {
     pub sandbox: SandboxSettings,
     /// Agent internet access, per-role switches, allowlist, budgets, and cache (Phase 1).
     pub web_access: crate::web_access::WebAccessSettings,
+    /// Threshold-gated read-only brownfield LLM scope-scout extractor (tb18 #7).
+    pub scout: ScoutSettings,
     /// Provider usage meter settings (O4). OAuth polling is opt-in and off by default.
     pub usage: UsageSettings,
     /// When the daemon settles finished runs on its own (A8).
@@ -85,6 +87,25 @@ pub struct LabsSettings {
 pub struct UsageSettings {
     /// Opt-in OAuth usage polling. Off by default; CLI-reported rate-limit events are always read.
     pub oauth_polling: bool,
+}
+
+/// Threshold-gated read-only brownfield LLM scope-scout extractor settings (tb18 #7).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScoutSettings {
+    /// Enable the `-low` effort read-only brownfield scout on repos at or above `min_files`.
+    pub enabled: bool,
+    /// Minimum source files required before invoking the LLM scout (smaller repos use deterministic packing).
+    pub min_files: usize,
+}
+
+impl Default for ScoutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_files: crate::scout::DEFAULT_MIN_FILES,
+        }
+    }
 }
 
 /// Prices Taskmaster knows without a settings file: Grok Build's, as the benchmark's grader

@@ -59,6 +59,7 @@ mod resume;
 pub mod race;
 pub mod push;
 pub mod run_index;
+pub mod scout;
 pub mod settling;
 pub mod suggest;
 pub mod retention;
@@ -452,6 +453,10 @@ pub struct Config {
     pub warm_reuse_max_context: u64,
     /// Force offline mode: disables web search, web fetch, and OSV advisories (local `docs()` stays available).
     pub offline: bool,
+    /// Enable the threshold-gated read-only brownfield LLM scope-scout extractor (tb18 #7).
+    pub brownfield_scout: bool,
+    /// Minimum tracked source files required before the brownfield scout runs (default 25).
+    pub brownfield_scout_min_files: usize,
 }
 
 /// How an active run should stop when cancelled.
@@ -537,6 +542,8 @@ impl Config {
             effort_routing: true,
             warm_reuse_max_context: crate::engine::WARM_REUSE_MAX_CONTEXT,
             offline: false,
+            brownfield_scout: true,
+            brownfield_scout_min_files: crate::scout::DEFAULT_MIN_FILES,
         }
     }
 }

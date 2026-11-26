@@ -50,6 +50,10 @@
     "native_search_max_planner": 5,
     "native_search_max_worker": 3
   },
+  "scout": {
+    "enabled": true,
+    "min_files": 25
+  },
   "prices_file": "",
   "prices": {}
 }

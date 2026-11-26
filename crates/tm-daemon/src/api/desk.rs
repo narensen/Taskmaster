@@ -1980,6 +1980,10 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
             "cache_ttl_secs": role_defaults.web_access.cache_ttl_secs,
             "cache_max_mb": role_defaults.web_access.cache_max_mb,
         },
+        "scout": {
+            "enabled": role_defaults.scout.enabled,
+            "min_files": role_defaults.scout.min_files,
+        },
         "editor": *app.editor.lock().unwrap(),
         "approvals": {
             "mode": app.live.approvals.policy().mode.id(),
@@ -1992,7 +1996,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
 }
 
 const SETTING_KEYS: &[&str] = &[
-    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox", "web_access",
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox", "web_access", "scout",
 ];
 
 /// Tokens are not part of an export. Host connections live in another file and stay there.

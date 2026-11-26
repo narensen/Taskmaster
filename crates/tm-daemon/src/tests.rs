@@ -14354,3 +14354,155 @@ async fn tb18_fresh_planner_keeps_dictionary_for_web_fetch_and_verifier_stays_of
         assert!(!c.planner_brief.contains("Research phase"), "offline brief must omit Research phase");
     }
 }
+
+#[tokio::test]
+async fn tb18_brownfield_scout_runs_above_threshold_writes_scope_json_and_falls_back_silently_on_error() {
+    #[derive(Default)]
+    struct Log {
+        calls: Vec<(String, Option<String>, bool, bool, String)>, // (role_tag_guess, effort, read_only, native_search, brief)
+    }
+    struct ScoutAndPlannerHarness {
+        log: Arc<Mutex<Log>>,
+        fail_scout: bool,
+    }
+    #[async_trait]
+    impl Harness for ScoutAndPlannerHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let is_scout = task.brief.contains("brownfield scope scout");
+            {
+                let mut l = self.log.lock().unwrap();
+                l.calls.push((
+                    if is_scout { "scout".into() } else { "planner".into() },
+                    task.effort.clone(),
+                    task.read_only,
+                    task.native_search,
+                    task.brief.clone(),
+                ));
+            }
+            if is_scout {
+                if self.fail_scout {
+                    return Err(anyhow::anyhow!("simulated scout timeout"));
+                }
+                let out = serde_json::json!({
+                    "frozen_interfaces": ["py:pkg/mod_0.py#fn_0"],
+                    "modify_targets": [{ "id": "py:pkg/mod_1.py#fn_1", "note": "add ttl support" }],
+                    "new_files": ["pkg/ttl.py"],
+                    "test_conventions": "pytest under tests/"
+                });
+                let _ = events.send(HarnessEvent::Text { text: out.to_string() }).await;
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.001), denied: 0, freed: None, requests: Some(1) });
+            }
+            let plan = serde_json::json!({
+                "kind": "library",
+                "summary": "Add TTL support",
+                "contracts": [],
+                "units": [{ "id": "mod1", "owned_glob": "pkg/mod_1.py", "brief": "Update fn_1.", "done": "pytest passes" }],
+                "dictionary": []
+            });
+            let _ = events.send(HarnessEvent::Text { text: plan.to_string() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let make_big_repo = |name: &str, count: usize| {
+        let tmp = seeded(name);
+        std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+        for i in 0..count {
+            std::fs::write(
+                tmp.0.join(format!("pkg/mod_{i}.py")),
+                format!("def fn_{i}(x: int) -> int:\n    return x + {i}\n"),
+            )
+            .unwrap();
+        }
+        git_out(&tmp.0, &["add", "."]);
+        git_out(&tmp.0, &["commit", "-q", "-m", "seed brownfield"]);
+        tmp
+    };
+
+    let big_prompt = format!(
+        "Extend the existing pkg/mod_1.py architecture with TTL caching, expiration sweeps, and metrics. {}",
+        "Keep existing public APIs backwards compatible and add thorough unit tests. ".repeat(4)
+    );
+
+    // 1. Above threshold (>= 25 source files): scout runs at `-low` effort, read-only, offline,
+    //    writes ephemeral `.taskmaster/runs/<id>/scope.json`, and hydrates into planner brief.
+    let tmp_big = make_big_repo("tb18-scout-big", 26);
+    let log_big = Arc::new(Mutex::new(Log::default()));
+    let h_big = Arc::new(ScoutAndPlannerHarness { log: log_big.clone(), fail_scout: false });
+    let harnesses_big = Harnesses { master: h_big.clone(), mid: h_big.clone(), worker: h_big.clone(), reviewer: h_big.clone(), verifier: h_big };
+    let mut cfg = Config::new(&tmp_big.0);
+    cfg.run_id = "scout-ok".into();
+    cfg.prompt = Some(big_prompt.clone());
+    cfg.yes = false;
+    cfg.offline = true;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    let out = drive(cfg, harnesses_big).await.unwrap();
+    assert!(matches!(out, Outcome::NeedsApproval { .. }), "{out:?}");
+
+    let calls = log_big.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 2, "expected scout then planner, got: {}", calls.len());
+    assert_eq!(calls[0].0, "scout");
+    assert_eq!(calls[0].1.as_deref(), Some("low"), "scout must run at low effort");
+    assert!(calls[0].2, "scout must be read_only");
+    assert!(!calls[0].3, "scout must be offline (native_search=false)");
+    assert_eq!(calls[1].0, "planner");
+    assert!(calls[1].4.contains("## Brownfield scope brief (scout, hydrated from .flow)"), "{}", calls[1].4);
+    assert!(calls[1].4.contains("py:pkg/mod_1.py#fn_1"), "{}", calls[1].4);
+    assert!(calls[1].4.contains("add ttl support"), "{}", calls[1].4);
+    assert!(crate::scout::scope_path(&tmp_big.0, "scout-ok").is_file(), "ephemeral scope.json must be written");
+
+    // 2. Below threshold (3 files < 25): scout is skipped completely!
+    let tmp_small = make_big_repo("tb18-scout-small", 3);
+    let log_small = Arc::new(Mutex::new(Log::default()));
+    let h_small = Arc::new(ScoutAndPlannerHarness { log: log_small.clone(), fail_scout: false });
+    let harnesses_small = Harnesses { master: h_small.clone(), mid: h_small.clone(), worker: h_small.clone(), reviewer: h_small.clone(), verifier: h_small };
+    let mut cfg_small = Config::new(&tmp_small.0);
+    cfg_small.run_id = "scout-skip".into();
+    cfg_small.prompt = Some(big_prompt.clone());
+    cfg_small.yes = false;
+    cfg_small.offline = true;
+    cfg_small.checks = false;
+    cfg_small.runtime_checks = false;
+    cfg_small.code_mode = false;
+    cfg_small.browser = false;
+    let out_small = drive(cfg_small, harnesses_small).await.unwrap();
+    assert!(matches!(out_small, Outcome::NeedsApproval { .. }), "{out_small:?}");
+    let calls_small = log_small.lock().unwrap().calls.clone();
+    assert_eq!(calls_small.len(), 1, "small repo must skip scout");
+    assert_eq!(calls_small[0].0, "planner");
+    assert!(!crate::scout::scope_path(&tmp_small.0, "scout-skip").exists());
+
+    // 3. Scout error/timeout falls back silently to deterministic `.flow` packing and planning succeeds.
+    let tmp_err = make_big_repo("tb18-scout-err", 26);
+    let log_err = Arc::new(Mutex::new(Log::default()));
+    let h_err = Arc::new(ScoutAndPlannerHarness { log: log_err.clone(), fail_scout: true });
+    let harnesses_err = Harnesses { master: h_err.clone(), mid: h_err.clone(), worker: h_err.clone(), reviewer: h_err.clone(), verifier: h_err };
+    let mut cfg_err = Config::new(&tmp_err.0);
+    cfg_err.run_id = "scout-fallback".into();
+    cfg_err.prompt = Some(big_prompt);
+    cfg_err.yes = false;
+    cfg_err.offline = true;
+    cfg_err.checks = false;
+    cfg_err.runtime_checks = false;
+    cfg_err.code_mode = false;
+    cfg_err.browser = false;
+    let out_err = drive(cfg_err, harnesses_err).await.unwrap();
+    assert!(matches!(out_err, Outcome::NeedsApproval { .. }), "planner must succeed despite scout failure: {out_err:?}");
+    let calls_err = log_err.lock().unwrap().calls.clone();
+    assert_eq!(calls_err.len(), 2);
+    assert_eq!(calls_err[0].0, "scout");
+    assert_eq!(calls_err[1].0, "planner");
+    assert!(calls_err[1].4.contains("## Repository summary (.flow)"), "deterministic summary must still be present");
+    assert!(!calls_err[1].4.contains("## Brownfield scope brief"), "failed scout must not inject partial brief");
+}

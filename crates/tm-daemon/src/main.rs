@@ -288,6 +288,8 @@ async fn run() -> anyhow::Result<Outcome> {
         tm_daemon::settings::effective_effort_routing(settings.agents.effort_routing)
     };
     config.offline = args.offline || tm_daemon::settings::offline_env_enabled();
+    config.brownfield_scout = settings.scout.enabled;
+    config.brownfield_scout_min_files = settings.scout.min_files;
     config.prices = tm_daemon::settings::load_price_table(&settings, &project_root, args.prices.as_deref())?;
     config.remote = settings.remote();
     let phone = if args.pair {

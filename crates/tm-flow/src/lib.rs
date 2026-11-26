@@ -8,6 +8,8 @@
 pub mod env;
 pub mod model;
 pub mod parse;
+pub mod query;
+pub mod render;
 pub mod resolve;
 pub mod store;
 pub mod update;
@@ -18,6 +20,11 @@ pub use model::{
     NodeKind, NodeStatus, PlanSeed, SCHEMA_VERSION, Shard, UnitSeed, body_hash, file_node_id,
     git_blob_sha, is_flow_path, lang_prefix, sig_hash, symbol_node_id, unit_node_id,
 };
+pub use query::{
+    Direction, EdgeView, FindResult, FlowQuery, MAX_QUERY_CHARS, MAX_QUERY_NODES, NeighborsResult,
+    NodeDetail, QueryOutput, SourceSlice, execute_op,
+};
+pub use render::{DEFAULT_UNIT_MAP_BUDGET, REPAIR_UNIT_MAP_BUDGET, is_integrator_unit, unit_map};
 pub use store::FlowDb;
 pub use update::{
     BuildReport, SeedReport, UpdateReport, build, discover_source_files, ensure_fresh,

@@ -211,6 +211,23 @@ fn extract_import_stems(text: &str) -> Vec<String> {
                     stems.push(seg.to_string());
                 }
             }
+        } else if let Some(rest) = t.strip_prefix("from ")
+            && let Some((mod_path, _)) = rest.split_once(" import ")
+        {
+            let mod_path = mod_path.trim().trim_start_matches('.');
+            if let Some(stem) = mod_path.rsplit('.').next().filter(|s| !s.is_empty()) {
+                stems.push(stem.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix("import ")
+            && !t.contains("from ")
+            && !t.contains('{')
+        {
+            for part in rest.split(',') {
+                let mod_path = part.split(" as ").next().unwrap_or("").trim();
+                if let Some(stem) = mod_path.rsplit('.').next().filter(|s| !s.is_empty()) {
+                    stems.push(stem.to_string());
+                }
+            }
         }
     }
     stems
@@ -407,6 +424,94 @@ pub fn build_or_load(project: &Path, force_refresh: bool) -> Atlas {
     atlas
 }
 
+impl Atlas {
+    /// Render a compact (~1.5–2 KB) architectural summary for brownfield planners covering
+    /// languages, conventions, module clusters, import hubs, churn hotspots, and test mapping.
+    pub fn render_for_planner(&self, max_chars: usize) -> String {
+        if self.total_files == 0 || max_chars < 120 {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let langs: Vec<String> = self
+            .languages
+            .iter()
+            .take(5)
+            .map(|l| format!("{} ({}f/{}L)", l.language, l.files, l.lines))
+            .collect();
+        lines.push(format!(
+            "## Codebase Atlas ({} files, {} lines{})",
+            self.total_files,
+            self.total_lines,
+            if langs.is_empty() { String::new() } else { format!("; {}", langs.join(", ")) }
+        ));
+        if !self.conventions.is_empty() {
+            lines.push(format!("Conventions: {}", self.conventions.join(", ")));
+        }
+        if !self.modules.is_empty() {
+            let mods: Vec<String> = self
+                .modules
+                .iter()
+                .take(8)
+                .map(|m| format!("{} ({}f/{}L, {} exp, {} tests)", m.name, m.files, m.lines, m.exports, m.tests))
+                .collect();
+            lines.push(format!("Modules: {}", mods.join("; ")));
+        }
+        if !self.hubs.is_empty() {
+            let hubs: Vec<String> = self
+                .hubs
+                .iter()
+                .take(8)
+                .map(|h| format!("{} ({} in, {} exp, {}L)", h.path, h.imports_in, h.exports, h.lines))
+                .collect();
+            lines.push(format!("Import hubs: {}", hubs.join("; ")));
+        }
+        if !self.hotspots.is_empty() {
+            let hot: Vec<String> = self
+                .hotspots
+                .iter()
+                .take(6)
+                .map(|c| format!("{} ({}x)", c.path, c.touches))
+                .collect();
+            lines.push(format!("Recent hotspots: {}", hot.join(", ")));
+        }
+        if !self.test_map.is_empty() {
+            let tmap: Vec<String> = self
+                .test_map
+                .iter()
+                .take(6)
+                .map(|t| {
+                    let files: Vec<&str> = t.test_files.iter().take(4).map(String::as_str).collect();
+                    let extra = t.test_files.len().saturating_sub(files.len());
+                    if extra > 0 {
+                        format!("{}: {} (+{extra})", t.module, files.join(", "))
+                    } else {
+                        format!("{}: {}", t.module, files.join(", "))
+                    }
+                })
+                .collect();
+            lines.push(format!("Test map: {}", tmap.join("; ")));
+        }
+
+        let mut out = String::new();
+        for line in lines {
+            if out.len() + line.len() + 1 > max_chars {
+                if out.is_empty() {
+                    let mut end = max_chars.saturating_sub(1);
+                    while end > 0 && !line.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    out.push_str(&line[..end]);
+                    out.push('\n');
+                }
+                break;
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +541,41 @@ mod tests {
         assert!(atlas.hubs.iter().any(|h| h.path == "src/auth/session.ts" && h.imports_in >= 1));
         assert!(atlas.test_map.iter().any(|t| t.test_files.iter().any(|f| f.contains("auth.spec.ts"))));
         assert!(atlas.conventions.iter().any(|c| c.contains("Node")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tb18_atlas_render_for_planner_is_compact_and_covers_hubs_and_tests() {
+        let dir = std::env::temp_dir().join(format!("tm-atlas-planner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
+        std::fs::write(
+            dir.join("pkg/storage.py"),
+            "class Storage:\n    pass\ndef open_db(): pass\ndef close_db(): pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkg/cli.py"),
+            "from pkg.storage import Storage, open_db\ndef main(): return open_db()\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("tests/test_storage.py"), "def test_open(): pass\n").unwrap();
+
+        let atlas = build(&dir);
+        let rendered = atlas.render_for_planner(2_000);
+        assert!(rendered.contains("## Codebase Atlas"), "{rendered}");
+        assert!(rendered.contains("Python"), "{rendered}");
+        assert!(rendered.contains("Import hubs:"), "{rendered}");
+        assert!(rendered.contains("pkg/storage.py"), "{rendered}");
+        assert!(rendered.contains("Test map:"), "{rendered}");
+        assert!(rendered.contains("tests/test_storage.py"), "{rendered}");
+        assert!(rendered.len() <= 2_000, "rendered len {} exceeded cap", rendered.len());
+
+        let tight = atlas.render_for_planner(180);
+        assert!(tight.len() <= 180, "tight len {} exceeded 180:\n{tight}", tight.len());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14135,3 +14135,88 @@ fn tb18_code_mode_guide_allows_one_to_two_write_calls_and_targeted_test() {
     assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("1-2 `run_code` calls"));
     assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Never spend a call probing Python/venv"));
 }
+
+#[tokio::test]
+async fn tb18_brownfield_planner_gets_atlas_and_rich_flow_summary() {
+    let tmp = seeded("tb18-brownfield-planner");
+    std::fs::create_dir_all(tmp.0.join("app")).unwrap();
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(
+        tmp.0.join("app/storage.py"),
+        "class RecordStore:\n    def put_item(self, key: str, value: bytes) -> None:\n        pass\n    def get_item(self, key: str) -> bytes:\n        return b''\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("app/api.py"),
+        "from app.storage import RecordStore\n\ndef fetch_record(store: RecordStore, key: str) -> bytes:\n    return store.get_item(key)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_storage.py"),
+        "def test_put_and_get():\n    assert True\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "existing app"]);
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct CapturePlanner {
+        captured: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for CapturePlanner {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.captured.lock().unwrap().push(task.brief.clone());
+            let plan = serde_json::json!({
+                "kind": "library",
+                "summary": "Add TTL support to RecordStore and API",
+                "contracts": [],
+                "units": [
+                    {
+                        "id": "storage",
+                        "owned_glob": "app/storage.py",
+                        "brief": "Add ttl_secs parameter to RecordStore.put_item.",
+                        "done": "pytest passes"
+                    }
+                ],
+                "dictionary": []
+            });
+            let _ = events.send(HarnessEvent::Text { text: plan.to_string() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h = Arc::new(CapturePlanner { captured: captured.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.prompt = Some(
+        "Extend the existing RecordStore architecture across storage, API, and migration paths with per-key TTL expiration, \
+         background compaction, metrics reporting, and backwards-compatible test coverage across existing storage and api suites."
+            .into(),
+    );
+    cfg.yes = false;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    cfg.parallel = 2;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert!(matches!(outcome, Outcome::NeedsApproval { .. }), "{outcome:?}");
+
+    let brief = captured.lock().unwrap().first().cloned().expect("planner brief");
+    assert!(brief.contains("## Repository summary (.flow)"), "{brief}");
+    assert!(brief.contains("put_item(self, key: str, value: bytes)"), "planner brief should include method signatures:\n{brief}");
+    assert!(brief.contains("Existing test files:"), "planner brief should include existing test outline:\n{brief}");
+    assert!(brief.contains("tests/test_storage.py: test_put_and_get"), "{brief}");
+    assert!(brief.contains("## Codebase Atlas"), "brownfield planner brief should include compact Atlas:\n{brief}");
+    assert!(brief.contains("Import hubs:"), "{brief}");
+}

@@ -2185,6 +2185,13 @@ impl Driver {
             brief.push_str(&self.repo_map);
             brief.push('\n');
         }
+        if !self.fresh_project(prompt)? {
+            let atlas_summary = crate::atlas::build_or_load(&self.tree, false).render_for_planner(1_800);
+            if !atlas_summary.is_empty() {
+                brief.push_str(&atlas_summary);
+                brief.push('\n');
+            }
+        }
         brief.push_str(&format!(
             "{look} Cite an existing entry instead of rewriting it. \
              If you include an existing key, its content must match exactly.\n\n\
@@ -6675,7 +6682,10 @@ impl Driver {
         // When a unit edits existing code (brownfield, repairs, or later waves referencing built
         // symbols), also pre-inject node + 1-hop neighbors + callers within the same budget.
         let contract_paths: Vec<String> = contracts.iter().map(|c| c.path.clone()).collect();
-        let budget = if errors.is_some() || tm_flow::is_integrator_unit(&self.tree, page_id) {
+        let has_existing_owned = non_contract_owned.iter().any(|p| self.tree.join(p).is_file());
+        let budget = if has_existing_owned {
+            tm_flow::BROWNFIELD_UNIT_MAP_BUDGET
+        } else if errors.is_some() || tm_flow::is_integrator_unit(&self.tree, page_id) {
             tm_flow::REPAIR_UNIT_MAP_BUDGET
         } else {
             tm_flow::DEFAULT_UNIT_MAP_BUDGET
@@ -6708,7 +6718,11 @@ impl Driver {
             .as_ref()
             .map_or(page.depends_on.is_empty(), |u| u.depends_on.is_empty() && page.depends_on.is_empty());
         let wave1_independent = errors.is_none() && no_deps && owned.is_empty();
-        let pre_cap = (budget * 45) / 100;
+        let pre_cap = if has_existing_owned {
+            (budget * 72) / 100
+        } else {
+            (budget * 45) / 100
+        };
         let preinjected = if wave1_independent {
             // Independent wave-1 units with no depends_on build purely against locked contracts;
             // skip injecting peer symbols that may have landed concurrently and tempt fishing.
@@ -6733,7 +6747,9 @@ impl Driver {
         if !preinjected.is_empty() {
             // If unit_map used less than its cap, allow pre-injection to fill up to the total budget.
             let remaining = budget.saturating_sub(pack.len() + usize::from(!pack.is_empty()));
-            let pre_final = if remaining > pre_cap && preinjected.contains("more symbols") {
+            let pre_final = if remaining > pre_cap + 512
+                && (preinjected.contains("more symbols") || preinjected.contains("... (truncated)"))
+            {
                 tm_flow::preinjected_context(&self.tree, page_id, owned, &task_text, remaining)
                     .unwrap_or(preinjected)
             } else {

@@ -26,8 +26,8 @@ pub use query::{
     execute_batch, execute_op,
 };
 pub use render::{
-    DEFAULT_UNIT_MAP_BUDGET, PLANNER_REPO_SUMMARY_BUDGET, REPAIR_UNIT_MAP_BUDGET,
-    is_integrator_unit, preinjected_context, repo_summary, unit_map,
+    BROWNFIELD_UNIT_MAP_BUDGET, DEFAULT_UNIT_MAP_BUDGET, PLANNER_REPO_SUMMARY_BUDGET,
+    REPAIR_UNIT_MAP_BUDGET, is_integrator_unit, preinjected_context, repo_summary, unit_map,
 };
 pub use store::FlowDb;
 pub use update::{

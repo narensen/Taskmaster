@@ -118,6 +118,43 @@ impl Sandbox {
         out.extend(args.iter().map(OsString::from));
         out
     }
+
+    /// Arguments for `bwrap` to run a read-only probe (such as checking whether a shared venv
+    /// can import `pytest`) under the exact filesystem and env view a worker shell gets:
+    /// `/` read-only, `/tmp` and `$HOME` hidden by empty tmpfs, `TOOL_DIRS` and `readable`
+    /// mounted read-only, and `LEAKY_VARS` cleared.
+    pub fn bwrap_ro_probe_args(
+        &self,
+        binary: &Path,
+        args: &[String],
+        readable: &[PathBuf],
+        env: &[(String, String)],
+    ) -> Vec<OsString> {
+        let mut out: Vec<OsString> = Vec::new();
+        let mut push = |parts: &[&dyn AsRef<std::ffi::OsStr>]| {
+            out.extend(parts.iter().map(|p| p.as_ref().to_os_string()));
+        };
+        push(&[&"--ro-bind", &"/", &"/", &"--dev", &"/dev", &"--proc", &"/proc"]);
+        push(&[&"--tmpfs", &"/tmp", &"--tmpfs", &self.home]);
+        for dir in TOOL_DIRS.iter().map(|d| self.home.join(d)).filter(|d| d.exists()) {
+            push(&[&"--ro-bind", &dir, &dir]);
+        }
+        for dir in readable {
+            if dir.exists() {
+                push(&[&"--ro-bind", dir, dir]);
+            }
+        }
+        for name in LEAKY_VARS {
+            push(&[&"--unsetenv", &name]);
+        }
+        push(&[&"--setenv", &"PATH", &clean_path()]);
+        for (key, value) in env {
+            push(&[&"--setenv", key, value]);
+        }
+        push(&[&"--die-with-parent", &"--", &binary]);
+        out.extend(args.iter().map(OsString::from));
+        out
+    }
 }
 
 /// Toolchain directories under the home directory a shell may run programs from. They are

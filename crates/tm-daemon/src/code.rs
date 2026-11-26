@@ -701,7 +701,7 @@ impl CodeTools {
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
-                let (venv, steps) = select_test_steps(scope);
+                let (venv, steps) = select_test_steps(scope).await;
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
                 }
@@ -912,7 +912,7 @@ impl CodeTools {
                     })
                     .take(12)
                     .collect();
-                let (_, steps) = select_test_steps(scope);
+                let (_, steps) = select_test_steps(scope).await;
                 if !steps.iter().any(|step| !step.setup) {
                     return Ok(json!({
                         "ok": true,
@@ -1225,7 +1225,7 @@ async fn probe_local_http(url: &str) -> Option<u16> {
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
 /// One shell line that runs the project's test steps: setup steps may fail and are reported,
 /// the checks must all pass.
-fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
+async fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
     let fallback_venv = scope
         .shell
         .as_ref()
@@ -1233,7 +1233,8 @@ fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
         .map(|scratch| scratch.join("venv"))
         .unwrap_or_else(|| scope.cwd.join(".venv"));
     // Prefer an already-prepared shared read-only venv mounted into the worker's sandbox
-    // when it needs zero setup writes; otherwise fall back to the writable scratch venv.
+    // when it needs zero setup writes AND its pytest is actually importable under the worker
+    // sandbox view (never masked by host `~/.local/lib`); otherwise fall back to the writable scratch venv.
     let shared_venv = scope
         .shell
         .as_ref()
@@ -1242,7 +1243,11 @@ fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
     match shared_venv {
         Some(shared) => {
             let candidate = crate::runtime::steps(&scope.cwd, &shared);
-            if candidate.iter().any(|s| !s.setup) && !candidate.iter().any(|s| s.setup) {
+            let needs_pytest = candidate.iter().any(crate::runtime::is_pytest_step);
+            let ready = candidate.iter().any(|s| !s.setup)
+                && !candidate.iter().any(|s| s.setup)
+                && (!needs_pytest || crate::runtime::venv_has_pytest(&shared).await);
+            if ready {
                 (shared, candidate)
             } else {
                 let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
@@ -2568,6 +2573,72 @@ mod tests {
         assert!(!dir.join(".flow/evil3.json").exists());
 
         tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn select_test_steps_rejects_shared_venv_missing_sandbox_pytest() {
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !has_python3 {
+            return;
+        }
+        let ver_out = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .unwrap();
+        let py_mm = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
+
+        let dir = repo("select-shared-venv");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_ok.py"), "def test_ok():\n    assert True\n").unwrap();
+        let scratch = dir.join(".scratch");
+        let shared = dir.join(".shared-venv");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        // Create an isolated shared venv WITHOUT pytest installed in it, then stamp it as if a
+        // buggy host probe had approved it.
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", &shared.display().to_string()])
+            .status()
+            .unwrap();
+        assert!(mk.success());
+        // Write matching `.taskmaster-deps` stamp (compute by letting runtime::steps tell us the stamp).
+        let probe_steps = crate::runtime::steps(&dir, &shared);
+        let stamp_pair = probe_steps.iter().find_map(|s| s.stamp.clone()).expect("stamp on setup step");
+        std::fs::write(&stamp_pair.0, &stamp_pair.1).unwrap();
+
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: Some(tm_harness::ShellScope {
+                writable: vec![scratch.clone()],
+                readable: vec![shared.clone()],
+                env: vec![],
+            }),
+            read_only: false,
+            warm: tokio::sync::Mutex::new(None),
+        };
+
+        // Even though `.taskmaster-deps` matches, `select_test_steps` must reject `shared` because
+        // `pytest` is not importable in the sandbox view, falling back to `scratch/venv`.
+        let (chosen_before, _) = select_test_steps(&scope).await;
+        assert_eq!(chosen_before, scratch.join("venv"), "broken shared venv must not be selected");
+
+        // Once pytest exists inside `shared`'s own site-packages, `select_test_steps` selects it.
+        let venv_site = shared.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(venv_site.join("__init__.py"), "__version__ = '0.0.0-venv'\n").unwrap();
+        std::fs::write(venv_site.join("__main__.py"), "print('pytest 0.0.0-venv')\n").unwrap();
+
+        let (chosen_after, steps_after) = select_test_steps(&scope).await;
+        assert_eq!(chosen_after, shared, "self-contained shared venv must be selected");
+        assert!(steps_after.iter().all(|s| !s.setup), "ready shared venv needs no setup writes");
+
         std::fs::remove_dir_all(dir).ok();
     }
 }

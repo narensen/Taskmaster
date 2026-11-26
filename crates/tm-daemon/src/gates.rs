@@ -488,7 +488,7 @@ pub fn mutation_test_command(
             let is_missing_path = (program.contains('/') || program.contains('\\')) && !Path::new(&program).is_file();
             if is_missing_path {
                 program = "python3".into();
-                env.retain(|(k, _)| k != "VIRTUAL_ENV" && k != "PATH");
+                env.retain(|(k, _)| !matches!(k.as_str(), "VIRTUAL_ENV" | "PATH" | "PYTHONNOUSERSITE" | "PIP_USER"));
             }
             args.push(contract_path.to_string());
             let mut cmd = Vec::with_capacity(1 + args.len());

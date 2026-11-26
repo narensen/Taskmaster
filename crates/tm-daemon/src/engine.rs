@@ -5151,7 +5151,7 @@ impl Driver {
         // If no venv exists yet (or the recorded path is gone), workers fall back to $TASKMASTER_SCRATCH/venv.
         let mut candidate_venvs: Vec<PathBuf> = Vec::new();
         let verify_venv = self.verify_venv();
-        if verify_venv.is_dir() {
+        if verify_venv.is_dir() && verify_venv.join(".taskmaster-deps").is_file() {
             candidate_venvs.push(verify_venv);
         }
         let loaded_env = tm_flow::read_env(&self.tree)

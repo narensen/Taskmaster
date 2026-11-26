@@ -31,6 +31,7 @@ pub mod egress;
 mod engine;
 mod eval;
 pub mod eval_suite;
+pub mod flow_tools;
 pub mod gates;
 mod git;
 pub mod goals;

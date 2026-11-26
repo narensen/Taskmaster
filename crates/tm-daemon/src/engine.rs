@@ -258,6 +258,32 @@ struct Feed {
 }
 
 impl AgentRequest {
+    /// Construct an [`AgentRequest`] with safe defaults for all optional flags and scopes.
+    fn new(harness: Arc<dyn Harness>, cwd: PathBuf, brief: String, timeout: Duration) -> Self {
+        Self {
+            harness,
+            brief,
+            cwd,
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout,
+            stall: None,
+            read_only: false,
+            no_file_reads: false,
+            feed: None,
+            browser: None,
+            code_mode: false,
+            commit: None,
+            shell: None,
+            fetch: false,
+            native_search: false,
+            keep: false,
+            permission_mode: None,
+            hold: None,
+        }
+    }
+
     fn to_worker_task(&self) -> WorkerTask {
         WorkerTask {
             brief: self.brief.clone(),
@@ -427,8 +453,8 @@ struct Driver {
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     /// `run_code` for each page being built, when Code Mode is on and Node is here.
     code: Option<Arc<crate::code::CodeTools>>,
-    /// Daemon MCP extension for `docs`, `flow_query`, and web access.
-    web_tools: Arc<crate::web_access::WebTools>,
+    /// Local `.flow` code-graph MCP extension (`flow_query`).
+    flow_tools: Arc<crate::flow_tools::FlowTools>,
     /// Status-line MCP extension (O6) always available to every agent.
     status_tools: Arc<crate::code::StatusTools>,
     /// Mid-tier checks running beside the build (see `checker.rs`).
@@ -712,7 +738,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     if let Some(code) = &code {
         code.attach_runtime(live.clone(), records.clone(), status_tools.clone());
     }
-    // Daemon-served web_search, web_fetch, and local-first docs() (Phase 1).
+    // Daemon-served web_search, web_fetch, advisories, and local-first docs() (Phase 1).
     let loaded_settings = crate::settings::Settings::load(&project).unwrap_or_default();
     let web_tools = crate::web_access::WebTools::new(
         project.clone(),
@@ -721,6 +747,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         live.clone(),
         records.clone(),
     );
+    // Local `.flow` code-graph MCP extension (`flow_query`), decoupled from web access.
+    let flow_tools = crate::flow_tools::FlowTools::new(project.clone(), live.clone());
     let mut extensions: Vec<Arc<dyn tm_dictionary::Extension>> = Vec::new();
     if let Some(browsers) = &browsers {
         extensions.push(browsers.clone());
@@ -729,7 +757,8 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         extensions.push(code.clone());
     }
     extensions.push(status_tools.clone());
-    extensions.push(web_tools.clone());
+    extensions.push(web_tools);
+    extensions.push(flow_tools.clone());
     mcp.extend(Arc::new(crate::code::Extensions(extensions)));
     mcp.on_reply({
         let live = live.clone();
@@ -812,7 +841,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         small: false,
         browsers,
         code,
-        web_tools,
+        flow_tools,
         status_tools,
         checks: JoinSet::new(),
         checked: BTreeSet::new(),
@@ -849,7 +878,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         mutation_cache,
     };
     driver.open_tree(meta.base.as_deref())?;
-    driver.web_tools.set_flow_root(driver.tree.clone());
+    driver.flow_tools.set_flow_root(driver.tree.clone());
     if let Some(code) = &driver.code {
         code.set_flow_root(driver.tree.clone());
         code.set_project_root(driver.project.clone());
@@ -3708,26 +3737,16 @@ impl Driver {
             screenshot,
         });
         let mut request = AgentRequest {
-            harness: self.harnesses.mid.clone(),
-            brief,
-            cwd: dir.clone(),
             model: self.config.models.mid.clone(),
             effort: Some("low".into()),
-            dictionary: None,
-            timeout: self.config.timeout.min(Duration::from_secs(300)),
-            stall: None,
             read_only: true,
-            no_file_reads: false,
-            feed: None,
-            browser: None,
-            code_mode: false,
-            commit: None,
-            shell: None,
-            fetch: false,
-            native_search: false,
-            keep: false,
             permission_mode: self.config.permission_mode,
-            hold: None,
+            ..AgentRequest::new(
+                self.harnesses.mid.clone(),
+                dir.clone(),
+                brief,
+                self.config.timeout.min(Duration::from_secs(300)),
+            )
         };
         self.tag(&mut request, &format!("checker:{page}"), "checker", Some(page), None);
         let bill = request.bill(Role::Checker, Some(page));
@@ -5366,26 +5385,13 @@ impl Driver {
         }
         let shell = self.shell_for(&harness, "master-repair");
         let mut request = AgentRequest {
-            harness,
-            brief,
-            cwd: worktree.clone(),
             model: self.config.models.master.clone(),
-            effort: None,
             dictionary: Some(self.access(&self.master_token.clone())),
-            timeout: self.config.timeout,
-            stall: None,
-            read_only: false,
-            no_file_reads: false,
-            feed: None,
-            browser: None,
             code_mode: self.code.is_some(),
-            commit: None,
             shell,
             fetch: self.config.package_indexes,
-            native_search: false,
-            keep: false,
             permission_mode: self.config.permission_mode,
-            hold: None,
+            ..AgentRequest::new(harness, worktree.clone(), brief, self.config.timeout)
         };
         self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
@@ -5538,26 +5544,13 @@ impl Driver {
         }
         let shell = self.shell_for(&harness, "master-shared");
         let mut request = AgentRequest {
-            harness,
-            brief,
-            cwd: worktree.clone(),
             model: self.config.models.master.clone(),
-            effort: None,
             dictionary: Some(self.access(&self.master_token.clone())),
-            timeout: self.config.timeout,
-            stall: None,
-            read_only: false,
-            no_file_reads: false,
-            feed: None,
-            browser: None,
             code_mode: self.code.is_some(),
-            commit: None,
             shell,
             fetch: self.config.package_indexes,
-            native_search: false,
-            keep: false,
             permission_mode: self.config.permission_mode,
-            hold: None,
+            ..AgentRequest::new(harness, worktree.clone(), brief, self.config.timeout)
         };
         self.offer_code("master", &worktree, &mut request);
         self.tag(&mut request, "master", "master", None, None);
@@ -5813,26 +5806,14 @@ impl Driver {
         let shell = self.shell_for(&harness, &label);
         let effort = self.worker_effort(page, harness.id(), errors);
         Ok(AgentRequest {
-            harness,
-            brief,
-            cwd,
             model: self.model_for(tier),
             effort,
             dictionary: Some(self.access(&token)),
-            timeout: self.config.timeout,
-            stall: None,
-            read_only: false,
-            no_file_reads: false,
-            feed: None,
-            browser: None,
-            code_mode: false,
-            commit: None,
             shell,
             fetch: self.config.package_indexes,
-            native_search: false,
             keep: true,
             permission_mode: self.config.permission_mode,
-            hold: None,
+            ..AgentRequest::new(harness, cwd, brief, self.config.timeout)
         })
     }
 
@@ -7022,26 +7003,11 @@ impl Driver {
         token: &str,
     ) -> anyhow::Result<AgentRequest> {
         Ok(AgentRequest {
-            harness,
-            brief,
-            cwd: cwd.to_path_buf(),
             model,
-            effort: None,
             dictionary: Some(self.access(token)),
-            timeout: self.config.timeout,
-            stall: None,
             read_only: true,
-            no_file_reads: false,
-            feed: None,
-            browser: None,
-            code_mode: false,
-            commit: None,
-            shell: None,
-            fetch: false,
-            native_search: false,
-            keep: false,
             permission_mode: self.config.permission_mode,
-            hold: None,
+            ..AgentRequest::new(harness, cwd.to_path_buf(), brief, self.config.timeout)
         })
     }
 
@@ -7879,7 +7845,7 @@ impl Driver {
     /// the master and its workers, as [`crate::turns::turn_mode`] decides.
     fn open_turn(&mut self) -> anyhow::Result<()> {
         self.finalized = false;
-        self.web_tools.set_flow_root(self.tree.clone());
+        self.flow_tools.set_flow_root(self.tree.clone());
         if let Some(code) = &self.code {
             code.set_flow_root(self.tree.clone());
         }
@@ -8080,7 +8046,7 @@ impl Driver {
             let tree = self.tree.clone();
             self.drop_worktree(&tree);
             self.tree = self.project.clone();
-            self.web_tools.set_flow_root(self.tree.clone());
+            self.flow_tools.set_flow_root(self.tree.clone());
             if let Some(code) = &self.code {
                 code.set_flow_root(self.tree.clone());
             }
@@ -10106,15 +10072,37 @@ mod engine_coherence_tests {
             _gate: Arc<dyn PermissionGate>,
             _events: mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary {
-                ok: true,
-                usage: tm_harness::Usage::default(),
-                cost_usd: None,
-                denied: 0,
-                freed: None,
-                requests: None,
-            })
+            Ok(RunSummary { ok: true, ..RunSummary::default() })
         }
+    }
+
+    #[test]
+    fn fix_n9_agent_request_new_sets_safe_defaults() {
+        let req = AgentRequest::new(
+            Arc::new(DummyHarness),
+            PathBuf::from("/tmp/wt"),
+            "hello".into(),
+            Duration::from_secs(45),
+        );
+        assert_eq!(req.cwd, PathBuf::from("/tmp/wt"));
+        assert_eq!(req.brief, "hello");
+        assert_eq!(req.timeout, Duration::from_secs(45));
+        assert!(req.model.is_none());
+        assert!(req.effort.is_none());
+        assert!(req.dictionary.is_none());
+        assert!(req.stall.is_none());
+        assert!(!req.read_only);
+        assert!(!req.no_file_reads);
+        assert!(req.feed.is_none());
+        assert!(req.browser.is_none());
+        assert!(!req.code_mode);
+        assert!(req.commit.is_none());
+        assert!(req.shell.is_none());
+        assert!(!req.fetch);
+        assert!(!req.native_search);
+        assert!(!req.keep);
+        assert!(req.permission_mode.is_none());
+        assert!(req.hold.is_none());
     }
 
     #[test]
@@ -10125,26 +10113,12 @@ mod engine_coherence_tests {
             env: vec![("K".into(), "V".into())],
         };
         let mut req = AgentRequest {
-            harness: Arc::new(DummyHarness),
-            brief: "task".into(),
-            cwd: PathBuf::from("/tmp/wt"),
             model: Some("m".into()),
             effort: Some("low".into()),
-            dictionary: None,
-            timeout: Duration::from_secs(30),
-            stall: None,
-            read_only: false,
-            no_file_reads: false,
-            feed: None,
-            browser: None,
             code_mode: true,
-            commit: None,
             shell: Some(shell.clone()),
-            fetch: false,
-            native_search: false,
             keep: true,
-            permission_mode: None,
-            hold: None,
+            ..AgentRequest::new(Arc::new(DummyHarness), PathBuf::from("/tmp/wt"), "task".into(), Duration::from_secs(30))
         };
         let rw_task = req.to_worker_task();
         assert_eq!(rw_task.shell, Some(shell));
@@ -10164,8 +10138,8 @@ mod engine_coherence_tests {
             usage: tm_harness::Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 },
             cost_usd: Some(0.05),
             denied: 1,
-            freed: None,
             requests: Some(2),
+            ..RunSummary::default()
         });
         apply_run_end_fields(&mut ok_end, &ok_res, &["read_file /etc/passwd".into()]);
         assert_eq!(ok_end["ok"], true);
@@ -10177,14 +10151,7 @@ mod engine_coherence_tests {
         let mut zero_usage_end = serde_json::json!({});
         apply_run_end_fields(
             &mut zero_usage_end,
-            &Ok(RunSummary {
-                ok: true,
-                usage: tm_harness::Usage::default(),
-                cost_usd: None,
-                denied: 0,
-                freed: None,
-                requests: None,
-            }),
+            &Ok(RunSummary { ok: true, ..RunSummary::default() }),
             &[],
         );
         assert!(zero_usage_end.get("usage").is_none());

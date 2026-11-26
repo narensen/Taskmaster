@@ -1651,7 +1651,7 @@ impl WebRole {
         }
     }
 
-    fn agent_tag(grant: &Grant) -> Value {
+    pub(crate) fn agent_tag(grant: &Grant) -> Value {
         match grant.page.as_str() {
             "master" | "planner" => json!({ "id": "master", "role": "planner" }),
             "reviewer" => json!({ "id": "reviewer", "role": "reviewer" }),
@@ -1667,10 +1667,9 @@ struct BudgetCounters {
     planner_fetches: HashMap<String, usize>,
 }
 
-/// Daemon MCP extension exposing `web_search`, `web_fetch`, `docs`, and `flow_query`.
+/// Daemon MCP extension exposing `web_search`, `web_fetch`, `advisories`, and `docs`.
 pub struct WebTools {
     project: PathBuf,
-    flow_root: std::sync::RwLock<PathBuf>,
     settings: WebAccessSettings,
     provider: Arc<dyn SearchProvider>,
     transport: Arc<dyn HttpTransport>,
@@ -1709,10 +1708,8 @@ impl WebTools {
         records: Records,
     ) -> Arc<Self> {
         let worker_allowlist = derive_project_allowlist(&project, &settings.allowlist);
-        let flow_root = std::sync::RwLock::new(project.clone());
         Arc::new(Self {
             project,
-            flow_root,
             settings,
             provider,
             transport,
@@ -1722,11 +1719,6 @@ impl WebTools {
             budgets: Mutex::new(BudgetCounters::default()),
             worker_allowlist,
         })
-    }
-
-    /// Update the active tree root used by `flow_query` (e.g. the run's branch worktree).
-    pub fn set_flow_root(&self, root: PathBuf) {
-        *self.flow_root.write().unwrap() = root;
     }
 
     fn role_policy(&self, role: WebRole) -> &RoleWebPolicy {
@@ -2278,86 +2270,24 @@ impl WebTools {
             "No local docs found for `{package}` in node_modules, site-packages, or ~/.cargo/registry/src, and web fallback is unavailable for this role."
         ))
     }
-
-    async fn handle_flow_query(&self, grant: &Grant, args: &Value) -> Value {
-        let agent = WebRole::agent_tag(grant);
-        let raw_op = args["op"].as_str().unwrap_or("").trim();
-        let op = if raw_op.is_empty() && args.get("queries").and_then(Value::as_array).is_some() {
-            "batch".to_string()
-        } else {
-            raw_op.to_string()
-        };
-        if op.is_empty() {
-            return mcp_err("flow_query requires `op`: one of `find`, `node`, `neighbors`, `source`, or `batch` (with `queries`).");
-        }
-        let batch_len = args.get("queries").and_then(Value::as_array).map(Vec::len);
-        let root = self.flow_root.read().unwrap().clone();
-        let args_owned = args.clone();
-        let op_for_task = op.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            if !root.join(tm_flow::FLOW_DIR).is_dir() {
-                let _ = tm_flow::build(&root);
-            }
-            tm_flow::execute_op(&root, &op_for_task, &args_owned)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let mut entry = json!({
-                    "op": op,
-                    "id": args.get("id").and_then(|v| v.as_str()),
-                    "query": args.get("query").and_then(|v| v.as_str()),
-                    "reply_bytes": output.text.len(),
-                });
-                if let Some(n) = batch_len {
-                    entry["batch_len"] = json!(n);
-                }
-                self.live.push(&grant.run, &agent, "flow_query", entry);
-                mcp_ok(&output.text)
-            }
-            Ok(Err(err)) => mcp_err(&format!("flow_query failed: {err:#}")),
-            Err(err) => mcp_err(&format!("flow_query task failed: {err}")),
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl Extension for WebTools {
     fn tools(&self, grant: &Grant) -> Vec<Value> {
         let role = WebRole::from_grant(grant);
-        let mut out = vec![
-            json!({
-                "name": "docs",
-                "description": "Local-first package documentation lookup (reads node_modules, Python site-packages, or Cargo registry at the installed version before falling back to the web).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "package": { "type": "string", "description": "Package or crate name" },
-                        "symbol": { "type": "string", "description": "Optional symbol name to filter declarations" }
-                    },
-                    "required": ["package"]
-                }
-            }),
-            json!({
-                "name": "flow_query",
-                "description": "Query the deterministic .flow code graph instead of reading whole files. Ops: `find` (search symbols), `node` (signature/doc/edges), `neighbors` (k-hop subgraph), `source` (full symbol body span), `batch` (run up to 10 ops in `queries` in one call). `node` and `source` also accept `ids: [...]`.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "op": { "type": "string", "enum": ["find", "node", "neighbors", "source", "batch"], "description": "Operation to run (defaults to 'batch' when `queries` is set)" },
-                        "query": { "type": "string", "description": "Search text for op='find'" },
-                        "id": { "type": "string", "description": "Node id (e.g. py:pkg/mod.py#Class.method) for op='node'|'neighbors'|'source'" },
-                        "ids": { "type": "array", "items": { "type": "string" }, "description": "Multiple node ids for op='node'|'source' in one call" },
-                        "queries": { "type": "array", "items": { "type": "object" }, "description": "Array of sub-op objects ({op, id?, query?, k?, kinds?, dir?, limit?}) for op='batch'" },
-                        "k": { "type": "integer", "description": "Hop depth (1-3, default 1) for op='neighbors'" },
-                        "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge kind filter (imports, calls, inherits, implements, owns, contract_of, tests)" },
-                        "dir": { "type": "string", "enum": ["both", "out", "in"], "description": "Edge direction for op='neighbors' (default 'both')" },
-                        "limit": { "type": "integer", "description": "Max nodes returned (1-40, default 40)" }
-                    }
-                }
-            }),
-        ];
+        let mut out = vec![json!({
+            "name": "docs",
+            "description": "Local-first package documentation lookup (reads node_modules, Python site-packages, or Cargo registry at the installed version before falling back to the web).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "package": { "type": "string", "description": "Package or crate name" },
+                    "symbol": { "type": "string", "description": "Optional symbol name to filter declarations" }
+                },
+                "required": ["package"]
+            }
+        })];
 
         if !self.settings.enabled || role == WebRole::Verifier {
             return out;
@@ -2413,20 +2343,19 @@ impl Extension for WebTools {
             "web_fetch" => Some(self.handle_fetch(grant, args).await),
             "advisories" => Some(self.handle_advisories(grant, args).await),
             "docs" => Some(self.handle_docs(grant, args).await),
-            "flow_query" => Some(self.handle_flow_query(grant, args).await),
             _ => None,
         }
     }
 }
 
-fn mcp_ok(text: &str) -> Value {
+pub(crate) fn mcp_ok(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
     })
 }
 
-fn mcp_err(text: &str) -> Value {
+pub(crate) fn mcp_err(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": true,
@@ -2804,12 +2733,13 @@ mod tests {
         assert_eq!(second["isError"], true);
         assert!(second["content"][0]["text"].as_str().unwrap().contains("Planner search budget reached (1/1"));
 
-        // Verifier gets neither web_search nor web_fetch (only local docs and flow_query)
+        // Verifier gets neither web_search nor web_fetch (only local docs; flow_query lives in FlowTools)
         let verifier = Grant { run: "run-roles".into(), page: "verifier".into(), unit: String::new() };
         let v_tools = tools.tools(&verifier);
         let v_names: Vec<&str> = v_tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(v_names, vec!["docs", "flow_query"]);
+        assert_eq!(v_names, vec!["docs"]);
         assert!(!v_names.contains(&"web_search") && !v_names.contains(&"web_fetch"));
+        assert!(!v_names.contains(&"flow_query"), "flow_query is registered via FlowTools, not WebTools");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3002,100 +2932,10 @@ mod tests {
             .await
             .expect("mcp_dictionary_docs must be handled");
         assert!(res["content"][0]["text"].is_string(), "{res}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn flow_query_mcp_tool_serves_find_node_neighbors_source_with_caps_for_all_roles() {
-        let dir = temp_project("flow-query");
-        std::fs::create_dir_all(dir.join("pkg")).unwrap();
-        std::fs::write(
-            dir.join("pkg/store.py"),
-            "class Store:\n    \"\"\"Persists items.\"\"\"\n    def put(self, key: str) -> None:\n        pass\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("pkg/app.py"),
-            "from pkg.store import Store\n\ndef handle(s: Store) -> None:\n    \"\"\"Handle request.\"\"\"\n    s.put('k')\n",
-        )
-        .unwrap();
-        tm_flow::build(&dir).unwrap();
-
-        let store = Arc::new(FileStore::in_project(&dir));
-        let live = Arc::new(Live::new(store.clone()));
-        let records = Records::new(store);
-        let cache = WebCache::new(dir.join(".cache-web"), 3600, 1024 * 1024);
-        // Web access disabled (and Code Mode off): flow_query is still registered for workers and read-only roles.
-        let tools = WebTools::with_backends(
-            dir.clone(),
-            WebAccessSettings { enabled: false, ..Default::default() },
-            Arc::new(NativePassthroughProvider),
-            Arc::new(FixtureTransport::new()),
-            cache,
-            live,
-            records,
+        assert!(
+            tools.call(&worker, "flow_query", &json!({ "op": "find", "query": "x" })).await.is_none(),
+            "WebTools must not dispatch flow_query after FlowTools extraction"
         );
-
-        let worker = Grant { run: "r-fq".into(), page: "app".into(), unit: String::new() };
-        let reviewer = Grant { run: "r-fq".into(), page: "reviewer".into(), unit: String::new() };
-        for g in [&worker, &reviewer] {
-            let listed = tools.tools(g);
-            let names: Vec<&str> = listed.iter().filter_map(|t| t["name"].as_str()).collect();
-            assert!(names.contains(&"flow_query"), "flow_query missing for {:?}: {names:?}", g.page);
-        }
-
-        let found = tools
-            .call(&reviewer, "flow_query", &json!({ "op": "find", "query": "handle" }))
-            .await
-            .unwrap();
-        assert_eq!(found["isError"], false, "{found}");
-        let ftext = found["content"][0]["text"].as_str().unwrap();
-        assert!(ftext.contains("py:pkg/app.py#handle"), "{ftext}");
-
-        let node = tools
-            .call(&worker, "mcp_dictionary_flow_query", &json!({ "op": "node", "id": "py:pkg/app.py#handle" }))
-            .await
-            .unwrap();
-        assert_eq!(node["isError"], false, "{node}");
-        let ntext = node["content"][0]["text"].as_str().unwrap();
-        assert!(ntext.contains("py:pkg/store.py#Store.put"), "{ntext}");
-
-        let nbrs = tools
-            .call(&worker, "flow_query", &json!({ "op": "neighbors", "id": "py:pkg/app.py#handle", "k": 1, "kinds": ["calls"], "dir": "out" }))
-            .await
-            .unwrap();
-        assert_eq!(nbrs["isError"], false, "{nbrs}");
-        assert!(nbrs["content"][0]["text"].as_str().unwrap().contains("Store.put"));
-
-        let src = tools
-            .call(&reviewer, "flow_query", &json!({ "op": "source", "id": "py:pkg/store.py#Store.put" }))
-            .await
-            .unwrap();
-        assert_eq!(src["isError"], false, "{src}");
-        let stext = src["content"][0]["text"].as_str().unwrap();
-        assert!(stext.contains("def put(self, key: str)"), "{stext}");
-        assert!(!stext.contains("class Store:"), "source must slice only the node span: {stext}");
-        assert!(stext.len() <= tm_flow::MAX_QUERY_CHARS);
-
-        // Batched op runs multiple queries in a single MCP call (both explicit op='batch' and omitted op).
-        let batched = tools
-            .call(
-                &worker,
-                "flow_query",
-                &json!({
-                    "queries": [
-                        { "op": "find", "query": "Store" },
-                        { "op": "source", "id": "py:pkg/app.py#handle" }
-                    ]
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(batched["isError"], false, "{batched}");
-        let btext = batched["content"][0]["text"].as_str().unwrap();
-        assert!(btext.contains("py:pkg/store.py#Store"), "{btext}");
-        assert!(btext.contains("s.put('k')"), "batched source must preserve full body: {btext}");
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

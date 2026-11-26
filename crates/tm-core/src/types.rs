@@ -288,7 +288,7 @@ pub fn units_disjoint(units: &[WorkUnit]) -> bool {
 }
 
 /// Split one top-level `{a,b}` group into its alternatives; any other glob is its own.
-fn glob_alternatives(glob: &str) -> Vec<String> {
+pub fn glob_alternatives(glob: &str) -> Vec<String> {
     let glob = glob.trim();
     if let Some(inner) = glob.strip_prefix('{').and_then(|g| g.strip_suffix('}'))
         && !inner.contains(['{', '}'])

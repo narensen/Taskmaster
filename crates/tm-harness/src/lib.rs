@@ -713,7 +713,7 @@ pub(crate) fn clip_result(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RunSummary {
     pub ok: bool,
     pub usage: Usage,
@@ -880,5 +880,16 @@ mod code_mode_fallback_tests {
         assert!(msg.contains("`run_command` -> call `mcp_dictionary_run_code` with `return await test()`"), "{msg}");
         assert!(msg.contains("`write_file` -> call `mcp_dictionary_run_code` passing `files:"), "{msg}");
         assert_eq!(msg.matches("`run_command` ->").count(), 1, "duplicates must be collapsed: {msg}");
+    }
+
+    #[test]
+    fn fix_n9_run_summary_default_is_zeroed() {
+        let summary = RunSummary::default();
+        assert!(!summary.ok);
+        assert_eq!(summary.usage, Usage::default());
+        assert!(summary.cost_usd.is_none());
+        assert_eq!(summary.denied, 0);
+        assert!(summary.freed.is_none());
+        assert!(summary.requests.is_none());
     }
 }

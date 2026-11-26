@@ -1741,7 +1741,7 @@ mod tests {
         let scratch = dir.with_extension("scratch");
         let outside = dir.with_extension("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
         tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
         let script = format!(
             r#"return await sh("echo in > made.txt && echo s > $TASKMASTER_SCRATCH/s.txt && (echo out > {}/x.txt || echo refused-outside)");"#,
@@ -1799,7 +1799,7 @@ mod tests {
         std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
         std::fs::write(dir.join("tests/test_calc.py"), "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n").unwrap();
         let scratch = dir.with_extension("scratch");
-        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
         tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
         let text = tools.run(&grant(), "const r = await test(); return { ok: r.ok, failed: r.failed };").await.unwrap();
         assert!(text.contains("\"ok\": false") && text.contains("tests/test_calc.py::test_add"), "{text}");

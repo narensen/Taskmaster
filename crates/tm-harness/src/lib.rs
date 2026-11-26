@@ -170,6 +170,8 @@ when you finish. If a call is refused, say which one in your reply and carry on 
 pub struct ShellScope {
     /// Writable directories: the agent's scratch and the run's package caches.
     pub writable: Vec<PathBuf>,
+    /// Extra read-only directories mounted into the sandbox (e.g. a shared verified Python venv).
+    pub readable: Vec<PathBuf>,
     /// Set for every command the agent runs, after the daemon's Python variables are removed.
     pub env: Vec<(String, String)>,
 }

@@ -172,6 +172,14 @@ impl WorktreeGate {
         self.resolve(path).starts_with(&self.root)
     }
 
+    /// True when `path` targets `.flow` or any file under `.flow/` inside the worktree.
+    fn is_flow_path(&self, path: &Path) -> bool {
+        let Some(rel) = self.relative(path) else {
+            return false;
+        };
+        matches!(rel.components().next(), Some(Component::Normal(first)) if first == ".flow")
+    }
+
     fn readable(&self, path: &Path) -> bool {
         let resolved = self.resolve(path);
         resolved.starts_with(&self.root) || self.readable.iter().any(|r| resolved.starts_with(r))
@@ -186,6 +194,10 @@ impl WorktreeGate {
 
 impl PermissionGate for WorktreeGate {
     fn decide(&self, request: &PermissionRequest) -> Decision {
+        // Workers may never write into `.flow/`; only Taskmaster updates the knowledge graph.
+        if request.kind == ToolKind::Edit && request.paths.iter().any(|p| self.is_flow_path(p)) {
+            return Decision::Deny;
+        }
         // Before the prefixes: the browser tool is served beside the Dictionary, but it
         // may only open the run's own preview.
         if request.kind == ToolKind::Browser {
@@ -445,5 +457,18 @@ mod tests {
         // Does not widen WebFetch or shell.
         assert_eq!(g.decide(&fetch), Decision::Deny);
         assert_eq!(g.decide(&request("run_command", ToolKind::Execute, &[])), Decision::Deny);
+    }
+
+    #[test]
+    fn denies_worker_edits_into_flow_dir_while_allowing_reads() {
+        let g = gate();
+        let edit_meta = request("write_file", ToolKind::Edit, &["/nonexistent/tm/work-a/.flow/meta.json"]);
+        let edit_rel = request("write_file", ToolKind::Edit, &[".flow/files/app.py.json"]);
+        assert_eq!(g.decide(&edit_meta), Decision::Deny);
+        assert_eq!(g.decide(&edit_rel), Decision::Deny);
+        assert_eq!(g.clone().with_full_access().decide(&edit_meta), Decision::Deny);
+
+        let read_meta = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/.flow/meta.json"]);
+        assert_eq!(g.decide(&read_meta), Decision::Allow);
     }
 }

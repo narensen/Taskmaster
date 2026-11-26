@@ -19,8 +19,8 @@ const EXTENSIONS: [&str; 26] = [
     "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java", "kt", "kts", "c", "h", "cc", "cpp",
     "cxx", "hh", "hpp", "hxx", "rb", "php", "cs", "css", "scss", "sass",
 ];
-const SKIP_DIRS: [&str; 10] =
-    ["node_modules", ".next", ".git", "dist", ".taskmaster", "target", "vendor", "__pycache__", ".venv", "venv"];
+const SKIP_DIRS: [&str; 11] =
+    ["node_modules", ".next", ".git", "dist", ".taskmaster", ".flow", "target", "vendor", "__pycache__", ".venv", "venv"];
 
 /// `import x from "y"`, `export * from "y"`, `import "y"`, `import("y")`, `require("y")`.
 static IMPORT: LazyLock<Regex> = LazyLock::new(|| {

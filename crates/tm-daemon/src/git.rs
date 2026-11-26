@@ -269,7 +269,10 @@ pub fn merge_branch(repo: &Path, branch: &str, generated: &[&str]) -> bool {
 fn settle_generated(repo: &Path, generated: &[&str]) -> bool {
     let Ok(unmerged) = git(repo, &["diff", "--name-only", "--diff-filter=U", "-z"]) else { return false };
     let paths: Vec<&str> = unmerged.split('\0').filter(|path| !path.is_empty()).collect();
-    if paths.is_empty() || !paths.iter().all(|path| generated.contains(path)) {
+    let is_gen = |path: &str| {
+        generated.iter().any(|g| if g.ends_with('/') { path.starts_with(g) } else { path == *g })
+    };
+    if paths.is_empty() || !paths.iter().all(|path| is_gen(path)) {
         return false;
     }
     let mut take = vec!["checkout", "--theirs", "--"];

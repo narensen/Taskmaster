@@ -89,6 +89,11 @@ impl Sandbox {
                 let _ = std::fs::create_dir_all(dir);
                 push(&[&"--bind", dir, dir]);
             }
+            for dir in &shell.readable {
+                if dir.exists() {
+                    push(&[&"--ro-bind", dir, dir]);
+                }
+            }
             for name in LEAKY_VARS {
                 push(&[&"--unsetenv", &name]);
             }
@@ -102,6 +107,13 @@ impl Sandbox {
         }
         let mount = if read_only { "--ro-bind" } else { "--bind" };
         push(&[&mount, &worktree, &worktree]);
+        // Keep `.flow/` read-only inside writable worker sandboxes so only Taskmaster writes it.
+        if !read_only {
+            let flow_dir = worktree.join(".flow");
+            if flow_dir.is_dir() {
+                push(&[&"--ro-bind", &flow_dir, &flow_dir]);
+            }
+        }
         push(&[&"--die-with-parent", &"--chdir", &worktree, &"--", &binary]);
         out.extend(args.iter().map(OsString::from));
         out
@@ -230,6 +242,7 @@ mod tests {
         let sandbox = Sandbox { home: "/home/u".into(), state_dirs: vec![] };
         let scope = crate::ShellScope {
             writable: vec![std::env::temp_dir().join(format!("tm-shell-scope-{}", std::process::id()))],
+            readable: vec![],
             env: vec![("TASKMASTER_SCRATCH".into(), "/s".into())],
         };
         let args = sandbox.bwrap_args_with(Path::new("/bin/grok"), &[], Path::new("/w"), false, Some(&scope));
@@ -261,7 +274,7 @@ mod tests {
         }
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()));
         let sandbox = Sandbox { home, state_dirs: vec![] };
-        let scope = crate::ShellScope { writable: vec![scratch.clone()], env: vec![] };
+        let scope = crate::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![] };
         let script = format!(
             "echo a > {w}/ok; echo b > {s}/ok; echo c > {o}/no 2>/dev/null; echo d > /etc/tm-no 2>/dev/null; true",
             w = work.display(), s = scratch.display(), o = outside.display()
@@ -296,5 +309,35 @@ mod tests {
         let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         assert!(args.windows(3).any(|w| w == ["--ro-bind", "/w", "/w"]));
         assert!(!args.windows(2).any(|w| w == ["--bind", "/w"]));
+    }
+
+    #[test]
+    fn flow_dir_and_shared_readable_venv_are_mounted_read_only_in_worker_sandbox() {
+        let base = std::env::temp_dir().join(format!("tm-sandbox-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let work = base.join("work");
+        let flow = work.join(".flow");
+        let venv = base.join("shared-venv");
+        std::fs::create_dir_all(&flow).unwrap();
+        std::fs::create_dir_all(&venv).unwrap();
+
+        let sandbox = Sandbox { home: "/home/u".into(), state_dirs: vec![] };
+        let scope = crate::ShellScope {
+            writable: vec![],
+            readable: vec![venv.clone()],
+            env: vec![],
+        };
+        let args = sandbox.bwrap_args_with(Path::new("/bin/sh"), &[], &work, false, Some(&scope));
+        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let flow_s = flow.display().to_string();
+        let work_s = work.display().to_string();
+        let venv_s = venv.display().to_string();
+        let pos = |needle: &[&str]| args.windows(needle.len()).position(|w| w == needle);
+        let work_pos = pos(&["--bind", &work_s, &work_s]).expect("worktree bound writable");
+        let flow_pos = pos(&["--ro-bind", &flow_s, &flow_s]).expect(".flow bound read-only");
+        assert!(flow_pos > work_pos, ".flow ro-bind must come after worktree bind");
+        assert!(pos(&["--ro-bind", &venv_s, &venv_s]).is_some(), "shared readable venv must be ro-bound");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -28,10 +28,20 @@ impl Owners {
     }
 }
 
+/// True when `file` is `.flow` itself or lives inside `.flow/` (Taskmaster's managed knowledge graph).
+/// `.flow/` never counts as a stray or unowned file in ownership checks.
+pub fn is_flow_path(file: &str) -> bool {
+    let norm = file.replace('\\', "/");
+    let trimmed = norm.trim_start_matches("./").trim_end_matches('/');
+    trimmed == ".flow" || trimmed.starts_with(".flow/")
+}
+
 /// Files a worker changed that its page does not own. These are dropped at merge and flagged.
+/// Taskmaster's `.flow/` directory is ignored here so it never counts as an unowned/stray file.
 pub fn outside_owned<'a>(owners: &Owners, page: &str, changed: &'a [String]) -> Vec<&'a str> {
     changed
         .iter()
+        .filter(|file| !is_flow_path(file))
         .filter(|file| owners.owner(file).map(String::as_str) != Some(page))
         .map(String::as_str)
         .collect()
@@ -80,5 +90,20 @@ mod tests {
     fn an_invalid_glob_names_its_page() {
         let err = Owners::from_plan(&test_plan(&[("a", "app/[")])).err().unwrap();
         assert!(err.to_string().contains("page `a`"));
+    }
+
+    #[test]
+    fn flow_dir_is_ignored_by_ownership_checks() {
+        let owners = Owners::from_plan(&test_plan(&[("a", "app/a/**")])).unwrap();
+        let changed: Vec<String> = [
+            "app/a/page.tsx",
+            ".flow/meta.json",
+            ".flow/files/app/a/page.tsx.json",
+            ".flow/.gitignore",
+            "./.flow/plan.json",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(outside_owned(&owners, "a", &changed).is_empty());
     }
 }

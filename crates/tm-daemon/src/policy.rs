@@ -119,7 +119,11 @@ impl Policy {
     }
 
     /// Check whether a repo-relative path is allowed, protected, or denied.
+    /// `.flow/` is always denied for worker writes because only Taskmaster writes the graph.
     pub fn check_path(&self, rel: &str) -> PathVerdict {
+        if tm_verify::is_flow_path(rel) {
+            return PathVerdict::Denied(".flow/**".into());
+        }
         if let Some(glob) = first_matching_glob(&self.denied_globs, rel) {
             return PathVerdict::Denied(glob);
         }
@@ -524,6 +528,8 @@ redact_patterns = ["SUPER_SECRET_42"]
             PathVerdict::Protected("**/auth/**".into())
         );
         assert_eq!(policy.check_path("src/ui/button.tsx"), PathVerdict::Allowed);
+        assert_eq!(policy.check_path(".flow/meta.json"), PathVerdict::Denied(".flow/**".into()));
+        assert_eq!(policy.check_path(".flow/files/app.py.json"), PathVerdict::Denied(".flow/**".into()));
 
         let rendered = render_policy_toml(&policy);
         let again = parse_policy_toml(&rendered).unwrap();

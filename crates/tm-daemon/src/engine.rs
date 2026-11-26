@@ -5015,7 +5015,7 @@ impl Driver {
             ("PYTEST_ADDOPTS".into(), "-p no:cacheprovider".into()),
             ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
         ];
-        Some(ShellScope { writable: vec![scratch, cache], env })
+        Some(ShellScope { writable: vec![scratch, cache], readable: vec![], env })
     }
 
     /// Serve the worktree as the page's preview and give the agent the browser on it, when

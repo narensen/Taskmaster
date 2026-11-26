@@ -27,9 +27,11 @@
 //! `.taskmaster/runs/<id>/`. `--eval` runs the plan again with one model and writes
 //! `.taskmaster/evals/<id>.json`. A prompt is planned once and reused for the baseline.
 //! `--timeout 0` lets an agent call run with no time limit. The exit code is 0 when the
-//! run finishes clean, 1 when it fails, 2 when the plan waits for `--yes`, and 3 when a
-//! provider stopped it (a usage limit, no balance left, a sign-in): run the same command
-//! again to resume.
+//! run finishes clean, 1 when it fails, 2 when the plan waits for `--yes`, 3 when a
+//! provider requires sign-in or credit balance, and 75 (`EX_TEMPFAIL`) when a provider
+//! hits a quota limit or HTTP 429 rate limit (`RESOURCE_EXHAUSTED`): outer scripts can
+//! stop on 75 instead of launching doomed runs, and re-running the same command picks up
+//! where the run stopped once the reset time passes.
 //! `--pair` serves the API and the phone page on this machine's Tailscale address for as
 //! long as the run lasts. `serve` keeps the API up with no run of its own: a frontend
 //! starts, approves and cancels runs through it. It listens on `127.0.0.1:8737` unless
@@ -109,15 +111,16 @@ fn main() -> ExitCode {
         Ok(Outcome::Finished { ok: true }) => ExitCode::SUCCESS,
         Ok(Outcome::Finished { ok: false }) => ExitCode::from(1),
         Ok(Outcome::NeedsApproval { .. } | Outcome::Rejected) => ExitCode::from(2),
-        // A provider stopped the run (a usage limit, no balance, a sign-in): the run is kept
-        // where it stopped, and the same command picks it up again.
+        // A provider stopped the run (quota / HTTP 429 rate limit -> exit 75 EX_TEMPFAIL;
+        // auth / balance -> exit 3): the run is kept where it stopped so the same command resumes it.
         Err(err) if err.downcast_ref::<tm_daemon::reply::ReportedLimit>().is_some() => {
-            eprintln!("taskmaster: {err:#}");
+            let limit = err.downcast_ref::<tm_daemon::reply::ReportedLimit>().expect("checked");
+            eprintln!("taskmaster: {limit}");
             eprintln!(
                 "taskmaster: the run is kept where it stopped. Run the same command again to resume it, \
                  or pass a different --master/--mid/--worker/--reviewer/--verifier to switch the provider."
             );
-            ExitCode::from(3)
+            ExitCode::from(limit.exit_code())
         }
         Err(err) => {
             eprintln!("taskmaster: {err:#}");

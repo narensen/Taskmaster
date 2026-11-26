@@ -138,7 +138,7 @@ Taskmaster improves the more you run it because every failure and fix feeds back
 - **Stratified model scorecard.** Tracks first-pass rate, average cost, and latency per `(model, difficulty, language)`, recommends the cheapest worker hitting ≥85% first-pass success, warns when a chosen worker is struggling, and powers `--worker auto`.
 - **Dictionary citations.** Each unit records the Dictionary hashes it was built against; later runs skip units whose cited contracts still match.
 - **Reviews that learn.** Independent reviewer and verifier findings (confirmed and rejected) feed into subsequent review passes.
-- **Event-sourced runs.** `events.jsonl` is the source of truth, so crashes, usage-limit stops (exit code `3`), or daemon restarts pick up cleanly from the log.
+- **Event-sourced runs.** `events.jsonl` is the source of truth, so crashes, provider quota / HTTP 429 stops (exit code `75`, `EX_TEMPFAIL`), auth/balance stops (exit code `3`), or daemon restarts pick up cleanly from the log.
 
 ## Studio, operations & safety
 

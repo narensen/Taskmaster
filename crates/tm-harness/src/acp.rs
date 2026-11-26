@@ -241,6 +241,7 @@ impl AcpHarness {
             cost: None,
             requests: 0,
             saw_tool_finish: false,
+            turn_text: String::new(),
         }
     }
 
@@ -494,6 +495,8 @@ struct Session {
     requests: u32,
     /// True after a tool batch finishes so the next model emission counts as a new request turn.
     saw_tool_finish: bool,
+    /// Leading text emitted during the current `session/prompt`, inspected for quota/429 errors.
+    turn_text: String,
 }
 
 impl Session {
@@ -633,6 +636,7 @@ impl Session {
     async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
         self.tools.clear();
         self.tool_names.clear();
+        self.turn_text.clear();
         self.requests = 0;
         self.saw_tool_finish = false;
         let session_id = self.id.clone().context("the session is not open")?;
@@ -642,7 +646,45 @@ impl Session {
         });
         let before = self.cost;
         let result = self.call("session/prompt", prompt).await?;
-        Ok(self.summary(&result, before))
+        let summary = self.summary(&result, before);
+        // Antigravity ACP often surfaces quota exhaustion / HTTP 429 as an agent message
+        // (`⚠ Individual quota reached ... Resets in XhYmZs.`) followed by `stopReason: "end_turn"`.
+        // Detect it directly in the harness so callers never treat it as a valid reply.
+        if let Some(hit) = self.quota_error_in_turn_text() {
+            self.emit_quota_rate_limit(&hit).await;
+            return Err(hit.into());
+        }
+        Ok(summary)
+    }
+
+    async fn emit_quota_rate_limit(&self, hit: &crate::QuotaError) {
+        let _ = self
+            .events
+            .send(HarnessEvent::RateLimit(crate::RateLimitReport {
+                source: Some("acp".into()),
+                window_5h_pct: Some(100.0),
+                reset_5h: hit.reset.clone(),
+                ..Default::default()
+            }))
+            .await;
+    }
+
+    fn quota_error_in_turn_text(&self) -> Option<crate::QuotaError> {
+        let trimmed = self.turn_text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Leave genuine structured replies (plans, findings, releases) alone even if prose quotes a limit.
+        if trimmed.contains("RELEASE ")
+            || (trimmed.contains('{')
+                && (trimmed.contains("\"pages\"")
+                    || trimmed.contains("\"units\"")
+                    || trimmed.contains("\"contracts\"")
+                    || trimmed.contains("\"resolution\"")))
+        {
+            return None;
+        }
+        crate::detect_quota_or_rate_limit(trimmed)
     }
 
     /// A turn's summary from its prompt reply, with `before` the running cost when it began.
@@ -699,6 +741,11 @@ impl Session {
                 self.incoming(msg).await?;
             } else if msg["id"] == id {
                 if let Some(error) = msg.get("error") {
+                    let err_text = error.to_string();
+                    if let Some(hit) = crate::detect_quota_or_rate_limit(&err_text) {
+                        self.emit_quota_rate_limit(&hit).await;
+                        return Err(hit.into());
+                    }
                     bail!("`{method}` failed: {error}");
                 }
                 return Ok(msg["result"].clone());
@@ -720,6 +767,18 @@ impl Session {
                 for event in update_events(&params["update"]) {
                     let mut erofs_tool: Option<String> = None;
                     match &event {
+                        HarnessEvent::Text { text } if self.turn_text.len() < 4096 => {
+                            let avail = 4096 - self.turn_text.len();
+                            if text.len() <= avail {
+                                self.turn_text.push_str(text);
+                            } else {
+                                let mut cut = avail;
+                                while cut > 0 && !text.is_char_boundary(cut) {
+                                    cut -= 1;
+                                }
+                                self.turn_text.push_str(&text[..cut]);
+                            }
+                        }
                         HarnessEvent::ToolCall { id, name, .. } if !id.is_empty() => {
                             self.tool_names.insert(id.clone(), name.clone());
                         }
@@ -2197,5 +2256,74 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         let msg = crate::code_mode_redirect_message(&["edit_file (use run_code)".into()], "mcp_dictionary_run_code")
             .expect("redirect message");
         assert!(msg.contains("mcp_dictionary_run_code") && msg.contains("edit"));
+    }
+
+    #[tokio::test]
+    async fn fix_n9_acp_detects_antigravity_individual_quota_and_429_without_returning_ok() {
+        // 1. Text-delivered Antigravity quota stop with `stopReason: "end_turn"` (tb15-calcx-plus-tmh).
+        let text_quota_script = r#"
+read l; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-q1"}}'
+read l
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m23s.\n"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), text_quota_script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "plan".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: true,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).read_only());
+        let (tx, mut rx) = mpsc::channel(16);
+        let err = harness.run(task.clone(), gate.clone(), tx).await.unwrap_err();
+        let quota = err.downcast_ref::<crate::QuotaError>().expect("QuotaError from ACP harness");
+        assert!(!quota.is_rate_limit);
+        assert_eq!(quota.reset.as_deref(), Some("in 1h1m23s"));
+        let mut saw_rl = false;
+        while let Some(ev) = rx.recv().await {
+            if let HarnessEvent::RateLimit(r) = ev {
+                assert_eq!(r.window_5h_pct, Some(100.0));
+                assert_eq!(r.reset_5h.as_deref(), Some("in 1h1m23s"));
+                saw_rl = true;
+            }
+        }
+        assert!(saw_rl, "expected RateLimit event on quota stop");
+
+        // 2. JSON-RPC error with RESOURCE_EXHAUSTED (code 429) from tb15b-calcx-agy.log.
+        let rpc_429_script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-q2"}}'
+read l
+echo '{"jsonrpc":"2.0","id":3,"error":{"code":429,"message":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m7s."}}'
+"#;
+        let harness2 = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), rpc_429_script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let (tx2, _rx2) = mpsc::channel(16);
+        let err2 = harness2.run(task, gate, tx2).await.unwrap_err();
+        let quota2 = err2.downcast_ref::<crate::QuotaError>().expect("QuotaError from JSON-RPC 429");
+        assert_eq!(quota2.reset.as_deref(), Some("in 1h1m7s"));
     }
 }

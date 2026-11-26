@@ -1036,6 +1036,25 @@ pub enum LimitKind {
     Balance,
 }
 
+/// Exit code returned by `tm-daemon` when a provider hits a temporary quota or HTTP 429 rate
+/// limit (`EX_TEMPFAIL` = 75), so outer automation scripts stop immediately instead of firing
+/// doomed runs until the reset window passes.
+pub const QUOTA_LIMIT_EXIT: u8 = 75;
+
+/// Exit code returned by `tm-daemon` when a provider requires authentication or credit balance
+/// before continuing.
+pub const AUTH_LIMIT_EXIT: u8 = 3;
+
+impl LimitKind {
+    /// Distinct CLI exit code for this provider limit kind.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            LimitKind::Quota | LimitKind::RateLimit => QUOTA_LIMIT_EXIT,
+            LimitKind::Auth | LimitKind::Balance => AUTH_LIMIT_EXIT,
+        }
+    }
+}
+
 /// A provider limit found in a reply, before any role or provider name is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderLimit {
@@ -1070,6 +1089,10 @@ pub struct ReportedLimit {
 impl ReportedLimit {
     pub fn new(provider: &str, role: &str, hit: ProviderLimit) -> Self {
         Self { provider: provider.to_string(), role: role.to_string(), kind: hit.kind, reset: hit.reset, raw: hit.raw }
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        self.kind.exit_code()
     }
 
     pub fn sentence(&self) -> String {
@@ -1115,6 +1138,19 @@ pub fn provider_label(id: &str) -> String {
     }
 }
 
+/// Extract a typed [`ProviderLimit`] from a harness error (preferring a structured
+/// [`tm_harness::QuotaError`] emitted by the harness, then falling back to text matching).
+pub fn limit_from_error(err: &anyhow::Error) -> Option<ProviderLimit> {
+    if let Some(q) = err.downcast_ref::<tm_harness::QuotaError>() {
+        return Some(ProviderLimit {
+            kind: if q.is_rate_limit { LimitKind::RateLimit } else { LimitKind::Quota },
+            reset: q.reset.clone(),
+            raw: q.raw.clone(),
+        });
+    }
+    limit_of(&format!("{err:#}"))
+}
+
 /// A quota, rate-limit, or auth failure in a harness reply. A plan, a review, or an
 /// arbitration that parses is left alone, even if its prose mentions a limit.
 pub fn limit_of(text: &str) -> Option<ProviderLimit> {
@@ -1129,12 +1165,13 @@ pub fn limit_of(text: &str) -> Option<ProviderLimit> {
         LimitKind::Balance
     } else if auth_failure(&lower) {
         LimitKind::Auth
-    } else if rate_failure(&lower) {
-        LimitKind::RateLimit
-    } else if quota_failure(&lower) {
-        LimitKind::Quota
     } else {
-        return None;
+        let hit = tm_harness::detect_quota_or_rate_limit(raw)?;
+        return Some(ProviderLimit {
+            kind: if hit.is_rate_limit { LimitKind::RateLimit } else { LimitKind::Quota },
+            reset: hit.reset,
+            raw: hit.raw,
+        });
     };
     let raw = {
         let mut cut = raw.chars().take(2000).collect::<String>();
@@ -1143,7 +1180,7 @@ pub fn limit_of(text: &str) -> Option<ProviderLimit> {
         }
         cut
     };
-    Some(ProviderLimit { kind, reset: reset_time(window), raw })
+    Some(ProviderLimit { kind, reset: tm_harness::extract_reset_time(window), raw })
 }
 
 fn has_answer_json(text: &str) -> bool {
@@ -1194,42 +1231,6 @@ fn balance_failure(text: &str) -> bool {
         "no remaining balance",
     ];
     PHRASES.iter().any(|phrase| text.contains(phrase))
-}
-
-fn rate_failure(text: &str) -> bool {
-    const PHRASES: &[&str] = &["rate limit", "rate_limit", "too many requests", "429 too many"];
-    PHRASES.iter().any(|phrase| text.contains(phrase))
-}
-
-fn quota_failure(text: &str) -> bool {
-    const PHRASES: &[&str] = &[
-        "usage limit",
-        "usage_limit",
-        "you've hit your usage",
-        "you have hit your usage",
-        "hit your limit",
-        "insufficient_quota",
-        "credit balance is too low",
-        "out of credits",
-        "spend limit",
-        "exceeded your current quota",
-    ];
-    PHRASES.iter().any(|phrase| text.contains(phrase))
-}
-
-fn reset_time(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    for marker in ["resets at ", "reset at ", "resets ", "try again at ", "retry after ", "available again at "] {
-        let Some(at) = lower.find(marker) else { continue };
-        let rest = text[at + marker.len()..].trim();
-        let end = rest.find(['.', '\n']).unwrap_or(rest.len());
-        let phrase = rest[..end].trim().trim_matches(|c: char| c == ',' || c == ';');
-        if phrase.is_empty() || phrase.chars().count() > 40 {
-            continue;
-        }
-        return Some(phrase.to_string());
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1366,6 +1367,31 @@ mod tests {
             Ok(_) => panic!("a usage limit is not an arbitration"),
         }
         assert!(matches!(parse_resolution("{\"resolution\":\"conform\"}").unwrap(), Resolution::Conform));
+    }
+
+    #[test]
+    fn fix_n9_recognizes_antigravity_quota_429_reset_and_exit_code_75() {
+        let agy_text = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m23s.\n";
+        let hit = limit_of(agy_text).expect("Antigravity individual quota text");
+        assert_eq!(hit.kind, LimitKind::Quota);
+        assert_eq!(hit.reset.as_deref(), Some("in 1h1m23s"));
+        let reported = ReportedLimit::new("antigravity", "Planner", hit);
+        assert_eq!(reported.exit_code(), 75);
+        assert_eq!(reported.sentence(), "Antigravity hit its usage limit (Planner). Resets in 1h1m23s.");
+
+        let agy_json = r#"AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m7s.","status":"RESOURCE_EXHAUSTED","error_code":429}"#;
+        let hit2 = limit_of(agy_json).expect("AGY_ERROR 429 JSON");
+        assert_eq!(hit2.kind, LimitKind::Quota);
+        assert_eq!(hit2.reset.as_deref(), Some("in 1h1m7s"));
+        assert_eq!(hit2.kind.exit_code(), 75);
+
+        let bare_429 = limit_of("RESOURCE_EXHAUSTED (code 429). Try again in 5m.").expect("bare 429");
+        assert_eq!(bare_429.kind, LimitKind::RateLimit);
+        assert_eq!(bare_429.reset.as_deref(), Some("in 5m"));
+        assert_eq!(bare_429.kind.exit_code(), 75);
+
+        assert_eq!(LimitKind::Auth.exit_code(), 3);
+        assert_eq!(LimitKind::Balance.exit_code(), 3);
     }
 
     #[test]

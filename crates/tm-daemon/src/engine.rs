@@ -8997,7 +8997,7 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
                 }
             }
             Err(err) => {
-                if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+                if let Some(hit) = reply::limit_from_error(&err) {
                     return Err(reported_limit(&request, hit).into());
                 }
                 return Err(err);
@@ -9494,7 +9494,7 @@ async fn follow(
     let summary = match run {
         Ok(summary) => summary,
         Err(err) => {
-            if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+            if let Some(hit) = reply::limit_from_error(&err) {
                 let _ = session.close().await;
                 return Err(reported_limit(&request, hit).into());
             }
@@ -9673,7 +9673,7 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
             })
         }
         Err(err) => {
-            if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+            if let Some(hit) = reply::limit_from_error(&err) {
                 return Err(reported_limit(&request, hit).into());
             }
             eprintln!("taskmaster: resuming session failed ({err:#}); falling back to fresh brief");
@@ -9758,7 +9758,7 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
             })
         }
         Err(err) => {
-            if let Some(hit) = reply::limit_of(&format!("{err:#}")) {
+            if let Some(hit) = reply::limit_from_error(&err) {
                 return Err(reported_limit(&request, hit).into());
             }
             eprintln!("taskmaster: the held agent stopped ({err:#}); resuming it instead");

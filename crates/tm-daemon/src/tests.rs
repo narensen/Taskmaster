@@ -13656,3 +13656,65 @@ async fn fix_n9_code_mode_dedupes_prompt_enforces_repair_run_code_and_saves_toke
         "two-call run_code path ({code_total} cumulative input bytes) must save >50% over native 7-call path ({native_total} bytes)"
     );
 }
+
+#[tokio::test]
+async fn fix_n9_quota_429_stops_planner_without_retry_loop_reports_reset_and_exit_75() {
+    // Reproduces tb15-calcx-plus-tmh / tb15-notesapi-tmh: Antigravity returns
+    // `⚠ Individual quota reached ... Resets in 1h1m23s.` on the planner call.
+    // Taskmaster must stop immediately on call #1 (never retry-loop or print
+    // "the plan reply had no JSON object"), include the reset time, and map to exit code 75.
+    let tmp = seeded("n9-quota-429");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct QuotaPlannerFake {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl Harness for QuotaPlannerFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            _task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m23s.\n";
+            let _ = events.send(HarnessEvent::Text { text: msg.into() }).await;
+            let hit = tm_harness::detect_quota_or_rate_limit(msg).expect("quota detected");
+            Err(hit.into())
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(QuotaPlannerFake { calls: calls.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.run_id = "n9-fix4".into();
+    cfg.prompt = Some("Build a tiny Python CLI.".into());
+    cfg.yes = true;
+    cfg.timeout = Duration::from_secs(30);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let err = drive(cfg, harnesses).await.unwrap_err();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "planner must stop on call #1 with zero retry loops when provider quota/429 hits"
+    );
+    let limit = err
+        .downcast_ref::<crate::reply::ReportedLimit>()
+        .expect("must surface typed ReportedLimit, not 'plan reply had no JSON object'");
+    assert_eq!(limit.kind, crate::reply::LimitKind::Quota);
+    assert_eq!(limit.reset.as_deref(), Some("in 1h1m23s"));
+    assert_eq!(limit.exit_code(), crate::reply::QUOTA_LIMIT_EXIT);
+    assert_eq!(limit.exit_code(), 75);
+    assert!(
+        limit.sentence().contains("Antigravity") && limit.sentence().contains("Resets in 1h1m23s"),
+        "error message must include provider and reset time: {}",
+        limit.sentence()
+    );
+}

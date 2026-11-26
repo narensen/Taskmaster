@@ -417,6 +417,119 @@ impl std::fmt::Display for Stalled {
 
 impl std::error::Error for Stalled {}
 
+/// A provider quota exhaustion or HTTP 429 rate-limit error detected directly inside a harness
+/// (for example Antigravity's `Individual quota reached ... Resets in XhYmZs.` or
+/// `RESOURCE_EXHAUSTED (code 429)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaError {
+    pub is_rate_limit: bool,
+    pub reset: Option<String>,
+    pub raw: String,
+}
+
+impl std::fmt::Display for QuotaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.is_rate_limit {
+            "provider rate limit reached (HTTP 429)"
+        } else {
+            "provider quota reached"
+        };
+        match &self.reset {
+            Some(reset) => write!(f, "{what}. Resets {reset}."),
+            None => write!(f, "{what}."),
+        }
+    }
+}
+
+impl std::error::Error for QuotaError {}
+
+/// Extract a short reset-time phrase (e.g. `"in 1h1m23s"`, `"6:30 PM"`, `"4:00 PM"`) from a
+/// provider quota or rate-limit message.
+pub fn extract_reset_time(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for marker in [
+        "resets at ",
+        "reset at ",
+        "resets ",
+        "try again at ",
+        "try again in ",
+        "retry after ",
+        "available again at ",
+    ] {
+        let Some(at) = lower.find(marker) else { continue };
+        let start = if marker == "try again in " {
+            at + "try again ".len()
+        } else {
+            at + marker.len()
+        };
+        let rest = text[start..].trim();
+        let end = rest.find(['.', '\n', '"']).unwrap_or(rest.len());
+        let phrase = rest[..end].trim().trim_matches(|c: char| c == ',' || c == ';');
+        if phrase.is_empty() || phrase.chars().count() > 40 {
+            continue;
+        }
+        return Some(phrase.to_string());
+    }
+    None
+}
+
+/// Detect a provider quota or HTTP 429 / `RESOURCE_EXHAUSTED` message in raw harness text or
+/// JSON-RPC error output. Shared by both harness adapters and daemon reply parsing.
+pub fn detect_quota_or_rate_limit(text: &str) -> Option<QuotaError> {
+    const QUOTA_PHRASES: &[&str] = &[
+        "individual quota reached",
+        "quota reached",
+        "quota exceeded",
+        "quota_exhausted",
+        "usage limit",
+        "usage_limit",
+        "you've hit your usage",
+        "you have hit your usage",
+        "hit your limit",
+        "insufficient_quota",
+        "credit balance is too low",
+        "out of credits",
+        "spend limit",
+        "exceeded your current quota",
+    ];
+    const RATE_PHRASES: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "429 too many",
+        "resource_exhausted",
+        "code 429",
+        "\"error_code\":429",
+        "\"error_code\": 429",
+        "status 429",
+        "status: 429",
+        "http 429",
+    ];
+    let raw = text.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let head = raw.lines().find(|line| !line.trim().is_empty()).unwrap_or(raw);
+    let window = if raw.chars().count() <= 1200 { raw } else { head };
+    let lower = window.to_ascii_lowercase();
+    let is_quota = QUOTA_PHRASES.iter().any(|p| lower.contains(p));
+    let is_rate = RATE_PHRASES.iter().any(|p| lower.contains(p));
+    if !is_quota && !is_rate {
+        return None;
+    }
+    let mut clipped: String = raw.chars().take(2000).collect();
+    if raw.chars().count() > 2000 {
+        clipped.push('…');
+    }
+    Some(QuotaError {
+        // When both a quota phrase and 429/RESOURCE_EXHAUSTED appear (e.g. Antigravity's
+        // `RESOURCE_EXHAUSTED (code 429): Individual quota reached`), treat it as Quota.
+        is_rate_limit: !is_quota && is_rate,
+        reset: extract_reset_time(window),
+        raw: clipped,
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub input: u64,

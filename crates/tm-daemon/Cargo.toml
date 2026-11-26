@@ -18,7 +18,7 @@ tokio.workspace = true
 anyhow.workspace = true
 axum = "0.8"
 sha2 = "0.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = "0.30"

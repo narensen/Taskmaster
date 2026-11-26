@@ -7,6 +7,8 @@
 
 pub mod env;
 pub mod model;
+pub mod parse;
+pub mod resolve;
 
 pub use env::{EnvFacts, read_env, write_env};
 pub use model::{

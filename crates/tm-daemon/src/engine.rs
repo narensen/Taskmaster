@@ -6444,7 +6444,7 @@ impl Driver {
         let fetch_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_fetch");
         let adv_tool = tm_harness::mcp_tool_name(wid, "dictionary", "advisories");
         let search_tool = tm_harness::mcp_tool_name(wid, "dictionary", "web_search");
-        let show_docs = project_has_external_deps(&self.tree) || self.web_access.enabled;
+        let show_docs = crate::runtime::project_has_external_deps(&self.tree) || self.web_access.enabled;
         out.push_str("\nCode graph");
         if show_docs {
             out.push_str(&format!(" & docs (`{docs_tool}(package, symbol?)` for installed package APIs)"));
@@ -7242,7 +7242,7 @@ impl Driver {
                 page.cites.iter().any(|k| catalog.resolve(k).ok().flatten().is_none())
             });
         let mut hidden = vec!["set_status".to_string()];
-        if !project_has_external_deps(&self.tree) && !self.web_access.enabled {
+        if !crate::runtime::project_has_external_deps(&self.tree) && !self.web_access.enabled {
             hidden.push("docs".to_string());
         }
         tm_dictionary::ToolPolicy {
@@ -8882,64 +8882,6 @@ pub(crate) fn expand_glob_in_worktree(worktree: &Path, glob: &str) -> Vec<String
     rels.into_iter()
         .map(|rel| worktree.join(rel.trim_start_matches("./")).display().to_string())
         .collect()
-}
-
-/// True when `tree` declares external third-party packages (Node, Python, Rust, or Go),
-/// indicating the local `docs(package)` MCP tool may be useful to workers.
-pub(crate) fn project_has_external_deps(tree: &Path) -> bool {
-    if tree.join("node_modules").is_dir() {
-        return true;
-    }
-    if let Ok(raw) = fs::read_to_string(tree.join("package.json"))
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-    {
-        for key in ["dependencies", "devDependencies", "peerDependencies"] {
-            if val[key].as_object().is_some_and(|m| !m.is_empty()) {
-                return true;
-            }
-        }
-    }
-    for req in ["requirements.txt", "requirements-dev.txt"] {
-        if let Ok(raw) = fs::read_to_string(tree.join(req)) {
-            let has_pkg = raw.lines().map(str::trim).any(|l| {
-                !l.is_empty()
-                    && !l.starts_with('#')
-                    && !l.starts_with('-')
-                    && !l.to_ascii_lowercase().starts_with("pytest")
-            });
-            if has_pkg {
-                return true;
-            }
-        }
-    }
-    if let Ok(raw) = fs::read_to_string(tree.join("pyproject.toml")) {
-        let lower = raw.to_ascii_lowercase();
-        let in_deps = lower.contains("dependencies = [")
-            && !lower.contains("dependencies = []")
-            && !lower.contains("dependencies = [\"pytest\"]")
-            && !lower.contains("dependencies = ['pytest']");
-        if in_deps || lower.contains("[tool.poetry.dependencies]") {
-            return true;
-        }
-    }
-    if let Ok(raw) = fs::read_to_string(tree.join("Cargo.toml"))
-        && let Some((_, rest)) = raw.split_once("[dependencies]")
-    {
-        let has_crate = rest
-            .lines()
-            .take_while(|l| !l.trim_start().starts_with('['))
-            .map(str::trim)
-            .any(|l| !l.is_empty() && !l.starts_with('#') && l.contains('='));
-        if has_crate {
-            return true;
-        }
-    }
-    if let Ok(raw) = fs::read_to_string(tree.join("go.mod"))
-        && raw.lines().any(|l| l.trim_start().starts_with("require "))
-    {
-        return true;
-    }
-    false
 }
 
 fn collapse_ws(text: &str) -> String {

@@ -139,15 +139,285 @@ pub fn has_tests(tree: &Path) -> bool {
     python_tests(tree) || tree.join("Cargo.toml").is_file() || npm_test
 }
 
+/// Dependency-relevant subset extracted from `pyproject.toml`.
+/// Cosmetic edits (`version`, `description`, `[tool.pytest.ini_options]`, `[tool.ruff]`, empty
+/// `dependencies = []`, etc.) leave this empty so adding a stdlib-only `pyproject.toml` mid-run
+/// never invalidates a working shared venv.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PyprojectDepInfo {
+    deps: Vec<String>,
+    scripts: Vec<String>,
+    env_lines: Vec<String>,
+}
+
+impl PyprojectDepInfo {
+    fn has_third_party_deps(&self) -> bool {
+        self.deps.iter().any(|d| is_third_party_python_spec(d))
+    }
+
+    fn has_scripts(&self) -> bool {
+        !self.scripts.is_empty()
+    }
+
+    fn fingerprint(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.deps.len() + self.scripts.len() + self.env_lines.len());
+        for d in &self.deps {
+            out.push(format!("dep:{d}"));
+        }
+        for s in &self.scripts {
+            out.push(format!("script:{s}"));
+        }
+        for e in &self.env_lines {
+            out.push(format!("env:{e}"));
+        }
+        out
+    }
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_single && !in_double => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn extract_quoted_strings(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let mut val = String::new();
+            while let Some(c) = chars.next() {
+                if c == '\\' && quote == '"' {
+                    if let Some(next) = chars.next() {
+                        val.push(next);
+                    }
+                    continue;
+                }
+                if c == quote {
+                    break;
+                }
+                val.push(c);
+            }
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_third_party_python_spec(spec: &str) -> bool {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+        return false;
+    }
+    let pkg: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    let norm = pkg.to_ascii_lowercase().replace(['_', '.'], "-");
+    !norm.is_empty() && norm != "pytest" && norm != "python"
+}
+
+fn requirement_file_has_third_party(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|raw| raw.lines().any(is_third_party_python_spec))
+}
+
+fn parse_pyproject_dep_info(pyproject: &str) -> PyprojectDepInfo {
+    let mut info = PyprojectDepInfo::default();
+    let mut section = String::new();
+    let mut collecting_array_key: Option<String> = None;
+    let mut array_buf = String::new();
+
+    for raw in pyproject.lines() {
+        let clean = strip_toml_comment(raw).trim();
+        if clean.is_empty() {
+            continue;
+        }
+        if let Some(key) = collecting_array_key.clone() {
+            array_buf.push(' ');
+            array_buf.push_str(clean);
+            if clean.contains(']') {
+                for item in extract_quoted_strings(&array_buf) {
+                    if section == "[project.optional-dependencies]" {
+                        info.deps.push(format!("{key}:{item}"));
+                    } else {
+                        info.deps.push(item);
+                    }
+                }
+                collecting_array_key = None;
+                array_buf.clear();
+            }
+            continue;
+        }
+        if clean.starts_with('[') && clean.ends_with(']') {
+            section = clean.to_ascii_lowercase();
+            continue;
+        }
+        if section == "[project]" {
+            if let Some((k, v)) = clean.split_once('=')
+                && k.trim() == "dependencies"
+            {
+                let v = v.trim();
+                if v.starts_with('[') {
+                    if v.contains(']') {
+                        info.deps.extend(extract_quoted_strings(v));
+                    } else {
+                        collecting_array_key = Some("dependencies".into());
+                        array_buf = v.to_string();
+                    }
+                }
+            }
+        } else if section == "[project.optional-dependencies]" {
+            if let Some((k, v)) = clean.split_once('=') {
+                let key = k.trim().trim_matches('"').to_string();
+                let v = v.trim();
+                if v.starts_with('[') {
+                    if v.contains(']') {
+                        for item in extract_quoted_strings(v) {
+                            info.deps.push(format!("{key}:{item}"));
+                        }
+                    } else {
+                        collecting_array_key = Some(key);
+                        array_buf = v.to_string();
+                    }
+                }
+            }
+        } else if section == "[project.scripts]"
+            || section == "[project.gui-scripts]"
+            || section.starts_with("[project.entry-points")
+            || section == "[tool.poetry.scripts]"
+        {
+            if clean.contains('=') {
+                info.scripts.push(clean.to_string());
+            }
+        } else if section == "[tool.poetry.dependencies]"
+            || section == "[tool.poetry.dev-dependencies]"
+            || section.starts_with("[tool.poetry.group.")
+        {
+            if let Some((k, v)) = clean.split_once('=') {
+                let pkg = k.trim().trim_matches('"');
+                if !pkg.eq_ignore_ascii_case("python") {
+                    info.deps.push(format!("{pkg}={}", v.trim()));
+                }
+            }
+        } else if section.starts_with("[tool.uv") || section.starts_with("[tool.hatch.envs") {
+            info.env_lines.push(format!("{section}:{clean}"));
+        }
+    }
+
+    info.deps.sort();
+    info.deps.dedup();
+    info.scripts.sort();
+    info.scripts.dedup();
+    info.env_lines.sort();
+    info.env_lines.dedup();
+    info
+}
+
+/// True when `tree` has a `pyproject.toml` declaring console/entry-point scripts (requiring
+/// editable installation so `venv/bin/<script>` is generated).
+pub(crate) fn pyproject_has_scripts(tree: &Path) -> bool {
+    std::fs::read_to_string(tree.join("pyproject.toml"))
+        .ok()
+        .is_some_and(|raw| parse_pyproject_dep_info(&raw).has_scripts())
+}
+
+/// True when `tree` declares external third-party packages (Node, Python, Rust, or Go),
+/// indicating the local `docs(package)` MCP tool may be useful or a venv needs third-party installs.
+pub(crate) fn project_has_external_deps(tree: &Path) -> bool {
+    if tree.join("node_modules").is_dir() {
+        return true;
+    }
+    if let Ok(raw) = std::fs::read_to_string(tree.join("package.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+    {
+        for key in ["dependencies", "devDependencies", "peerDependencies"] {
+            if val[key].as_object().is_some_and(|m| !m.is_empty()) {
+                return true;
+            }
+        }
+    }
+    for req in requirement_files(tree) {
+        if requirement_file_has_third_party(&tree.join(req)) {
+            return true;
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(tree.join("pyproject.toml"))
+        && parse_pyproject_dep_info(&raw).has_third_party_deps()
+    {
+        return true;
+    }
+    if let Ok(raw) = std::fs::read_to_string(tree.join("Cargo.toml"))
+        && let Some((_, rest)) = raw.split_once("[dependencies]")
+    {
+        let has_crate = rest
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with('['))
+            .map(str::trim)
+            .any(|l| !l.is_empty() && !l.starts_with('#') && l.contains('='));
+        if has_crate {
+            return true;
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(tree.join("go.mod"))
+        && raw.lines().any(|l| l.trim_start().starts_with("require "))
+    {
+        return true;
+    }
+    false
+}
+
 /// The dependency files that decide what a Python environment holds, as one stamp.
+/// Only dependency-affecting fields of `pyproject.toml` are hashed so cosmetic metadata or
+/// `[tool.pytest.ini_options]` changes never invalidate an existing venv.
 fn python_stamp(tree: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut names: Vec<PathBuf> = ["pyproject.toml", "poetry.lock", "uv.lock", "setup.py", "setup.cfg", "Pipfile.lock"].iter().map(|f| tree.join(f)).collect();
+    if let Ok(raw) = std::fs::read_to_string(tree.join("pyproject.toml")) {
+        let fp = parse_pyproject_dep_info(&raw).fingerprint();
+        if !fp.is_empty() {
+            "pyproject.toml".hash(&mut hasher);
+            fp.hash(&mut hasher);
+        }
+    }
+    let mut names: Vec<PathBuf> = ["poetry.lock", "uv.lock", "setup.py", "setup.cfg", "Pipfile.lock"]
+        .iter()
+        .map(|f| tree.join(f))
+        .collect();
     names.extend(requirement_files(tree).into_iter().map(|f| tree.join(f)));
     for name in names {
-        name.file_name().hash(&mut hasher);
-        std::fs::read(&name).unwrap_or_default().hash(&mut hasher);
+        if let Ok(bytes) = std::fs::read(&name) {
+            // Skip requirements files that only declare `pytest` (already in the shared venv).
+            if name
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".txt"))
+                && !requirement_file_has_third_party(&name)
+            {
+                continue;
+            }
+            name.file_name().hash(&mut hasher);
+            bytes.hash(&mut hasher);
+        }
     }
     format!("{:x}", hasher.finish())
 }
@@ -208,9 +478,10 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
         ("PYTHONNOUSERSITE".into(), "1".into()),
         ("PIP_USER".into(), "0".into()),
     ];
+    let python_bin = bin.join(if cfg!(windows) { "python.exe" } else { "python" });
     let stamp = python_stamp(tree);
     let stamp_file = venv.join(".taskmaster-deps");
-    let ready = std::fs::read_to_string(&stamp_file).is_ok_and(|have| have == stamp) && bin.is_dir();
+    let ready = std::fs::read_to_string(&stamp_file).is_ok_and(|have| have == stamp) && python_bin.is_file();
     let mut out = Vec::new();
     let with_env = |mut step: Step| {
         step.env = venv_env.clone();
@@ -220,11 +491,13 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
         step.setup = true;
         step
     };
-    if !ready {
+    // Never recreate an existing venv over a working `bin/python`: only create it when missing.
+    if !python_bin.is_file() {
         // System packages stay visible underneath, so a machine with no network still has pytest.
         out.push(setup(Step::new("setup", python, &["-m", "venv", "--system-site-packages", &venv.display().to_string()])));
     }
-    let venv_python = bin.join(if cfg!(windows) { "python.exe" } else { "python" }).display().to_string();
+    let venv_python = python_bin.display().to_string();
+    let py_info = parse_pyproject_dep_info(&pyproject);
     let poetry = (pyproject.contains("[tool.poetry") || tree.join("poetry.lock").is_file()) && on_path("poetry");
     let uv = (tree.join("uv.lock").is_file() || pyproject.contains("[tool.uv")) && on_path("uv");
     let hatch = pyproject.contains("[tool.hatch.envs") && on_path("hatch");
@@ -243,20 +516,44 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
         with_env(Step::new("test", "hatch", &["run", "pytest", "-q", "-x", "--tb=short"]))
     } else {
         let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into(), "-q".into()];
-        let installable = pyproject.contains("[project]") || pyproject.contains("[build-system]") || tree.join("setup.py").is_file() || tree.join("setup.cfg").is_file();
+        let has_legacy_setup = tree.join("setup.py").is_file() || tree.join("setup.cfg").is_file();
+        let reqs = requirement_files(tree);
+        let has_external = py_info.has_third_party_deps()
+            || has_legacy_setup
+            || reqs.iter().any(|f| requirement_file_has_third_party(&tree.join(f)));
+        let installable = pyproject.contains("[project]") || pyproject.contains("[build-system]") || has_legacy_setup;
         if installable {
-            let extras = test_extras(&pyproject);
-            args.push("-e".into());
-            args.push(if extras.is_empty() { ".".into() } else { format!(".[{}]", extras.join(",")) });
+            if !has_external && !py_info.has_scripts() {
+                // Pure stdlib package with no console scripts: skip `-e .` so offline runs never
+                // invoke PEP 517 build isolation against PyPI.
+            } else if !has_external && py_info.has_scripts() {
+                // Stdlib package with `[project.scripts]`: install console entry points offline-safely.
+                args.push("--no-build-isolation".into());
+                args.push("--no-deps".into());
+                args.push("-e".into());
+                args.push(".".into());
+            } else {
+                let extras = test_extras(&pyproject);
+                args.push("-e".into());
+                args.push(if extras.is_empty() { ".".into() } else { format!(".[{}]", extras.join(",")) });
+            }
         }
-        for file in requirement_files(tree) {
-            args.push("-r".into());
-            args.push(file);
+        for file in reqs {
+            if requirement_file_has_third_party(&tree.join(&file)) {
+                args.push("-r".into());
+                args.push(file);
+            }
         }
-        args.push("pytest".into());
+        if !args.iter().any(|a| a == "--no-deps") {
+            args.push("pytest".into());
+        }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         install.push(with_env(Step::new("setup", venv_python.clone(), &refs)));
-        with_env(Step::new("test", venv_python, &["-m", "pytest", "-q", "-x", "--tb=short"]))
+        let mut run = with_env(Step::new("test", venv_python, &["-m", "pytest", "-q", "-x", "--tb=short"]));
+        if !has_external {
+            run.env.push(("PYTHONPATH".into(), ".".into()));
+        }
+        run
     };
     if !ready {
         for step in install {
@@ -1487,6 +1784,71 @@ mod tests {
         let mut cargo = vec![Step::new("test", "cargo", &["test", "--quiet"])];
         filter_test_steps(&mut cargo, &["tests/integration.rs".into(), "src/parser.rs".into()]);
         assert_eq!(cargo[0].args, vec!["test", "--quiet", "--test", "integration", "parser"]);
+    }
+
+    #[test]
+    fn tb18_pyproject_cosmetic_change_preserves_stamp_and_existing_venv_not_recreated() {
+        let dir = std::env::temp_dir().join(format!("tm-tb18-venv-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_calc.py"), "def test_ok(): assert True\n").unwrap();
+        let venv = dir.join("venv");
+        let bin = venv.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        std::fs::create_dir_all(&bin).unwrap();
+        let py_bin = bin.join(if cfg!(windows) { "python.exe" } else { "python" });
+        std::fs::write(&py_bin, "#!/bin/sh\n").unwrap();
+
+        let stamp_before = python_stamp(&dir);
+        std::fs::write(venv.join(".taskmaster-deps"), &stamp_before).unwrap();
+
+        // 1. Adding a stdlib-only `pyproject.toml` with `[tool.pytest.ini_options]` and empty
+        //    `dependencies = []` keeps the EXACT same stamp and emits zero setup steps!
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"setuptools\"]\n\n[project]\nname = \"calcx\"\nversion = \"0.1.0\"\ndependencies = []\n\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+        )
+        .unwrap();
+        assert_eq!(python_stamp(&dir), stamp_before, "cosmetic/stdlib pyproject.toml must keep stamp stable");
+        assert!(!project_has_external_deps(&dir));
+        let steps_stdlib = python_steps(&dir, &venv);
+        assert!(steps_stdlib.iter().all(|s| !s.setup), "ready venv must need zero setup steps: {steps_stdlib:?}");
+
+        // 2. Adding `[project.scripts]` changes the stamp, does NOT emit `python -m venv` over
+        //    existing `bin/python`, and installs offline-safely with `--no-build-isolation --no-deps -e .`.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"calcx\"\nversion = \"0.1.0\"\ndependencies = []\n\n[project.scripts]\ncalcx = \"calcx.cli:main\"\n",
+        )
+        .unwrap();
+        assert_ne!(python_stamp(&dir), stamp_before);
+        let steps_scripts = python_steps(&dir, &venv);
+        assert!(
+            !steps_scripts.iter().any(|s| s.args.iter().any(|a| a == "venv")),
+            "existing bin/python must never trigger `python -m venv` again: {steps_scripts:?}"
+        );
+        let pip_step = steps_scripts.iter().find(|s| s.setup && s.args.iter().any(|a| a == "pip")).expect("pip setup step");
+        assert!(pip_step.args.iter().any(|a| a == "--no-build-isolation"), "{pip_step:?}");
+        assert!(pip_step.args.iter().any(|a| a == "--no-deps"), "{pip_step:?}");
+        assert!(pip_step.args.iter().any(|a| a == "-e"), "{pip_step:?}");
+
+        // 3. Adding a real third-party dependency changes the stamp, reports external deps, and
+        //    does NOT recreate `bin/python`.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"calcx\"\ndependencies = [\n  \"requests>=2.31\",\n]\n",
+        )
+        .unwrap();
+        assert!(project_has_external_deps(&dir));
+        let steps_ext = python_steps(&dir, &venv);
+        assert!(
+            !steps_ext.iter().any(|s| s.args.iter().any(|a| a == "venv")),
+            "existing bin/python must not be recreated when adding third-party deps: {steps_ext:?}"
+        );
+        let pip_ext = steps_ext.iter().find(|s| s.setup && s.args.iter().any(|a| a == "pip")).expect("pip setup step");
+        assert!(pip_ext.args.iter().any(|a| a == "-e"), "{pip_ext:?}");
+        assert!(!pip_ext.args.iter().any(|a| a == "--no-deps"), "{pip_ext:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

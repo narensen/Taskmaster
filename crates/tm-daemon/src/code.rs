@@ -1643,11 +1643,28 @@ async fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>
         Some(shared) => {
             let candidate = crate::runtime::steps(&scope.cwd, &shared);
             let needs_pytest = candidate.iter().any(crate::runtime::is_pytest_step);
+            let has_pytest = !needs_pytest || crate::runtime::venv_has_pytest(&shared).await;
             let ready = candidate.iter().any(|s| !s.setup)
                 && !candidate.iter().any(|s| s.setup)
-                && (!needs_pytest || crate::runtime::venv_has_pytest(&shared).await);
+                && has_pytest;
             if ready {
                 (shared, candidate)
+            } else if needs_pytest
+                && has_pytest
+                && !crate::runtime::project_has_external_deps(&scope.cwd)
+                && !crate::runtime::pyproject_has_scripts(&scope.cwd)
+            {
+                // Shared read-only venv already has working pytest and the worktree declares no
+                // third-party packages or console scripts: keep reusing `shared` directly with
+                // `PYTHONPATH=.` rather than building an offline scratch venv.
+                let mut test_only: Vec<crate::runtime::Step> =
+                    candidate.into_iter().filter(|s| !s.setup).collect();
+                for step in &mut test_only {
+                    if !step.env.iter().any(|(k, _)| k == "PYTHONPATH") {
+                        step.env.push(("PYTHONPATH".into(), ".".into()));
+                    }
+                }
+                (shared, test_only)
             } else {
                 let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
                 (fallback_venv, steps)
@@ -3351,5 +3368,74 @@ mod tests {
 
         let _ = crate::git::remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn tb18_select_test_steps_reuses_shared_venv_after_stdlib_pyproject_added() {
+        let Some(py_mm) = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        else {
+            return;
+        };
+        let dir = repo("tb18-shared-venv-reuse");
+        let shared = dir.join("shared-venv");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(dir.join("tests/test_ok.py"), "def test_ok(): assert True\n").unwrap();
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", &shared.display().to_string()])
+            .status()
+            .unwrap();
+        if !mk.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let venv_site = shared.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(venv_site.join("__init__.py"), "__version__ = '0.0.0-venv'\n").unwrap();
+        std::fs::write(venv_site.join("__main__.py"), "print('pytest 0.0.0-venv')\n").unwrap();
+
+        // Stamp was written BEFORE worker added a stdlib-only `pyproject.toml`.
+        let probe = crate::runtime::steps(&dir, &shared);
+        let stamp_pair = probe.iter().find_map(|s| s.stamp.clone()).expect("stamp");
+        std::fs::write(&stamp_pair.0, &stamp_pair.1).unwrap();
+
+        // Worker writes a stdlib-only `pyproject.toml` with pytest config + empty deps.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"calcx\"\ndependencies = []\n\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+        )
+        .unwrap();
+
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: Some(tm_harness::ShellScope {
+                writable: vec![scratch.clone()],
+                readable: vec![shared.clone()],
+                env: vec![],
+            }),
+            read_only: false,
+            sync: None,
+            warm: tokio::sync::Mutex::new(None),
+        };
+        let (chosen, chosen_steps) = select_test_steps(&scope).await;
+        assert_eq!(chosen, shared, "stdlib pyproject.toml must keep reusing ready shared RO venv");
+        assert!(chosen_steps.iter().all(|s| !s.setup), "must emit no setup steps: {chosen_steps:?}");
+
+        // Even if the stamp was deliberately stale (e.g. legacy stamp), stdlib repo with working
+        // shared pytest still keeps `shared` instead of falling back to scratch!
+        std::fs::write(&stamp_pair.0, "stale-old-stamp").unwrap();
+        let (chosen_stale, steps_stale) = select_test_steps(&scope).await;
+        assert_eq!(chosen_stale, shared, "stdlib repo with working shared pytest must not fall back to scratch");
+        assert!(steps_stale.iter().all(|s| !s.setup));
+        assert!(steps_stale.iter().any(|s| s.env.iter().any(|(k, v)| k == "PYTHONPATH" && v == ".")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2406,7 +2406,7 @@ impl Extension for WebTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        match crate::code::strip_dict_prefix(name) {
+        match tm_dictionary::strip_dict_prefix(name) {
             "web_search" => Some(self.handle_search(grant, args).await),
             "web_fetch" => Some(self.handle_fetch(grant, args).await),
             "advisories" => Some(self.handle_advisories(grant, args).await),

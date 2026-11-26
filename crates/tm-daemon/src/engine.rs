@@ -9022,7 +9022,7 @@ fn resolve_env_path(raw: &str, project: &Path, tree: &Path) -> PathBuf {
 }
 
 fn dict_prefixes() -> Vec<String> {
-    ["dict__", "dictionary__", "dictionary_", "mcp__dictionary", "mcp_dictionary_"]
+    tm_dictionary::DICT_TOOL_PREFIXES
         .into_iter()
         .map(str::to_string)
         .collect()

@@ -285,7 +285,7 @@ impl Extension for StatusTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if strip_dict_prefix(name) != "set_status" {
+        if tm_dictionary::strip_dict_prefix(name) != "set_status" {
             return None;
         }
         let text = args["text"].as_str().unwrap_or("");
@@ -1546,26 +1546,16 @@ fn bwrap_works() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Strip any known Dictionary MCP server prefix from a tool name so aliases work uniformly.
-pub(crate) fn strip_dict_prefix(name: &str) -> &str {
-    for prefix in ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            return rest;
-        }
-    }
-    name
-}
-
 /// Accept both the canonical MCP name (`run_code`) and harness-prefixed aliases
 /// (such as `mcp_dictionary_run_code` on Antigravity or `mcp__dictionary__run_code` on Claude).
 fn is_run_code_tool(name: &str) -> bool {
-    strip_dict_prefix(name) == "run_code"
+    tm_dictionary::strip_dict_prefix(name) == "run_code"
 }
 
 /// Accept `writeFile` / `write_file` (with or without a Dictionary prefix) taking `{path, content}`
 /// as separate MCP arguments so raw files bypass JS string escaping.
 fn is_write_file_tool(name: &str) -> bool {
-    matches!(strip_dict_prefix(name), "writeFile" | "write_file")
+    matches!(tm_dictionary::strip_dict_prefix(name), "writeFile" | "write_file")
 }
 
 /// Refuse writes into Taskmaster's `.flow/` directory or matching `Policy::denied_globs`

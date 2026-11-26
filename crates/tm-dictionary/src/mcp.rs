@@ -280,8 +280,19 @@ fn dispatch(state: &McpState, grant: &Grant, msg: &Value) -> Result<Value, (i32,
     }
 }
 
-fn strip_dict_prefix(name: &str) -> &str {
-    for prefix in ["mcp_dictionary_", "mcp__dictionary__", "dictionary__", "dictionary_", "dict__", "taskmaster__"] {
+/// Every MCP tool-name prefix harnesses attach to Taskmaster's Dictionary server.
+pub const DICT_TOOL_PREFIXES: [&str; 6] = [
+    "mcp_dictionary_",
+    "mcp__dictionary__",
+    "dictionary__",
+    "dictionary_",
+    "dict__",
+    "taskmaster__",
+];
+
+/// Strip any known Dictionary MCP server prefix from a tool name so aliases dispatch uniformly.
+pub fn strip_dict_prefix(name: &str) -> &str {
+    for prefix in DICT_TOOL_PREFIXES {
         if let Some(rest) = name.strip_prefix(prefix) {
             return rest;
         }
@@ -584,5 +595,14 @@ mod tests {
         let (call_status, res) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
         assert_eq!(call_status, StatusCode::OK);
         assert_eq!(res["result"]["isError"], false);
+    }
+
+    #[test]
+    fn strip_dict_prefix_handles_all_known_mcp_prefixes() {
+        for prefix in DICT_TOOL_PREFIXES {
+            assert_eq!(strip_dict_prefix(&format!("{prefix}flow_query")), "flow_query");
+        }
+        assert_eq!(strip_dict_prefix("run_code"), "run_code");
+        assert_eq!(strip_dict_prefix("other__tool"), "other__tool");
     }
 }

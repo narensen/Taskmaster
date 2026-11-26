@@ -5,11 +5,10 @@
 //! body is rejected so planning does not publish a successor by accident.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{valid_key, ContractFile, DictKey, EntryKind, PagePlan, Plan};
+use crate::types::{safe_rel, valid_key, ContractFile, DictKey, EntryKind, PagePlan, Plan};
 
 /// One Dictionary entry the planner wants published. The hash is computed when it is stored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -673,12 +672,6 @@ fn contract_references_deliverable(content: &str, deliver: &str) -> bool {
         }
     }
     false
-}
-
-/// A relative path that cannot climb out of the project. Globs such as `app/home/**` pass.
-fn safe_rel(path: &str) -> bool {
-    let path = Path::new(path);
-    !path.is_absolute() && !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 #[cfg(test)]

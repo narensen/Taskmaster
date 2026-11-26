@@ -21,9 +21,7 @@ pub const FLOW_GITIGNORE_CONTENT: &str = "index.sqlite\nindex.sqlite-wal\nindex.
 
 /// True when `path` refers to `.flow` itself or any file inside `.flow/`.
 pub fn is_flow_path(path: &str) -> bool {
-    let norm = path.replace('\\', "/");
-    let trimmed = norm.trim_start_matches("./").trim_end_matches('/');
-    trimmed == FLOW_DIR || trimmed.starts_with(".flow/")
+    tm_core::is_flow_path(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

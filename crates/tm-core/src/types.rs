@@ -505,6 +505,23 @@ pub struct ChangeEntry {
     pub summary: String,
 }
 
+/// True when `path` is a non-empty relative path with only normal components (no `/`, `..`, or `.`
+/// traversal). Globs such as `app/home/**` pass.
+pub fn safe_rel(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    !path.is_absolute()
+        && !path.as_os_str().is_empty()
+        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// True when `path` refers to `.flow` itself or any file inside `.flow/` (Taskmaster's managed
+/// code knowledge graph).
+pub fn is_flow_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    let trimmed = norm.trim_start_matches("./").trim_end_matches('/');
+    trimmed == ".flow" || trimmed.starts_with(".flow/")
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -581,5 +598,23 @@ mod unit_tests {
         assert_eq!(page(vec![unit("a", "a.js"), unit("b", "../b.js")]).work_units().len(), 1);
         let too_many: Vec<_> = (0..=MAX_UNITS).map(|i| unit(&format!("u{i}"), &format!("f{i}.js"))).collect();
         assert_eq!(page(too_many).work_units().len(), 1);
+    }
+
+    #[test]
+    fn safe_rel_and_is_flow_path_handle_traversal_and_separators() {
+        assert!(safe_rel("app/home/**"));
+        assert!(safe_rel("contracts/types.ts"));
+        assert!(!safe_rel(""));
+        assert!(!safe_rel("/etc/passwd"));
+        assert!(!safe_rel("../outside.py"));
+        assert!(!safe_rel("app/../outside.py"));
+        assert!(!safe_rel("./app/main.py"));
+
+        assert!(is_flow_path(".flow"));
+        assert!(is_flow_path(".flow/meta.json"));
+        assert!(is_flow_path("./.flow/files/a.py.json"));
+        assert!(is_flow_path(".flow\\index.sqlite"));
+        assert!(!is_flow_path(".flow2/meta.json"));
+        assert!(!is_flow_path("src/.flow/meta.json"));
     }
 }

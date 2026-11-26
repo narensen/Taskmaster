@@ -31,9 +31,7 @@ impl Owners {
 /// True when `file` is `.flow` itself or lives inside `.flow/` (Taskmaster's managed knowledge graph).
 /// `.flow/` never counts as a stray or unowned file in ownership checks.
 pub fn is_flow_path(file: &str) -> bool {
-    let norm = file.replace('\\', "/");
-    let trimmed = norm.trim_start_matches("./").trim_end_matches('/');
-    trimmed == ".flow" || trimmed.starts_with(".flow/")
+    tm_core::is_flow_path(file)
 }
 
 /// Files a worker changed that its page does not own. These are dropped at merge and flagged.

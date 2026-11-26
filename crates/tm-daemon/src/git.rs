@@ -332,10 +332,7 @@ pub fn commit_paths(repo: &Path, message: &str, paths: &[String]) -> anyhow::Res
 
 /// A relative path that cannot climb out of the project.
 pub fn safe_rel(path: &str) -> bool {
-    let path = Path::new(path);
-    !path.is_absolute()
-        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
-        && !path.as_os_str().is_empty()
+    tm_core::safe_rel(path)
 }
 
 fn link_dir(src: &Path, dst: &Path) {

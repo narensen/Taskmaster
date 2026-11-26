@@ -50,6 +50,15 @@ pub const DECIDE_RULE: &str = "Decide quickly: settle the pages, the shared cont
 Do not work out each file's code or every CSS rule in your head; the workers write those from the design system, and the free \
 checks catch what they miss. A plan written now beats a perfect plan that is never written.\n";
 
+/// Maximum units recommended for a single-phase plan (one parallel wave).
+pub const SINGLE_PHASE_MAX_UNITS: usize = 4;
+
+/// Effective unit cap for a single-phase plan: at most `slots` units in one wave, capped at 4,
+/// and never below 2 so multi-module projects are not forced into one mega-unit.
+pub fn single_phase_wave_cap(slots: usize) -> usize {
+    slots.clamp(2, SINGLE_PHASE_MAX_UNITS)
+}
+
 /// Tell the master model upfront exactly how many parallel workers it can call upon and how
 /// to delegate work to them in JSON with self-contained context for each worker.
 pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
@@ -66,11 +75,13 @@ pub fn worker_pool_rule(slots: usize, worker_label: Option<&str>) -> String {
              (exact file paths, exported symbols/types, DOM ids or API shapes, conventions, and edge cases) so it can build cleanly without guessing.\n"
         );
     }
+    let wave_cap = single_phase_wave_cap(cap);
     format!(
         "Worker pool: you can call upon up to {cap} parallel worker agents{who} simultaneously in this run. \
-         ALWAYS delegate across multiple parallel workers whenever the work spans independent files, layers, or modules \
-         (pages/routes, markup+styles vs. logic/state, backend vs. frontend, core module vs. tests, or distinct subsystems) \
-         via multiple `units` or `parts` with disjoint `owned_glob` patterns so up to {cap} workers build at once. \
+         Each unit launches a fresh worker session with cold-start context overhead, so split into cohesive modules that fit in one parallel wave \
+         (typically 2-{wave_cap} units for a multi-module project, at most {wave_cap} for a single-phase plan). \
+         Merge closely coupled small files (for example tokenizer+parser or btree+storage) into one cohesive unit rather than spawning tiny units, \
+         and do not collapse a multi-module project into a single mega-unit. \
          Only use `depends_on: [\"id\"]` for concrete implementation imports (never for locked `contracts`), with chains no deeper than 2 for <=6 units. \
          Include a concise `summary`. Every worker runs in isolation and only sees its `brief`, `context`, `done`, locked `contracts`, `design`, and cited Dictionary entries: \
          give each worker self-contained `brief` + `context` (files, exports, types, DOM ids/selectors, shared interfaces, sibling boundaries).\n"
@@ -86,11 +97,10 @@ pub fn units_rule(slots: usize) -> String {
     }
     let range = if most == 2 { "2".to_string() } else { format!("2-{most}") };
     format!(
-        "Split a single page/unit into `parts` ({range} work units, up to {most} parallel workers), \
-         each {{\"id\",\"owned_glob\",\"brief\",\"context\",\"done\"}}, one worker agent per part, built concurrently. \
-         Split by file or concern (for example markup+styles, scripts/state, tests, docs, or independent modules) whenever the files are disjoint given the contracts; \
-         part globs must be disjoint and inside the unit glob (braces list files: `{{app/index.html,app/styles.css}}`); the unit `owned_glob` must cover them all. \
-         Only omit `parts` when a unit is truly one tightly coupled file.\n"
+        "Only split a single oversized page/unit (>400 lines or clearly independent large files) into `parts` ({range} work units, up to {most} parallel workers), \
+         each {{\"id\",\"owned_glob\",\"brief\",\"context\",\"done\"}}, one worker agent per part. \
+         Part globs must be disjoint and inside the unit glob (braces list files: `{{app/index.html,app/styles.css}}`); the unit `owned_glob` must cover them all. \
+         Leave ordinary modules unsplit so you do not pay extra cold-session overhead.\n"
     )
 }
 
@@ -116,17 +126,24 @@ pub const PLAN_EXAMPLES: &str = concat!(
 
 /// How the first planning call sketches a job bigger than a small one: the phases in rough,
 /// and only the first in detail. Later phases are planned while earlier ones build.
-pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A large multi-subsystem job (more than about eight units or multiple distinct layers/apps that cannot fit in one parallel phase) gets `phases`: \
+pub const PHASES_RULE: &str = "Sketch first, then detail only the start. A large multi-subsystem job (multiple distinct layers/apps that cannot fit in one parallel wave of up to 4 cohesive units) gets `phases`: \
 2-6 phases in build order, each {\"id\",\"goal\",\"delivers\":[paths],\"interfaces\":\"signatures only, no bodies\",\"test\":\"the command \
 that runs this phase's tests\",\"needs\":\"interfaces\" or \"results\"}. `needs` is `results` only when a phase cannot be planned \
 until the one before it has been built and tested. With `phases`, `units` and `contracts` cover the first phase only; each later phase \
-is planned, with its own units, once the phases before it have locked their interfaces. A single-package or small job (up to about eight units) \
-has no `phases`: plan it whole across parallel units. Scale the units to the work: one per \
-independent module and its tests, up to the available parallel workers.\n";
+is planned, with its own units, once the phases before it have locked their interfaces. A single-package or small job \
+has no `phases`: plan it whole across 2-4 cohesive units in one wave. Do not over-split small modules into tiny units, and do not collapse a multi-module job into one mega-unit.\n";
 
-/// Planning guidance for a single-package CLI/library/tool prompt that fits in one parallel phase.
-pub const SINGLE_PHASE_RULE: &str = "Plan this whole job in a single phase (`\"phases\": []`): put all units (up to about 8 parallel units with disjoint `owned_glob` patterns and shared `contracts`) \
-directly in `units` so every independent worker starts immediately with no phase barrier and no second planning pass.\n";
+/// Slot-aware single-phase planning rule: at most `slots` units in one wave (max 4), without collapsing to one mega-unit.
+pub fn single_phase_rule(slots: usize) -> String {
+    let cap = single_phase_wave_cap(slots);
+    let range = if cap == 2 { "2".to_string() } else { format!("2-{cap}") };
+    format!(
+        "Plan this whole job in a single phase (`\"phases\": []`): put at most {cap} cohesive units in `units` \
+         (one parallel wave, {range} units when the job spans multiple distinct modules; never exceed {cap}, and do not collapse a multi-module project into one mega-unit) \
+         with disjoint `owned_glob` patterns and shared `contracts` so every worker starts immediately with no phase barrier and no second planning pass. \
+         Merge closely coupled small modules (such as tokenizer+parser or btree+storage) into one cohesive unit rather than spawning tiny units.\n"
+    )
+}
 
 const MULTI_PHASE_CUES: [&str; 16] = [
     "multi-phase",
@@ -275,10 +292,11 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
         brief.push_str("Add new dictionary entries only if a page truly needs one that is not listed.\n");
     }
     brief.push_str(template);
+    let wave_cap = single_phase_wave_cap(slots);
     let unit_guidance = if slots >= 2 {
-        "Divide the work into parallel `units` or `parts` across your available workers whenever multiple files or concerns exist."
+        format!("Use at most {wave_cap} cohesive `units` in one parallel wave (2-{wave_cap} when there are multiple distinct modules; do not over-split small files, and do not collapse a multi-module project into one mega-unit).")
     } else {
-        "Use one unit when a single worker owns the files."
+        "Use 1-2 cohesive units (never over-split tiny files).".to_string()
     };
     brief.push_str(&format!(
         "\nReply with one JSON object only and do not edit files. {unit_guidance} \
@@ -295,12 +313,6 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
     brief.push_str(DESIGN_RULE);
     brief.push_str(DECIDE_RULE);
     brief.push_str(&units_rule(slots));
-    if slots >= 2 {
-        brief.push_str(
-            "Parallel parts finish sooner: when a unit has separate markup and styles, scripts, docs, or modules and their tests, split it into parts \
-             and pin every id, file name and interface they share in a contract, a cited entry or each part's brief and context.\n",
-        );
-    }
     brief.push_str("Optional unit `difficulty`: easy|normal|hard (hard starts on the mid tier).\n");
     brief
 }
@@ -525,10 +537,29 @@ mod tests {
     fn worker_pool_rule_always_informs_count_and_context() {
         let multi = worker_pool_rule(4, Some("codex / gpt-5"));
         assert!(multi.contains("up to 4 parallel worker agents (codex / gpt-5)"));
-        assert!(multi.contains("ALWAYS delegate across multiple parallel workers"));
+        assert!(!multi.contains("ALWAYS delegate across multiple parallel workers"));
+        assert!(multi.contains("cohesive modules"));
+        assert!(multi.contains("do not collapse a multi-module project into a single mega-unit"));
         assert!(multi.contains("`context`"));
         let single = worker_pool_rule(1, Some("claude"));
         assert!(single.contains("1 worker agent (claude)"));
         assert!(single.contains("`context`"));
+    }
+
+    #[test]
+    fn single_phase_rule_caps_units_at_slots_max_four() {
+        assert_eq!(single_phase_wave_cap(1), 2);
+        assert_eq!(single_phase_wave_cap(2), 2);
+        assert_eq!(single_phase_wave_cap(3), 3);
+        assert_eq!(single_phase_wave_cap(4), 4);
+        assert_eq!(single_phase_wave_cap(8), 4);
+
+        let r3 = single_phase_rule(3);
+        assert!(r3.contains("at most 3 cohesive units"));
+        assert!(r3.contains("do not collapse a multi-module project into one mega-unit"));
+        let r8 = single_phase_rule(8);
+        assert!(r8.contains("at most 4 cohesive units"));
+        assert!(!units_rule(4).contains("Only omit `parts` when a unit is truly one tightly coupled file"));
+        assert!(!small_brief("tiny todo", &[], "", 4, None).contains("Parallel parts finish sooner"));
     }
 }

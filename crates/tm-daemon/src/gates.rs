@@ -548,8 +548,15 @@ pub struct PlanReview {
 
 /// Deterministic structural plan review run before approval (and paired with a
 /// second-model reviewer when configured): catches overlapping ownership globs,
-/// missing contracts for multi-unit plans, oversized units, and miscalibrated difficulty.
+/// missing contracts for multi-unit plans, oversized units, over-split single-phase plans,
+/// under-sized units that should be merged, and miscalibrated difficulty.
 pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
+    review_plan_structure_for_slots(plan, None)
+}
+
+/// Like [`review_plan_structure`], also checking single-phase unit count against `slots`
+/// (capped at [`crate::small::SINGLE_PHASE_MAX_UNITS`], never forcing collapse to 1 mega-unit).
+pub fn review_plan_structure_for_slots(plan: &Plan, slots: Option<usize>) -> Vec<PlanReviewFinding> {
     let mut findings = Vec::new();
     // 1. Overlapping ownership globs across pages.
     for i in 0..plan.pages.len() {
@@ -633,7 +640,73 @@ pub fn review_plan_structure(plan: &Plan) -> Vec<PlanReviewFinding> {
             page: None,
         });
     }
+    // 6. Single-phase wave cap: non-UI single-phase plans should stay within one parallel wave
+    //    (at most `slots` units, capped at 4, never forcing collapse to 1 mega-unit).
+    let wave_cap = slots
+        .map(crate::small::single_phase_wave_cap)
+        .unwrap_or(crate::small::SINGLE_PHASE_MAX_UNITS);
+    if plan.phases.is_empty() && !plan.has_ui() && plan.pages.len() > wave_cap {
+        findings.push(PlanReviewFinding {
+            severity: "warning".into(),
+            category: "oversplit_plan".into(),
+            message: format!(
+                "Single-phase plan has {} units, exceeding the single-wave cap of {} (max {}); merge closely coupled modules into 2-{} cohesive units without collapsing to one mega-unit.",
+                plan.pages.len(),
+                wave_cap,
+                crate::small::SINGLE_PHASE_MAX_UNITS,
+                wave_cap,
+            ),
+            page: None,
+        });
+    }
+    // 7. Under-sized-unit merge check: flag tiny single-file units in >=3-unit plans so
+    //    closely coupled small modules are merged instead of paying extra cold-session overhead
+    //    (never fires on 1-2 unit plans so multi-module projects are never collapsed to 1 mega-unit).
+    if plan.pages.len() >= 3 {
+        let undersized: Vec<&tm_core::PagePlan> = plan
+            .pages
+            .iter()
+            .filter(|page| is_undersized_unit(page))
+            .collect();
+        if undersized.len() >= 2 || (!undersized.is_empty() && plan.pages.len() > wave_cap) {
+            let names: Vec<&str> = undersized.iter().map(|p| p.id.as_str()).collect();
+            findings.push(PlanReviewFinding {
+                severity: "warning".into(),
+                category: "undersized_unit".into(),
+                message: format!(
+                    "Under-sized unit(s) ({}) each own at most one small file; consider merging them with a closely related unit into 2-{} cohesive units rather than paying extra cold-session overhead.",
+                    names.join(", "),
+                    wave_cap,
+                ),
+                page: undersized.first().map(|p| p.id.clone()),
+            });
+        }
+    }
     findings
+}
+
+/// True when `page` looks like an under-sized unit (single concrete source file, no sub-units,
+/// and either tagged `easy` or carrying a very short brief+context) that could be merged with a
+/// closely related sibling in a 3+ unit plan.
+fn is_undersized_unit(page: &tm_core::PagePlan) -> bool {
+    if !page.units.is_empty() {
+        return false;
+    }
+    let glob = page.owned_glob.trim();
+    if glob.contains(['*', '?', '[']) {
+        return false;
+    }
+    let concrete = concrete_paths_in_glob(glob);
+    let non_test = concrete.iter().filter(|p| !is_test_path(p)).count();
+    if non_test > 1 {
+        return false;
+    }
+    let easy = page
+        .difficulty
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("easy"));
+    let short_spec = page.brief.trim().len() < 180 && page.context.trim().len() < 220;
+    easy || short_spec
 }
 
 /// Longest `depends_on` chain length (in nodes) across `plan.pages`.
@@ -1986,6 +2059,59 @@ mod tests {
         assert!(findings.iter().any(|f| f.category == "overlap"));
         assert!(apply_mechanical_plan_fixes(&mut plan));
         assert!(review_plan_structure(&plan).iter().all(|f| f.category != "overlap"));
+    }
+
+    #[test]
+    fn tok4_plan_review_flags_oversplit_and_undersized_units_without_collapsing_two_unit_plans() {
+        let contract = ContractFile {
+            path: "tinydb/contract.py".into(),
+            content: "class Token: ...\n".into(),
+            phase: 0,
+        };
+        // 5-unit over-split plan on slots=3 triggers both oversplit_plan and undersized_unit.
+        let oversplit = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![contract.clone()],
+            pages: vec![
+                PagePlan { id: "tok".into(), owned_glob: "{tinydb/tok.py,tests/test_tok.py}".into(), brief: "Write tokenizer.".into(), difficulty: Some("easy".into()), ..Default::default() },
+                PagePlan { id: "par".into(), owned_glob: "{tinydb/par.py,tests/test_par.py}".into(), brief: "Write parser.".into(), difficulty: Some("easy".into()), ..Default::default() },
+                PagePlan { id: "bt".into(), owned_glob: "{tinydb/bt.py,tests/test_bt.py}".into(), brief: "Write btree.".into(), ..Default::default() },
+                PagePlan { id: "st".into(), owned_glob: "{tinydb/st.py,tests/test_st.py}".into(), brief: "Write storage.".into(), ..Default::default() },
+                PagePlan { id: "cli".into(), owned_glob: "{tinydb/cli.py,tests/test_cli.py}".into(), brief: "Write cli.".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let findings = review_plan_structure_for_slots(&oversplit, Some(3));
+        assert!(findings.iter().any(|f| f.category == "oversplit_plan"), "{findings:#?}");
+        assert!(findings.iter().any(|f| f.category == "undersized_unit"), "{findings:#?}");
+
+        // Clean 3-unit cohesive plan on slots=3 passes with neither warning.
+        let long_brief = "Implement the complete cohesive subsystem including parsing, AST validation, error handling, edge-case coverage, and concise unit tests covering every statement form and invalid input path.";
+        let cohesive = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![contract.clone()],
+            pages: vec![
+                PagePlan { id: "frontend".into(), owned_glob: "{tinydb/tok.py,tinydb/par.py,tests/test_front.py}".into(), brief: long_brief.into(), ..Default::default() },
+                PagePlan { id: "storage".into(), owned_glob: "{tinydb/bt.py,tinydb/st.py,tests/test_store.py}".into(), brief: long_brief.into(), ..Default::default() },
+                PagePlan { id: "runtime".into(), owned_glob: "{tinydb/exec.py,tinydb/cli.py,tests/test_exec.py}".into(), brief: long_brief.into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let ok_findings = review_plan_structure_for_slots(&cohesive, Some(3));
+        assert!(ok_findings.iter().all(|f| f.category != "oversplit_plan" && f.category != "undersized_unit"), "{ok_findings:#?}");
+
+        // 2-unit plan never triggers undersized_unit (never encourages collapsing to 1 mega-unit).
+        let two_unit = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![contract],
+            pages: vec![
+                PagePlan { id: "core".into(), owned_glob: "pkg/core.py".into(), brief: "Core.".into(), difficulty: Some("easy".into()), ..Default::default() },
+                PagePlan { id: "cli".into(), owned_glob: "pkg/cli.py".into(), brief: "Cli.".into(), difficulty: Some("easy".into()), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let two_findings = review_plan_structure_for_slots(&two_unit, Some(1));
+        assert!(two_findings.iter().all(|f| f.category != "oversplit_plan" && f.category != "undersized_unit"), "{two_findings:#?}");
     }
 
     #[test]

@@ -11243,3 +11243,123 @@ async fn tok3_antigravity_non_code_mode_worker_gets_absolute_worktree_paths_and_
     assert!(alpha_cm.contains("Do not call `update_steps`"));
     assert!(alpha_cm.contains("trailing `git status`"));
 }
+
+#[tokio::test]
+async fn tok4_single_phase_plan_rejects_oversplit_beyond_parallel_wave_cap() {
+    let prompt = concat!(
+        "Build \"tinydb\", a minimal SQL database engine in Python 3.11 (standard library only).\n\n",
+        "Requirements:\n",
+        "- CLI: `python -m tinydb <dbfile>` opens a REPL; `python -m tinydb <dbfile> -f script.sql` runs a file and prints results.\n",
+        "- SQL support: CREATE TABLE (INTEGER, TEXT, REAL columns, PRIMARY KEY), INSERT, SELECT with WHERE (=, !=, <, >, <=, >=, AND, OR), ",
+        "ORDER BY (ASC/DESC), LIMIT, INNER JOIN on equality, COUNT/SUM/AVG/MIN/MAX with GROUP BY, UPDATE, DELETE, DROP TABLE.\n",
+        "- Storage: data persists to a single file on disk; primary keys are indexed with a B-tree you implement yourself.\n",
+        "- Output: SELECT results print as pipe-separated rows with a header line.\n",
+        "- Errors: invalid SQL or unknown tables/columns print an error line and do not crash the REPL.\n\n",
+        "Structure the code into separate modules (tokenizer, parser, planner/executor, storage, btree). ",
+        "Write a pytest suite covering every feature above. Done = all your tests pass and `pytest` exits 0.\n",
+    );
+    let tmp = seeded("tok4-wave-cap");
+    let first_planner_brief = Arc::new(Mutex::new(String::new()));
+    let repairs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct OversplitPlanner {
+        first_brief: Arc<Mutex<String>>,
+        repairs: Arc<Mutex<Vec<String>>>,
+        attempt: AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for OversplitPlanner {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let is_planner = task.brief.contains("Plan this product")
+                || task.brief.contains("Plan this small product")
+                || task.brief.contains("Repair this plan");
+            let reply = if is_planner {
+                if task.brief.contains("Repair this plan") {
+                    self.repairs.lock().unwrap().push(task.brief.clone());
+                } else {
+                    *self.first_brief.lock().unwrap() = task.brief.clone();
+                }
+                if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // 5 units on parallel=3 exceeds the wave cap of 3.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Oversplit 5-unit plan",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [],
+                        "units": [
+                            { "id": "tok", "owned_glob": "tinydb/tok.py", "brief": "Write tokenizer", "context": "", "done": "done" },
+                            { "id": "par", "owned_glob": "tinydb/par.py", "brief": "Write parser", "context": "", "done": "done" },
+                            { "id": "bt", "owned_glob": "tinydb/bt.py", "brief": "Write btree", "context": "", "done": "done" },
+                            { "id": "st", "owned_glob": "tinydb/st.py", "brief": "Write storage", "context": "", "done": "done" },
+                            { "id": "cli", "owned_glob": "tinydb/cli.py", "brief": "Write cli", "context": "", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                } else {
+                    // Merged into 3 cohesive units fitting one wave.
+                    serde_json::json!({
+                        "kind": "cli",
+                        "summary": "Cohesive 3-unit plan",
+                        "contracts": [{ "path": "tinydb/contract.py", "content": "class Token: pass\n" }],
+                        "phases": [],
+                        "units": [
+                            { "id": "frontend", "owned_glob": "{tinydb/tok.py,tinydb/par.py}", "brief": "Write tokenizer and parser", "context": "", "done": "done" },
+                            { "id": "storage", "owned_glob": "{tinydb/bt.py,tinydb/st.py}", "brief": "Write btree and storage", "context": "", "done": "done" },
+                            { "id": "cli", "owned_glob": "tinydb/cli.py", "brief": "Write cli", "context": "", "done": "done" }
+                        ],
+                        "estimate": { "tokens": 0, "usd": 0 },
+                        "dictionary": []
+                    })
+                    .to_string()
+                }
+            } else {
+                let unit = task.brief.split("Build unit `").nth(1).and_then(|s| s.split('`').next()).unwrap_or("x");
+                std::fs::create_dir_all(task.cwd.join("tinydb"))?;
+                match unit {
+                    "frontend" => {
+                        std::fs::write(task.cwd.join("tinydb/tok.py"), "# tok\n")?;
+                        std::fs::write(task.cwd.join("tinydb/par.py"), "# par\n")?;
+                    }
+                    "storage" => {
+                        std::fs::write(task.cwd.join("tinydb/bt.py"), "# bt\n")?;
+                        std::fs::write(task.cwd.join("tinydb/st.py"), "# st\n")?;
+                    }
+                    _ => {
+                        std::fs::write(task.cwd.join("tinydb/cli.py"), "# cli\n")?;
+                    }
+                }
+                format!("done\nRELEASE unit:{unit}\n")
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(OversplitPlanner {
+        first_brief: first_planner_brief.clone(),
+        repairs: repairs.clone(),
+        attempt: AtomicUsize::new(0),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = prompt_config(&tmp.0, prompt, true);
+    cfg.parallel = 3;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let first = first_planner_brief.lock().unwrap().clone();
+    assert!(first.contains("at most 3 cohesive units"), "expected slot-capped single-phase rule, got:\n{first}");
+    let rep = repairs.lock().unwrap().clone();
+    assert_eq!(rep.len(), 1);
+    assert!(rep[0].contains("exceeding the single-wave cap of 3"), "got:\n{}", rep[0]);
+}

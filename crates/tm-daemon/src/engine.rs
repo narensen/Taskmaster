@@ -1170,7 +1170,7 @@ impl Driver {
                 } else {
                     bail!("no plan for this run; pass --plan <file> or --prompt <text>");
                 };
-                let mut review_findings = crate::gates::review_plan_structure(&plan);
+                let mut review_findings = crate::gates::review_plan_structure_for_slots(&plan, Some(self.parallel));
                 if let Some(prompt) = review_prompt.as_deref() {
                     review_findings.extend(crate::gates::check_plan_prompt_consistency(prompt, &plan));
                 }
@@ -1443,6 +1443,16 @@ impl Driver {
                             .into(),
                     );
                 }
+            }
+            let wave_cap = crate::small::single_phase_wave_cap(self.parallel);
+            if plan.phases.is_empty() && !plan.has_ui() && plan.pages.len() > wave_cap {
+                errors.push(format!(
+                    "this single-phase plan has {} units, exceeding the single-wave cap of {} (max {}); merge closely coupled small modules into 2-{} cohesive units without collapsing into one mega-unit",
+                    plan.pages.len(),
+                    wave_cap,
+                    crate::small::SINGLE_PHASE_MAX_UNITS,
+                    wave_cap,
+                ));
             }
         }
         if errors.is_empty() { Ok((plan, drafts)) } else { Err((errors, Some(json))) }
@@ -1894,7 +1904,7 @@ impl Driver {
         brief.push_str(&crate::small::plan_shape());
         brief.push_str(&crate::gates::format_prompt_acceptance_guidance(&crate::gates::extract_prompt_io_examples(prompt)));
         if self.single_phase_pass(prompt) {
-            brief.push_str(crate::small::SINGLE_PHASE_RULE);
+            brief.push_str(&crate::small::single_phase_rule(self.parallel));
         } else {
             brief.push_str(crate::small::PHASES_RULE);
         }

@@ -13310,3 +13310,177 @@ async fn fix_n9_per_unit_acceptance_test_runs_when_unit_finishes_and_repairs_imm
         "core must fail its per-unit acceptance contract test and repair immediately before cli runs"
     );
 }
+
+#[tokio::test]
+async fn fix_n9_noop_repair_reprompts_same_warm_session_and_rejects_failing_greenfield_noop() {
+    // Greenfield 2-unit project mirroring tb15-mdtodo-tmhcode:
+    // - `core` owns mdtodo/storage.py (writes buggy header on build).
+    // - `cli` owns mdtodo/__main__.py (builds fine; triggers acceptance failure on `<!-- next-id: 4 -->`).
+    // - On `cli`'s warm repair turn 1, the warm session changes NOTHING (no-op repair!).
+    //   Instead of counting it as done or dropping the session, Taskmaster must IMMEDIATELY
+    //   re-prompt the SAME warm session with the concrete failure output, and on that follow-up
+    //   the session fixes the bug and the run finishes cleanly!
+    let tmp = seeded("n9-noop-repair");
+    let contract = concat!(
+        "import subprocess, sys\n\n",
+        "def test_storage_format():\n",
+        "    r = subprocess.run([sys.executable, '-m', 'mdtodo'], capture_output=True, text=True)\n",
+        "    assert r.returncode == 0\n",
+        "    assert r.stdout == '# Todo\\n<!-- next-id: 4 -->\\n'\n",
+    );
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "tests/test_acceptance_contract.py".into(),
+            content: contract.into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "core".into(),
+                owned_glob: "{mdtodo/__init__.py,mdtodo/storage.py}".into(),
+                brief: "Implement mdtodo/storage.py.".into(),
+                done: "storage ready.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "mdtodo/__main__.py".into(),
+                brief: "Implement mdtodo/__main__.py.".into(),
+                done: "CLI passes acceptance contract.".into(),
+                depends_on: vec!["core".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    struct WarmNoopThenFixSession {
+        cwd: PathBuf,
+        followups: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmNoopThenFixSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            let n = {
+                let mut log = self.followups.lock().unwrap();
+                log.push(text.clone());
+                log.len()
+            };
+            if n == 1 {
+                // First repair turn: agent changes NOTHING (mirrors tb15-mdtodo-tmhcode cli repair #1)!
+                let _ = events.send(HarnessEvent::Text { text: "Looks fine.\nRELEASE unit:cli\n".into() }).await;
+            } else {
+                // Automatic no-op repair follow-up on the SAME warm session: receives concrete failure
+                // output and writes the real fix!
+                std::fs::write(
+                    self.cwd.join("mdtodo/__main__.py"),
+                    "print('# Todo\\n<!-- next-id: 4 -->\\n', end='')\n",
+                )?;
+                let _ = events.send(HarnessEvent::Text { text: "Fixed header.\nRELEASE unit:cli\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some("sess-cli-warm")
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct NoopRepairFake {
+        cli_followups: Arc<Mutex<Vec<String>>>,
+        cli_cold_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for NoopRepairFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let _ = std::fs::create_dir_all(task.cwd.join("mdtodo"));
+            if unit == "core" {
+                let _ = std::fs::write(task.cwd.join("mdtodo/__init__.py"), "");
+                let _ = std::fs::write(task.cwd.join("mdtodo/storage.py"), "HEADER = '# Todo\\n'\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                return (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                    None,
+                );
+            }
+            self.cli_cold_calls.fetch_add(1, Ordering::SeqCst);
+            // Initial build omits `<!-- next-id: 4 -->` header!
+            let _ = std::fs::write(
+                task.cwd.join("mdtodo/__main__.py"),
+                "from mdtodo.storage import HEADER\nprint(HEADER, end='')\n",
+            );
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            let sess: Box<dyn tm_harness::Session> = Box::new(WarmNoopThenFixSession {
+                cwd: task.cwd.clone(),
+                followups: self.cli_followups.clone(),
+            });
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                Some(sess),
+            )
+        }
+    }
+
+    let cli_followups = Arc::new(Mutex::new(Vec::new()));
+    let fake = Arc::new(NoopRepairFake {
+        cli_followups: cli_followups.clone(),
+        cli_cold_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let h: Arc<dyn Harness> = fake.clone();
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n9-fix2".into();
+    cfg.checks = false;
+    cfg.runtime_checks = true;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(
+        fake.cli_cold_calls.load(Ordering::SeqCst),
+        1,
+        "cli must stay on its single warm session instead of spawning a second cold agent"
+    );
+    let followups = cli_followups.lock().unwrap().clone();
+    assert_eq!(
+        followups.len(),
+        2,
+        "expected repair #1 (no-op) + automatic in-session no-op repair follow-up on the SAME warm session: {followups:#?}"
+    );
+    assert!(
+        followups[1].contains("changed none of your owned files") && followups[1].contains("next-id: 4"),
+        "in-session no-op repair follow-up must include concrete failure output:\n{}",
+        followups[1]
+    );
+}

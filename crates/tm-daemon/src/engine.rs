@@ -2811,8 +2811,13 @@ impl Driver {
                     && product.answer.ok
                     && reply::parse_flag(&product.answer.text).is_none()
                 {
+                    let repair_errors = self.running.iter().find_map(|cmd| match cmd {
+                        Command::SpawnWorker { page: p, errors, .. } if p == &page => errors.clone(),
+                        _ => None,
+                    });
                     self.maybe_run_code_error_followup(&page, index, &mut product).await?;
                     self.maybe_code_mode_refusal_followup(&page, index, &mut product).await?;
+                    self.maybe_noop_repair_followup(&page, index, &mut product, repair_errors.as_deref()).await?;
                     self.maybe_release_gate_nudge(&page, index, &mut product).await?;
                 }
                 self.batches.entry(page.clone()).or_default().push((index, product));
@@ -3117,10 +3122,7 @@ impl Driver {
         };
         self.live.flush(&self.id);
         let (_, entries) = self.live.read(&self.id, 0);
-        let has_changes = git::worktree_changes(&product.worktree)
-            .unwrap_or_default()
-            .iter()
-            .any(|c| !tm_verify::is_flow_path(&c.path));
+        let has_changes = self.worktree_has_real_changes(&product.worktree);
         if has_changes && !code_mode_refusal_ended_turn(&entries, &agent_id) {
             return Ok(());
         }
@@ -3128,6 +3130,61 @@ impl Driver {
         eprintln!("taskmaster: sending Code Mode refusal redirect follow-up to {agent_id}");
         let _ = self
             .send_worker_followup(page, index, product, &agent_id, &redirect, "Code Mode refusal follow-up")
+            .await?;
+        Ok(())
+    }
+
+    /// If a repair turn finished without modifying any owned files while checks are still failing
+    /// (excluding pure soft-gate waiver findings), immediately re-prompt the same warm session
+    /// with the concrete failure output instead of silently counting the no-op as done.
+    async fn maybe_noop_repair_followup(
+        &mut self,
+        page: &str,
+        index: usize,
+        product: &mut Product,
+        repair_errors: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(err_text) = repair_errors else {
+            return Ok(());
+        };
+        if self.worktree_has_real_changes(&product.worktree) {
+            return Ok(());
+        }
+        let concrete_failure = match self.check_no_change_unit(page, &product.worktree).await {
+            Some(test_err) => test_err,
+            None if self.last_gate_findings.contains_key(page) => return Ok(()),
+            None if !self.config.runtime_checks => clip(err_text, 2000),
+            None => return Ok(()),
+        };
+        let agent_id = product
+            .bill
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.agent_id(page, None));
+        let glob = self
+            .page(page)
+            .map(|p| p.owned_glob.clone())
+            .unwrap_or_else(|_| page.to_string());
+        let tier = match product.bill.role {
+            Role::Mid => Tier::Mid,
+            Role::Master => Tier::Master,
+            _ => Tier::Worker,
+        };
+        let code_hint = if self.code.is_some() {
+            let run_code_tool = tm_harness::run_code_tool_name(self.harness_for(tier).id(), "dictionary");
+            format!(" using `{run_code_tool}` (`edit`/`files` + `return await test()`)")
+        } else {
+            String::new()
+        };
+        let msg = format!(
+            "Your last repair turn changed none of your owned files (`{glob}`), and checks are still failing:\n\
+             {concrete_failure}\n\
+             Do not stop without editing your owned files to fix this failure. Apply the fix directly{code_hint}, \
+             verify tests pass, and end your reply with `{RELEASE} {agent_id}`."
+        );
+        eprintln!("taskmaster: {page} repair changed nothing while checks still fail; re-prompting warm session {agent_id}");
+        let _ = self
+            .send_worker_followup(page, index, product, &agent_id, &msg, "no-op repair follow-up")
             .await?;
         Ok(())
     }
@@ -3151,8 +3208,7 @@ impl Driver {
             return Ok(());
         }
         // Only nudge workers that actually produced file changes.
-        let changed = git::worktree_changes(&product.worktree).unwrap_or_default();
-        if changed.is_empty() {
+        if !self.worktree_has_real_changes(&product.worktree) {
             return Ok(());
         }
         let agent_id = product
@@ -4072,7 +4128,8 @@ impl Driver {
                         )));
                     }
                 }
-                // Run the unit's own / acceptance tests before accepting a no-change unit as done.
+                // Run the unit's own / acceptance tests before accepting a no-change unit as done
+                // (applies to greenfield, brownfield, initial builds, and repairs alike).
                 let check_dir = products
                     .first()
                     .map(|(_, p)| p.worktree.as_path())
@@ -4082,6 +4139,19 @@ impl Driver {
                     return Ok(failed(format!(
                         "The last attempt changed none of your owned files, and checks failed:\n{test_err}\n\
                          Implement the required changes in your owned files and verify tests pass."
+                    )));
+                }
+                // On a repair turn for a concrete non-gate failure where no runtime test check ran
+                // to prove the failure is gone, never silently accept a zero-diff repair as done.
+                if let Some(err_text) = errors
+                    && !self.last_gate_findings.contains_key(page)
+                    && !self.config.runtime_checks
+                {
+                    eprintln!("taskmaster: {page} repair changed nothing without resolving failure; sending it back");
+                    return Ok(failed(format!(
+                        "The repair attempt changed none of your owned files, so the failure was not fixed:\n{}\n\
+                         Edit your owned files directly to resolve this failure.",
+                        clip(err_text, 2000)
                     )));
                 }
                 // On an initial brownfield build whose owned files pre-existed before this run,
@@ -4101,6 +4171,15 @@ impl Driver {
                          Edit your owned files directly and verify tests pass before releasing.",
                         unit_plan.owned_glob,
                         clip(unit_plan.brief.trim(), 240)
+                    )));
+                }
+                let missing = self.missing_owned_files(page);
+                if !missing.is_empty() {
+                    eprintln!("taskmaster: {page} changed nothing while owned file(s) are missing: {}", missing.join(", "));
+                    return Ok(failed(format!(
+                        "The last attempt changed none of your files, and required owned file(s) do not exist yet: {}. \
+                         Create and verify them before releasing.",
+                        missing.join(", ")
                     )));
                 }
                 eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
@@ -5944,13 +6023,38 @@ impl Driver {
         out
     }
 
+    /// True when `worktree` contains real file changes relative to `self.tree` (ignoring setup
+    /// artifacts and `.flow` metadata), matching [`Self::judge_inner`]'s diff filter.
+    fn worktree_has_real_changes(&self, worktree: &Path) -> bool {
+        let ignored = self.setup_artifacts.get(worktree);
+        git::worktree_changes(worktree)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| !git::same_as(worktree, &self.tree, c))
+            .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
+            .any(|c| !tm_verify::is_flow_path(&c.path))
+    }
+
     /// Whether the run's tree already has a file the unit owns that is not a locked contract.
     fn owned_files_exist(&self, page: &str) -> bool {
         let Ok(unit) = self.page(page) else { return false };
         let Ok(glob) = globset::Glob::new(&unit.owned_glob) else { return false };
         let matcher = glob.compile_matcher();
         let locked = self.locked_files();
-        git::tracked_files(&self.tree).unwrap_or_default().iter().any(|f| matcher.is_match(f) && !locked.contains(f))
+        git::tracked_files(&self.tree)
+            .unwrap_or_default()
+            .iter()
+            .any(|f| matcher.is_match(f) && !locked.contains(f))
+    }
+
+    /// Concrete non-locked paths named in `page`'s `owned_glob` that do not exist in `self.tree` yet.
+    fn missing_owned_files(&self, page: &str) -> Vec<String> {
+        let Ok(unit) = self.page(page) else { return Vec::new() };
+        let locked = self.locked_files();
+        crate::gates::concrete_paths_in_glob(&unit.owned_glob)
+            .into_iter()
+            .filter(|f| !locked.contains(f) && !self.tree.join(f).is_file())
+            .collect()
     }
 
     /// True when `page` has already merged at least one build or repair commit during this run.

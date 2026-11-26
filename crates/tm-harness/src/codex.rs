@@ -99,7 +99,7 @@ impl Codex {
         let (proc, mut io) = crate::child::start(&mut cmd, false, task.hold.as_ref())
             .await
             .with_context(|| format!("failed to start `{}`", self.binary))?;
-        let mut stream = Stream { thread_id: resume.map(str::to_string), emitted: false };
+        let mut stream = Stream { thread_id: resume.map(str::to_string), emitted: false, requests: 0, saw_tool: false };
         if let Some(id) = resume {
             let _ = events.send(HarnessEvent::SessionStarted { session_id: id.to_string() }).await;
             stream.emitted = true;
@@ -124,6 +124,8 @@ impl Codex {
 struct Stream {
     thread_id: Option<String>,
     emitted: bool,
+    requests: u32,
+    saw_tool: bool,
 }
 
 impl Stream {
@@ -176,12 +178,23 @@ impl Stream {
         }
         let end = match msg["type"].as_str() {
             Some("item.completed") => {
+                let item_type = msg["item"]["type"].as_str().unwrap_or_default();
+                let is_tool = matches!(item_type, "command_execution" | "file_change" | "mcp_tool_call");
+                let is_model = matches!(item_type, "agent_message" | "reasoning") || is_tool;
+                if is_model && (self.requests == 0 || self.saw_tool) {
+                    self.requests = self.requests.saturating_add(1);
+                    self.saw_tool = false;
+                }
+                if is_tool {
+                    self.saw_tool = true;
+                }
                 out.extend(item_events(&msg["item"]));
                 None
             }
             Some("turn.completed") => {
                 let usage = read_usage(&msg["usage"]);
-                Some(Ok(RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None }))
+                let requests = (self.requests > 0).then_some(self.requests).or(Some(1));
+                Some(Ok(RunSummary { ok: true, usage, cost_usd: None, denied: 0, freed: None, requests }))
             }
             Some("turn.failed") => Some(Err(anyhow::anyhow!("codex: {}", error_message(&msg["error"])))),
             Some("error") => Some(Err(anyhow::anyhow!("codex: {}", error_message(&msg)))),

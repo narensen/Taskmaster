@@ -73,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
                         println!("diff   {diff}");
                     }
                 }
+                HarnessEvent::ToolDiff { id, diff, synthetic } => {
+                    let diff: String = diff.chars().take(120).collect();
+                    println!("diff   {id} (synthetic={synthetic}) {diff}");
+                }
             }
         }
         let said: String = said.trim().chars().take(600).collect();

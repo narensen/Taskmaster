@@ -158,6 +158,8 @@ impl Harness for AcpHarness {
         session.cost = rebuilt.cost;
         session.tools = rebuilt.tools.clone();
         session.denied = rebuilt.denied;
+        session.requests = rebuilt.requests;
+        session.saw_tool_finish = rebuilt.saw_tool_finish;
         let turn = async {
             let Some(prompt) = rebuilt.prompt else {
                 // The turn ended before this daemon took over: its reply is in the log.
@@ -226,6 +228,8 @@ impl AcpHarness {
             tools: BTreeSet::new(),
             id: None,
             cost: None,
+            requests: 0,
+            saw_tool_finish: false,
         }
     }
 
@@ -320,6 +324,10 @@ struct Session {
     id: Option<String>,
     /// The session's running cost, from the agent's `usage_update` events, when it sends one.
     cost: Option<f64>,
+    /// Model requests / turns observed in the current `session/prompt`.
+    requests: u32,
+    /// True after a tool batch finishes so the next model emission counts as a new request turn.
+    saw_tool_finish: bool,
 }
 
 impl Session {
@@ -387,6 +395,8 @@ impl Session {
     /// One turn in the open session.
     async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
         self.tools.clear();
+        self.requests = 0;
+        self.saw_tool_finish = false;
         let session_id = self.id.clone().context("the session is not open")?;
         let prompt = json!({
             "sessionId": session_id,
@@ -401,12 +411,26 @@ impl Session {
     fn summary(&self, result: &Value, before: Option<f64>) -> RunSummary {
         // The reply's own price if it has one, else what the running cost grew by this turn.
         let cost = read_cost(result).or_else(|| self.cost.map(|now| (now - before.unwrap_or(0.0)).max(0.0)));
+        let ok = result["stopReason"] == "end_turn";
+        let reported_requests = result["num_turns"]
+            .as_u64()
+            .or_else(|| result["usage"]["requests"].as_u64())
+            .or_else(|| result["_meta"]["usage"]["requests"].as_u64())
+            .map(|n| n as u32);
+        let requests = reported_requests.or(if self.requests > 0 {
+            Some(self.requests)
+        } else if ok {
+            Some(1)
+        } else {
+            None
+        });
         RunSummary {
-            ok: result["stopReason"] == "end_turn",
+            ok,
             usage: read_usage(result),
             cost_usd: cost,
             denied: self.denied,
             freed: None,
+            requests,
         }
     }
 
@@ -448,7 +472,7 @@ impl Session {
         let params = &msg["params"];
         match msg["method"].as_str() {
             Some("session/update") => {
-                track_tool(&mut self.tools, &params["update"]);
+                observe_turn(&mut self.requests, &mut self.saw_tool_finish, &mut self.tools, &params["update"]);
                 if let Some(cost) = running_cost(&params["update"]) {
                     self.cost = Some(cost);
                 }
@@ -470,8 +494,11 @@ impl Session {
                 let blocked_by_code_mode = self.code_mode && matches!(request.kind, ToolKind::Execute | ToolKind::Edit);
                 let allowed = !blocked_by_code_mode && self.gate.decide_async(&request).await == Decision::Allow;
                 if !allowed {
-                    if let Some(id) = params["toolCall"]["toolCallId"].as_str() {
-                        self.tools.remove(id);
+                    if let Some(id) = params["toolCall"]["toolCallId"].as_str()
+                        && self.tools.remove(id)
+                        && self.tools.is_empty()
+                    {
+                        self.saw_tool_finish = true;
                     }
                     if !blocked_by_code_mode {
                         self.denied += 1;
@@ -539,6 +566,10 @@ struct Rebuilt {
     asked: Vec<Value>,
     /// Permission requests refused this turn.
     denied: u32,
+    /// Model request turns observed in the active prompt so far.
+    requests: u32,
+    /// True after a tool batch completed.
+    saw_tool_finish: bool,
 }
 
 impl Rebuilt {
@@ -565,6 +596,8 @@ impl Rebuilt {
                             out.answered = None;
                             out.cost_before = out.cost;
                             out.denied = 0;
+                            out.requests = 0;
+                            out.saw_tool_finish = false;
                         }
                         _ => {}
                     }
@@ -575,11 +608,17 @@ impl Rebuilt {
                     let asked = out.asked.remove(at);
                     if asked["method"] == "session/request_permission" && !allowed_by(&asked, &msg) {
                         out.denied += 1;
+                        if let Some(id) = asked["params"]["toolCall"]["toolCallId"].as_str()
+                            && out.tools.remove(id)
+                            && out.tools.is_empty()
+                        {
+                            out.saw_tool_finish = true;
+                        }
                     }
                 }
                 (false, Some("session/update")) => {
                     let update = &msg["params"]["update"];
-                    track_tool(&mut out.tools, update);
+                    observe_turn(&mut out.requests, &mut out.saw_tool_finish, &mut out.tools, update);
                     if let Some(cost) = running_cost(update) {
                         out.cost = Some(cost);
                     }
@@ -623,6 +662,26 @@ fn trace(way: &str, line: &str) {
     }
 }
 
+/// Track running tool calls and model request/turn boundaries for an ACP `session/update`.
+fn observe_turn(requests: &mut u32, saw_tool_finish: &mut bool, tools: &mut BTreeSet<String>, update: &Value) {
+    let kind = update["sessionUpdate"].as_str();
+    if matches!(kind, Some("agent_thought_chunk" | "agent_message_chunk" | "tool_call"))
+        && (*requests == 0 || *saw_tool_finish)
+    {
+        *requests = requests.saturating_add(1);
+        *saw_tool_finish = false;
+    }
+    let was_running = !tools.is_empty();
+    let finished = matches!(
+        update["status"].as_str(),
+        Some("completed" | "failed" | "cancelled" | "canceled" | "rejected" | "denied" | "error")
+    );
+    track_tool(tools, update);
+    if finished && (was_running || matches!(kind, Some("tool_call" | "tool_call_update"))) && tools.is_empty() {
+        *saw_tool_finish = true;
+    }
+}
+
 /// Keep the set of running tool calls current. A call is running from its first report
 /// until an update says it reached any terminal status.
 fn track_tool(tools: &mut BTreeSet<String>, update: &Value) {
@@ -654,33 +713,41 @@ fn update_events(update: &Value) -> Vec<HarnessEvent> {
                 name: tool_name(update),
                 input: update["rawInput"].clone(),
             }];
-            if let Some(result) = tool_result(&id, update) {
-                events.push(result);
-            }
+            events.extend(tool_result(&id, update));
             events
         }
         // A later update carries the call's output. Status alone is not a result.
         Some("tool_call_update") => {
             let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
-            tool_result(&id, update).into_iter().collect()
+            tool_result(&id, update)
         }
         _ => Vec::new(),
     }
 }
 
-/// Text and a diff from an ACP tool call, only from fields the agent sent.
+/// Text and diffs from an ACP tool call, only from fields the agent sent.
 /// `content` is a list of `{ type: "content", content: { type: "text", text } }`
 /// or `{ type: "diff", path, oldText?, newText }`. `rawOutput` is the fallback.
-fn tool_result(id: &str, update: &Value) -> Option<HarnessEvent> {
+///
+/// Synthetic diffs computed locally from `oldText`/`newText` (e.g. `write_file` preview
+/// blocks that the agent does not feed back to the model as tool output) are returned as
+/// [`HarnessEvent::ToolDiff`] separate from [`HarnessEvent::ToolResult`] so output
+/// analysis never double-counts file writes.
+fn tool_result(id: &str, update: &Value) -> Vec<HarnessEvent> {
     let mut text = String::new();
-    let mut diffs = Vec::new();
+    let mut real_diffs = Vec::new();
+    let mut synthetic_diffs = Vec::new();
     if let Some(blocks) = update["content"].as_array() {
         for block in blocks {
             match block["type"].as_str() {
                 Some("content") => push_text(&mut text, content_text(&block["content"])),
                 Some("diff") => {
-                    if let Some(diff) = acp_diff(block) {
-                        diffs.push(diff);
+                    if let Some((diff, synthetic)) = acp_diff(block) {
+                        if synthetic {
+                            synthetic_diffs.push(diff);
+                        } else {
+                            real_diffs.push(diff);
+                        }
                     }
                 }
                 _ => {}
@@ -693,14 +760,22 @@ fn tool_result(id: &str, update: &Value) -> Option<HarnessEvent> {
     if text.is_empty() {
         push_text(&mut text, loose_output(&update["output"]));
     }
-    if text.is_empty() && diffs.is_empty() {
-        return None;
+    let mut events = Vec::new();
+    if !text.is_empty() || !real_diffs.is_empty() {
+        events.push(HarnessEvent::ToolResult {
+            id: id.to_string(),
+            text: crate::clip_result(&text),
+            diff: (!real_diffs.is_empty()).then(|| crate::clip_result(&real_diffs.join("\n"))),
+        });
     }
-    Some(HarnessEvent::ToolResult {
-        id: id.to_string(),
-        text: crate::clip_result(&text),
-        diff: (!diffs.is_empty()).then(|| crate::clip_result(&diffs.join("\n"))),
-    })
+    if !synthetic_diffs.is_empty() {
+        events.push(HarnessEvent::ToolDiff {
+            id: id.to_string(),
+            diff: crate::clip_result(&synthetic_diffs.join("\n")),
+            synthetic: true,
+        });
+    }
+    events
 }
 
 fn push_text(into: &mut String, next: String) {
@@ -732,10 +807,11 @@ fn loose_output(value: &Value) -> String {
     String::new()
 }
 
-/// A unified diff from the `oldText` and `newText` an ACP diff block already carried.
-fn acp_diff(block: &Value) -> Option<String> {
+/// A unified diff from an ACP diff block, plus whether it was synthesized locally from
+/// `oldText`/`newText` (`true`) versus provided directly in `block["diff"]` (`false`).
+fn acp_diff(block: &Value) -> Option<(String, bool)> {
     if let Some(diff) = block["diff"].as_str().filter(|d| !d.is_empty()) {
-        return Some(diff.to_string());
+        return Some((diff.to_string(), false));
     }
     if block.get("newText").is_none() && block.get("oldText").is_none() {
         return None;
@@ -743,7 +819,7 @@ fn acp_diff(block: &Value) -> Option<String> {
     let path = block["path"].as_str().filter(|p| !p.is_empty()).unwrap_or("file");
     let old = block["oldText"].as_str().unwrap_or("");
     let new = block["newText"].as_str().unwrap_or("");
-    Some(unified(path, old, new))
+    Some((unified(path, old, new), true))
 }
 
 fn unified(path: &str, old: &str, new: &str) -> String {
@@ -1217,7 +1293,7 @@ sleep 30"#,
     }
 
     #[test]
-    fn a_tool_update_attaches_its_output_and_diff_and_nothing_else() {
+    fn a_tool_update_separates_synthetic_diffs_from_real_tool_output() {
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "call_1",
@@ -1228,16 +1304,48 @@ sleep 30"#,
             ]
         });
         let events = update_events(&update);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             HarnessEvent::ToolResult { id, text, diff } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(text, "ok\n");
-                let diff = diff.as_deref().unwrap();
-                assert!(diff.contains("--- a/a.ts") && diff.contains("-a") && diff.contains("+b"), "{diff}");
+                assert!(diff.is_none(), "synthetic diff must not ride inside ToolResult");
             }
             other => panic!("expected a tool result, got {other:?}"),
         }
+        match &events[1] {
+            HarnessEvent::ToolDiff { id, diff, synthetic } => {
+                assert_eq!(id, "call_1");
+                assert!(*synthetic);
+                assert!(diff.contains("--- a/a.ts") && diff.contains("-a") && diff.contains("+b"), "{diff}");
+            }
+            other => panic!("expected a synthetic tool diff, got {other:?}"),
+        }
+        // A write_file diff block with no output text emits only ToolDiff, never a fake ToolResult.
+        let write_diff_only = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_w",
+            "status": "completed",
+            "content": [
+                { "type": "diff", "path": "pkg/mod.py", "newText": "def hi():\n    return 1\n" }
+            ]
+        });
+        let events = update_events(&write_diff_only);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], HarnessEvent::ToolDiff { id, synthetic: true, diff } if id == "call_w" && diff.contains("+def hi():")));
+        // A direct agent-supplied `block["diff"]` stays on ToolResult (non-synthetic).
+        let direct_diff = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_d",
+            "status": "completed",
+            "content": [
+                { "type": "diff", "diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-1\n+2\n" }
+            ]
+        });
+        let events = update_events(&direct_diff);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], HarnessEvent::ToolResult { id, text, diff: Some(d) } if id == "call_d" && text.is_empty() && d.contains("+2")));
+
         assert!(update_events(&json!({
             "sessionUpdate": "tool_call_update", "toolCallId": "call_1", "status": "completed"
         }))
@@ -1251,6 +1359,30 @@ sleep 30"#,
         assert!(matches!(&events[0], HarnessEvent::ToolCall { name, .. } if name == "write"));
         assert!(matches!(&events[1], HarnessEvent::ToolResult { text, diff: None, .. } if text == "wrote a.ts"));
         assert!(!events.iter().any(|event| matches!(event, HarnessEvent::Thought { .. })));
+    }
+
+    #[test]
+    fn observe_turn_counts_parallel_batches_and_silent_mcp_completions() {
+        let mut requests = 0u32;
+        let mut saw_finish = false;
+        let mut tools = BTreeSet::new();
+        // Turn 1: thought + two parallel tool calls
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "agent_thought_chunk", "content": { "text": "plan" } }));
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "w1", "status": "pending" }));
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "w2", "status": "pending" }));
+        assert_eq!(requests, 1);
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "w1", "status": "completed" }));
+        assert!(!saw_finish, "batch still has w2 running");
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "w2", "status": "completed" }));
+        assert!(saw_finish);
+        // Turn 2: silent flow_query (no content text, only completed status)
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "fq1", "status": "pending" }));
+        assert_eq!(requests, 2);
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "fq1", "status": "completed" }));
+        assert!(saw_finish);
+        // Turn 3: final assistant text
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "agent_message_chunk", "content": { "text": "done" } }));
+        assert_eq!(requests, 3);
     }
 
     #[tokio::test]

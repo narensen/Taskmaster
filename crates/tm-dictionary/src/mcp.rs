@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::store::LocalStore;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Grant {
     pub run: String,
     pub page: String,
@@ -37,6 +37,17 @@ pub struct CiteRecord {
     pub found: bool,
 }
 
+/// Summary of one daemon-served MCP `tools/call` reply, for transcript/ledger instrumentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpReplyRecord {
+    pub grant: Grant,
+    pub tool: String,
+    pub reply_bytes: usize,
+    pub is_error: bool,
+}
+
+pub type ReplyObserver = Arc<dyn Fn(McpReplyRecord) + Send + Sync>;
+
 /// More tools served beside the Dictionary's, under the same tokens. The daemon adds the
 /// browser this way, so every harness that can reach the Dictionary can reach it too.
 #[async_trait::async_trait]
@@ -54,11 +65,19 @@ pub struct McpState {
     tokens: Mutex<HashMap<String, Grant>>,
     cites: Mutex<Vec<CiteRecord>>,
     extension: Mutex<Option<Arc<dyn Extension>>>,
+    observer: Mutex<Option<ReplyObserver>>,
 }
 
 impl McpState {
     pub fn new(store: LocalStore) -> Arc<Self> {
-        Arc::new(McpState { local: store, commons: None, tokens: Mutex::default(), cites: Mutex::default(), extension: Mutex::default() })
+        Arc::new(McpState {
+            local: store,
+            commons: None,
+            tokens: Mutex::default(),
+            cites: Mutex::default(),
+            extension: Mutex::default(),
+            observer: Mutex::default(),
+        })
     }
 
     pub fn with_commons(local: LocalStore, commons: LocalStore) -> Arc<Self> {
@@ -68,11 +87,27 @@ impl McpState {
             tokens: Mutex::default(),
             cites: Mutex::default(),
             extension: Mutex::default(),
+            observer: Mutex::default(),
         })
     }
 
     pub fn extend(&self, extension: Arc<dyn Extension>) {
         *self.extension.lock().unwrap() = Some(extension);
+    }
+
+    /// Register an observer notified after every MCP `tools/call` reply (built-in or extension).
+    pub fn on_reply(&self, observer: ReplyObserver) {
+        *self.observer.lock().unwrap() = Some(observer);
+    }
+
+    fn record_reply(&self, grant: &Grant, name: &str, result: &Value) {
+        let Some(observer) = self.observer.lock().unwrap().clone() else { return };
+        observer(McpReplyRecord {
+            grant: grant.clone(),
+            tool: strip_dict_prefix(name).to_string(),
+            reply_bytes: reply_text_bytes(result),
+            is_error: result["isError"].as_bool().unwrap_or(false),
+        });
     }
 
     pub fn grant(&self, token: &str, grant: Grant) {
@@ -110,12 +145,13 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
     let Some(id) = msg.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response(); // notification
     };
+    let method = msg["method"].as_str().unwrap_or_default();
     let extension = state.extension.lock().unwrap().clone();
     if let Some(extension) = extension {
-        let method = msg["method"].as_str().unwrap_or_default();
         if method == "tools/call" {
             let name = msg["params"]["name"].as_str().unwrap_or_default();
             if let Some(result) = extension.call(&grant, name, &msg["params"]["arguments"]).await {
+                state.record_reply(&grant, name, &result);
                 return Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response();
             }
         }
@@ -129,12 +165,36 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
         }
     }
     let reply = match dispatch(&state, &grant, &msg) {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Ok(result) => {
+            if method == "tools/call" {
+                let name = msg["params"]["name"].as_str().unwrap_or_default();
+                state.record_reply(&grant, name, &result);
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
         Err((code, message)) => {
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
         }
     };
     Json(reply).into_response()
+}
+
+/// UTF-8 byte length of the text blocks in an MCP tool result (falls back to JSON byte length).
+pub fn reply_text_bytes(result: &Value) -> usize {
+    if let Some(blocks) = result["content"].as_array() {
+        let mut total = 0usize;
+        let mut saw_text = false;
+        for block in blocks {
+            if let Some(text) = block["text"].as_str() {
+                total += text.len();
+                saw_text = true;
+            }
+        }
+        if saw_text {
+            return total;
+        }
+    }
+    result.to_string().len()
 }
 
 fn dispatch(state: &McpState, grant: &Grant, msg: &Value) -> Result<Value, (i32, String)> {
@@ -400,5 +460,40 @@ mod tests {
         let (status, r) = rpc(&app, Some("tok-a"), req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(r["result"]["isError"], false, "{r}");
+    }
+
+    #[tokio::test]
+    async fn reply_observer_records_builtin_and_extension_reply_bytes() {
+        let (state, app) = setup();
+        state.extend(Arc::new(Echo));
+        let seen: Arc<Mutex<Vec<McpReplyRecord>>> = Arc::default();
+        let sink = seen.clone();
+        state.on_reply(Arc::new(move |rec| sink.lock().unwrap().push(rec)));
+
+        let (_, _) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
+        let echo = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "mcp_dictionary_echo", "arguments": { "say": "hi" } }
+        });
+        // Echo matches bare "echo", so call bare name for extension test.
+        let echo_bare = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "echo", "arguments": { "say": "hi" } }
+        });
+        let _ = rpc(&app, Some("tok-a"), echo).await;
+        let _ = rpc(&app, Some("tok-a"), echo_bare).await;
+
+        let records = seen.lock().unwrap().clone();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tool, "cite");
+        assert_eq!(records[0].reply_bytes, "export const G = 1;".len());
+        assert!(!records[0].is_error);
+        assert_eq!(records[1].tool, "echo");
+        assert_eq!(records[1].reply_bytes, "dashboard \"hi\"".len());
+        assert!(!records[1].is_error);
     }
 }

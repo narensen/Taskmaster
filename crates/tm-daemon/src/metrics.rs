@@ -156,6 +156,9 @@ mod tests {
                     brief_hash: None,
                     difficulty: None,
                     language: None,
+                    requests: None,
+                    mcp_calls: None,
+                    mcp_reply_bytes: None,
                 },
             )
             .unwrap();

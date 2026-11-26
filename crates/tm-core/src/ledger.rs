@@ -97,6 +97,15 @@ pub struct LedgerEntry {
     /// Dominant language of the unit built by this call (e.g. `ts`, `rs`, `py`) (Item 5.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Model request / turn count inside this agent call, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<u32>,
+    /// Number of daemon-served MCP tool calls made during this agent call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_calls: Option<u32>,
+    /// Total reply bytes returned by daemon-served MCP tools during this agent call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_reply_bytes: Option<u64>,
 }
 
 impl LedgerEntry {
@@ -635,6 +644,9 @@ mod tests {
             brief_hash: None,
             difficulty: None,
             language: None,
+            requests: None,
+            mcp_calls: None,
+            mcp_reply_bytes: None,
         }
     }
 
@@ -789,5 +801,21 @@ mod tests {
         styles.unit = Some("styles".into());
         let sum = totals(&[list, styles]);
         assert_eq!(sum.by_agent.keys().collect::<Vec<_>>(), ["unit:books/list", "unit:books/styles"]);
+    }
+
+    #[test]
+    fn ledger_entry_preserves_instrumentation_fields_and_reads_legacy_rows() {
+        let legacy = r#"{"at":"2026-11-26T00:00:00Z","role":"worker","page":"a","harness":"antigravity","input":100,"output":50,"seconds":1.0,"ok":true}"#;
+        let parsed: LedgerEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!((parsed.requests, parsed.mcp_calls, parsed.mcp_reply_bytes), (None, None, None));
+
+        let mut instrumented = entry(Role::Worker, "antigravity", 1200, 400, None);
+        instrumented.requests = Some(4);
+        instrumented.mcp_calls = Some(3);
+        instrumented.mcp_reply_bytes = Some(2840);
+        let json = serde_json::to_string(&instrumented).unwrap();
+        assert!(json.contains("\"requests\":4") && json.contains("\"mcp_calls\":3") && json.contains("\"mcp_reply_bytes\":2840"), "{json}");
+        let roundtrip: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, instrumented);
     }
 }

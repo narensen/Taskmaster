@@ -182,7 +182,7 @@ const CMD_OUTPUT_THROTTLE: Duration = Duration::from_millis(100);
 /// Replace oversized `output` bodies (`text` or `diff` > 2 KiB) with a stub pointing to
 /// `GET /api/runs/{id}/agents/{index}` so large command outputs never ride the main stream.
 pub fn stub_large_output(entry: &Value, index: usize) -> Value {
-    if entry["kind"].as_str() != Some("output") {
+    if !matches!(entry["kind"].as_str(), Some("output" | "tool_diff")) {
         return entry.clone();
     }
     let text_len = entry["text"].as_str().map(str::len).unwrap_or(0);

@@ -117,6 +117,9 @@ pub async fn small_call(harness: Arc<dyn Harness>, model: Option<String>, scratc
         brief_hash: None,
         difficulty: None,
         language: None,
+        requests: summary.requests,
+        mcp_calls: None,
+        mcp_reply_bytes: None,
     };
     (summary.ok.then_some(text), Some(entry))
 }

@@ -48,6 +48,12 @@ struct Answer {
     refused: Vec<String>,
     /// The agent's session, still open, when the call asked to keep it and the harness can.
     kept: Option<Box<dyn tm_harness::Session>>,
+    /// Number of model requests / turns observed in this call.
+    requests: Option<u32>,
+    /// Number of daemon-served MCP tool calls observed in this call.
+    mcp_calls: u32,
+    /// Total reply bytes returned by daemon-served MCP tools in this call.
+    mcp_reply_bytes: u64,
 }
 
 /// Who a call is charged to in the ledger.
@@ -669,6 +675,14 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
     extensions.push(status_tools.clone());
     extensions.push(web_tools.clone());
     mcp.extend(Arc::new(crate::code::Extensions(extensions)));
+    mcp.on_reply({
+        let live = live.clone();
+        let status_tools = status_tools.clone();
+        Arc::new(move |rec| {
+            let tag = status_tools.tag_for(&rec.grant);
+            live.record_mcp_reply(&rec.grant.run, &tag, &rec.tool, rec.reply_bytes, rec.is_error);
+        })
+    });
     mcp.grant(&reviewer_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: String::new() });
     mcp.grant(&security_token, Grant { run: run_id.clone(), page: "reviewer".into(), unit: "security".into() });
     mcp.grant(&verifier_token, Grant { run: run_id.clone(), page: "verifier".into(), unit: String::new() });
@@ -6079,6 +6093,9 @@ impl Driver {
             brief_hash: bill.brief_hash.clone(),
             difficulty: bill.difficulty.clone(),
             language: bill.language.clone(),
+            requests: answer.requests,
+            mcp_calls: (answer.mcp_calls > 0).then_some(answer.mcp_calls),
+            mcp_reply_bytes: (answer.mcp_calls > 0).then_some(answer.mcp_reply_bytes),
         };
         self.records.charge(&self.id, &entry)
     }
@@ -7332,6 +7349,15 @@ async fn ask(mut request: AgentRequest) -> anyhow::Result<Answer> {
 /// Read an agent's events as they come: the text is the answer, everything goes to the
 /// run's transcript, refused calls are kept with what they asked for, a commit budget's
 /// watcher sees the tool calls and thoughts, and provider session ids / rate limits are tracked.
+#[derive(Default)]
+struct CollectedEvents {
+    text: String,
+    refused: Vec<String>,
+    session_id: Option<String>,
+    tool_calls: u32,
+    inferred_requests: u32,
+}
+
 #[cfg(test)]
 pub(crate) fn collect_events(
     tee: Option<(Arc<Live>, String, serde_json::Value)>,
@@ -7341,8 +7367,8 @@ pub(crate) fn collect_events(
 ) -> tokio::task::JoinHandle<(String, Vec<String>)> {
     let inner = collect_events_full(tee, watching, rx, heard);
     tokio::spawn(async move {
-        let (text, refused, _) = inner.await.unwrap_or_default();
-        (text, refused)
+        let collected = inner.await.unwrap_or_default();
+        (collected.text, collected.refused)
     })
 }
 
@@ -7351,7 +7377,7 @@ fn collect_events_full(
     watching: Option<Arc<std::sync::Mutex<Watched>>>,
     mut rx: mpsc::Receiver<HarnessEvent>,
     heard: Arc<std::sync::Mutex<Instant>>,
-) -> tokio::task::JoinHandle<(String, Vec<String>, Option<String>)> {
+) -> tokio::task::JoinHandle<CollectedEvents> {
     tokio::spawn(async move {
         // The answer is only the text. Thoughts and tool calls go to the transcript.
         let mut text = String::new();
@@ -7359,6 +7385,9 @@ fn collect_events_full(
         let mut asked: HashMap<String, String> = HashMap::new();
         let mut refused: Vec<String> = Vec::new();
         let mut session_id: Option<String> = None;
+        let mut tool_calls = 0u32;
+        let mut inferred_requests = 0u32;
+        let mut saw_tool_result = false;
         // Text and thought fragments are written as one transcript line per message, or
         // per [`MERGE_FOR`] of a long one, not one line per streamed fragment.
         let mut merging: Option<(&'static str, String, Instant)> = None;
@@ -7381,7 +7410,23 @@ fn collect_events_full(
             let Some(event) = next else { break };
             *heard.lock().unwrap() = Instant::now();
             match &event {
+                HarnessEvent::Text { .. } | HarnessEvent::Thought { .. } | HarnessEvent::ToolCall { .. } => {
+                    if inferred_requests == 0 || saw_tool_result {
+                        inferred_requests = inferred_requests.saturating_add(1);
+                        saw_tool_result = false;
+                    }
+                }
+                HarnessEvent::ToolResult { .. } | HarnessEvent::ToolDiff { .. } => {
+                    saw_tool_result = true;
+                }
+                HarnessEvent::PermissionDecided { allowed: false, .. } => {
+                    saw_tool_result = true;
+                }
+                _ => {}
+            }
+            match &event {
                 HarnessEvent::ToolCall { name, input, .. } => {
+                    tool_calls = tool_calls.saturating_add(1);
                     asked.insert(name.clone(), tool_target(input).unwrap_or_default());
                 }
                 HarnessEvent::PermissionDecided { tool, allowed: false } => {
@@ -7444,6 +7489,19 @@ fn collect_events_full(
                         }
                         live.push(run, agent, "output", fields);
                     }
+                    HarnessEvent::ToolDiff { id, diff, synthetic } => {
+                        live.push(
+                            run,
+                            agent,
+                            "tool_diff",
+                            serde_json::json!({
+                                "id": id,
+                                "diff": diff,
+                                "synthetic": synthetic,
+                                "diff_bytes": diff.len(),
+                            }),
+                        );
+                    }
                     HarnessEvent::SessionStarted { session_id: sid } if !sid.is_empty() => {
                         live.push(run, agent, "session", serde_json::json!({ "session_id": sid }));
                     }
@@ -7462,7 +7520,7 @@ fn collect_events_full(
                 }
         }
         flush(&mut merging);
-        (text, refused, session_id)
+        CollectedEvents { text, refused, session_id, tool_calls, inferred_requests }
     })
 }
 
@@ -7713,13 +7771,21 @@ async fn follow(
         run = session.follow_up(prompt, tx, request.timeout) => run,
         stalled = wait_stall(stall_rx) => Err(stalled.into()),
     };
-    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let collected = collect.await.unwrap_or_default();
+    let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let final_sid = captured_sid.or_else(|| session.session_id().map(str::to_string));
+    let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(request.feed.as_ref());
+    let requests = run
+        .as_ref()
+        .ok()
+        .and_then(|s| s.requests)
+        .or_else(|| (collected.inferred_requests > 0).then_some(collected.inferred_requests));
     if let Some(feed) = &request.feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64(), "follow_up": true });
         if let Some(sid) = &final_sid {
             end["session_id"] = serde_json::json!(sid);
         }
+        apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         match &run {
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
@@ -7776,7 +7842,27 @@ async fn follow(
         seconds: started.elapsed().as_secs_f64(),
         refused,
         kept: summary.ok.then_some(session),
+        requests,
+        mcp_calls,
+        mcp_reply_bytes,
     })
+}
+
+fn take_feed_mcp_stats(feed: Option<&Feed>) -> (u32, u64) {
+    feed.and_then(|f| f.agent["call"].as_u64().map(|call| f.live.take_mcp_stats(call))).unwrap_or((0, 0))
+}
+
+fn apply_end_metrics(end: &mut serde_json::Value, requests: Option<u32>, tool_calls: u32, mcp_calls: u32, mcp_reply_bytes: u64) {
+    if let Some(reqs) = requests {
+        end["requests"] = serde_json::json!(reqs);
+    }
+    if tool_calls > 0 {
+        end["tool_calls"] = serde_json::json!(tool_calls);
+    }
+    if mcp_calls > 0 {
+        end["mcp_calls"] = serde_json::json!(mcp_calls);
+        end["mcp_reply_bytes"] = serde_json::json!(mcp_reply_bytes);
+    }
 }
 
 /// Resume a previously recorded provider session by id with a short prompt (H2 restart resume
@@ -7816,16 +7902,24 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
         res = request.harness.resume_kept(&session_id, prompt, task, gate, tx) => res,
         stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
     };
-    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let collected = collect.await.unwrap_or_default();
+    let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let final_sid = captured_sid
         .or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)))
         .unwrap_or(session_id);
+    let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(request.feed.as_ref());
+    let requests = run
+        .as_ref()
+        .ok()
+        .and_then(|s| s.requests)
+        .or_else(|| (collected.inferred_requests > 0).then_some(collected.inferred_requests));
     if let Some(feed) = &request.feed {
         let mut end = serde_json::json!({
             "seconds": started.elapsed().as_secs_f64(),
             "session_id": final_sid,
             "resumed": true,
         });
+        apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         match &run {
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
@@ -7858,6 +7952,9 @@ async fn resume_or_ask(request: AgentRequest, session_id: String, prompt: String
                 seconds: started.elapsed().as_secs_f64(),
                 refused,
                 kept: if request.keep && summary.ok { kept } else { None },
+                requests,
+                mcp_calls,
+                mcp_reply_bytes,
             })
         }
         Err(err) => {
@@ -7913,13 +8010,21 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
         res = request.harness.reattach(task, gate, tx, attached) => res,
         stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
     };
-    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let collected = collect.await.unwrap_or_default();
+    let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let text = format!("{said}{text}");
+    let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(request.feed.as_ref());
+    let requests = run
+        .as_ref()
+        .ok()
+        .and_then(|s| s.requests)
+        .or_else(|| (collected.inferred_requests > 0).then_some(collected.inferred_requests));
     if let Some(feed) = &request.feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64(), "reattached": true });
         if let Some(sid) = captured_sid.as_ref().or(session_id.as_ref()) {
             end["session_id"] = serde_json::json!(sid);
         }
+        apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         match &run {
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
@@ -7953,6 +8058,9 @@ async fn reattach_or_resume(request: AgentRequest, said: String, session_id: Opt
                 seconds: started.elapsed().as_secs_f64(),
                 refused,
                 kept: if request.keep && summary.ok { kept } else { None },
+                requests,
+                mcp_calls,
+                mcp_reply_bytes,
             })
         }
         Err(err) => {
@@ -8063,8 +8171,10 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
             }
         }
     };
-    let (text, refused, captured_sid) = collect.await.unwrap_or_default();
+    let collected = collect.await.unwrap_or_default();
+    let (text, refused, captured_sid) = (collected.text, collected.refused, collected.session_id);
     let final_sid = captured_sid.or_else(|| kept.as_ref().and_then(|s| s.session_id().map(str::to_string)));
+    let (mcp_calls, mcp_reply_bytes) = take_feed_mcp_stats(feed.as_ref());
     let run = run.map_err(|err| match err.downcast::<Overrun>() {
         Ok(over) => {
             let notes = tail_chars(&watch.lock().unwrap().thoughts, OVERRUN_NOTES);
@@ -8072,11 +8182,17 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         }
         Err(err) => err,
     });
+    let requests = run
+        .as_ref()
+        .ok()
+        .and_then(|s| s.requests)
+        .or_else(|| (collected.inferred_requests > 0).then_some(collected.inferred_requests));
     if let Some(feed) = &feed {
         let mut end = serde_json::json!({ "seconds": started.elapsed().as_secs_f64() });
         if let Some(sid) = &final_sid {
             end["session_id"] = serde_json::json!(sid);
         }
+        apply_end_metrics(&mut end, requests, collected.tool_calls, mcp_calls, mcp_reply_bytes);
         match &run {
             Ok(summary) => {
                 end["ok"] = serde_json::json!(summary.ok);
@@ -8117,6 +8233,9 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
         seconds: started.elapsed().as_secs_f64(),
         refused,
         kept,
+        requests,
+        mcp_calls,
+        mcp_reply_bytes,
     })
 }
 

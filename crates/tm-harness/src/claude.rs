@@ -529,6 +529,7 @@ fn summary(result: &Value) -> RunSummary {
         cost_usd: result["total_cost_usd"].as_f64(),
         denied,
         freed: None,
+        requests: result["num_turns"].as_u64().map(|n| n as u32),
     }
 }
 

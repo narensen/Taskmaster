@@ -170,7 +170,7 @@ impl Harness for Fake {
         }
         let _ = events.send(HarnessEvent::Text { text: script.text }).await;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: Some(tm_harness::Freed { processes: 1, lingering: 0 }) })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: Some(tm_harness::Freed { processes: 1, lingering: 0 }), requests: None })
     }
 }
 
@@ -188,7 +188,7 @@ impl tm_harness::Session for FakeSession {
         std::fs::create_dir_all(self.cwd.join(format!("app/{}", self.id)))?;
         std::fs::write(self.cwd.join(format!("app/{}/page.ts", self.id)), format!("export const page = \"{}\"; // fixed\n", self.id))?;
         let _ = events.send(HarnessEvent::Text { text: "fixed".into() }).await;
-        Ok(RunSummary { ok: true, usage: Usage { input: 10, output: 5, cache_read: 90, cache_write: 0 }, cost_usd: Some(0.001), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage: Usage { input: 10, output: 5, cache_read: 90, cache_write: 0 }, cost_usd: Some(0.001), denied: 0, freed: None, requests: None })
     }
 
     async fn close(self: Box<Self>) -> tm_harness::Freed {
@@ -607,7 +607,7 @@ impl Harness for EarlyChecked {
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(file, body)?;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
     }
 }
 
@@ -665,7 +665,7 @@ impl Harness for ContractTested {
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(file, body)?;
         let usage = Usage { input: 100, output: 20, cache_read: 0, cache_write: 0 };
-        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage, cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
     }
 }
 
@@ -1509,6 +1509,9 @@ fn the_cost_line_says_where_each_price_came_from_and_never_fakes_zero() {
         brief_hash: None,
         difficulty: None,
         language: None,
+        requests: None,
+        mcp_calls: None,
+        mcp_reply_bytes: None,
     };
     assert!(cost_words(&[call(None, None)]).starts_with("unpriced"), "no price is not $0.00");
     assert!(cost_words(&[call(Some(0.0), Some("provider"))]).contains("charged nothing (a free model)"));
@@ -5160,7 +5163,7 @@ async fn w1_release_gate_nudges_worker_that_skips_tests_exactly_once() {
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5222,7 +5225,7 @@ async fn w2_red_green_gate_refuses_new_test_that_already_passes_on_base() {
                 std::fs::write(&app_file, "VALUE = 2\n")?;
                 std::fs::write(&test_file, "import sys\nsys.path.insert(0, 'app/a')\nimport mod\nassert mod.VALUE == 2\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5276,7 +5279,7 @@ async fn w3_best_of_n_races_hard_unit_merges_winner_removes_loser_and_bills_both
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, self.body)?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.02), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.02), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5353,7 +5356,7 @@ async fn w4_contract_mutation_sanity_flags_vacuous_contract_test() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, format!("# attempt {attempt}\ndef add(x, y):\n    return x + y\n"))?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5408,7 +5411,7 @@ async fn mutation_gate_without_import_edge_is_skipped() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5463,7 +5466,7 @@ async fn identical_gate_failure_after_noop_repair_is_waived_not_escalated() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5569,7 +5572,7 @@ async fn mutation_gate_all_skipped_is_inconclusive() {
             let file = task.cwd.join("app/a/mod.py");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "def add(x, y):\n    return x + y\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5656,7 +5659,7 @@ async fn intermediate_phase_verify_skips_later_phase_contract_tests() {
                     "dictionary": []
                 });
                 let _ = _events.send(HarnessEvent::Text { text: phase2_json.to_string() }).await;
-                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None });
             }
             if task.brief.contains("Build unit `core`") {
                 std::fs::create_dir_all(task.cwd.join("pkg"))?;
@@ -5665,7 +5668,7 @@ async fn intermediate_phase_verify_skips_later_phase_contract_tests() {
                 std::fs::create_dir_all(task.cwd.join("pkg"))?;
                 std::fs::write(task.cwd.join("pkg/cli.py"), "from pkg.core import value\n\ndef run_cli():\n    return f'ok:{value()}'\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5766,7 +5769,7 @@ async fn repair_shared_refuses_locked_contract_test() {
         ) -> anyhow::Result<RunSummary> {
             std::fs::create_dir_all(task.cwd.join("pkg"))?;
             std::fs::write(task.cwd.join("pkg/mod.py"), "def ok():\n    return True\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5790,7 +5793,7 @@ async fn repair_shared_refuses_locked_contract_test() {
             if test_path.is_file() {
                 std::fs::write(&test_path, "import pytest\npytestmark = pytest.mark.skipif(True, reason='hack')\ndef test_x(): assert False\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -5869,7 +5872,7 @@ async fn o1_taskmaster_yaml_setup_copy_and_trust_by_hash() {
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6049,7 +6052,7 @@ async fn a1_queued_notes_batch_into_one_turn_and_steer_note_reaches_master_befor
             if task.brief.starts_with("Read these notes") {
                 self.master_briefs.lock().unwrap().push(task.brief.clone());
                 let _ = events.send(HarnessEvent::Text { text: "Master says: follow the steer note.".into() }).await;
-                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None });
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None });
             }
             self.worker_briefs.lock().unwrap().push(task.brief.clone());
             // When page `a` runs, drop 1 steer note (reaches master before page `b`) and 2 queued notes (batched into 1 turn after finish).
@@ -6074,7 +6077,7 @@ async fn a1_queued_notes_batch_into_one_turn_and_steer_note_reaches_master_befor
                 std::fs::create_dir_all(file.parent().unwrap())?;
                 std::fs::write(&file, "export const a = 2;\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6181,7 +6184,7 @@ async fn h1_pending_approval_marks_run_blocked_needs_you_and_approving_clears_it
             let file = task.cwd.join("app/a/page.ts");
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6315,7 +6318,7 @@ async fn a2_rewind_restores_checkpoint_and_drops_later_turns_from_view_and_next_
             } else {
                 std::fs::write(&file, "export const v = 'turn1';\n")?;
             }
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6478,7 +6481,7 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
             std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
             std::fs::write(&page_file, "export const a = 1;\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -6519,6 +6522,9 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     brief_hash: None,
                     difficulty: Some("normal".into()),
                     language: Some("general".into()),
+                    requests: None,
+                    mcp_calls: None,
+                    mcp_reply_bytes: None,
                 },
             )
             .unwrap();
@@ -6545,6 +6551,9 @@ async fn o4_provider_reporting_85_pct_shows_warning_and_is_skipped_by_auto() {
                     brief_hash: None,
                     difficulty: Some("normal".into()),
                     language: Some("general".into()),
+                    requests: None,
+                    mcp_calls: None,
+                    mcp_reply_bytes: None,
                 },
             )
             .unwrap();
@@ -6634,7 +6643,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
             std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
             std::fs::write(&page_file, "export const a = 'fresh';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn run_kept(
             &self,
@@ -6661,7 +6670,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
             std::fs::write(&page_file, "export const a = 'resumed';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "continued after restart".into() }).await;
             (
-                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None }),
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None, requests: None }),
                 None,
             )
         }
@@ -6756,7 +6765,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
             _timeout: Duration,
         ) -> anyhow::Result<RunSummary> {
             self.follow_ups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         fn session_id(&self) -> Option<&str> {
             Some(&self.sid)
@@ -6786,7 +6795,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
             _gate: Arc<dyn tm_harness::PermissionGate>,
             _events: tokio::sync::mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn run_kept(
             &self,
@@ -6806,7 +6815,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
                 follow_ups: self.follow_ups.clone(),
             });
             (
-                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }),
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }),
                 Some(sess),
             )
         }
@@ -6826,7 +6835,7 @@ async fn o7_idle_warm_session_is_detached_and_resumed_by_session_id_on_repair() 
             std::fs::write(&page_file, "export const a = 'repaired-by-id';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "fixed via resume".into() }).await;
             (
-                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None }),
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.005), denied: 0, freed: None, requests: None }),
                 None,
             )
         }
@@ -7090,7 +7099,7 @@ async fn o3_batched_diff_review_groups_three_comments_on_two_pages_into_two_note
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, format!("export const p = '{page}';\n"))?;
             let _ = events.send(HarnessEvent::Text { text: "updated".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7207,7 +7216,7 @@ async fn o2_preview_design_mode_proxy_and_capture_routes_h1_to_page_worker() {
             let file = task.cwd.join(format!("app/{page}/page.ts"));
             std::fs::create_dir_all(file.parent().unwrap())?;
             std::fs::write(&file, "export const ok = true;\n")?;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7339,7 +7348,7 @@ impl Harness for Plain {
     }
     async fn run(&self, _task: WorkerTask, _gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> anyhow::Result<RunSummary> {
         let _ = events.send(HarnessEvent::Text { text: "done".into() }).await;
-        Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.0), denied: 0, freed: None })
+        Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.0), denied: 0, freed: None, requests: None })
     }
 }
 
@@ -7464,7 +7473,7 @@ async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brie
             _gate: Arc<dyn tm_harness::PermissionGate>,
             _events: tokio::sync::mpsc::Sender<HarnessEvent>,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn run_kept(
             &self,
@@ -7482,7 +7491,7 @@ async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brie
                     closed: self.closed.clone(),
                     follow_ups: self.follow_ups.clone(),
                 });
-                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }), Some(sess))
             } else {
                 // Fallback fresh ask() receives the full worker brief and fixes the file.
                 let _ = std::fs::remove_file(task.cwd.join("outside.txt"));
@@ -7490,7 +7499,7 @@ async fn stalled_warm_follow_closes_session_and_falls_back_to_ask_with_full_brie
                 std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
                 std::fs::write(&page_file, "export const a = 'recovered';\n").unwrap();
                 let _ = events.send(HarnessEvent::Text { text: "fixed on fallback".into() }).await;
-                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), None)
+                (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }), None)
             }
         }
     }
@@ -7567,7 +7576,7 @@ async fn single_worker_error_in_join_one_escalates_instead_of_aborting_run() {
             std::fs::create_dir_all(page_file.parent().unwrap()).unwrap();
             std::fs::write(&page_file, "export const a = 'from-mid';\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7628,7 +7637,7 @@ async fn stalled_worker_in_batch_does_not_abort_sibling_and_retries() {
                 std::fs::write(&f, "export const b = 'ok';\n").unwrap();
             }
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7714,7 +7723,7 @@ async fn planner_rejects_contract_constants_contradicting_prompt_and_repairs_wit
                 .to_string()
             };
             let _ = events.send(HarnessEvent::Text { text: reply }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7787,7 +7796,7 @@ async fn verify_reports_import_failure_reasons_and_keeps_parallel_build_timings(
                 std::fs::write(&f, "export const b = 2;\n").unwrap();
             }
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -7846,7 +7855,7 @@ async fn finalize_runs_once_on_error_return_and_success_paths() {
             _events: mpsc::Sender<HarnessEvent>,
             _timeout: Duration,
         ) -> anyhow::Result<RunSummary> {
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
         async fn close(self: Box<Self>) -> tm_harness::Freed {
             self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7886,7 +7895,7 @@ async fn finalize_runs_once_on_error_return_and_success_paths() {
             std::fs::write(&f, format!("export const {page} = 1;\n")).unwrap();
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
             let sess: Box<dyn tm_harness::Session> = Box::new(CountingSession { closed: self.closed.clone() });
-            (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None }), Some(sess))
+            (Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None }), Some(sess))
         }
     }
 
@@ -8052,7 +8061,7 @@ async fn stall_timeout_is_configurable_and_final_attempt_stays_bounded() {
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(&f, "export const a = 1;\n").unwrap();
             let _ = events.send(HarnessEvent::Text { text: "ok".into() }).await;
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -8227,7 +8236,7 @@ async fn unit_with_contract_only_dependency_starts_immediately() {
                 std::fs::write(task.cwd.join("tinydb/storage.py"), "from tinydb.contract import BTreeProtocol\nclass Storage:\n    pass\n")?;
             }
             self.inflight.fetch_sub(1, Ordering::SeqCst);
-            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None })
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: None })
         }
     }
 
@@ -8445,6 +8454,7 @@ async fn small_cli_prompt_uses_single_phase_plan() {
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8595,6 +8605,7 @@ async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildca
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8674,6 +8685,7 @@ async fn contract_soft_cap_warns_without_repair_while_hard_cap_triggers_repair()
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8766,6 +8778,7 @@ async fn scheduling_wave_starts_long_pole_unit_first_under_parallel_limit() {
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -8886,6 +8899,7 @@ async fn worker_brief_deduplicates_contracts_full_when_used_and_signatures_other
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9060,6 +9074,7 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9146,6 +9161,7 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9201,6 +9217,7 @@ async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_p
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9315,6 +9332,7 @@ async fn flow_graph_seeds_updates_places_unit_map_after_task_marker_keeps_prefix
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9410,6 +9428,7 @@ async fn flow_env_json_records_after_verify_injects_stable_prefix_hint_and_share
                 cost_usd: Some(0.01),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9571,6 +9590,7 @@ async fn planner_json_local_repair_avoids_replan_and_unrepairable_uses_ask_repai
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9736,6 +9756,7 @@ class BTreeProtocol(Protocol):
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9882,6 +9903,7 @@ async fn flow_env_json_prepared_before_wave1_with_relative_paths_and_shared_venv
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -9974,6 +9996,7 @@ async fn flow_worker_brief_includes_harness_exact_flow_query_examples_for_every_
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10137,6 +10160,7 @@ async fn flow_preinjected_context_included_for_existing_files_and_later_wave_wit
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10350,6 +10374,7 @@ async fn flow_audit_mcp_tool_listed_and_callable_code_mode_off_and_on() {
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10488,6 +10513,7 @@ async fn flow_audit_staleness_gate_repairs_and_emits_flow_stale_event_in_run() {
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10614,6 +10640,7 @@ async fn flow_audit_commit_paths_flag_repair_and_race_merge() {
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10767,6 +10794,7 @@ async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
                     cost_usd: Some(0.0),
                     denied: 0,
                     freed: None,
+                    requests: None,
                 });
             }
             if task.brief.contains("Build unit `extra`") {
@@ -10784,6 +10812,7 @@ async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
                     cost_usd: Some(0.0),
                     denied: 0,
                     freed: None,
+                    requests: None,
                 });
             }
             let _ = events.send(HarnessEvent::Text { text: "[]".into() }).await;
@@ -10793,6 +10822,7 @@ async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10901,6 +10931,7 @@ async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
                 cost_usd: Some(0.0),
                 denied: 0,
                 freed: None,
+                requests: None,
             })
         }
     }
@@ -10934,4 +10965,148 @@ async fn flow_audit_brownfield_e2e_template_cancel_resume_and_undo() {
     assert!(tmp.0.join("pkg/base.py").is_file(), "pre-existing brownfield file must stay intact");
     assert_eq!(git_out(&tmp.0, &["status", "--porcelain"]).trim(), "");
     let _ = std::fs::remove_dir_all(&tmpl_dir);
+}
+
+#[tokio::test]
+async fn tok1_instrumentation_logs_mcp_replies_requests_and_separates_synthetic_diffs() {
+    let tmp = seeded("tok1-instr");
+    std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+    std::fs::write(tmp.0.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(tmp.0.join("pkg/base.py"), "def base_val() -> int:\n    return 7\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-q", "-m", "init"]);
+
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        summary: "instrumented run".into(),
+        contracts: vec![],
+        pages: vec![PagePlan {
+            id: "svc".into(),
+            owned_glob: "pkg/svc.py".into(),
+            brief: "create svc".into(),
+            done: "svc exists".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct InstrHarness;
+    #[async_trait]
+    impl Harness for InstrHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Simulate calling MCP `flow_query` and `index` against the live daemon MCP server.
+            if let Some(dict) = task.dictionary.clone() {
+                tokio::task::spawn_blocking(move || {
+                    for (id, name, args) in [
+                        (1, "mcp_dictionary_flow_query", serde_json::json!({ "op": "find", "query": "base_val" })),
+                        (2, "mcp_dictionary_index", serde_json::json!({})),
+                    ] {
+                        let resp: serde_json::Value = ureq::post(&dict.url)
+                            .set("Authorization", &format!("Bearer {}", dict.bearer_token))
+                            .set("Content-Type", "application/json")
+                            .send_json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "tools/call",
+                                "params": { "name": name, "arguments": args }
+                            }))
+                            .expect("MCP POST failed")
+                            .into_json()
+                            .expect("invalid MCP JSON");
+                        assert!(resp["result"]["content"].is_array(), "MCP call {name} failed: {resp}");
+                    }
+                })
+                .await?;
+            }
+            // Emit a synthetic write_file diff (ToolDiff) and a real command output (ToolResult).
+            let _ = events
+                .send(HarnessEvent::ToolCall {
+                    id: "c_write".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "pkg/svc.py" }),
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolDiff {
+                    id: "c_write".into(),
+                    diff: "--- a/pkg/svc.py\n+++ b/pkg/svc.py\n+def f(): return 1\n".into(),
+                    synthetic: true,
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolCall {
+                    id: "c_cmd".into(),
+                    name: "run_command".into(),
+                    input: serde_json::json!({ "CommandLine": "echo ok" }),
+                })
+                .await;
+            let _ = events
+                .send(HarnessEvent::ToolResult {
+                    id: "c_cmd".into(),
+                    text: "ok\n".into(),
+                    diff: None,
+                })
+                .await;
+            std::fs::write(task.cwd.join("pkg/svc.py"), "def f() -> int:\n    return 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:svc\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 500, output: 120, cache_read: 200, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+                requests: Some(3),
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(InstrHarness);
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "tok1-run".into();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    let out = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(out, Outcome::Finished { ok: true });
+
+    let records = Records::files(&tmp.0);
+    let ledger = records.ledger("tok1-run").unwrap();
+    let worker_row = ledger.iter().find(|e| e.page.as_deref() == Some("svc")).expect("worker ledger row");
+    assert_eq!(worker_row.requests, Some(3));
+    assert_eq!(worker_row.mcp_calls, Some(2));
+    assert!(worker_row.mcp_reply_bytes.unwrap_or(0) > 10, "expected nonzero mcp_reply_bytes: {worker_row:?}");
+
+    let raw_agents = std::fs::read_to_string(tmp.0.join(".taskmaster/runs/tok1-run/agents.jsonl")).unwrap();
+    let entries: Vec<serde_json::Value> = raw_agents.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+
+    let mcp_replies: Vec<&serde_json::Value> = entries.iter().filter(|e| e["kind"] == "mcp_reply").collect();
+    assert_eq!(mcp_replies.len(), 2, "expected 2 mcp_reply entries, got: {mcp_replies:#?}");
+    assert!(mcp_replies.iter().any(|e| e["tool"] == "flow_query" && e["reply_bytes"].as_u64().unwrap_or(0) > 0));
+    assert!(mcp_replies.iter().any(|e| e["tool"] == "index" && e["reply_bytes"].as_u64().unwrap_or(0) > 0));
+
+    let tool_diffs: Vec<&serde_json::Value> = entries.iter().filter(|e| e["kind"] == "tool_diff").collect();
+    assert_eq!(tool_diffs.len(), 1, "synthetic diff must be logged as kind=tool_diff");
+    assert_eq!(tool_diffs[0]["synthetic"], true);
+    let worker_outputs: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["kind"] == "output" && e["agent"]["id"] != "runtime")
+        .collect();
+    assert_eq!(worker_outputs.len(), 1, "only real ToolResult should be logged as kind=output: {worker_outputs:#?}");
+    assert_eq!(worker_outputs[0]["id"], "c_cmd");
+
+    let end = entries.iter().find(|e| e["kind"] == "end").expect("end entry");
+    assert_eq!(end["requests"], 3);
+    assert_eq!(end["tool_calls"], 2);
+    assert_eq!(end["mcp_calls"], 2);
+    assert_eq!(end["mcp_reply_bytes"].as_u64(), worker_row.mcp_reply_bytes);
 }

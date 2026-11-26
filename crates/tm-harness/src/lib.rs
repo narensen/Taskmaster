@@ -477,9 +477,12 @@ pub enum HarnessEvent {
     Text { text: String },
     Thought { text: String },
     ToolCall { id: String, name: String, input: Value },
-    /// Output a harness attached to a tool call. `diff` is set only when the harness sent one.
+    /// Output a harness attached to a tool call. `diff` is set only when the harness sent one directly.
     /// An empty `text` with a `diff` is still a result. This is never a substitute for a thought.
     ToolResult { id: String, text: String, diff: Option<String> },
+    /// Locally synthesized diff from an ACP `oldText`/`newText` block (such as a `write_file`
+    /// preview not fed back to the model), kept separate from model-visible [`HarnessEvent::ToolResult`].
+    ToolDiff { id: String, diff: String, synthetic: bool },
     PermissionDecided { tool: String, allowed: bool },
     /// The provider assigned or resumed a session id for this call (H2 / O7).
     SessionStarted { session_id: String },
@@ -510,6 +513,9 @@ pub struct RunSummary {
     pub denied: u32,
     /// What was freed when the agent was released after its turn. `None` before release.
     pub freed: Option<Freed>,
+    /// Number of model requests / turns taken during this call, when observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<u32>,
 }
 
 /// A session kept open after its first turn, so a repair can be sent to the same agent as

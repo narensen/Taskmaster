@@ -235,6 +235,19 @@ impl StatusTools {
         self.tags.lock().unwrap().insert(scope.to_string(), tag);
     }
 
+    /// Resolve the transcript agent tag registered for `grant` (falling back to a minimal tag).
+    pub fn tag_for(&self, grant: &Grant) -> Value {
+        let scope = grant.agent();
+        self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
+            let id = match scope.as_str() {
+                "master" | "reviewer" | "verifier" => scope.clone(),
+                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
+                other => format!("page:{other}"),
+            };
+            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
+        })
+    }
+
     /// Publish a one-line status update into the run's transcript for `grant`.
     pub fn set_status(&self, grant: &Grant, raw: &str) -> String {
         let first_line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
@@ -248,15 +261,7 @@ impl StatusTools {
         if cleaned.is_empty() {
             return String::new();
         }
-        let scope = grant.agent();
-        let tag = self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
-            let id = match scope.as_str() {
-                "master" | "reviewer" | "verifier" => scope.clone(),
-                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
-                other => format!("page:{other}"),
-            };
-            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
-        });
+        let tag = self.tag_for(grant);
         self.live.push(&grant.run, &tag, "status", json!({ "text": cleaned }));
         cleaned
     }

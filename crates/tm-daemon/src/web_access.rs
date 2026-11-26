@@ -1759,6 +1759,9 @@ impl WebTools {
             brief_hash: None,
             difficulty: None,
             language: None,
+            requests: None,
+            mcp_calls: None,
+            mcp_reply_bytes: None,
         };
         let _ = self.records.charge(&grant.run, &entry);
     }
@@ -2238,6 +2241,10 @@ impl WebTools {
             .ok()
             .flatten();
         if let Some(doc) = local {
+            let body = format!(
+                "# {} @ {} ({}, local: {})\n\n{}",
+                doc.package, doc.version, doc.ecosystem, doc.path, doc.content
+            );
             self.live.push(
                 &grant.run,
                 &agent,
@@ -2249,13 +2256,10 @@ impl WebTools {
                     "symbol": symbol,
                     "source": "local",
                     "path": doc.path,
+                    "reply_bytes": body.len(),
                 }),
             );
             self.record_ledger(grant, role, "docs", true, started.elapsed().as_secs_f64(), Vec::new());
-            let body = format!(
-                "# {} @ {} ({}, local: {})\n\n{}",
-                doc.package, doc.version, doc.ecosystem, doc.path, doc.content
-            );
             return mcp_ok(&body);
         }
 
@@ -2300,6 +2304,7 @@ impl WebTools {
                         "op": op,
                         "id": args.get("id").and_then(|v| v.as_str()),
                         "query": args.get("query").and_then(|v| v.as_str()),
+                        "reply_bytes": output.text.len(),
                     }),
                 );
                 mcp_ok(&output.text)

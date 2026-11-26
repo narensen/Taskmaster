@@ -156,6 +156,10 @@ Harnesses that do not report USD costs stay unpriced by default (no model prices
 }
 ```
 
+## Benchmarks
+
+On a hidden-test tinydb build, Taskmaster scored 24/24 in about 410s with ~125k uncached input tokens, against 1,279s for T3 Code and 1,432s for the native Antigravity agent at the same score. Full results, methodology and limitations are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Develop
 
 ```bash

@@ -228,6 +228,14 @@ pub fn phase_brief(
 /// The brief that repairs a rejected plan instead of planning again from nothing: the plan,
 /// the reasons, and the rules. The planner changes only what the reasons name.
 pub fn repair_brief(prompt: &str, plan_json: &str, errors: &[String]) -> String {
+    if errors.len() == 1 && errors[0].starts_with("invalid JSON at line ") {
+        return format!(
+            "Fix the JSON syntax error in this plan without rewriting or dropping any content. \
+             Change only what is needed to make it valid JSON, and reply with the complete corrected JSON object and nothing else. Do not call any tools.\n\n\
+             JSON error:\n- {}\n\nThe broken plan JSON:\n{plan_json}\n",
+            errors[0],
+        );
+    }
     let mut brief = String::from(
         "Repair this plan. It was rejected for the reasons below. Change only what the reasons name, keep everything else \
          exactly as it is, and reply with the whole corrected JSON object and nothing else. Do not call any tools.\n\nThe request it plans:\n",

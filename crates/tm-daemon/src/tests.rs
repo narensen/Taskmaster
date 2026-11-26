@@ -9537,3 +9537,115 @@ async fn flow_env_json_records_after_verify_injects_stable_prefix_hint_and_share
     let shell_a3 = shell_a3.as_ref().expect("shell scope for a3");
     assert!(!shell_a3.readable.contains(&shared_venv), "missing venv must not be mounted");
 }
+
+#[tokio::test]
+async fn planner_json_local_repair_avoids_replan_and_unrepairable_uses_ask_repair() {
+    struct ScriptedPlanner {
+        replies: Mutex<std::collections::VecDeque<String>>,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for ScriptedPlanner {
+        fn id(&self) -> &'static str {
+            "fake-planner"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "{}".into());
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 10, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.0),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let make_harnesses = |replies: Vec<String>| -> (Harnesses, Arc<Mutex<Vec<String>>>) {
+        let briefs = Arc::new(Mutex::new(Vec::new()));
+        let h: Arc<dyn Harness> = Arc::new(ScriptedPlanner {
+            replies: Mutex::new(replies.into()),
+            briefs: briefs.clone(),
+        });
+        (
+            Harnesses {
+                master: h.clone(),
+                mid: h.clone(),
+                worker: h.clone(),
+                reviewer: h.clone(),
+                verifier: h,
+            },
+            briefs,
+        )
+    };
+
+    // 1. Repairable invalid JSON (unescaped `""` in string, like n6) succeeds in 1 planner call (no replan/repair).
+    let tmp1 = seeded("plan-json-local");
+    let repairable = "```json\n{\n  \"kind\": \"cli\",\n  \"summary\": \"Demo CLI\",\n  \"units\": [\n    {\"id\": \"cli\", \"owned_glob\": \"app.py\", \"brief\": \"Format None as `\"\"`, other values as str(v).\", \"done\": \"pytest passes\",}\n  ]\n}\n```";
+    let (h1, briefs1) = make_harnesses(vec![repairable.into()]);
+    let mut cfg1 = Config::new(&tmp1.0);
+    cfg1.prompt = Some("Build a demo CLI.".into());
+    cfg1.yes = false;
+    cfg1.fast_path = false;
+    cfg1.timeout = Duration::from_secs(20);
+    let out1 = drive(cfg1, h1).await.unwrap();
+    assert!(matches!(out1, Outcome::NeedsApproval { .. }), "{out1:?}");
+    assert_eq!(
+        briefs1.lock().unwrap().len(),
+        1,
+        "local JSON repair must accept the plan in a single planner call without replanning"
+    );
+
+    // 2. Unrepairable invalid JSON triggers small `ask_repair` turn (NOT a fresh full replan) with accurate line/col error.
+    let tmp2 = seeded("plan-json-repair");
+    let broken = "{\n  \"kind\": \"cli\",\n  \"units\": [\n    {\"id\": \"cli\", \"owned_glob\": \"app.py\", \"brief\": [}\n  ]\n}";
+    let fixed = r#"{"kind":"cli","summary":"Fixed","units":[{"id":"cli","owned_glob":"app.py","brief":"Build CLI","done":"tests pass"}]}"#;
+    let (h2, briefs2) = make_harnesses(vec![broken.into(), fixed.into()]);
+    let mut cfg2 = Config::new(&tmp2.0);
+    cfg2.prompt = Some("Build a demo CLI.".into());
+    cfg2.yes = false;
+    cfg2.fast_path = false;
+    cfg2.timeout = Duration::from_secs(20);
+    let out2 = drive(cfg2, h2).await.unwrap();
+    assert!(matches!(out2, Outcome::NeedsApproval { .. }), "{out2:?}");
+    let seen2 = briefs2.lock().unwrap().clone();
+    assert_eq!(seen2.len(), 2, "expected initial plan + 1 small ask_repair call");
+    assert!(
+        seen2[1].contains("Fix the JSON syntax error") && seen2[1].contains("invalid JSON at line "),
+        "second call must be ask_repair with accurate JSON error, got:\n{}",
+        seen2[1]
+    );
+    assert!(seen2[1].contains("\"brief\": [}"), "ask_repair must include the broken JSON:\n{}", seen2[1]);
+
+    // 3. Truly missing JSON object reports "no JSON object" and falls back to a fresh planner call.
+    let tmp3 = seeded("plan-json-missing");
+    let (h3, briefs3) = make_harnesses(vec!["I cannot produce JSON right now.".into(), fixed.into()]);
+    let mut cfg3 = Config::new(&tmp3.0);
+    cfg3.prompt = Some("Build a demo CLI.".into());
+    cfg3.yes = false;
+    cfg3.fast_path = false;
+    cfg3.timeout = Duration::from_secs(20);
+    let out3 = drive(cfg3, h3).await.unwrap();
+    assert!(matches!(out3, Outcome::NeedsApproval { .. }), "{out3:?}");
+    let seen3 = briefs3.lock().unwrap().clone();
+    assert_eq!(seen3.len(), 2);
+    assert!(
+        seen3[1].contains("no JSON object") && !seen3[1].contains("Fix the JSON syntax error"),
+        "missing JSON should report 'no JSON object' and re-ask planner, got:\n{}",
+        seen3[1]
+    );
+}

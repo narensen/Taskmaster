@@ -118,6 +118,754 @@ fn last_json(text: &str, open: char, close: char) -> Option<Value> {
     slice.char_indices().filter(|(_, c)| *c == open).find_map(|(start, _)| serde_json::from_str(&slice[start..]).ok())
 }
 
+/// Extract markdown fenced code block bodies (outermost to innermost, returned last-to-first).
+fn extract_fenced_blocks(text: &str) -> Vec<(bool, String)> {
+    let mut blocks: Vec<(bool, String)> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            let lang = rest.trim().to_ascii_lowercase();
+            let is_json_fence = lang.is_empty() || lang == "json" || lang == "json5" || lang == "jsonc";
+            let start = i + 1;
+            let mut end = lines.len();
+            let mut j = start;
+            while j < lines.len() {
+                if lines[j].trim_start().starts_with("```") {
+                    end = j;
+                    break;
+                }
+                j += 1;
+            }
+            if end > start {
+                blocks.push((is_json_fence, lines[start..end].join("\n")));
+            }
+            i = if end < lines.len() { end + 1 } else { lines.len() };
+        } else {
+            i += 1;
+        }
+    }
+    blocks.reverse();
+    blocks
+}
+
+/// Skip ASCII whitespace and JSON5/JS comments (`// ...` and `/* ... */`).
+fn skip_ws_and_comments(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            match rest.find('\n') {
+                Some(nl) => s = &rest[nl + 1..],
+                None => return "",
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(end) => s = &rest[end + 2..],
+                None => return "",
+            }
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+/// True when `slice` begins with `{` followed by plausible JSON/JSON5 object syntax (not prose like `{this}`).
+fn looks_like_json_object_start(slice: &str) -> bool {
+    let Some(rest) = slice.strip_prefix('{') else {
+        return false;
+    };
+    let rest = skip_ws_and_comments(rest);
+    if rest.is_empty() {
+        return false;
+    }
+    let first = rest.chars().next().unwrap();
+    if matches!(first, '}' | '"' | '\'' | '\u{201C}' | '\u{201D}') {
+        return true;
+    }
+    if first.is_ascii_alphabetic() || first == '_' || first == '$' {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '-'))
+            .unwrap_or(rest.len());
+        let after = skip_ws_and_comments(&rest[end..]);
+        if after.starts_with(':') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find the outermost balanced `{ ... }` span starting at byte 0 (tracking double-quoted strings loosely).
+fn balanced_object_end(slice: &str) -> Option<usize> {
+    if !slice.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (idx, ch) in slice.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract candidate JSON object substrings from a model reply, ordered most-likely first.
+fn json_object_candidates(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |s: &str| {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && !out.iter().any(|have| have == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    };
+
+    // 1. Markdown fenced blocks (last to first).
+    for (is_json_fence, body) in extract_fenced_blocks(text) {
+        if let Some(start) = body.find('{') {
+            let tail = &body[start..];
+            let slice = match tail.rfind('}') {
+                Some(end) => &tail[..=end],
+                None => tail,
+            };
+            if is_json_fence || looks_like_json_object_start(slice) {
+                push_unique(slice);
+            }
+        }
+    }
+
+    // 2. Unwrapped text: strip an outer fence if the entire reply is wrapped in one.
+    let trimmed = text.trim();
+    let unwrapped = if let Some(after_open) = trimmed.strip_prefix("```") {
+        let body = after_open.split_once('\n').map_or(after_open, |(_, rest)| rest);
+        body.trim_end().strip_suffix("```").unwrap_or(body).trim()
+    } else {
+        trimmed
+    };
+
+    if let Some(first_brace) = unwrapped.find('{') {
+        let from_first = &unwrapped[first_brace..];
+        if let Some(last_close) = from_first.rfind('}') {
+            let outer = &from_first[..=last_close];
+            if looks_like_json_object_start(outer) || outer.contains("\":") {
+                push_unique(outer);
+                if let Some(bal_end) = balanced_object_end(outer)
+                    && bal_end < outer.len()
+                {
+                    push_unique(&outer[..bal_end]);
+                }
+            }
+            // If prose before the JSON contained a brace like `{foo}`, locate the first `{`
+            // that actually starts a JSON object.
+            if !looks_like_json_object_start(outer) {
+                for (offset, ch) in outer.char_indices() {
+                    if ch == '{' && offset > 0 && looks_like_json_object_start(&outer[offset..]) {
+                        let sub = &outer[offset..];
+                        push_unique(sub);
+                        if let Some(bal_end) = balanced_object_end(sub)
+                            && bal_end < sub.len()
+                        {
+                            push_unique(&sub[..bal_end]);
+                        }
+                        break;
+                    }
+                }
+            }
+        } else if looks_like_json_object_start(from_first) {
+            // Truncated JSON object with no closing `}` yet.
+            push_unique(from_first);
+        }
+    }
+
+    out
+}
+
+/// Extract the best raw JSON object candidate from a reply (for `ask_repair` when local repair fails).
+pub fn extract_json_object_candidate(text: &str) -> Option<String> {
+    json_object_candidates(text).into_iter().next()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Object,
+    Array,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseState {
+    Value,
+    KeyOrEnd,
+    Colon,
+    CommaOrEnd,
+}
+
+/// Check if `rest` (already trimmed of leading whitespace/comments) begins a plausible JSON object key followed by `:`.
+fn looks_like_object_key(rest: &str, allow_json5: bool) -> bool {
+    let Some(first) = rest.chars().next() else {
+        return false;
+    };
+    if matches!(first, '"' | '\u{201C}' | '\u{201D}') {
+        let mut i = first.len_utf8();
+        let bytes = rest.as_bytes();
+        let mut escaped = false;
+        let mut chars_seen = 0usize;
+        while i < bytes.len() && chars_seen < 160 {
+            let ch = rest[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            chars_seen += 1;
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '\n' || ch == '\r' {
+                return false;
+            }
+            if ch == '"' || (first != '"' && ch == '\u{201D}') {
+                let after = skip_ws_and_comments(&rest[i..]);
+                return after.starts_with(':');
+            }
+        }
+        return false;
+    }
+    if allow_json5 && matches!(first, '\'' | '\u{2018}' | '\u{2019}') {
+        let mut i = first.len_utf8();
+        let mut escaped = false;
+        let mut chars_seen = 0usize;
+        while i < rest.len() && chars_seen < 160 {
+            let ch = rest[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            chars_seen += 1;
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '\n' || ch == '\r' {
+                return false;
+            }
+            if ch == '\'' || (first != '\'' && ch == '\u{2019}') {
+                let after = skip_ws_and_comments(&rest[i..]);
+                return after.starts_with(':');
+            }
+        }
+        return false;
+    }
+    if allow_json5 && (first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '-'))
+            .unwrap_or(rest.len());
+        let after = skip_ws_and_comments(&rest[end..]);
+        return after.starts_with(':');
+    }
+    false
+}
+
+/// Check if what follows a closing `}` or `]` is plausible given the parent container on `stack`.
+fn valid_after_container_close(after: &str, stack: &[Container], allow_json5: bool) -> bool {
+    if stack.len() <= 1 {
+        return after.is_empty();
+    }
+    let parent = stack[stack.len() - 2];
+    match parent {
+        Container::Object => {
+            if after.starts_with('}') {
+                return true;
+            }
+            if let Some(after_comma) = after.strip_prefix(',') {
+                let next = skip_ws_and_comments(after_comma);
+                return next.starts_with('}') || looks_like_object_key(next, allow_json5);
+            }
+            false
+        }
+        Container::Array => {
+            if after.starts_with(']') {
+                return true;
+            }
+            if let Some(after_comma) = after.strip_prefix(',') {
+                let next = skip_ws_and_comments(after_comma);
+                return next.starts_with(']') || looks_like_array_value_start(next, allow_json5);
+            }
+            false
+        }
+    }
+}
+
+/// Check if `rest` (trimmed of ws/comments) begins a plausible JSON array element value.
+fn looks_like_array_value_start(rest: &str, allow_json5: bool) -> bool {
+    let Some(first) = rest.chars().next() else {
+        return false;
+    };
+    if matches!(first, '{' | '[' | '-' | '0'..='9') {
+        return true;
+    }
+    for kw in ["true", "false", "null"] {
+        if let Some(tail) = rest.strip_prefix(kw) {
+            let next_ok = tail
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ',' | ']' | '}' | '/'));
+            if next_ok {
+                return true;
+            }
+        }
+    }
+    if matches!(first, '"' | '\u{201C}' | '\u{201D}')
+        || (allow_json5 && matches!(first, '\'' | '\u{2018}' | '\u{2019}'))
+    {
+        // Confirm the next quoted token is actually a JSON element (followed by `,` or `]`),
+        // not a pair of unescaped quotes embedded inside a single string like `"say "hi", "bye" now"`.
+        let mut i = first.len_utf8();
+        let mut escaped = false;
+        while i < rest.len() {
+            let ch = rest[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '\n' || ch == '\r' {
+                return false;
+            }
+            let closes = match first {
+                '"' => ch == '"',
+                '\u{201C}' | '\u{201D}' => ch == '"' || ch == '\u{201D}',
+                '\'' => ch == '\'',
+                '\u{2018}' | '\u{2019}' => ch == '\'' || ch == '\u{2019}',
+                _ => false,
+            };
+            if closes {
+                let after = skip_ws_and_comments(&rest[i..]);
+                return after.starts_with(',') || after.starts_with(']');
+            }
+        }
+        return false;
+    }
+    false
+}
+
+/// Decide whether an unescaped quote at `pos_after_quote` validly terminates the current JSON string,
+/// or is an unescaped interior quote that must be escaped as `\"`.
+fn is_valid_string_close(
+    input: &str,
+    pos_after_quote: usize,
+    expecting_key: bool,
+    stack: &[Container],
+    allow_json5: bool,
+) -> bool {
+    let rest = skip_ws_and_comments(&input[pos_after_quote..]);
+    if expecting_key {
+        return rest.starts_with(':');
+    }
+    match stack.last() {
+        Some(Container::Object) => {
+            if let Some(after_brace) = rest.strip_prefix('}') {
+                return valid_after_container_close(skip_ws_and_comments(after_brace), stack, allow_json5);
+            }
+            if let Some(after_comma) = rest.strip_prefix(',') {
+                let next = skip_ws_and_comments(after_comma);
+                if let Some(after_brace) = next.strip_prefix('}') {
+                    return valid_after_container_close(skip_ws_and_comments(after_brace), stack, allow_json5);
+                }
+                return looks_like_object_key(next, allow_json5);
+            }
+            false
+        }
+        Some(Container::Array) => {
+            if let Some(after_bracket) = rest.strip_prefix(']') {
+                return valid_after_container_close(skip_ws_and_comments(after_bracket), stack, allow_json5);
+            }
+            if let Some(after_comma) = rest.strip_prefix(',') {
+                let next = skip_ws_and_comments(after_comma);
+                if let Some(after_bracket) = next.strip_prefix(']') {
+                    return valid_after_container_close(skip_ws_and_comments(after_bracket), stack, allow_json5);
+                }
+                return looks_like_array_value_start(next, allow_json5);
+            }
+            false
+        }
+        None => rest.is_empty(),
+    }
+}
+
+fn push_escaped_control(out: &mut String, ch: char) {
+    match ch {
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{0008}' => out.push_str("\\b"),
+        '\u{000C}' => out.push_str("\\f"),
+        c => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\\u{:04x}", c as u32);
+        }
+    }
+}
+
+/// Deterministic, single-pass local JSON repair:
+/// - strips `//` and `/* ... */` comments outside strings
+/// - converts smart/curly quotes used as JSON delimiters
+/// - removes trailing commas before `}` and `]`
+/// - escapes raw newlines/tabs/control chars inside strings
+/// - escapes invalid backslash escapes inside strings (e.g. `\d`, `\'`)
+/// - escapes unescaped interior double quotes inside string values using structural lookahead
+/// - when `allow_json5` is true, also converts single-quoted strings and unquoted object keys.
+fn repair_json(input: &str, allow_json5: bool) -> String {
+    let mut out = String::with_capacity(input.len() + 64);
+    let mut stack: Vec<Container> = Vec::new();
+    let mut state = ParseState::Value;
+    let mut i = 0usize;
+
+    while i < input.len() {
+        let ch = input[i..].chars().next().unwrap();
+
+        if ch.is_whitespace() {
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        // Line comment outside string.
+        if input[i..].starts_with("//") {
+            match input[i + 2..].find('\n') {
+                Some(nl) => {
+                    out.push('\n');
+                    i += 2 + nl + 1;
+                }
+                None => break,
+            }
+            continue;
+        }
+        // Block comment outside string.
+        if input[i..].starts_with("/*") {
+            match input[i + 2..].find("*/") {
+                Some(end) => i += 2 + end + 2,
+                None => break,
+            }
+            continue;
+        }
+
+        match ch {
+            '{' => {
+                out.push('{');
+                stack.push(Container::Object);
+                state = ParseState::KeyOrEnd;
+                i += 1;
+            }
+            '}' => {
+                out.push('}');
+                if matches!(stack.last(), Some(Container::Object)) {
+                    stack.pop();
+                }
+                state = ParseState::CommaOrEnd;
+                i += 1;
+            }
+            '[' => {
+                out.push('[');
+                stack.push(Container::Array);
+                state = ParseState::Value;
+                i += 1;
+            }
+            ']' => {
+                out.push(']');
+                if matches!(stack.last(), Some(Container::Array)) {
+                    stack.pop();
+                }
+                state = ParseState::CommaOrEnd;
+                i += 1;
+            }
+            ':' => {
+                out.push(':');
+                state = ParseState::Value;
+                i += 1;
+            }
+            ',' => {
+                let next = skip_ws_and_comments(&input[i + 1..]);
+                if next.starts_with('}') || next.starts_with(']') {
+                    // Drop trailing comma.
+                    i += 1;
+                } else {
+                    out.push(',');
+                    state = match stack.last() {
+                        Some(Container::Object) => ParseState::KeyOrEnd,
+                        _ => ParseState::Value,
+                    };
+                    i += 1;
+                }
+            }
+            '"' | '\u{201C}' | '\u{201D}' => {
+                let opened_smart = ch != '"';
+                let expecting_key = state == ParseState::KeyOrEnd;
+                out.push('"');
+                i += ch.len_utf8();
+                while i < input.len() {
+                    let sc = input[i..].chars().next().unwrap();
+                    if sc == '\\' {
+                        let next_pos = i + 1;
+                        if next_pos >= input.len() {
+                            out.push_str("\\\\");
+                            i = next_pos;
+                            break;
+                        }
+                        let esc = input[next_pos..].chars().next().unwrap();
+                        if matches!(esc, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
+                            out.push('\\');
+                            out.push(esc);
+                            i = next_pos + esc.len_utf8();
+                        } else if esc == 'u' {
+                            let hex_start = next_pos + 1;
+                            let hex_ok = input.len() >= hex_start + 4
+                                && input[hex_start..hex_start + 4].bytes().all(|b| b.is_ascii_hexdigit());
+                            if hex_ok {
+                                out.push_str(&input[i..hex_start + 4]);
+                                i = hex_start + 4;
+                            } else {
+                                out.push_str("\\\\u");
+                                i = hex_start;
+                            }
+                        } else {
+                            // Invalid JSON escape like `\d`, `\s`, `\'`: escape the backslash so the next loop iteration handles `esc`.
+                            out.push_str("\\\\");
+                            i = next_pos;
+                        }
+                        continue;
+                    }
+                    if (sc as u32) < 0x20 {
+                        push_escaped_control(&mut out, sc);
+                        i += sc.len_utf8();
+                        continue;
+                    }
+                    let is_quote_candidate = sc == '"' || (opened_smart && sc == '\u{201D}');
+                    if is_quote_candidate {
+                        let after = i + sc.len_utf8();
+                        if is_valid_string_close(input, after, expecting_key, &stack, allow_json5) {
+                            out.push('"');
+                            i = after;
+                            break;
+                        } else {
+                            out.push_str("\\\"");
+                            i = after;
+                            continue;
+                        }
+                    }
+                    out.push(sc);
+                    i += sc.len_utf8();
+                }
+                state = if expecting_key { ParseState::Colon } else { ParseState::CommaOrEnd };
+            }
+            '\'' | '\u{2018}' | '\u{2019}' if allow_json5 => {
+                let opened_smart = ch != '\'';
+                let expecting_key = state == ParseState::KeyOrEnd;
+                out.push('"');
+                i += ch.len_utf8();
+                while i < input.len() {
+                    let sc = input[i..].chars().next().unwrap();
+                    if sc == '\\' {
+                        let next_pos = i + 1;
+                        if next_pos >= input.len() {
+                            out.push_str("\\\\");
+                            i = next_pos;
+                            break;
+                        }
+                        let esc = input[next_pos..].chars().next().unwrap();
+                        if esc == '\'' {
+                            out.push('\'');
+                            i = next_pos + 1;
+                        } else if matches!(esc, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
+                            out.push('\\');
+                            out.push(esc);
+                            i = next_pos + esc.len_utf8();
+                        } else if esc == 'u' {
+                            let hex_start = next_pos + 1;
+                            let hex_ok = input.len() >= hex_start + 4
+                                && input[hex_start..hex_start + 4].bytes().all(|b| b.is_ascii_hexdigit());
+                            if hex_ok {
+                                out.push_str(&input[i..hex_start + 4]);
+                                i = hex_start + 4;
+                            } else {
+                                out.push_str("\\\\u");
+                                i = hex_start;
+                            }
+                        } else {
+                            out.push_str("\\\\");
+                            i = next_pos;
+                        }
+                        continue;
+                    }
+                    if (sc as u32) < 0x20 {
+                        push_escaped_control(&mut out, sc);
+                        i += sc.len_utf8();
+                        continue;
+                    }
+                    if sc == '"' {
+                        out.push_str("\\\"");
+                        i += 1;
+                        continue;
+                    }
+                    if sc == '\'' || (opened_smart && sc == '\u{2019}') {
+                        let after = i + sc.len_utf8();
+                        if is_valid_string_close(input, after, expecting_key, &stack, allow_json5) {
+                            out.push('"');
+                            i = after;
+                            break;
+                        } else {
+                            out.push('\'');
+                            i = after;
+                            continue;
+                        }
+                    }
+                    out.push(sc);
+                    i += sc.len_utf8();
+                }
+                state = if expecting_key { ParseState::Colon } else { ParseState::CommaOrEnd };
+            }
+            _ if allow_json5 && state == ParseState::KeyOrEnd && (ch.is_ascii_alphabetic() || ch == '_' || ch == '$') => {
+                let end = i
+                    + input[i..]
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '-'))
+                        .unwrap_or(input.len() - i);
+                let ident = &input[i..end];
+                let after = skip_ws_and_comments(&input[end..]);
+                if after.starts_with(':') {
+                    out.push('"');
+                    out.push_str(ident);
+                    out.push('"');
+                    i = end;
+                    state = ParseState::Colon;
+                } else {
+                    out.push_str(ident);
+                    i = end;
+                }
+            }
+            _ => {
+                out.push(ch);
+                i += ch.len_utf8();
+                if matches!(state, ParseState::Value) && !ch.is_whitespace() {
+                    // Consume the rest of a bare primitive token (number/bool/null).
+                    while i < input.len() {
+                        let nc = input[i..].chars().next().unwrap();
+                        if nc.is_whitespace() || matches!(nc, ',' | '}' | ']' | ':') {
+                            break;
+                        }
+                        out.push(nc);
+                        i += nc.len_utf8();
+                    }
+                    state = ParseState::CommaOrEnd;
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Format an accurate JSON syntax error with line, column, serde message, and short context snippet.
+fn format_json_error(candidate: &str, err: &serde_json::Error) -> String {
+    let line = err.line();
+    let col = err.column();
+    let raw_msg = err.to_string();
+    let suffix = format!(" at line {line} column {col}");
+    let msg = raw_msg.strip_suffix(&suffix).unwrap_or(&raw_msg);
+
+    let snippet = candidate
+        .lines()
+        .nth(line.saturating_sub(1))
+        .map(|line_text| {
+            let chars: Vec<char> = line_text.chars().collect();
+            let idx = col.saturating_sub(1).min(chars.len());
+            let start = idx.saturating_sub(35);
+            let end = (idx + 35).min(chars.len());
+            let mut s = String::new();
+            if start > 0 {
+                s.push('…');
+            }
+            for &c in &chars[start..end] {
+                if c == '\t' {
+                    s.push(' ');
+                } else {
+                    s.push(c);
+                }
+            }
+            if end < chars.len() {
+                s.push('…');
+            }
+            s
+        })
+        .unwrap_or_default();
+
+    if snippet.is_empty() {
+        format!("invalid JSON at line {line} column {col}: {msg}")
+    } else {
+        format!("invalid JSON at line {line} column {col}: {msg} (near `{snippet}`)")
+    }
+}
+
+/// Parse a JSON object from `text`, trying strict JSON first and then deterministic local repair.
+/// Returns `missing_msg` only when no JSON object exists; otherwise reports exact line/column + snippet.
+fn parse_json_object_lenient(text: &str, missing_msg: &str) -> anyhow::Result<Value> {
+    if let Some(val @ Value::Object(_)) = last_json(text, '{', '}') {
+        return Ok(val);
+    }
+    for (_, body) in extract_fenced_blocks(text) {
+        if let Ok(val @ Value::Object(_)) = serde_json::from_str::<Value>(body.trim()) {
+            return Ok(val);
+        }
+    }
+    let candidates = json_object_candidates(text);
+    if candidates.is_empty() {
+        bail!("{missing_msg}");
+    }
+    for cand in &candidates {
+        if let Ok(val @ Value::Object(_)) = serde_json::from_str::<Value>(cand) {
+            return Ok(val);
+        }
+        let repaired = repair_json(cand, false);
+        if let Ok(val @ Value::Object(_)) = serde_json::from_str::<Value>(&repaired) {
+            return Ok(val);
+        }
+        let repaired_json5 = repair_json(cand, true);
+        if let Ok(val @ Value::Object(_)) = serde_json::from_str::<Value>(&repaired_json5) {
+            return Ok(val);
+        }
+    }
+    let best = &candidates[0];
+    match serde_json::from_str::<Value>(best) {
+        Ok(_) => bail!("{missing_msg}"),
+        Err(err) => bail!("{}", format_json_error(best, &err)),
+    }
+}
+
 /// A worker objecting to a Dictionary entry. `None` when the reply is ordinary work.
 pub fn parse_flag(text: &str) -> Option<(String, String)> {
     let value = last_json(text, '{', '}')?;
@@ -223,7 +971,7 @@ pub fn parse_plan(text: &str) -> anyhow::Result<(Plan, Vec<DraftEntry>)> {
     if let Some(hit) = limit_of(text) {
         return Err(hit.into());
     }
-    let value = last_json(text, '{', '}').context("the plan reply had no JSON object")?;
+    let value = parse_json_object_lenient(text, "the plan reply had no JSON object")?;
     let raw: RawPlan = serde_json::from_value(value).context("the plan reply was not a plan")?;
     let estimate = raw.estimate.unwrap_or(Estimate { tokens: 0, usd: 0.0, ..Default::default() });
     let design = design_text(&raw.design);
@@ -252,7 +1000,7 @@ pub fn parse_resolution(text: &str) -> anyhow::Result<Resolution> {
     if let Some(hit) = limit_of(text) {
         return Err(hit.into());
     }
-    let value = last_json(text, '{', '}').context("the arbitration reply had no JSON object")?;
+    let value = parse_json_object_lenient(text, "the arbitration reply had no JSON object")?;
     match value["resolution"].as_str().unwrap_or("").to_ascii_lowercase().as_str() {
         "conform" => Ok(Resolution::Conform),
         "amended" | "amend" => {
@@ -399,8 +1147,12 @@ pub fn limit_of(text: &str) -> Option<ProviderLimit> {
 }
 
 fn has_answer_json(text: &str) -> bool {
-    if let Some(value) = last_json(text, '{', '}')
-        && (value.get("pages").is_some() || value.get("resolution").is_some() || value.get("contracts").is_some() || value.get("flag").is_some())
+    if let Ok(value) = parse_json_object_lenient(text, "")
+        && (value.get("pages").is_some()
+            || value.get("units").is_some()
+            || value.get("resolution").is_some()
+            || value.get("contracts").is_some()
+            || value.get("flag").is_some())
     {
         return true;
     }
@@ -635,5 +1387,68 @@ mod tests {
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].key.as_deref(), Some("auth"));
         assert_eq!(findings[1].key.as_deref(), Some("nav"));
+    }
+
+    #[test]
+    fn repairs_real_n6_rejected_plan_replies_locally() {
+        let tmh = include_str!("fixtures/n6_rejected_plan_tmh.txt");
+        let (plan_tmh, dict_tmh) = parse_plan(tmh).expect("n6 tmh rejected plan must repair locally");
+        assert_eq!(plan_tmh.kind, ProjectKind::Cli);
+        assert_eq!(plan_tmh.pages.len(), 6);
+        assert!(dict_tmh.len() >= 3);
+        let cli_unit = plan_tmh.pages.iter().find(|p| p.id == "cli_integration").expect("cli_integration unit");
+        assert!(cli_unit.context.contains("`None` -> `\"\"`"), "unescaped empty quotes must survive repair:\n{}", cli_unit.context);
+        let cli_entry = dict_tmh.iter().find(|d| d.content.contains("empty string `\"\"`"));
+        assert!(cli_entry.is_some(), "second unescaped \"\" in dictionary entry must survive repair");
+
+        let tmhcode = include_str!("fixtures/n6_rejected_plan_tmhcode.txt");
+        let (plan_code, dict_code) = parse_plan(tmhcode).expect("n6 tmhcode rejected plan must repair locally");
+        assert_eq!(plan_code.kind, ProjectKind::Cli);
+        assert_eq!(plan_code.pages.len(), 4);
+        assert!(!dict_code.is_empty());
+        let cli_docs = plan_code.pages.iter().find(|p| p.id == "cli_and_docs").expect("cli_and_docs unit");
+        assert!(cli_docs.context.contains("return `\"\"`"), "unescaped \"\" in tmhcode context must survive repair:\n{}", cli_docs.context);
+    }
+
+    #[test]
+    fn repairs_trailing_commas_control_chars_smart_quotes_and_json5() {
+        // Code fence + trailing prose with braces + trailing commas + unescaped quotes + raw newline/tab + smart quotes
+        let messy = "Here is the plan:\n```json\n{\n  // header comment\n  \u{201C}kind\u{201D}: \u{201C}cli\u{201D},\n  \"summary\": \"Line 1\n\tLine 2 with \"quoted\" text and \"\" empty\",\n  \"units\": [\n    {\n      \"id\": \"core\",\n      \"owned_glob\": \"src/**\",\n      \"brief\": \"Format None as \"\", other values as str(v)\",\n    },\n  ],\n}\n```\nNote: ignore {x} in this note.\n";
+        let (plan, _) = parse_plan(messy).expect("messy JSON must repair locally");
+        assert_eq!(plan.kind, ProjectKind::Cli);
+        assert!(plan.summary.contains("Line 1\n\tLine 2"), "raw newline/tab preserved: {:?}", plan.summary);
+        assert!(plan.summary.contains("\"quoted\""), "{:?}", plan.summary);
+        assert_eq!(plan.pages.len(), 1);
+        assert_eq!(plan.pages[0].brief, "Format None as \"\", other values as str(v)");
+
+        // JSON5-ish: unquoted keys, single-quoted strings, block comment, trailing comma
+        let json5 = "/* plan */\n{ kind: 'library', units: [{ id: 'a', owned_glob: 'a.py', brief: 'Build \"a\"', },], }";
+        let (plan5, _) = parse_plan(json5).expect("json5-ish plan must repair locally");
+        assert_eq!(plan5.kind, ProjectKind::Library);
+        assert_eq!(plan5.pages[0].id, "a");
+        assert_eq!(plan5.pages[0].brief, "Build \"a\"");
+    }
+
+    #[test]
+    fn reports_accurate_invalid_json_line_and_column_vs_no_json_object() {
+        let broken = "{\n  \"kind\": \"cli\",\n  \"units\": [\n    {\"id\": \"a\", \"owned_glob\": \"a.py\", \"brief\": [}\n  ]\n}";
+        let err = parse_plan(broken).unwrap_err().to_string();
+        assert!(err.starts_with("invalid JSON at line "), "expected accurate line/col error, got: {err}");
+        assert!(err.contains("column "), "{err}");
+        assert!(err.contains("(near `"), "expected short context snippet, got: {err}");
+        assert!(!err.contains("no JSON object"), "must not falsely claim no JSON object: {err}");
+        assert!(extract_json_object_candidate(broken).is_some());
+
+        // Truncated JSON with no closing brace is also invalid JSON, not "no JSON object".
+        let truncated = "{\"kind\": \"cli\", \"units\": [{\"id\": \"a\"";
+        let err_trunc = parse_plan(truncated).unwrap_err().to_string();
+        assert!(err_trunc.starts_with("invalid JSON at line "), "got: {err_trunc}");
+
+        // Truly no JSON object (plain prose, or prose with non-JSON braces) reports "no JSON object".
+        for prose in ["no json here", "I cannot plan {this} right now."] {
+            let err_none = parse_plan(prose).unwrap_err().to_string();
+            assert!(err_none.contains("no JSON object"), "for {prose:?} got: {err_none}");
+            assert!(extract_json_object_candidate(prose).is_none(), "prose must not yield candidate: {prose:?}");
+        }
     }
 }

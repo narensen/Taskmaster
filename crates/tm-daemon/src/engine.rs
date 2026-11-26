@@ -1353,7 +1353,14 @@ impl Driver {
     fn accept_plan(&self, text: &str, prompt: &str, base: Option<&Plan>) -> Result<(Plan, Vec<DraftEntry>), Rejected> {
         let (mut plan, mut drafts) = match reply::parse_plan(text) {
             Ok(parsed) => parsed,
-            Err(err) => return Err((vec![format!("{err:#}")], None)),
+            Err(err) => {
+                let candidate = if err.downcast_ref::<reply::ProviderLimit>().is_none() {
+                    reply::extract_json_object_candidate(text)
+                } else {
+                    None
+                };
+                return Err((vec![format!("{err:#}")], candidate));
+            }
         };
         if let Some(base) = base {
             // A later phase is part of the same project: same kind, same design, no sketch.

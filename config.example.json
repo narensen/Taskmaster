@@ -33,6 +33,23 @@
     "shell": true,
     "package_indexes": true
   },
+  "web_access": {
+    "enabled": true,
+    "provider": "native",
+    "endpoint": "",
+    "roles": {
+      "planner": { "search": true, "fetch": true },
+      "worker": { "search": true, "fetch": true },
+      "reviewer": { "search": false, "fetch": true },
+      "verifier": { "search": false, "fetch": false }
+    },
+    "allowlist": [],
+    "planner_max_searches": 5,
+    "planner_max_fetches": 8,
+    "worker_max_fetches": 5,
+    "native_search_max_planner": 5,
+    "native_search_max_worker": 3
+  },
   "prices_file": "",
   "prices": {}
 }

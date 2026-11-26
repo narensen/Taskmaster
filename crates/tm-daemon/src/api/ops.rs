@@ -523,6 +523,9 @@ pub(super) struct WebAccessUpdateBody {
     allowlist: Option<Vec<String>>,
     planner_max_searches: Option<usize>,
     planner_max_fetches: Option<usize>,
+    worker_max_fetches: Option<usize>,
+    native_search_max_planner: Option<usize>,
+    native_search_max_worker: Option<usize>,
     max_fetch_bytes: Option<usize>,
     cache_ttl_secs: Option<u64>,
     cache_max_mb: Option<u64>,
@@ -606,6 +609,15 @@ pub(super) async fn update_web_access(
     }
     if let Some(n) = body.planner_max_fetches {
         web.planner_max_fetches = n.min(100);
+    }
+    if let Some(n) = body.worker_max_fetches {
+        web.worker_max_fetches = n.min(100);
+    }
+    if let Some(n) = body.native_search_max_planner {
+        web.native_search_max_planner = n.min(100);
+    }
+    if let Some(n) = body.native_search_max_worker {
+        web.native_search_max_worker = n.min(100);
     }
     if let Some(b) = body.max_fetch_bytes {
         web.max_fetch_bytes = b.clamp(16 * 1024, 20 * 1024 * 1024);

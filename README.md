@@ -82,6 +82,7 @@ tm-daemon serve . --lan                      # also reachable from the local net
 tm-daemon serve . --auto-resume              # resume unfinished runs on daemon startup
 tm-daemon . --prompt "A notes app with a list and an editor."
 tm-daemon . --yes                            # approve the plan and build it
+tm-daemon . --offline --yes                  # run strictly offline (disables web search/fetch; also TASKMASTER_OFFLINE=1)
 tm-daemon . --worker auto --yes              # auto-route workers from the local scorecard
 tm-daemon report .                           # inspect run cost, tokens, and outcomes
 tm-daemon eval --suite bench/suite --check-only
@@ -109,13 +110,13 @@ Everything that reaches the daemon lives on the **Connect** page (`/connect`, or
 
 ## Web access & local-first docs
 
-Off by default (`Settings → Web access`). Worker sandboxes keep `--unshare-net`; all web traffic goes through the daemon so every request is cached, budgeted, and logged in the egress audit log and run transcript.
+**On by default** with `provider: "native"` (`Settings → Web access`). Pass `--offline` or set `TASKMASTER_OFFLINE=1` (used automatically by benchmarks and `tm-daemon eval`) to disable all web access. Provider-native search is capped per role (planner 5, worker 3) and recorded in the run transcript and ledger, while raw harness `web_fetch` stays denied so every fetch goes through the daemon's SSRF-hardened MCP `web_fetch` (cached, budgeted, audited, and framed as untrusted data). Code Mode's `WarmNode` stays `--unshare-net`.
 
-- **Local-first `docs(package, symbol?)`** — always available offline. Reads READMEs and type definitions directly from `node_modules`, Python `site-packages`, or `~/.cargo/registry/src` at the project's locked version before falling back to search.
-- **`web_search`** — supports **SearXNG**, **Brave Search**, **Tavily**, **Exa**, or **Native** provider passthrough (allowing a harness's built-in search tool per role through the permission gate). API keys are stored in the OS keychain vault and redacted from logs and exports.
+- **Local-first `docs(package, symbol?)`** — always available offline (pruned from worker tool lists on stdlib-only repos). Reads READMEs and type definitions directly from `node_modules`, Python `site-packages`, or `~/.cargo/registry/src` at the project's locked version before falling back to search.
+- **`web_search`** — defaults to **Native** provider passthrough (harness built-in search gated and capped per role; plumbed for ACP harnesses, Claude Code `--allowedTools WebSearch`, and Codex). Also supports **SearXNG**, **Brave Search**, **Tavily**, and **Exa** with API keys stored in the OS keychain vault and redacted from logs and exports.
 - **SSRF-safe `web_fetch`** — HTTPS only, pinned DNS resolution to stop DNS rebinding, blocks loopback/RFC 1918/link-local/metadata/internal addresses on every redirect hop, enforces response size and content-type limits, extracts markdown from HTML and text from PDFs, and caches pages under `$XDG_CACHE_HOME/taskmaster/web`.
-- **OSV security `advisories`** — queries `api.osv.dev` for package vulnerabilities during reviews and dependency checks.
-- **Per-role permissions & budgets** — Planner researches up to a configurable search/fetch cap and writes concise decisions (with source URL and version) into `PROJECT.md`; Workers fetch only from a project-derived + custom domain allowlist (off-list domains trigger an approval prompt in `risky` mode); Reviewers check security advisories; Verifiers get no web access.
+- **OSV security `advisories`** — queries `api.osv.dev` for package vulnerabilities during reviews and dependency checks (pruned on stdlib-only worker units).
+- **Per-role permissions & budgets** — Planner researches unfamiliar third-party APIs (up to 5 searches / 8 fetches) and writes concise decisions into `PROJECT.md`; Workers get capped native search (3) and SSRF-safe `web_fetch` (up to 5 per unit on public HTTPS URLs when `allowlist` is empty, or restricted to the project-derived + custom allowlist when configured); Reviewers check security advisories; Verifiers remain strictly offline.
 - **Prompt-injection framing** — strips HTML comments, hidden elements, and zero-width characters, flags imperative injection patterns, wraps results in untrusted provenance tags, and prevents raw web content from entering the workers' shared prefix.
 - **Per-run Web sources view** — Run View displays every agent's searches, fetched URLs, cache hits, local docs lookups, advisory checks, injection warnings, and planner research decisions.
 

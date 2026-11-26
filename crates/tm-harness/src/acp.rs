@@ -1336,6 +1336,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
@@ -1440,6 +1441,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let (tx, _rx) = mpsc::channel(8);
@@ -1472,6 +1474,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![]));
@@ -1553,6 +1556,7 @@ sleep 30"#,
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: Some(crate::hold::HoldSpec { holder: holder.clone(), key: "p/r/unit:a".into(), meta: json!({}) }),
         };
         let (tx, mut rx) = mpsc::channel(32);
@@ -1776,6 +1780,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             code_mode: true,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -1840,6 +1845,7 @@ echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
             code_mode: true,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -1899,6 +1905,7 @@ sleep 30
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -1962,6 +1969,7 @@ echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
                     code_mode,
                     shell: None,
                     permission_mode: None,
+            native_search: false,
                     hold: None,
                 };
                 let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -2051,6 +2059,7 @@ read l; echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -2116,6 +2125,7 @@ read l; echo '{{"jsonrpc":"2.0","id":5,"result":{{"stopReason":"end_turn"}}}}'
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate2 = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -2182,6 +2192,7 @@ echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         // Turn 1 gate allows shell; turn 2 rebinds to a read-only gate that denies shell.
@@ -2236,6 +2247,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             code_mode: true,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -2288,6 +2300,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).read_only());

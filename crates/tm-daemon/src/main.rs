@@ -58,6 +58,8 @@ struct Args {
     no_runtime_checks: bool,
     /// Disable effort-based thinking routing and pin explicit model ids verbatim.
     no_effort_routing: bool,
+    /// Disable web search, web fetch, and advisories for this run (also via TASKMASTER_OFFLINE=1).
+    offline: bool,
     parallel: usize,
     /// Seconds per agent call; 0 is no limit. None takes the settings file's limit.
     timeout: Option<u64>,
@@ -80,6 +82,7 @@ struct ServeArgs {
     /// Listen on every address, so the local network and the tailnet can pair.
     lan: bool,
     auto_resume: bool,
+    offline: bool,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
     web: Option<PathBuf>,
@@ -284,6 +287,7 @@ async fn run() -> anyhow::Result<Outcome> {
     } else {
         tm_daemon::settings::effective_effort_routing(settings.agents.effort_routing)
     };
+    config.offline = args.offline || tm_daemon::settings::offline_env_enabled();
     config.prices = tm_daemon::settings::load_price_table(&settings, &project_root, args.prices.as_deref())?;
     config.remote = settings.remote();
     let phone = if args.pair {
@@ -294,6 +298,7 @@ async fn run() -> anyhow::Result<Outcome> {
             tailscale: false,
             lan: false,
             auto_resume: false,
+            offline: args.offline,
             dictionary: config.dictionary.clone(),
             commons: config.commons.clone(),
             web: None,
@@ -370,6 +375,7 @@ async fn start_server(args: &ServeArgs, bind: SocketAddr) -> anyhow::Result<Serv
     options.web = args.web.clone().or_else(installed_web);
     options.holder = holder();
     options.push = tm_daemon::push::default_path();
+    options.offline = args.offline || tm_daemon::settings::offline_env_enabled();
     let server = Server::serve(options).await?;
     server.warm_providers();
     println!("taskmaster: api {}  code {code}", server.url);
@@ -642,7 +648,7 @@ fn eval_args(argv: &[String]) -> anyhow::Result<EvalMode> {
 }
 
 fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
-    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--auto-resume] [--dictionary <dir>] \
+    let usage = "usage: tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--auto-resume] [--offline] [--dictionary <dir>] \
                  [--commons <dir>] [--web <dir>]";
     let mut argv = argv.iter().cloned();
     let project = argv.next().filter(|arg| !arg.starts_with('-')).context(usage)?;
@@ -652,6 +658,7 @@ fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
         tailscale: false,
         lan: false,
         auto_resume: false,
+        offline: false,
         dictionary: None,
         commons: None,
         web: None,
@@ -661,6 +668,7 @@ fn serve_args(argv: &[String]) -> anyhow::Result<ServeArgs> {
             "--tailscale" => args.tailscale = true,
             "--lan" => args.lan = true,
             "--auto-resume" => args.auto_resume = true,
+            "--offline" => args.offline = true,
             "--bind" => {
                 let value = need(&mut argv, "--bind", usage)?;
                 args.bind = Some(value.parse().with_context(|| format!("`{value}` is not an address like 127.0.0.1:8737"))?);
@@ -703,7 +711,7 @@ async fn print_providers(harness: Option<&str>) -> anyhow::Result<()> {
 
 /// What `tm-daemon --help` prints, and what a wrong command line is answered with.
 const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
-                     tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--auto-resume] [--web <dir>]\n       \
+                     tm-daemon serve <project> [--bind <addr>] [--lan] [--tailscale] [--auto-resume] [--offline] [--web <dir>]\n       \
                      tm-daemon eval --suite <dir> [--check-only]\n       \
                      tm-daemon eval --gate <baseline.jsonl> <candidate.jsonl> [--max-cost-pct <n>]\n       \
                      tm-daemon report [<project>] [--run <id>] [--json] [--append <file>]\n       \
@@ -713,7 +721,7 @@ const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
                      [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
                      [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
                      [--timeout <secs, 0 for none>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
-                     [--template <next | dir>] [--no-runtime-checks] [--no-effort-routing] \
+                     [--template <next | dir>] [--no-runtime-checks] [--no-effort-routing] [--offline] \
                      [--eval] [--baseline <h>] [--pair]\n       \
                      tm-daemon --version\n\
                      harnesses: claude, agy, grok, codex, opencode (worker also accepts auto)";
@@ -743,6 +751,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         pair: false,
         no_runtime_checks: false,
         no_effort_routing: false,
+        offline: false,
         roles: Roles::default(),
         models: Models::default(),
     };
@@ -752,6 +761,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
             "--yes" => args.yes = true,
             "--no-runtime-checks" => args.no_runtime_checks = true,
             "--no-effort-routing" => args.no_effort_routing = true,
+            "--offline" => args.offline = true,
             "--plan" => args.plan = Some(need(&mut argv, "--plan", usage)?.into()),
             "--prompt" => args.prompt = Some(need(&mut argv, "--prompt", usage)?),
             "--prompt-file" => args.prompt_file = Some(need(&mut argv, "--prompt-file", usage)?.into()),
@@ -938,10 +948,12 @@ mod args_tests {
             }
             _ => panic!("expected Eval::Gate"),
         }
-        match invocation_from(["serve".into(), ".".into(), "--auto-resume".into()]).unwrap() {
-            Invocation::Serve(args) => assert!(args.auto_resume),
+        match invocation_from(["serve".into(), ".".into(), "--auto-resume".into(), "--offline".into()]).unwrap() {
+            Invocation::Serve(args) => assert!(args.auto_resume && args.offline),
             _ => panic!("expected Serve"),
         }
+        let offline_drive = parse(". --prompt hello --offline").unwrap();
+        assert!(offline_drive.offline);
     }
 
     #[test]

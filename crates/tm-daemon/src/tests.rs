@@ -1091,7 +1091,9 @@ async fn an_empty_project_is_planned_without_tools_and_told_to_decide() {
     let world = World::new(Mode::Plan);
     // Long enough for the full planning pass rather than the small one.
     let prompt = format!("Build page a with a greeting. {}", "It is a card with a title, a short line of text, and a button. ".repeat(5));
-    let outcome = run(prompt_config(&tmp.0, &prompt, true), &world).await.unwrap();
+    let mut cfg = prompt_config(&tmp.0, &prompt, true);
+    cfg.offline = true;
+    let outcome = run(cfg, &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     let first = &planner_calls(&world)[0];
     assert!(first.contains("Plan this product and lock its contracts."), "{first}");
@@ -12064,7 +12066,7 @@ async fn tok9_warm_planner_session_repairs_and_local_contract_compaction_avoids_
 
 #[tokio::test]
 async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_spec() {
-    let run_probe = |tmp: &Tmp, code_mode: bool| {
+    let run_probe = |tmp: &Tmp, code_mode: bool, offline: bool| {
         let root = tmp.0.clone();
         async move {
             let plan = Plan {
@@ -12125,17 +12127,26 @@ async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_sp
             cfg.runtime_checks = false;
             cfg.code_mode = code_mode;
             cfg.browser = false;
+            cfg.offline = offline;
             assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
             (listed_tools.lock().unwrap().clone(), captured_brief.lock().unwrap().clone())
         }
     };
 
-    // 1. Stdlib-only greenfield worker: cite/index/search/set_status/docs are all pruned.
+    // 1. Offline stdlib-only greenfield worker: cite/index/search/set_status/docs/advisories/web_fetch all pruned.
     let tmp_stdlib = seeded("tok10-stdlib");
-    let (tools_off, brief_off) = run_probe(&tmp_stdlib, false).await;
+    let (tools_off, brief_off) = run_probe(&tmp_stdlib, false, true).await;
     let names_off: Vec<&str> = tools_off.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert_eq!(names_off, vec!["flow_query"], "stdlib non-code worker should only see flow_query: {names_off:?}");
-    assert!(!brief_off.contains("for local-first API docs"), "brief should not advertise pruned docs tool");
+    assert_eq!(names_off, vec!["flow_query"], "offline stdlib non-code worker should only see flow_query: {names_off:?}");
+    assert!(!brief_off.contains("for installed package APIs"), "brief should not advertise pruned docs tool");
+
+    // 1b. Online (default) stdlib-only worker: still prunes `docs` and `advisories` while keeping `web_fetch`.
+    let tmp_stdlib_online = seeded("tok10-stdlib-online");
+    let (tools_online, brief_online) = run_probe(&tmp_stdlib_online, false, false).await;
+    let names_online: Vec<&str> = tools_online.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names_online.contains(&"flow_query") && names_online.contains(&"web_fetch"), "{names_online:?}");
+    assert!(!names_online.contains(&"docs") && !names_online.contains(&"advisories"), "stdlib online worker must still prune docs/advisories: {names_online:?}");
+    assert!(!brief_online.contains("for installed package APIs"), "brief must not advertise pruned docs tool");
 
     // 2. Project with external npm deps + Code Mode: keeps `docs` and trimmed `run_code`, still prunes dict & set_status.
     let tmp_deps = seeded("tok10-deps");
@@ -12143,7 +12154,7 @@ async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_sp
     git(&tmp_deps.0, &["add", "."]);
     git(&tmp_deps.0, &["commit", "-q", "-m", "deps"]);
     let has_node = crate::code::CodeTools::new(None).is_some();
-    let (tools_deps, _) = run_probe(&tmp_deps, has_node).await;
+    let (tools_deps, _) = run_probe(&tmp_deps, has_node, false).await;
     let names_deps: Vec<&str> = tools_deps.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names_deps.contains(&"docs"), "project with external deps should keep docs: {names_deps:?}");
     assert!(names_deps.contains(&"flow_query"), "{names_deps:?}");
@@ -14219,4 +14230,127 @@ async fn tb18_brownfield_planner_gets_atlas_and_rich_flow_summary() {
     assert!(brief.contains("tests/test_storage.py: test_put_and_get"), "{brief}");
     assert!(brief.contains("## Codebase Atlas"), "brownfield planner brief should include compact Atlas:\n{brief}");
     assert!(brief.contains("Import hubs:"), "{brief}");
+}
+
+#[tokio::test]
+async fn tb18_fresh_planner_keeps_dictionary_for_web_fetch_and_verifier_stays_offline() {
+    #[derive(Default)]
+    struct Captured {
+        planner_has_dict: Option<bool>,
+        planner_native_search: Option<bool>,
+        planner_brief: String,
+    }
+    struct ProbeHarness {
+        cap: Arc<Mutex<Captured>>,
+        emit_search: bool,
+    }
+    #[async_trait]
+    impl Harness for ProbeHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            {
+                let mut c = self.cap.lock().unwrap();
+                c.planner_has_dict = Some(task.dictionary.is_some());
+                c.planner_native_search = Some(task.native_search);
+                c.planner_brief = task.brief.clone();
+            }
+
+            if self.emit_search {
+                // Verify gate allows native search and emits transcript + ledger entry.
+                let req = tm_harness::PermissionRequest {
+                    tool: "WebSearch".into(),
+                    kind: tm_harness::ToolKind::Fetch,
+                    paths: vec![],
+                    command: None,
+                    url: None,
+                };
+                let allowed = gate.decide(&req) == tm_harness::Decision::Allow;
+                let _ = events
+                    .send(HarnessEvent::ToolCall {
+                        id: "ns1".into(),
+                        name: "WebSearch".into(),
+                        input: serde_json::json!({ "query": "fastapi 0.115 lifespan" }),
+                    })
+                    .await;
+                let _ = events
+                    .send(HarnessEvent::PermissionDecided { tool: "WebSearch".into(), allowed })
+                    .await;
+            }
+            let plan = serde_json::json!({
+                "kind": "server",
+                "summary": "FastAPI service",
+                "contracts": [],
+                "units": [{ "id": "api", "owned_glob": "app/main.py", "brief": "Write app.", "done": "pytest passes" }],
+                "dictionary": []
+            });
+            let _ = events.send(HarnessEvent::Text { text: plan.to_string() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. Fresh greenfield project with default (online native) web access: planner MUST keep
+    //    `dictionary: Some(...)` so it can call `web_fetch` / `docs`, AND `native_search == true`,
+    //    AND native search calls appear in both live web activity and `ledger.jsonl`.
+    let tmp_on = repo("tb18-fresh-planner-online");
+    let cap_on = Arc::new(Mutex::new(Captured::default()));
+    let h_on = Arc::new(ProbeHarness { cap: cap_on.clone(), emit_search: true });
+    let harnesses_on = Harnesses { master: h_on.clone(), mid: h_on.clone(), worker: h_on.clone(), reviewer: h_on.clone(), verifier: h_on };
+    let full_prompt = format!(
+        "Build a FastAPI 0.115 service with async lifespan hooks, SQLite persistence, Pydantic v2 schemas, \
+         background job scheduling, rate limiting, and full pytest coverage across multiple endpoints. {}",
+        "Include structured logging, migrations, health probes, and typed error handlers. ".repeat(4)
+    );
+    let mut cfg_on = Config::new(&tmp_on.0);
+    cfg_on.run_id = "online-plan".into();
+    cfg_on.prompt = Some(full_prompt.clone());
+    cfg_on.yes = false;
+    cfg_on.checks = false;
+    cfg_on.runtime_checks = false;
+    cfg_on.code_mode = false;
+    cfg_on.browser = false;
+    let out_on = drive(cfg_on, harnesses_on).await.unwrap();
+    assert!(matches!(out_on, Outcome::NeedsApproval { .. }), "{out_on:?}");
+    {
+        let c = cap_on.lock().unwrap();
+        assert_eq!(c.planner_has_dict, Some(true), "fresh online planner must keep dictionary for web_fetch");
+        assert_eq!(c.planner_native_search, Some(true), "fresh online planner must have native_search enabled");
+        assert!(c.planner_brief.contains("Research phase"), "{brief}", brief = c.planner_brief);
+    }
+    let records = Records::files(&tmp_on.0);
+    let ledger = records.ledger("online-plan").unwrap();
+    assert!(
+        ledger.iter().any(|e| e.harness == "web-access" && e.model.as_deref() == Some("WebSearch:native") && e.ok),
+        "native search call must be recorded in ledger: {ledger:#?}"
+    );
+
+    // 2. Fresh greenfield project with `offline = true`: planner gets `dictionary: None`, `native_search: false`,
+    //    and no Research phase hint.
+    let tmp_off = repo("tb18-fresh-planner-offline");
+    let cap_off = Arc::new(Mutex::new(Captured::default()));
+    let h_off = Arc::new(ProbeHarness { cap: cap_off.clone(), emit_search: false });
+    let harnesses_off = Harnesses { master: h_off.clone(), mid: h_off.clone(), worker: h_off.clone(), reviewer: h_off.clone(), verifier: h_off };
+    let mut cfg_off = Config::new(&tmp_off.0);
+    cfg_off.run_id = "offline-plan".into();
+    cfg_off.prompt = Some(full_prompt);
+    cfg_off.yes = false;
+    cfg_off.offline = true;
+    cfg_off.checks = false;
+    cfg_off.runtime_checks = false;
+    cfg_off.code_mode = false;
+    cfg_off.browser = false;
+    let out_off = drive(cfg_off, harnesses_off).await.unwrap();
+    assert!(matches!(out_off, Outcome::NeedsApproval { .. }), "{out_off:?}");
+    {
+        let c = cap_off.lock().unwrap();
+        assert_eq!(c.planner_has_dict, Some(false), "offline fresh planner should omit dictionary");
+        assert_eq!(c.planner_native_search, Some(false), "offline fresh planner must not enable native_search");
+        assert!(!c.planner_brief.contains("Research phase"), "offline brief must omit Research phase");
+    }
 }

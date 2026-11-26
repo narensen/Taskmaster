@@ -450,6 +450,8 @@ pub struct Config {
     /// Maximum estimated context tokens in a clean warm worker session eligible for reuse on a
     /// subsequent wave's unit (~65k tokens by default; 0 disables cross-unit warm reuse).
     pub warm_reuse_max_context: u64,
+    /// Force offline mode: disables web search, web fetch, and OSV advisories (local `docs()` stays available).
+    pub offline: bool,
 }
 
 /// How an active run should stop when cancelled.
@@ -534,6 +536,7 @@ impl Config {
             stall_timeout: None,
             effort_routing: true,
             warm_reuse_max_context: crate::engine::WARM_REUSE_MAX_CONTEXT,
+            offline: false,
         }
     }
 }

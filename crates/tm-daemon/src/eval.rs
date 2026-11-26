@@ -50,6 +50,8 @@ pub async fn evaluate(
     let id = config.run_id.clone();
     let taskmaster_name = harnesses.worker.id().to_string();
     config.incremental = true;
+    // Benchmark evaluations stay offline so results stay deterministic and comparable.
+    config.offline = true;
     let outcome = drive(config.clone(), harnesses.clone()).await?;
     let taskmaster = side(&records, &id, &taskmaster_name, &outcome)?;
     if !matches!(outcome, Outcome::Finished { .. }) {

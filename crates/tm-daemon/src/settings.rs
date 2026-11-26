@@ -167,6 +167,20 @@ fn default_true() -> bool {
     true
 }
 
+/// True when the environment forces offline mode (`TASKMASTER_OFFLINE=1|true|on|yes` or
+/// `TASKMASTER_WEB_ACCESS=0|false|off|no`), disabling all agent web search and fetch.
+pub fn offline_env_enabled() -> bool {
+    let is_truthy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+    let is_falsy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no");
+    if std::env::var("TASKMASTER_OFFLINE").ok().is_some_and(|v| is_truthy(&v)) {
+        return true;
+    }
+    if std::env::var("TASKMASTER_WEB_ACCESS").ok().is_some_and(|v| is_falsy(&v)) {
+        return true;
+    }
+    false
+}
+
 /// Resolve effective effort routing from saved settings plus `TASKMASTER_EFFORT_ROUTING`
 /// (`0`/`false`/`off`/`no` disables routing and pins explicit models verbatim; `1`/`true`/`on`/`yes` enables it).
 pub fn effective_effort_routing(setting: bool) -> bool {
@@ -354,11 +368,16 @@ impl Settings {
     /// The project's file if it has one, otherwise the one in the home directory.
     pub fn load(project: &Path) -> anyhow::Result<Self> {
         let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".taskmaster/config.json"));
+        let mut settings = Settings::default();
         for path in [Some(project.join(".taskmaster/config.json")), home].into_iter().flatten() {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            return serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", path.display()));
+            settings = serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", path.display()))?;
+            break;
         }
-        Ok(Settings::default())
+        if offline_env_enabled() {
+            settings.web_access.enabled = false;
+        }
+        Ok(settings)
     }
 
     /// The role choices the person saved, and only those: no role is filled in for them.
@@ -523,5 +542,15 @@ mod tests {
         assert_eq!(with_cli["custom-model-high"].input, 3.0);
         assert_eq!(with_cli["custom-model-low"].output, 2.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tb18_example_config_sets_native_web_access_defaults() {
+        let example: Settings = serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        assert!(example.web_access.enabled);
+        assert_eq!(example.web_access.provider_norm(), "native");
+        assert!(example.web_access.roles.planner.search && example.web_access.roles.planner.fetch);
+        assert!(example.web_access.roles.worker.search && example.web_access.roles.worker.fetch);
+        assert!(!example.web_access.roles.verifier.search && !example.web_access.roles.verifier.fetch);
     }
 }

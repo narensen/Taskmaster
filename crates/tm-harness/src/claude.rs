@@ -82,6 +82,11 @@ impl ClaudeCode {
         } else {
             vec!["Bash"]
         };
+        if task.native_search && !full_access {
+            // Allow provider-side WebSearch while keeping local WebFetch denied so fetches
+            // always flow through Taskmaster's SSRF-hardened MCP `web_fetch`.
+            denied.push("WebFetch");
+        }
         denied.dedup();
         // The stream cannot stop to ask, so Supervised and Auto-accept edits are honoured
         // through `run_code` (Code Mode), which goes through the gate. With Claude Code's
@@ -99,6 +104,9 @@ impl ClaudeCode {
         let mut allowed: Vec<String> = Vec::new();
         if shell && !task.code_mode {
             allowed.push("Bash".into());
+        }
+        if task.native_search {
+            allowed.push("WebSearch".into());
         }
         if let Some(model) = &task.model {
             args.extend(["--model".into(), model.clone()]);
@@ -604,6 +612,7 @@ mod tests {
             code_mode,
             shell: shell.then(crate::ShellScope::default),
             permission_mode: None,
+            native_search: false,
             hold: None,
         }
     }
@@ -631,6 +640,13 @@ mod tests {
         let reader = sandboxed().args(&task(true, true, false));
         assert_eq!(after(&reader, "--disallowedTools"), ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
         assert!(after(&reader, "--allowedTools").is_empty());
+
+        // Native search enables Claude's WebSearch while explicitly denying WebFetch.
+        let mut t = task(true, false, false);
+        t.native_search = true;
+        let with_search = sandboxed().args(&t);
+        assert!(after(&with_search, "--allowedTools").contains(&"WebSearch"), "{with_search:?}");
+        assert!(after(&with_search, "--disallowedTools").contains(&"WebFetch"), "{with_search:?}");
     }
 
     #[test]

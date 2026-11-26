@@ -252,6 +252,8 @@ pub struct WorkerTask {
     pub shell: Option<ShellScope>,
     /// Optional per-run permission mode mapped onto provider flags and the daemon gate (A3).
     pub permission_mode: Option<PermissionMode>,
+    /// Allow the harness's built-in web search tool when Web access provider is `native`.
+    pub native_search: bool,
     /// Start the agent in the holder, so it can outlive a daemon update (H3). `None` starts it here.
     pub hold: Option<hold::HoldSpec>,
 }

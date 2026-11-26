@@ -1308,7 +1308,11 @@ impl Driver {
         } else {
             self.offer_code_readonly("master", &cwd, &mut request);
         }
-        request.effort = if self.small || quick || single_phase {
+        // Antigravity planners stay at the configured model (typically `-high`) so planning
+        // quality is never downgraded when effort routing maps `low`/`medium` to smaller variants.
+        request.effort = if !self.config.effort_routing || self.harnesses.master.id() == "antigravity" {
+            None
+        } else if self.small || quick || single_phase {
             Some(crate::small::SMALL_EFFORT.to_string())
         } else if fresh {
             Some(FRESH_EFFORT.to_string())
@@ -1348,7 +1352,11 @@ impl Driver {
         let brief = crate::small::repair_brief(prompt, json, errors);
         let mut request = self.read_request(&cwd, brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
         request.dictionary = None;
-        request.effort = Some(crate::small::SMALL_EFFORT.to_string());
+        request.effort = if !self.config.effort_routing || self.harnesses.master.id() == "antigravity" {
+            None
+        } else {
+            Some(crate::small::SMALL_EFFORT.to_string())
+        };
         request.commit = Some(self.commit_budget(true));
         self.tag(&mut request, "master", "planner", None, None);
         let bill = request.bill(Role::Planner, None);
@@ -1481,7 +1489,11 @@ impl Driver {
         let token = self.master_token.clone();
         let mut request = self.read_request(&cwd, brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
         request.dictionary = None;
-        request.effort = Some(FRESH_EFFORT.to_string());
+        request.effort = if !self.config.effort_routing || self.harnesses.master.id() == "antigravity" {
+            None
+        } else {
+            Some(FRESH_EFFORT.to_string())
+        };
         request.commit = Some(self.commit_budget(true));
         self.tag(&mut request, "master", "planner", None, None);
         Ok((request, cwd))
@@ -5036,11 +5048,16 @@ impl Driver {
         let harness = self.harness_for(tier);
         let label = if units > 1 { format!("{page}-{unit}") } else { page.to_string() };
         let shell = self.shell_for(&harness, &label);
-        let effort = match self.page(page).ok().and_then(|p| p.effort_hint()) {
-            // An easy unit that failed once is repaired at the harness's usual effort.
-            Some("low") if errors.is_some() => None,
-            Some(hint) => Some(hint.to_string()),
-            None => (self.small && errors.is_none()).then(|| crate::small::SMALL_EFFORT.to_string()),
+        let effort = if !self.config.effort_routing || errors.is_some() {
+            // Repairs and runs with effort routing disabled keep the configured tier/model verbatim.
+            None
+        } else {
+            match self.page(page).ok().and_then(|p| p.effort_hint()) {
+                Some(hint) => Some(hint.to_string()),
+                None if self.small => Some(crate::small::SMALL_EFFORT.to_string()),
+                None if harness.id() == "antigravity" => Some("medium".to_string()),
+                None => None,
+            }
         };
         Ok(AgentRequest {
             harness,

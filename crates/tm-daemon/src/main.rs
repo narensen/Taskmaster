@@ -54,6 +54,8 @@ struct Args {
     yes: bool,
     /// Skip the project's build, its tests and the browser.
     no_runtime_checks: bool,
+    /// Disable effort-based thinking routing and pin explicit model ids verbatim.
+    no_effort_routing: bool,
     parallel: usize,
     /// Seconds per agent call; 0 is no limit. None takes the settings file's limit.
     timeout: Option<u64>,
@@ -272,6 +274,11 @@ async fn run() -> anyhow::Result<Outcome> {
     config.code_sh_secs = settings.code_mode.sh_secs;
     config.worker_shell = settings.sandbox.shell;
     config.package_indexes = settings.sandbox.package_indexes;
+    config.effort_routing = if args.no_effort_routing {
+        false
+    } else {
+        tm_daemon::settings::effective_effort_routing(settings.agents.effort_routing)
+    };
     config.prices = tm_daemon::settings::price_table(&settings);
     config.remote = settings.remote();
     let phone = if args.pair {
@@ -701,7 +708,7 @@ const USAGE: &str = "usage: tm-daemon providers [--harness <h>]\n       \
                      [--verifier <h>] [--worker-model <m>] [--mid-model <m>] [--master-model <m>] \
                      [--reviewer-model <m>] [--verifier-model <m>] [--parallel <n>] \
                      [--timeout <secs, 0 for none>] [--dictionary <dir>] [--commons <dir>] [--run <id>] \
-                     [--template <next | dir>] [--no-runtime-checks] \
+                     [--template <next | dir>] [--no-runtime-checks] [--no-effort-routing] \
                      [--eval] [--baseline <h>] [--pair]\n       \
                      tm-daemon --version\n\
                      harnesses: claude, agy, grok, codex, opencode (worker also accepts auto)";
@@ -729,6 +736,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         baseline: "claude".into(),
         pair: false,
         no_runtime_checks: false,
+        no_effort_routing: false,
         roles: Roles::default(),
         models: Models::default(),
     };
@@ -737,6 +745,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         match flag.as_str() {
             "--yes" => args.yes = true,
             "--no-runtime-checks" => args.no_runtime_checks = true,
+            "--no-effort-routing" => args.no_effort_routing = true,
             "--plan" => args.plan = Some(need(&mut argv, "--plan", usage)?.into()),
             "--prompt" => args.prompt = Some(need(&mut argv, "--prompt", usage)?),
             "--prompt-file" => args.prompt_file = Some(need(&mut argv, "--prompt-file", usage)?.into()),

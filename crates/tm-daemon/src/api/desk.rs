@@ -1744,6 +1744,8 @@ pub struct SettingsBody {
     agent_timeout_secs: Option<u64>,
     /// Seconds an idle warm session is kept before detaching (O7); 0 disables idle release.
     warm_idle_secs: Option<u64>,
+    /// Effort-based thinking routing on or off.
+    effort_routing: Option<bool>,
     /// Opt-in OAuth usage polling (O4). Off by default.
     usage_oauth_polling: Option<bool>,
     /// A8: minutes a merged run stays out before it settles itself.
@@ -1845,6 +1847,9 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
             return Err(fail(StatusCode::BAD_REQUEST, "warm_idle_secs is at most 86400"));
         }
         save_setting(&app.project(), "agents", json!({ "warm_idle_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(on) = body.effort_routing {
+        save_setting(&app.project(), "agents", json!({ "effort_routing": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
     if let Some(on) = body.labs_suggest_next {
         save_setting(&app.project(), "labs", json!({ "suggest_next": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1949,6 +1954,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "agents": {
             "timeout_secs": role_defaults.agents.timeout_secs,
             "warm_idle_secs": role_defaults.agents.warm_idle_secs,
+            "effort_routing": role_defaults.agents.effort_routing,
         },
         "usage": {
             "oauth_polling": role_defaults.usage.oauth_polling,

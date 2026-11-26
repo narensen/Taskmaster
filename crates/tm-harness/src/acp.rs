@@ -218,6 +218,7 @@ impl AcpHarness {
     fn session(&self, task: &WorkerTask, io: crate::child::AgentIo, gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> Session {
         Session {
             io,
+            harness_id: self.id,
             next_id: 0,
             dictionary_prefix: task.dictionary.as_ref().map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
             code_mode: task.code_mode && !task.read_only && task.dictionary.is_some(),
@@ -298,6 +299,26 @@ impl crate::Session for Kept {
     }
 }
 
+/// Verified Antigravity (`agy models`) model families that ship `-low`, `-medium`, and `-high`
+/// thinking variants. Models without full tiered variants (e.g. `gpt-oss-120b-medium`,
+/// `gemini-pro-orchestrator*`) are deliberately omitted so explicit `--worker-model` choices
+/// are never rewritten to nonexistent ids.
+///
+/// Mapping when `effort_routing` is enabled and the session catalog confirms (or omits a list
+/// for one of these verified families):
+/// - `easy` (`effort = "low"`)    -> `*-low`
+/// - `normal` (`effort = "medium"`) -> `*-medium`
+/// - `hard` / repairs / planner / reviewer (`effort = "high"` or `None`) -> unchanged (`*-high` / `*-xhigh`)
+pub const ANTIGRAVITY_EFFORT_FAMILIES: [&str; 7] = [
+    "gemini-4-neon",
+    "gemini-4-carbon",
+    "gemini-4-argon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+];
+
 /// The id of the session option that chooses the model, when the agent has one.
 fn model_option(session: &Value) -> Option<&str> {
     session["configOptions"]
@@ -307,8 +328,131 @@ fn model_option(session: &Value) -> Option<&str> {
         .and_then(|option| option["id"].as_str())
 }
 
+/// Model ids advertised by `session/new` in `models.availableModels` or `configOptions[model].options`.
+fn available_models(session: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = session["models"]["availableModels"].as_array() {
+        for item in arr {
+            let id = item
+                .as_str()
+                .or_else(|| item["modelId"].as_str())
+                .or_else(|| item["id"].as_str());
+            if let Some(id) = id
+                && !id.is_empty()
+                && !out.iter().any(|have| have == id)
+            {
+                out.push(id.to_string());
+            }
+        }
+    }
+    if let Some(opts) = session["configOptions"].as_array() {
+        for opt in opts {
+            if (opt["category"] == "model" || opt["id"] == "model")
+                && let Some(values) = opt["options"].as_array()
+            {
+                for item in values {
+                    let id = item
+                        .as_str()
+                        .or_else(|| item["value"].as_str())
+                        .or_else(|| item["id"].as_str());
+                    if let Some(id) = id
+                        && !id.is_empty()
+                        && !out.iter().any(|have| have == id)
+                    {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Session config option that controls thinking/reasoning effort, if the ACP server exposes one.
+fn effort_option(session: &Value) -> Option<(&str, Vec<String>)> {
+    let opts = session["configOptions"].as_array()?;
+    let opt = opts.iter().find(|o| {
+        matches!(
+            o["category"].as_str().unwrap_or(""),
+            "thought_level" | "reasoning_effort" | "effort" | "thinking"
+        ) || matches!(
+            o["id"].as_str().unwrap_or(""),
+            "effort" | "reasoning_effort" | "thought_level" | "thinking_level"
+        )
+    })?;
+    let id = opt["id"].as_str()?;
+    let mut vals = Vec::new();
+    if let Some(arr) = opt["options"].as_array() {
+        for item in arr {
+            if let Some(v) = item
+                .as_str()
+                .or_else(|| item["value"].as_str())
+                .or_else(|| item["id"].as_str())
+            {
+                vals.push(v.to_string());
+            }
+        }
+    }
+    Some((id, vals))
+}
+
+fn split_effort_suffix(model: &str) -> Option<(&str, &'static str, u8)> {
+    for (suffix, tier, rank) in [
+        ("-xhigh", "xhigh", 4),
+        ("-high", "high", 3),
+        ("-medium", "medium", 2),
+        ("-low", "low", 1),
+    ] {
+        if let Some(base) = model.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return Some((base, tier, rank));
+        }
+    }
+    None
+}
+
+/// Resolve an Antigravity model id for `effort`, preserving explicit choices when the target
+/// variant does not exist or would silently raise thinking cost above `requested`.
+///
+/// - `available` comes from ACP `session/new` (`models.availableModels` / `configOptions`).
+/// - When `available` is non-empty, only a candidate present in `available` is chosen.
+/// - When `available` is empty, only families in [`ANTIGRAVITY_EFFORT_FAMILIES`] are mapped.
+pub fn resolve_antigravity_model(requested: &str, effort: Option<&str>, available: &[String]) -> String {
+    let Some(raw_effort) = effort else {
+        return requested.to_string();
+    };
+    let (target_tier, target_rank) = match raw_effort.trim().to_ascii_lowercase().as_str() {
+        "low" | "easy" => ("low", 1u8),
+        "medium" | "normal" => ("medium", 2u8),
+        // High / hard always preserves the caller's configured tier (`-high`, `-xhigh`, etc.).
+        "high" | "hard" => return requested.to_string(),
+        _ => return requested.to_string(),
+    };
+    let Some((base, _current_tier, current_rank)) = split_effort_suffix(requested) else {
+        return requested.to_string();
+    };
+    // Never silently raise effort above what the user explicitly configured (e.g. keep `-low` as `-low`
+    // and keep `-xhigh` on `"high"`). Only step down to `-low` / `-medium` when requested is higher.
+    if target_rank >= current_rank {
+        return requested.to_string();
+    }
+    let candidate = format!("{base}-{target_tier}");
+    if !available.is_empty() {
+        if available.iter().any(|m| m == &candidate) {
+            return candidate;
+        }
+        return requested.to_string();
+    }
+    if ANTIGRAVITY_EFFORT_FAMILIES.contains(&base) {
+        return candidate;
+    }
+    requested.to_string()
+}
+
 struct Session {
     io: crate::child::AgentIo,
+    harness_id: &'static str,
     next_id: u64,
     dictionary_prefix: Option<String>,
     /// When Code Mode (`run_code`) is active on a builder, steer native shell/edit prompts to `run_code`.
@@ -370,17 +514,45 @@ impl Session {
         let session_id =
             session["sessionId"].as_str().context("session/new returned no sessionId")?.to_string();
 
-        if let Some(model) = &task.model {
-            // Opencode offers the model as a session option. Antigravity and Grok Build
-            // take `session/set_model`.
-            let (method, params) = match model_option(&session) {
-                Some(option) => (
-                    "session/set_config_option",
-                    json!({ "sessionId": session_id, "configId": option, "value": model }),
-                ),
-                None => ("session/set_model", json!({ "sessionId": session_id, "modelId": model })),
+        let avail = available_models(&session);
+        if let Some(requested_model) = &task.model {
+            let effective = if self.harness_id == "antigravity" {
+                resolve_antigravity_model(requested_model, task.effort.as_deref(), &avail)
+            } else {
+                requested_model.clone()
             };
-            self.call(method, params).await.with_context(|| format!("could not select model `{model}`"))?;
+            if let Err(err) = self.select_model(&session, &session_id, &effective).await {
+                if effective != *requested_model {
+                    // The effort-mapped variant was rejected by the live server: fall back cleanly
+                    // to the caller's explicit model so `--worker-model` never breaks.
+                    self.select_model(&session, &session_id, requested_model)
+                        .await
+                        .with_context(|| format!("could not select model `{requested_model}` (after effort variant `{effective}` failed: {err})"))?;
+                } else {
+                    return Err(err).with_context(|| format!("could not select model `{requested_model}`"));
+                }
+            }
+        } else if self.harness_id == "antigravity"
+            && let Some(effort) = task.effort.as_deref()
+        {
+            // No explicit model passed: prefer an ACP effort configOption if offered, otherwise
+            // step down the session's reported currentModelId when its variant is available.
+            if let Some((config_id, values)) = effort_option(&session) {
+                let norm = effort.trim().to_ascii_lowercase();
+                if values.is_empty() || values.iter().any(|v| v.eq_ignore_ascii_case(&norm)) {
+                    let _ = self
+                        .call(
+                            "session/set_config_option",
+                            json!({ "sessionId": session_id, "configId": config_id, "value": norm }),
+                        )
+                        .await;
+                }
+            } else if let Some(current) = session["models"]["currentModelId"].as_str() {
+                let effective = resolve_antigravity_model(current, Some(effort), &avail);
+                if effective != current {
+                    let _ = self.select_model(&session, &session_id, &effective).await;
+                }
+            }
         }
 
         let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
@@ -390,6 +562,20 @@ impl Session {
             None => "run_code".to_string(),
         };
         self.prompt(task.framed_brief_for(&run_code_tool)).await
+    }
+
+    async fn select_model(&mut self, session: &Value, session_id: &str, model: &str) -> anyhow::Result<()> {
+        // Opencode offers the model as a session option. Antigravity and Grok Build
+        // take `session/set_model`.
+        let (method, params) = match model_option(session) {
+            Some(option) => (
+                "session/set_config_option",
+                json!({ "sessionId": session_id, "configId": option, "value": model }),
+            ),
+            None => ("session/set_model", json!({ "sessionId": session_id, "modelId": model })),
+        };
+        self.call(method, params).await?;
+        Ok(())
     }
 
     /// One turn in the open session.
@@ -1630,5 +1816,130 @@ echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
                 );
             }
         }
+    }
+
+    #[test]
+    fn antigravity_effort_model_mapping_verifies_catalog_and_preserves_non_tiered_models() {
+        let catalog: Vec<String> = vec![
+            "gemini-4-neon-low".into(),
+            "gemini-4-neon-medium".into(),
+            "gemini-4-neon-high".into(),
+            "gemini-4-neon-xhigh".into(),
+            "gpt-oss-120b-medium".into(),
+            "gemini-pro-orchestrator-neon".into(),
+        ];
+        // Verified family with catalog: easy -> -low, normal -> -medium, hard/None -> unchanged.
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", Some("low"), &catalog), "gemini-4-neon-low");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", Some("medium"), &catalog), "gemini-4-neon-medium");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", Some("high"), &catalog), "gemini-4-neon-high");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", None, &catalog), "gemini-4-neon-high");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-xhigh", Some("high"), &catalog), "gemini-4-neon-xhigh");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-xhigh", Some("medium"), &catalog), "gemini-4-neon-medium");
+        // Never silently upgrades explicit -low model.
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-low", Some("medium"), &catalog), "gemini-4-neon-low");
+        // Models without target variant stay verbatim!
+        assert_eq!(resolve_antigravity_model("gpt-oss-120b-medium", Some("low"), &catalog), "gpt-oss-120b-medium");
+        assert_eq!(resolve_antigravity_model("gemini-pro-orchestrator-neon", Some("low"), &catalog), "gemini-pro-orchestrator-neon");
+        // Empty catalog: only verified ANTIGRAVITY_EFFORT_FAMILIES are mapped.
+        assert_eq!(resolve_antigravity_model("claude-sonnet-5-5-high", Some("low"), &[]), "claude-sonnet-5-5-low");
+        assert_eq!(resolve_antigravity_model("gpt-oss-120b-medium", Some("low"), &[]), "gpt-oss-120b-medium");
+        assert_eq!(resolve_antigravity_model("custom-model-high", Some("low"), &[]), "custom-model-high");
+    }
+
+    #[tokio::test]
+    async fn acp_antigravity_wires_effort_variant_and_falls_back_to_explicit_model() {
+        let capture = std::env::temp_dir().join(format!("tm-acp-effort-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        // Script returns availableModels with neon-{low,medium,high}, rejects the first set_model
+        // only on the fallback test case, and logs every set_model call.
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s","models":{{"currentModelId":"gemini-4-neon-high","availableModels":[{{"modelId":"gemini-4-neon-low"}},{{"modelId":"gemini-4-neon-medium"}},{{"modelId":"gemini-4-neon-high"}}]}}}}}}'
+read l; printf '%s\n' "$l" >> "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display(),
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: Some("gemini-4-neon-high".into()),
+            effort: Some("medium".into()),
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, _rx) = mpsc::channel(8);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        let sent: Value = serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert_eq!(sent["method"], "session/set_model");
+        assert_eq!(sent["params"]["modelId"], "gemini-4-neon-medium");
+
+        // Fallback test: if the mapped variant fails on set_model, fall back to the explicit model.
+        let capture2 = std::env::temp_dir().join(format!("tm-acp-effort-fb-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture2);
+        let script2 = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; printf '%s\n' "$l" >> "{}"
+echo '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32000,"message":"variant unavailable"}}}}'
+read l; printf '%s\n' "$l" >> "{}"
+echo '{{"jsonrpc":"2.0","id":4,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":5,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture2.display(),
+            capture2.display(),
+        );
+        let harness2 = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script2],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task2 = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: Some("gemini-4-neon-high".into()),
+            effort: Some("low".into()),
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            hold: None,
+        };
+        let gate2 = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx2, _rx2) = mpsc::channel(8);
+        let summary2 = harness2.run(task2, gate2, tx2).await.unwrap();
+        assert!(summary2.ok);
+        let log2 = std::fs::read_to_string(&capture2).unwrap();
+        let _ = std::fs::remove_file(&capture2);
+        let calls: Vec<Value> = log2.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["params"]["modelId"], "gemini-4-neon-low");
+        assert_eq!(calls[1]["params"]["modelId"], "gemini-4-neon-high");
     }
 }

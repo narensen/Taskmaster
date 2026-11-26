@@ -117,6 +117,24 @@ impl Default for SandboxSettings {
 /// Default idle duration before a warm session is detached and its process freed (O7): 10 minutes.
 pub const DEFAULT_WARM_IDLE_SECS: u64 = 600;
 
+fn default_true() -> bool {
+    true
+}
+
+/// Resolve effective effort routing from saved settings plus `TASKMASTER_EFFORT_ROUTING`
+/// (`0`/`false`/`off`/`no` disables routing and pins explicit models verbatim; `1`/`true`/`on`/`yes` enables it).
+pub fn effective_effort_routing(setting: bool) -> bool {
+    match std::env::var("TASKMASTER_EFFORT_ROUTING")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("0" | "false" | "off" | "no") => false,
+        Some("1" | "true" | "on" | "yes") => true,
+        _ => setting,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
@@ -126,6 +144,10 @@ pub struct AgentSettings {
     pub budget_usd: f64,
     /// Seconds a warm builder session may sit idle before being released (O7). 0 disables idle release.
     pub warm_idle_secs: u64,
+    /// Route worker thinking effort from unit difficulty (`easy` -> `-low`, `normal` -> `-medium`,
+    /// keeping `-high` for `hard`, repairs, planner, and reviewer). True by default.
+    #[serde(default = "default_true")]
+    pub effort_routing: bool,
 }
 
 impl Default for AgentSettings {
@@ -134,6 +156,7 @@ impl Default for AgentSettings {
             timeout_secs: DEFAULT_AGENT_SECS,
             budget_usd: 0.0,
             warm_idle_secs: DEFAULT_WARM_IDLE_SECS,
+            effort_routing: true,
         }
     }
 }

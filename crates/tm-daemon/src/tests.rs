@@ -11424,3 +11424,136 @@ async fn tok5_worker_brief_guides_concise_unit_tests_and_keeps_unrestricted_fix_
     assert!(brief.contains("~100-150 lines per module"), "missing concise unit-test target:\n{brief}");
     assert!(brief.contains("fix what fails until they pass"), "must not hard-cap test retries:\n{brief}");
 }
+
+#[tokio::test]
+async fn tok6_effort_routing_routes_antigravity_by_difficulty_keeps_high_for_repairs_and_planner_and_can_disable() {
+    let tmp = seeded("tok6-effort-on");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![
+            PagePlan {
+                id: "easy_u".into(),
+                owned_glob: "pkg/easy.py".into(),
+                brief: "Easy module.".into(),
+                difficulty: Some("easy".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "norm_u".into(),
+                owned_glob: "pkg/norm.py".into(),
+                brief: "Normal module.".into(),
+                difficulty: Some("normal".into()),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "hard_u".into(),
+                owned_glob: "pkg/hard.py".into(),
+                brief: "Hard module.".into(),
+                difficulty: Some("hard".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    #[derive(Clone, Debug)]
+    struct SeenCall {
+        unit: String,
+        effort: Option<String>,
+        model: Option<String>,
+        is_repair: bool,
+    }
+    struct AgyEffortFake {
+        calls: Arc<Mutex<Vec<SeenCall>>>,
+        fail_norm_once: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl Harness for AgyEffortFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("other")
+                .to_string();
+            let is_repair = task.brief.contains("Checks failed last time");
+            self.calls.lock().unwrap().push(SeenCall {
+                unit: unit.clone(),
+                effort: task.effort.clone(),
+                model: task.model.clone(),
+                is_repair,
+            });
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            match unit.as_str() {
+                "easy_u" => std::fs::write(task.cwd.join("pkg/easy.py"), "X = 1\n")?,
+                "hard_u" => std::fs::write(task.cwd.join("pkg/hard.py"), "Z = 1\n")?,
+                "norm_u" => {
+                    if self.fail_norm_once.swap(false, Ordering::SeqCst) {
+                        // Write outside owned_glob on first pass to trigger a deterministic repair.
+                        std::fs::write(task.cwd.join("pkg/unowned.py"), "BAD = 1\n")?;
+                    } else {
+                        std::fs::write(task.cwd.join("pkg/norm.py"), "Y = 1\n")?;
+                    }
+                }
+                _ => {}
+            }
+            let _ = events.send(HarnessEvent::Text { text: format!("RELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. Default effort_routing = true: easy -> low, normal -> medium (repair -> None/high), hard -> high.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(AgyEffortFake {
+        calls: calls.clone(),
+        fail_norm_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 1);
+    cfg.models.worker = Some("gemini-4-neon-high".into());
+    cfg.models.mid = Some("gemini-4-neon-high".into());
+    cfg.models.master = Some("gemini-4-neon-high".into());
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let got = calls.lock().unwrap().clone();
+    let easy = got.iter().find(|c| c.unit == "easy_u").unwrap();
+    assert_eq!(easy.effort.as_deref(), Some("low"));
+    assert_eq!(easy.model.as_deref(), Some("gemini-4-neon-high"));
+    let norm_first = got.iter().find(|c| c.unit == "norm_u" && !c.is_repair).unwrap();
+    assert_eq!(norm_first.effort.as_deref(), Some("medium"));
+    let norm_repair = got.iter().find(|c| c.unit == "norm_u" && c.is_repair).unwrap();
+    assert_eq!(norm_repair.effort, None, "repairs must stay at high/un-downgraded effort");
+    let hard = got.iter().find(|c| c.unit == "hard_u").unwrap();
+    assert_eq!(hard.effort.as_deref(), Some("high"));
+
+    // 2. effort_routing = false: every unit gets effort = None so explicit --worker-model stays verbatim.
+    let tmp_off = seeded("tok6-effort-off");
+    let calls_off = Arc::new(Mutex::new(Vec::new()));
+    let h_off: Arc<dyn Harness> = Arc::new(AgyEffortFake {
+        calls: calls_off.clone(),
+        fail_norm_once: std::sync::atomic::AtomicBool::new(false),
+    });
+    let harnesses_off = Harnesses { master: h_off.clone(), mid: h_off.clone(), worker: h_off.clone(), reviewer: h_off.clone(), verifier: h_off };
+    let mut cfg_off = config(&tmp_off.0, plan, true, 1);
+    cfg_off.effort_routing = false;
+    cfg_off.models.worker = Some("gemini-4-neon-high".into());
+    cfg_off.checks = false;
+    cfg_off.runtime_checks = false;
+    cfg_off.browser = false;
+    assert_eq!(drive(cfg_off, harnesses_off).await.unwrap(), Outcome::Finished { ok: true });
+    let got_off = calls_off.lock().unwrap().clone();
+    assert_eq!(got_off.len(), 3);
+    assert!(got_off.iter().all(|c| c.effort.is_none()), "effort_routing=false must pass None effort: {got_off:#?}");
+}

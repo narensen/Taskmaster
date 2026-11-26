@@ -542,6 +542,60 @@ pub fn deselect_test_paths(steps: &mut [Step], ignore_paths: &[String]) {
     }
 }
 
+/// Narrow non-setup `test` steps to explicit target test paths/filters (e.g. `tests/test_foo.py`,
+/// `tests/test_foo.py::test_bar`, `tests/integration.rs`). When `targets` is empty, steps are
+/// left untouched so bare `test()` continues to run the full suite (including acceptance checks).
+pub fn filter_test_steps(steps: &mut [Step], targets: &[String]) {
+    let mut unique: Vec<&str> = Vec::new();
+    for raw in targets {
+        let t = raw.trim();
+        if !t.is_empty() && !unique.contains(&t) {
+            unique.push(t);
+        }
+    }
+    if unique.is_empty() {
+        return;
+    }
+    for step in steps.iter_mut() {
+        if step.setup || step.name != "test" {
+            continue;
+        }
+        if is_pytest_step(step) {
+            for t in &unique {
+                let s = (*t).to_string();
+                if !step.args.contains(&s) {
+                    step.args.push(s);
+                }
+            }
+        } else if step.program == "cargo" && step.args.first().is_some_and(|a| a == "test") {
+            for t in &unique {
+                let norm = t.trim_start_matches("./");
+                if let Some(rest) = norm.strip_prefix("tests/").and_then(|s| s.strip_suffix(".rs"))
+                    && !rest.is_empty()
+                    && !rest.contains('/')
+                {
+                    step.args.push("--test".into());
+                    step.args.push(rest.to_string());
+                } else {
+                    let filter = Path::new(norm)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(norm);
+                    step.args.push(filter.to_string());
+                }
+            }
+        } else if matches!(step.program.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+            if step.program == "npm" && !step.args.iter().any(|a| a == "--") {
+                step.args.push("--".into());
+            }
+            for t in &unique {
+                step.args.push((*t).to_string());
+            }
+        }
+    }
+}
+
 /// Why a project with tests has nothing to run them with, when that is so.
 pub fn missing_runner(tree: &Path) -> Option<String> {
     if python_tests(tree) && !on_path("python3") && !on_path("python") {
@@ -1401,6 +1455,38 @@ mod tests {
         assert!(!is_deterministic_test_failure("AssertionError: timed out waiting for server"));
         assert!(!is_deterministic_test_failure(""));
         assert!(!is_deterministic_test_failure("exit status 1"));
+    }
+
+    #[test]
+    fn tb18_filter_test_steps_targets_pytest_npm_and_cargo_and_preserves_bare_full_suite() {
+        let mut py = vec![
+            Step { setup: true, ..Step::new("setup", "python3", &["-m", "venv", "venv"]) },
+            Step::new("test", "/venv/bin/python", &["-m", "pytest", "-q", "-x", "--tb=short"]),
+        ];
+        // Empty targets must keep bare full suite untouched.
+        filter_test_steps(&mut py, &[]);
+        assert_eq!(py[1].args, vec!["-m", "pytest", "-q", "-x", "--tb=short"]);
+
+        // Explicit pytest targets are appended and deduplicated; setup steps are untouched.
+        filter_test_steps(
+            &mut py,
+            &["tests/test_parser.py".into(), "tests/test_parser.py".into(), "tests/test_cli.py::test_help".into()],
+        );
+        assert_eq!(py[0].args, vec!["-m", "venv", "venv"]);
+        assert_eq!(
+            py[1].args,
+            vec!["-m", "pytest", "-q", "-x", "--tb=short", "tests/test_parser.py", "tests/test_cli.py::test_help"]
+        );
+
+        // npm receives `--` separator before target paths.
+        let mut npm = vec![Step::new("test", "npm", &["run", "test"])];
+        filter_test_steps(&mut npm, &["tests/alpha.test.ts".into()]);
+        assert_eq!(npm[0].args, vec!["run", "test", "--", "tests/alpha.test.ts"]);
+
+        // cargo maps `tests/<stem>.rs` to `--test <stem>` and other paths to stem filters.
+        let mut cargo = vec![Step::new("test", "cargo", &["test", "--quiet"])];
+        filter_test_steps(&mut cargo, &["tests/integration.rs".into(), "src/parser.rs".into()]);
+        assert_eq!(cargo[0].args, vec!["test", "--quiet", "--test", "integration", "parser"]);
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

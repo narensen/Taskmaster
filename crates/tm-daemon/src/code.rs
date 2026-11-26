@@ -16,7 +16,8 @@
 //! await grep(text, glob?)             ["path:line: text", ...]
 //! await ls(glob?)                     project files
 //! await sh(command)                   {code, output}; only inside bubblewrap, when the gate allows a shell
-//! await test()                        {ok, failed, output}: the project's tests, in the sandbox
+//! await test(paths?)                  {ok, failed, output, targets, interpreter}: project tests (or explicit paths), in the sandbox
+//! await testAffected(paths?)          {ok, affectedFiles, testFiles, failed, output}: runs only affected tests matching paths/git status
 //! await check()                       problems the static checks find in the worktree
 //! await browser(action, args)         open | click | type | screenshot | console on the page's preview
 //! console.log(...)                    lines returned with the result
@@ -109,8 +110,14 @@ const diff = (glob) => call("diff", { glob });
 const symbols = (glob) => call("symbols", { glob });
 const flow = (op, args = {}) => call("flow", { op: String(op ?? ""), args: args && typeof args === "object" ? args : {} });
 const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
-const test = () => call("test", {});
-const testAffected = (paths) => call("testAffected", { files: Array.isArray(paths) ? paths : (paths ? [paths] : []) });
+const test = (...paths) => {
+  const flat = paths.flat().filter((p) => p !== undefined && p !== null && String(p).trim() !== "").map(String);
+  return call("test", flat.length ? { files: flat } : {});
+};
+const testAffected = (...paths) => {
+  const flat = paths.flat().filter((p) => p !== undefined && p !== null && String(p).trim() !== "").map(String);
+  return call("testAffected", { files: flat });
+};
 const probe = {
   ast: (path) => call("probeAst", { path }),
 };
@@ -596,6 +603,58 @@ impl CodeTools {
         Ok((output.status.code(), text))
     }
 
+    /// Run the project's test steps (optionally narrowed to explicit `targets` via
+    /// [`crate::runtime::filter_test_steps`]) in the worker's sandbox. Shared by both `test`
+    /// and `testAffected` so bare `test()` always runs the full suite (preserving acceptance
+    /// checks) while targeted calls run only the requested/affected test paths.
+    async fn execute_test_steps(&self, scope: &Scope, targets: &[String], record_env: bool) -> anyhow::Result<Value> {
+        let (venv, raw_steps) = select_test_steps(scope).await;
+        if !raw_steps.iter().any(|step| !step.setup) {
+            return Ok(json!({
+                "ok": true,
+                "ran": false,
+                "targets": targets,
+                "failed": [],
+                "output": "no tests were found to run"
+            }));
+        }
+        let mut steps = raw_steps.clone();
+        crate::runtime::filter_test_steps(&mut steps, targets);
+        let interpreter = steps
+            .iter()
+            .rev()
+            .find(|s| s.name == "test" && !s.setup)
+            .map(|s| s.program.clone());
+        let command = test_command(&steps);
+        let (code, text) = self.sandboxed(scope, &command).await?;
+        if record_env && code == Some(0) {
+            let flow_root = self.flow_root.lock().unwrap().clone();
+            let rel_base = self
+                .project_root
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| flow_root.clone());
+            if let (Some(root), Some(base)) = (flow_root, rel_base)
+                && tm_flow::read_env(&root).ok().flatten().is_none()
+                && let Some(facts) = crate::runtime::env_facts_from_steps_rel(&raw_steps, &venv, &base)
+            {
+                let _ = tm_flow::write_env(&root, &facts);
+            }
+        }
+        let mut out = json!({
+            "ok": code == Some(0),
+            "ran": true,
+            "targets": targets,
+            "failed": failed_tests(&text),
+            "output": tail(&text, MAX_TOOL_OUTPUT)
+        });
+        if let Some(interp) = interpreter {
+            out["interpreter"] = json!(interp);
+        }
+        Ok(out)
+    }
+
     async fn allowed(&self, scope: &Scope, op: &str, kind: ToolKind, path: Option<&Path>, command: Option<&str>) -> anyhow::Result<()> {
         let request = PermissionRequest {
             tool: format!("run_code.{op}"),
@@ -813,28 +872,9 @@ impl CodeTools {
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
-                let (venv, steps) = select_test_steps(scope).await;
-                if !steps.iter().any(|step| !step.setup) {
-                    return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
-                }
-                let command = test_command(&steps);
-                let (code, text) = self.sandboxed(scope, &command).await?;
-                if code == Some(0) {
-                    let flow_root = self.flow_root.lock().unwrap().clone();
-                    let rel_base = self
-                        .project_root
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .or_else(|| flow_root.clone());
-                    if let (Some(root), Some(base)) = (flow_root, rel_base)
-                        && tm_flow::read_env(&root).ok().flatten().is_none()
-                        && let Some(facts) = crate::runtime::env_facts_from_steps_rel(&steps, &venv, &base)
-                    {
-                        let _ = tm_flow::write_env(&root, &facts);
-                    }
-                }
-                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, MAX_TOOL_OUTPUT) }))
+                let targets = parse_test_targets(args)?;
+                let res = self.execute_test_steps(scope, &targets, true).await?;
+                Ok(res)
             }
             "readMany" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -985,10 +1025,7 @@ impl CodeTools {
             }
             "testAffected" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("affected project tests")).await?;
-                let requested: Vec<String> = args["files"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                    .unwrap_or_default();
+                let requested = parse_test_targets(args)?;
                 let changed: Vec<String> = if !requested.is_empty() {
                     requested
                 } else {
@@ -1008,43 +1045,13 @@ impl CodeTools {
                     .unwrap_or_default()
                 };
                 let all_files = files(&scope.cwd, None).unwrap_or_default();
-                let stems: Vec<String> = changed
-                    .iter()
-                    .filter_map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()).map(str::to_ascii_lowercase))
-                    .collect();
-                let matched_tests: Vec<String> = all_files
-                    .into_iter()
-                    .filter(|f| {
-                        let lower = f.to_ascii_lowercase();
-                        let looks_test = lower.contains(".test.")
-                            || lower.contains(".spec.")
-                            || lower.contains("test_")
-                            || lower.ends_with("_test.rs");
-                        looks_test && (stems.is_empty() || stems.iter().any(|st| lower.contains(st)))
-                    })
-                    .take(12)
-                    .collect();
-                let (_, steps) = select_test_steps(scope).await;
-                if !steps.iter().any(|step| !step.setup) {
-                    return Ok(json!({
-                        "ok": true,
-                        "ran": false,
-                        "affectedFiles": changed,
-                        "testFiles": matched_tests,
-                        "failed": [],
-                        "output": "no tests were found to run"
-                    }));
+                let matched_tests = resolve_affected_test_targets(&changed, &all_files);
+                let mut res = self.execute_test_steps(scope, &matched_tests, false).await?;
+                if let Some(obj) = res.as_object_mut() {
+                    obj.insert("affectedFiles".into(), json!(changed));
+                    obj.insert("testFiles".into(), json!(matched_tests));
                 }
-                let command = test_command(&steps);
-                let (code, text) = self.sandboxed(scope, &command).await?;
-                Ok(json!({
-                    "ok": code == Some(0),
-                    "ran": true,
-                    "affectedFiles": changed,
-                    "testFiles": matched_tests,
-                    "failed": failed_tests(&text),
-                    "output": tail(&text, MAX_TOOL_OUTPUT)
-                }))
+                Ok(res)
             }
             "probeAst" => {
                 let file = path("path")?;
@@ -1332,6 +1339,112 @@ async fn probe_local_http(url: &str) -> Option<u16> {
     let mut first = String::new();
     tokio::time::timeout(Duration::from_millis(400), reader.read_line(&mut first)).await.ok()?.ok()?;
     first.split_whitespace().nth(1)?.parse::<u16>().ok()
+}
+
+/// Validate and normalize one test target path (or pytest `path::node_id` selector).
+/// Rejects flag injection (`-...`), traversal (`..`), quotes, and control characters.
+fn sanitize_test_target(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("empty test target");
+    }
+    if trimmed.starts_with('-') {
+        bail!("invalid test target `{trimmed}`: option flags are not allowed");
+    }
+    if let Some((file_part, node_part)) = trimmed.split_once("::") {
+        let clean_file = sanitize_file_path(file_part)?;
+        if clean_file.starts_with('-') {
+            bail!("invalid test target `{trimmed}`: option flags are not allowed");
+        }
+        if node_part.is_empty()
+            || node_part.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ';' | '|' | '&' | '$' | '\\'))
+        {
+            bail!("invalid pytest node selector in `{trimmed}`");
+        }
+        Ok(format!("{clean_file}::{node_part}"))
+    } else {
+        let clean = sanitize_file_path(trimmed)?;
+        if clean.starts_with('-') {
+            bail!("invalid test target `{trimmed}`: option flags are not allowed");
+        }
+        Ok(clean)
+    }
+}
+
+/// Extract validated test target paths from `{ files: [...] }` or `{ path: "..." }`.
+fn parse_test_targets(args: &Value) -> anyhow::Result<Vec<String>> {
+    let mut raw: Vec<&str> = Vec::new();
+    match &args["files"] {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(s) = item.as_str().filter(|s| !s.trim().is_empty()) {
+                    raw.push(s);
+                }
+            }
+        }
+        Value::String(one) if !one.trim().is_empty() => raw.push(one.as_str()),
+        _ => {}
+    }
+    if raw.is_empty()
+        && let Some(one) = args["path"].as_str().filter(|s| !s.trim().is_empty())
+    {
+        raw.push(one);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        let clean = sanitize_test_target(item)?;
+        if !out.contains(&clean) {
+            out.push(clean);
+        }
+    }
+    Ok(out)
+}
+
+/// Map changed or requested files to concrete test file targets for `testAffected`:
+/// - Direct test paths (or pytest `file::node` selectors) in `changed` are kept directly.
+/// - Non-test source files match test files in `all_files` whose filename contains the stem.
+fn resolve_affected_test_targets(changed: &[String], all_files: &[String]) -> Vec<String> {
+    let looks_like_test = |p: &str| {
+        let base = p.split("::").next().unwrap_or(p);
+        let lower = base.to_ascii_lowercase();
+        lower.contains(".test.")
+            || lower.contains(".spec.")
+            || lower.contains("test_")
+            || lower.ends_with("_test.rs")
+            || lower.ends_with("_test.py")
+            || lower.ends_with("_test.go")
+            || tm_core::is_test_path(base)
+    };
+    let mut matched: Vec<String> = Vec::new();
+    let mut stems: Vec<String> = Vec::new();
+    for path in changed {
+        if looks_like_test(path) {
+            if !matched.contains(path) {
+                matched.push(path.clone());
+            }
+        } else if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+            let low = stem.to_ascii_lowercase();
+            if !low.is_empty() && !stems.contains(&low) {
+                stems.push(low);
+            }
+        }
+    }
+    if !stems.is_empty() || (changed.is_empty() && matched.is_empty()) {
+        for f in all_files {
+            if matched.len() >= 12 {
+                break;
+            }
+            if !looks_like_test(f) {
+                continue;
+            }
+            let lower = f.to_ascii_lowercase();
+            if (stems.is_empty() || stems.iter().any(|st| lower.contains(st))) && !matched.contains(f) {
+                matched.push(f.clone());
+            }
+        }
+    }
+    matched.truncate(12);
+    matched
 }
 
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
@@ -1834,7 +1947,7 @@ impl Extension for CodeTools {
         let description = if scope.read_only {
             "Async JS body over repo (relative paths). Helpers: read, readMany, grep, ls, diff, symbols, flow(op, args), probe.ast, check, status, wait, console.log."
         } else {
-            "Async JS body over worktree (relative paths; await/return). Helpers: read, readMany, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow(op, args), probe.ast, sh, test, testAffected, check, browser, status, wait, console.log. Use `files` or `writeFile` for raw multi-line files; end with `return await test()`."
+            "Async JS body over worktree (relative paths; await/return). Helpers: read, readMany, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow(op, args), probe.ast, sh, test(paths?), testAffected(paths?), check, browser, status, wait, console.log. Use `files` or `writeFile` for raw multi-line files; end with `return await test(...)`."
         };
         let properties = if scope.read_only {
             json!({
@@ -2922,6 +3035,96 @@ mod tests {
 
         let recovered = tools.run(&grant(), r#"return await read("app/before_abort.py");"#).await.unwrap();
         assert!(recovered.contains("saved = 1"), "next run_code call must recover cleanly: {recovered}");
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tb18_test_path_args_and_test_affected_run_only_targeted_tests() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        if !tm_harness::sandbox::bwrap_usable() {
+            return;
+        }
+        let npm = std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("npm").is_file()));
+        if !npm {
+            return;
+        }
+        let dir = repo("tb18-test-paths");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("src/alpha.js"), "export const a = 1;\n").unwrap();
+        std::fs::write(dir.join("tests/alpha.test.js"), "// ok\n").unwrap();
+        std::fs::write(dir.join("tests/acceptance.test.js"), "// fails when full suite runs\n").unwrap();
+        // Test runner script: when passed explicit args, only runs those args (fails only if
+        // `acceptance` is among them); when passed NO args (full suite), runs both and fails!
+        std::fs::write(
+            dir.join("run_tests.sh"),
+            "#!/bin/sh\n\
+             if [ \"$#\" -eq 0 ]; then\n\
+               echo 'RAN=FULL_SUITE'\n\
+               echo 'FAILED tests/acceptance.test.js - AssertionError: missing sibling' >&2\n\
+               exit 1\n\
+             fi\n\
+             echo \"RAN=$*\"\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 *acceptance*) echo \"FAILED $arg - AssertionError\" >&2; exit 1 ;;\n\
+               esac\n\
+             done\n\
+             echo '1 passed'\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"tb18-test-paths","private":true,"scripts":{"test":"sh run_tests.sh"}}"#,
+        )
+        .unwrap();
+
+        let scratch = dir.join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let gate = Arc::new(WorktreeGate::new(&dir, vec![]).with_shell());
+        let shell = tm_harness::ShellScope { writable: vec![scratch], readable: vec![], env: vec![] };
+        tools.attach("home", &dir, gate, Some(shell));
+
+        // 1. Targeted `test("tests/alpha.test.js")` runs ONLY that file and passes.
+        let targeted = tools
+            .run(&grant(), r#"return await test("tests/alpha.test.js");"#)
+            .await
+            .unwrap();
+        assert!(targeted.contains("\"ok\": true"), "targeted test should pass:\n{targeted}");
+        assert!(targeted.contains("RAN=tests/alpha.test.js"), "must forward target arg:\n{targeted}");
+        assert!(!targeted.contains("RAN=FULL_SUITE"), "must not run full suite when targeted:\n{targeted}");
+        assert!(targeted.contains("\"interpreter\""), "must report interpreter to avoid probe loops:\n{targeted}");
+
+        // 2. Bare `test()` MUST still run the full suite (preserving acceptance tests).
+        let full = tools.run(&grant(), r#"return await test();"#).await.unwrap();
+        assert!(full.contains("\"ok\": false"), "bare test() must run full suite including acceptance:\n{full}");
+        assert!(full.contains("RAN=FULL_SUITE"), "bare test() must pass no filter args:\n{full}");
+
+        // 3. `testAffected("src/alpha.js")` resolves `tests/alpha.test.js` and runs ONLY it (passes!).
+        let affected = tools
+            .run(&grant(), r#"return await testAffected("src/alpha.js");"#)
+            .await
+            .unwrap();
+        assert!(affected.contains("\"ok\": true"), "testAffected must run only affected test:\n{affected}");
+        assert!(affected.contains("RAN=tests/alpha.test.js"), "testAffected must pass matched test to runner:\n{affected}");
+        assert!(affected.contains("\"testFiles\""), "{affected}");
+
+        // 4. Rejects traversal / option-flag injection in test() targets.
+        let bad_flag = tools
+            .run(&grant(), r#"try { await test("--collect-only"); return "ALLOWED"; } catch (e) { return e.message; }"#)
+            .await
+            .unwrap();
+        assert!(!bad_flag.contains("ALLOWED") && bad_flag.contains("option flags are not allowed"), "{bad_flag}");
+        let bad_trav = tools
+            .run(&grant(), r#"try { await test("../escape.py"); return "ALLOWED"; } catch (e) { return e.message; }"#)
+            .await
+            .unwrap();
+        assert!(!bad_trav.contains("ALLOWED") && bad_trav.contains(".."), "{bad_trav}");
 
         tools.detach_all();
         std::fs::remove_dir_all(dir).ok();

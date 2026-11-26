@@ -3466,7 +3466,11 @@ impl Driver {
         let Some(hash) = self.commit_entries(vec![entry], files.clone(), &message)? else {
             return Ok(failed("worker produced no changes under its owned files"));
         };
-        self.update_flow_files(&files);
+        if let Err(err) = tm_flow::update_files(&self.tree, &files) {
+            eprintln!("taskmaster: flow update failed: {err:#}");
+        }
+        let _ = self.check_flow_staleness("unit_merge");
+        self.commit_flow_update();
         self.records.mark_merged(&self.id, page, &hash)?;
         Ok(WorkerOutcome::Passed)
     }
@@ -3872,6 +3876,9 @@ impl Driver {
                 let fixed = checks::autofix(&self.tree, &changed).await;
                 self.commit_autofix(&fixed);
             }
+        }
+        if self.check_flow_staleness("final_verify") > 0 {
+            self.commit_flow_update();
         }
         let passed_pages: BTreeSet<PageId> = self
             .run
@@ -5925,6 +5932,35 @@ impl Driver {
             return;
         }
         self.commit_flow_update();
+    }
+
+    /// Deterministic `.flow` staleness gate: verifies every tracked source file has a shard
+    /// matching its disk blob, auto-repairs stale/missing shards, and emits a `flow_stale`
+    /// event/log line if any were repaired. Never fails the run.
+    fn check_flow_staleness(&self, stage: &str) -> usize {
+        match crate::gates::check_flow_fresh(&self.tree) {
+            Ok(res) if res.repaired > 0 => {
+                eprintln!(
+                    "taskmaster: flow_stale ({stage}): auto-repaired {} stale shard(s): {}",
+                    res.repaired,
+                    res.stale_paths.join(", ")
+                );
+                self.terminal(
+                    "flow_stale",
+                    serde_json::json!({
+                        "stage": stage,
+                        "count": res.repaired,
+                        "paths": res.stale_paths,
+                    }),
+                );
+                res.repaired
+            }
+            Ok(_) => 0,
+            Err(err) => {
+                eprintln!("taskmaster: flow staleness check skipped ({stage}): {err:#}");
+                0
+            }
+        }
     }
 
     /// Incrementally refresh `.flow/` against the current tree and commit if any shards/meta changed.

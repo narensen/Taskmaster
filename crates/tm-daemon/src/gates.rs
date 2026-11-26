@@ -1892,6 +1892,35 @@ pub fn evaluate_contract_proposal(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `.flow` staleness gate: deterministic blob check with automatic repair.
+// ---------------------------------------------------------------------------
+
+/// Result of checking every tracked source file against its `.flow` shard blob hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowFreshResult {
+    pub stale_paths: Vec<String>,
+    pub repaired: usize,
+    /// True when zero stale/missing shards were found. Even when `false`, the gate
+    /// auto-repairs and never fails the run.
+    pub ok: bool,
+}
+
+/// Verify that every tracked source file in `tree` has an up-to-date `.flow` shard.
+/// Any stale, missing, or orphaned shards are automatically re-parsed and counted.
+pub fn check_flow_fresh(tree: &Path) -> anyhow::Result<FlowFreshResult> {
+    let stale_paths = tm_flow::verify_all(tree)?;
+    let repaired = stale_paths.len();
+    if repaired > 0 {
+        tm_flow::update_files(tree, &stale_paths)?;
+    }
+    Ok(FlowFreshResult {
+        stale_paths,
+        repaired,
+        ok: repaired == 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2281,6 +2310,35 @@ def test_isolated_and_catches_stub():
         assert!(!hit4);
         let runs_after_4 = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(runs_after_4, 6, "modifying contract must invalidate cache and re-run");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flow_fresh_gate_detects_stale_shards_and_auto_repairs_without_failing() {
+        let root = std::env::temp_dir().join(format!("tm-flow-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/app.py"), "def hello():\n    return 1\n").unwrap();
+        tm_flow::build(&root).unwrap();
+
+        let fresh = check_flow_fresh(&root).unwrap();
+        assert!(fresh.ok);
+        assert_eq!(fresh.repaired, 0);
+
+        // Mutate file on disk without updating `.flow`: gate detects and auto-repairs.
+        std::fs::write(root.join("pkg/app.py"), "def hello():\n    return 2\ndef added():\n    pass\n").unwrap();
+        let stale = check_flow_fresh(&root).unwrap();
+        assert!(!stale.ok);
+        assert_eq!(stale.repaired, 1);
+        assert_eq!(stale.stale_paths, vec!["pkg/app.py"]);
+
+        // Subsequent check is clean and new symbol is indexed.
+        let after = check_flow_fresh(&root).unwrap();
+        assert!(after.ok);
+        assert_eq!(after.repaired, 0);
+        let q = tm_flow::FlowQuery::open(&root).unwrap();
+        assert!(!q.find("added", 5).unwrap().nodes.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

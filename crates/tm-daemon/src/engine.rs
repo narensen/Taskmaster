@@ -1269,23 +1269,47 @@ impl Driver {
             return Ok(plan);
         }
         let mut full_calls = 0;
+        let mut warm_planner: Option<(Box<dyn tm_harness::Session>, Option<PathBuf>)> = None;
         for attempt in 1..=PLAN_ATTEMPTS {
-            let answer = match rejected.take() {
+            let (mut answer, scratch_cwd) = match rejected.take() {
                 Some(json) => {
                     eprintln!("taskmaster: asking the planner to repair the plan");
-                    self.ask_repair(prompt, &json, &errors).await?
+                    let carried = warm_planner.take();
+                    match self.ask_repair(prompt, &json, &errors, carried).await {
+                        Ok(res) => res,
+                        Err(err) => return Err(err),
+                    }
                 }
                 None if full_calls < 2 => {
+                    if let Some((sess, sc)) = warm_planner.take() {
+                        let _ = sess.close().await;
+                        if let Some(dir) = sc {
+                            self.drop_worktree(&dir);
+                        }
+                    }
                     full_calls += 1;
                     self.ask_planner(prompt, &errors, &master_notes).await?
                 }
                 None => break,
             };
+            let kept_session = answer.kept.take();
             if !answer.ok {
+                if let Some(sess) = kept_session {
+                    let _ = sess.close().await;
+                }
+                if let Some(dir) = scratch_cwd {
+                    self.drop_worktree(&dir);
+                }
                 errors = vec!["the planner did not finish".into()];
             } else {
                 match self.accept_plan(&answer.text, prompt, None) {
                     Ok((plan, drafts)) => {
+                        if let Some(sess) = kept_session {
+                            let _ = sess.close().await;
+                        }
+                        if let Some(dir) = scratch_cwd {
+                            self.drop_worktree(&dir);
+                        }
                         let existing = self.existing_content(&plan, &drafts)?;
                         let published = self.publish_drafts(&drafts, &existing)?;
                         self.records.save_plan(&self.id, &plan)?;
@@ -1307,6 +1331,18 @@ impl Driver {
                     Err((found, json)) => {
                         errors = found;
                         rejected = json;
+                        if attempt < PLAN_ATTEMPTS && rejected.is_some()
+                            && let Some(sess) = kept_session
+                        {
+                            warm_planner = Some((sess, scratch_cwd));
+                        } else {
+                            if let Some(sess) = kept_session {
+                                let _ = sess.close().await;
+                            }
+                            if let Some(dir) = scratch_cwd {
+                                self.drop_worktree(&dir);
+                            }
+                        }
                     }
                 }
             }
@@ -1317,16 +1353,25 @@ impl Driver {
                 }
             }
         }
+        if let Some((sess, sc)) = warm_planner.take() {
+            let _ = sess.close().await;
+            if let Some(dir) = sc {
+                self.drop_worktree(&dir);
+            }
+        }
         bail!("plan is not usable:\n{}", errors.join("\n"))
     }
 
-    /// One full planning call, held to the commit budget.
-    async fn ask_planner(&mut self, prompt: &str, errors: &[String], notes: &[String]) -> anyhow::Result<Answer> {
+    /// One full planning call, held to the commit budget. Keeps the session open when supported
+    /// so an immediate [`ask_repair`] can reuse the warm planner context instead of resending
+    /// the whole brief and plan JSON.
+    async fn ask_planner(&mut self, prompt: &str, errors: &[String], notes: &[String]) -> anyhow::Result<(Answer, Option<PathBuf>)> {
         let brief = self.with_notes(self.planner_brief(prompt, errors)?, notes);
         let cwd = self.planner_dir()?;
         let scratch = cwd != self.tree;
         let token = self.master_token.clone();
         let mut request = self.read_request(&cwd, brief.clone(), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+        request.keep = true;
         self.small = self.small_pass(prompt);
         let quick = !self.small && self.quick_edit_pass(prompt);
         let single_phase = !self.small && self.single_phase_pass(prompt);
@@ -1361,26 +1406,71 @@ impl Driver {
             eprintln!("taskmaster: the planner was stopped ({why}); asking it to write the plan now");
             let mut quick_req = self.read_request(&cwd, commit_brief(&brief, &why, &notes), self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
             quick_req.dictionary = None;
-            quick_req.effort = Some(crate::small::SMALL_EFFORT.to_string());
+            quick_req.keep = true;
+            quick_req.effort = if !self.config.effort_routing || self.harnesses.master.id() == "antigravity" {
+                None
+            } else {
+                Some(crate::small::SMALL_EFFORT.to_string())
+            };
             self.tag(&mut quick_req, "master", "planner", None, None);
             asked = ask(quick_req).await;
         }
-        if scratch {
-            self.drop_worktree(&cwd);
-        }
-        let answer = asked?;
+        let answer = match asked {
+            Ok(ans) => ans,
+            Err(err) => {
+                if scratch {
+                    self.drop_worktree(&cwd);
+                }
+                return Err(err);
+            }
+        };
         self.charge(&bill, &answer)?;
-        Ok(answer)
+        let held_scratch = if scratch {
+            if answer.kept.is_some() {
+                Some(cwd)
+            } else {
+                self.drop_worktree(&cwd);
+                None
+            }
+        } else {
+            None
+        };
+        Ok((answer, held_scratch))
     }
 
-    /// A short call, with no tools, that fixes a rejected plan in place.
-    async fn ask_repair(&mut self, prompt: &str, json: &str, errors: &[String]) -> anyhow::Result<Answer> {
-        let cwd = self.planner_dir()?;
-        let scratch = cwd != self.tree;
+    /// A short call, with no tools, that fixes a rejected plan in place. Reuses the planner's
+    /// open warm session when available (sending only the rejection reasons) and falls back
+    /// cleanly to a cold repair call if the warm session is unavailable or fails.
+    async fn ask_repair(
+        &mut self,
+        prompt: &str,
+        json: &str,
+        errors: &[String],
+        warm: Option<(Box<dyn tm_harness::Session>, Option<PathBuf>)>,
+    ) -> anyhow::Result<(Answer, Option<PathBuf>)> {
+        let (warm_session, warm_scratch) = match warm {
+            Some((sess, sc)) => (Some(sess), sc),
+            None => (None, None),
+        };
+        let (cwd, scratch) = match warm_scratch {
+            Some(dir) if dir.is_dir() => (dir, true),
+            Some(dir) => {
+                self.drop_worktree(&dir);
+                let fresh = self.planner_dir()?;
+                let sc = fresh != self.tree;
+                (fresh, sc)
+            }
+            None => {
+                let fresh = self.planner_dir()?;
+                let sc = fresh != self.tree;
+                (fresh, sc)
+            }
+        };
         let token = self.master_token.clone();
         let brief = crate::small::repair_brief(prompt, json, errors);
         let mut request = self.read_request(&cwd, brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
         request.dictionary = None;
+        request.keep = true;
         request.effort = if !self.config.effort_routing || self.harnesses.master.id() == "antigravity" {
             None
         } else {
@@ -1389,13 +1479,53 @@ impl Driver {
         request.commit = Some(self.commit_budget(true));
         self.tag(&mut request, "master", "planner", None, None);
         let bill = request.bill(Role::Planner, None);
-        let asked = ask(request).await;
-        if scratch {
-            self.drop_worktree(&cwd);
-        }
-        let answer = asked?;
+        let asked = match warm_session {
+            Some(session) => {
+                eprintln!("taskmaster: reusing warm planner session for plan repair");
+                let warm_prompt = crate::small::warm_repair_brief(errors);
+                let fallback_brief = request.brief.clone();
+                match follow(request, session, warm_prompt, false).await {
+                    Ok(ans) => Ok(ans),
+                    Err(err) if err.downcast_ref::<crate::reply::ReportedLimit>().is_some() => Err(err),
+                    Err(err) => {
+                        eprintln!("taskmaster: warm planner repair failed ({err:#}); falling back to cold repair");
+                        let mut cold = self.read_request(&cwd, fallback_brief, self.harnesses.master.clone(), self.config.models.master.clone(), &token)?;
+                        cold.dictionary = None;
+                        cold.keep = true;
+                        cold.effort = if !self.config.effort_routing || self.harnesses.master.id() == "antigravity" {
+                            None
+                        } else {
+                            Some(crate::small::SMALL_EFFORT.to_string())
+                        };
+                        cold.commit = Some(self.commit_budget(true));
+                        self.tag(&mut cold, "master", "planner", None, None);
+                        ask(cold).await
+                    }
+                }
+            }
+            None => ask(request).await,
+        };
+        let answer = match asked {
+            Ok(ans) => ans,
+            Err(err) => {
+                if scratch {
+                    self.drop_worktree(&cwd);
+                }
+                return Err(err);
+            }
+        };
         self.charge(&bill, &answer)?;
-        Ok(answer)
+        let held_scratch = if scratch {
+            if answer.kept.is_some() {
+                Some(cwd)
+            } else {
+                self.drop_worktree(&cwd);
+                None
+            }
+        } else {
+            None
+        };
+        Ok((answer, held_scratch))
     }
 
     /// Read a planner's reply, fix what has one fix, and check it. `base` is the plan so far
@@ -1567,13 +1697,27 @@ impl Driver {
         };
         let base = self.plan()?.clone();
         let mut errors: Vec<String> = Vec::new();
+        let mut scratch_held: Option<PathBuf> = None;
         for attempt in 1..=PLAN_ATTEMPTS {
+            let kept_session = answer.kept.take();
             if !answer.ok {
+                if let Some(sess) = kept_session {
+                    let _ = sess.close().await;
+                }
+                if let Some(dir) = scratch_held.take() {
+                    self.drop_worktree(&dir);
+                }
                 errors = vec!["the planner did not finish".into()];
                 break;
             }
             match self.accept_plan(&answer.text, &goal, Some(&base)) {
                 Ok((added, drafts)) => {
+                    if let Some(sess) = kept_session {
+                        let _ = sess.close().await;
+                    }
+                    if let Some(dir) = scratch_held.take() {
+                        self.drop_worktree(&dir);
+                    }
                     let existing = self.existing_content(&added, &drafts)?;
                     self.publish_drafts(&drafts, &existing)?;
                     eprintln!("taskmaster: planned phase {} ({}): {} units", phase + 1, sketch.id, added.pages.len());
@@ -1589,14 +1733,33 @@ impl Driver {
                 }
                 Err((found, json)) => {
                     errors = found;
-                    let Some(json) = json.filter(|_| attempt < PLAN_ATTEMPTS) else { break };
+                    let Some(json) = json.filter(|_| attempt < PLAN_ATTEMPTS) else {
+                        if let Some(sess) = kept_session {
+                            let _ = sess.close().await;
+                        }
+                        if let Some(dir) = scratch_held.take() {
+                            self.drop_worktree(&dir);
+                        }
+                        break;
+                    };
                     eprintln!("taskmaster: the plan for phase {} was rejected; asking for a repair:", phase + 1);
                     for error in &errors {
                         eprintln!("taskmaster:   - {error}");
                     }
-                    answer = self.ask_repair(&goal, &json, &errors).await?;
+                    let warm = kept_session.map(|sess| (sess, scratch_held.take()));
+                    if warm.is_none()
+                        && let Some(dir) = scratch_held.take()
+                    {
+                        self.drop_worktree(&dir);
+                    }
+                    let (repaired, held) = self.ask_repair(&goal, &json, &errors, warm).await?;
+                    answer = repaired;
+                    scratch_held = held;
                 }
             }
+        }
+        if let Some(dir) = scratch_held.take() {
+            self.drop_worktree(&dir);
         }
         bail!("phase {} could not be planned:\n{}", phase + 1, errors.join("\n"))
     }
@@ -1929,8 +2092,10 @@ impl Driver {
         if let Some(template) = &self.template {
             brief.push_str(&template.brief());
         }
+        brief.push('\n');
+        brief.push_str(crate::small::JSON_AND_CONTRACT_LIMIT_RULE);
         brief.push_str(
-            "\nReply with one JSON object and do not edit files. \
+            "Do not edit files. \
              Leave `estimate` at zero: Taskmaster works it out from what past runs cost. \
              `summary` is one concise paragraph describing the overall plan and how work is divided across workers. \
              `kind` says what is being built: web, library, cli, server or migration. \
@@ -8506,10 +8671,20 @@ async fn ask_once(request: &AgentRequest) -> anyhow::Result<Answer> {
                 }
             };
             // Dropping the harness's run stops the agent and everything it started.
-            tokio::select! {
-                run = request.harness.run(task, gate, tx) => run,
-                why = overrun => Err(anyhow::Error::new(Overrun { why, notes: String::new() })),
-                stalled = wait_stall(stall_rx) => Err(stalled.into()),
+            if request.keep {
+                let (run, session) = tokio::select! {
+                    res = request.harness.run_kept(task, gate, tx) => res,
+                    why = overrun => (Err(anyhow::Error::new(Overrun { why, notes: String::new() })), None),
+                    stalled = wait_stall(stall_rx) => (Err(stalled.into()), None),
+                };
+                kept = session;
+                run
+            } else {
+                tokio::select! {
+                    run = request.harness.run(task, gate, tx) => run,
+                    why = overrun => Err(anyhow::Error::new(Overrun { why, notes: String::new() })),
+                    stalled = wait_stall(stall_rx) => Err(stalled.into()),
+                }
             }
         }
     };

@@ -236,9 +236,40 @@ pub fn phase_brief(
         brief.push_str(&format!(" (this phase's tests run with `{}`)", phase.test));
     }
     brief.push_str(".\n");
+    brief.push_str(JSON_AND_CONTRACT_LIMIT_RULE);
     brief.push_str(&tm_core::rules_text());
     brief.push_str(&units_rule(slots));
     brief.push_str(DECIDE_RULE);
+    brief
+}
+
+/// Up-front JSON formatting and contract line-cap rules shown before plan examples so
+/// planners avoid avoidable JSON syntax errors and >200-line contract rejections.
+pub const JSON_AND_CONTRACT_LIMIT_RULE: &str = "Strict output limits: reply with ONE valid JSON object only \
+(no prose outside JSON, no trailing commas, escape quotes and use \\n inside JSON strings—never raw unescaped newlines). \
+Keep every locked contract concise: target <= 120 lines and NEVER exceed the hard 200-line limit per contract (400 lines total across the plan).\n";
+
+/// Compact repair prompt for a warm planner session that already has the request and its
+/// rejected plan in context: sends only the rejection reasons instead of resending the full plan.
+pub fn warm_repair_brief(errors: &[String]) -> String {
+    if errors.len() == 1 && errors[0].starts_with("invalid JSON at line ") {
+        return format!(
+            "Your last JSON reply had a syntax error:\n- {}\n\
+             Fix only the JSON syntax (no trailing commas, escape quotes and use \\n inside strings) without rewriting content, \
+             and reply with the complete corrected JSON object and nothing else. Do not call any tools.\n",
+            errors[0],
+        );
+    }
+    let mut brief = String::from(
+        "Your last plan was rejected for these reasons:\n",
+    );
+    for error in errors {
+        brief.push_str(&format!("- {error}\n"));
+    }
+    brief.push_str(
+        "Change ONLY what the reasons above name, keep everything else identical, obey the 200-line hard limit per contract \
+         and strict JSON syntax/escaping, and reply with the complete corrected JSON object and nothing else. Do not call any tools.\n",
+    );
     brief
 }
 
@@ -299,11 +330,11 @@ pub fn small_brief(prompt: &str, entries: &[String], template: &str, slots: usiz
         "Use 1-2 cohesive units (never over-split tiny files).".to_string()
     };
     brief.push_str(&format!(
-        "\nReply with one JSON object only and do not edit files. {unit_guidance} \
+        "\n{JSON_AND_CONTRACT_LIMIT_RULE}Do not edit files. {unit_guidance} \
          Include a short `summary`. `kind` is web, library, cli, server or migration. \
          `contracts` are shared interface files, only for interfaces used by more than one file or worker; otherwise `[]`. \
          Each unit (or part) is one worker agent: `brief` is its task, `context` is the exact shared ids/interfaces/conventions it needs, `done` one line saying when it is finished. \
-         Keep contracts short. Leave `estimate` at zero.\n"
+         Leave `estimate` at zero.\n"
     ));
     brief.push_str(&plan_shape());
     let io_examples = crate::gates::extract_prompt_io_examples(prompt);
@@ -462,8 +493,9 @@ pub fn quick_edit_brief(
         }
         brief.push('\n');
     }
+    brief.push_str(JSON_AND_CONTRACT_LIMIT_RULE);
     brief.push_str(
-        "Reply with one compact JSON plan (no `phases`, only the 1-3 units actually touched, exact existing file paths in `owned_glob`, \
+        "Keep it compact (no `phases`, only the 1-3 units actually touched, exact existing file paths in `owned_glob`, \
          optional `difficulty`: `\"easy\"` | `\"normal\"` | `\"hard\"`, and `done` naming the verification command). \
          Do not edit files. Leave `estimate` at zero.\n",
     );

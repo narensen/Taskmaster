@@ -11880,3 +11880,178 @@ async fn tok8_wave1_independent_unit_suppresses_peer_fishing_and_dependent_unit_
     assert!(app_brief.contains("\"op\":\"batch\""), "dependent unit must get batched flow_query hint:\n{app_brief}");
     assert!(app_brief.contains("AlphaWorker"), "dependent unit should still receive built upstream symbols:\n{app_brief}");
 }
+
+#[tokio::test]
+async fn tok9_warm_planner_session_repairs_and_local_contract_compaction_avoids_replan() {
+    // Part A: warm planner session is reused for `ask_repair` via `follow_up` with compact prompt.
+    let tmp = seeded("tok9-warm-planner");
+    let fresh_planner = Arc::new(Mutex::new(Vec::<String>::new()));
+    let warm_repairs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    struct WarmPlannerSession {
+        warm_repairs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl tm_harness::Session for WarmPlannerSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.warm_repairs.lock().unwrap().push(text);
+            let fixed = serde_json::json!({
+                "kind": "library",
+                "summary": "Fixed plan",
+                "contracts": [{ "path": "pkg/contract.py", "content": "def api() -> int: ...\n" }],
+                "units": [
+                    { "id": "core", "owned_glob": "pkg/core.py", "brief": "Implement api.", "context": "", "done": "done" }
+                ],
+                "estimate": { "tokens": 0, "usd": 0 },
+                "dictionary": []
+            })
+            .to_string();
+            let _ = events.send(HarnessEvent::Text { text: fixed }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+        fn session_id(&self) -> Option<&str> {
+            Some("planner-warm-1")
+        }
+        async fn close(self: Box<Self>) -> tm_harness::Freed {
+            tm_harness::Freed::default()
+        }
+    }
+
+    struct WarmPlannerHarness {
+        fresh_planner: Arc<Mutex<Vec<String>>>,
+        warm_repairs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Harness for WarmPlannerHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn tm_harness::Session>>) {
+            if task.brief.contains("Plan this") || task.brief.contains("Repair this plan") {
+                self.fresh_planner.lock().unwrap().push(task.brief.clone());
+                // Deliberately invalid: unit `core` has an empty brief so `accept_plan` rejects it.
+                let bad = serde_json::json!({
+                    "kind": "library",
+                    "summary": "Bad plan",
+                    "contracts": [{ "path": "pkg/contract.py", "content": "def api() -> int: ...\n" }],
+                    "units": [
+                        { "id": "core", "owned_glob": "pkg/core.py", "brief": "", "context": "", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string();
+                let _ = events.send(HarnessEvent::Text { text: bad }).await;
+                let sess: Box<dyn tm_harness::Session> = Box::new(WarmPlannerSession {
+                    warm_repairs: self.warm_repairs.clone(),
+                });
+                (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                    Some(sess),
+                )
+            } else {
+                let _ = std::fs::create_dir_all(task.cwd.join("pkg"));
+                let _ = std::fs::write(task.cwd.join("pkg/core.py"), "def api() -> int:\n    return 1\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+                (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) }),
+                    None,
+                )
+            }
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(WarmPlannerHarness {
+        fresh_planner: fresh_planner.clone(),
+        warm_repairs: warm_repairs.clone(),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = prompt_config(&tmp.0, "Build a small library package.", true);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.browser = false;
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+
+    let fresh = fresh_planner.lock().unwrap().clone();
+    assert_eq!(fresh.len(), 1, "planner should start only 1 fresh session and repair warmly");
+    assert!(fresh[0].contains("hard 200-line limit per contract"), "must state 200-line contract limit up front:\n{}", fresh[0]);
+    assert!(fresh[0].contains("no trailing commas"), "must state strict JSON rules up front:\n{}", fresh[0]);
+    let reps = warm_repairs.lock().unwrap().clone();
+    assert_eq!(reps.len(), 1, "expected 1 warm follow_up repair");
+    assert!(reps[0].contains("empty brief"), "warm repair must state rejection reason:\n{}", reps[0]);
+    assert!(!reps[0].contains("The plan:\n{"), "warm repair must not resend full plan JSON:\n{}", reps[0]);
+
+    // Part B: near-miss 220-line contract with docstrings/blank lines is compacted locally with 0 repairs!
+    let tmp_c = seeded("tok9-local-compact");
+    let planner_calls_c = Arc::new(AtomicUsize::new(0));
+    struct NearMissPlanner(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Harness for NearMissPlanner {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            if task.brief.contains("Plan this") || task.brief.contains("Repair this plan") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let mut contract = String::from("# Header\n\nclass Api:\n    \"\"\"Contract doc.\"\"\"\n\n");
+                for i in 0..44 {
+                    contract.push_str(&format!(
+                        "    # Method {i}\n    def m_{i}(self) -> int:\n        \"\"\"Doc {i}.\"\"\"\n        ...\n\n"
+                    ));
+                }
+                assert!(contract.lines().count() > tm_core::CONTRACT_LINES);
+                let reply = serde_json::json!({
+                    "kind": "library",
+                    "summary": "Near miss contract",
+                    "contracts": [{ "path": "pkg/contract.py", "content": contract }],
+                    "units": [
+                        { "id": "core", "owned_glob": "pkg/core.py", "brief": "Implement Api.", "context": "", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string();
+                let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            } else {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/core.py"), "class ApiImpl: pass\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: None, denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+    let hc: Arc<dyn Harness> = Arc::new(NearMissPlanner(planner_calls_c.clone()));
+    let harnesses_c = Harnesses { master: hc.clone(), mid: hc.clone(), worker: hc.clone(), reviewer: hc.clone(), verifier: hc };
+    let mut cfg_c = prompt_config(&tmp_c.0, "Build a small library package.", true);
+    cfg_c.checks = false;
+    cfg_c.runtime_checks = false;
+    cfg_c.browser = false;
+    assert_eq!(drive(cfg_c, harnesses_c).await.unwrap(), Outcome::Finished { ok: true });
+    assert_eq!(planner_calls_c.load(Ordering::SeqCst), 1, "local compaction must avoid any replan/repair call");
+    let locked = std::fs::read_to_string(tmp_c.0.join("pkg/contract.py")).unwrap();
+    assert!(locked.lines().count() <= tm_core::CONTRACT_LINES);
+    assert!(locked.contains("def m_43(self) -> int:"));
+}

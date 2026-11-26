@@ -29,6 +29,9 @@ pub const CONTRACT_LINES_SOFT: usize = 120;
 /// Hard per-contract line cap: exceeding this rejects the plan and triggers planner repair.
 /// A contract is an interface; a body belongs to the unit that owns the file.
 pub const CONTRACT_LINES: usize = 200;
+/// Maximum lines eligible for safe local contract compaction in [`normalize_plan`] before
+/// rejecting and asking the planner to repair.
+pub const CONTRACT_COMPACT_MAX_LINES: usize = 280;
 /// The most contract lines a whole plan may lock.
 pub const PLAN_CONTRACT_LINES: usize = 400;
 
@@ -337,10 +340,49 @@ pub fn normalize_plan(plan: &mut Plan, drafts: &mut Vec<DraftEntry>) -> Vec<Stri
         if path != contract.path && !path.is_empty() {
             contract.path = path;
         }
+        let before_lines = contract.content.lines().count();
+        if before_lines > CONTRACT_LINES
+            && let Some(compacted) = compact_contract_locally(&contract.path, &contract.content, CONTRACT_LINES)
+        {
+            let after_lines = compacted.lines().count();
+            notes.push(format!(
+                "compacted contract `{}` locally from {before_lines} to {after_lines} lines to fit the {CONTRACT_LINES}-line limit",
+                contract.path
+            ));
+            contract.content = compacted;
+        }
         let inferred = effective_contract_phase(contract, &plan.phases);
         if contract.phase == 0 && inferred > 0 {
             notes.push(format!("tagged contract `{}` for phase {}", contract.path, inferred + 1));
             contract.phase = inferred;
+        }
+    }
+    // If combined contract lines slightly exceed PLAN_CONTRACT_LINES, compact verbose contracts
+    // locally before forcing a planner repair round-trip.
+    let total_contract_lines: usize = plan.contracts.iter().map(|c| c.content.lines().count()).sum();
+    if total_contract_lines > PLAN_CONTRACT_LINES && total_contract_lines <= PLAN_CONTRACT_LINES + 160 {
+        let mut remaining_over = total_contract_lines - PLAN_CONTRACT_LINES;
+        for contract in &mut plan.contracts {
+            if remaining_over == 0 {
+                break;
+            }
+            let before = contract.content.lines().count();
+            if before <= CONTRACT_LINES_SOFT {
+                continue;
+            }
+            let goal = before.saturating_sub(remaining_over).max(CONTRACT_LINES_SOFT);
+            if let Some(compacted) = compact_contract_locally(&contract.path, &contract.content, goal) {
+                let after = compacted.lines().count();
+                if after < before {
+                    let saved = before - after;
+                    remaining_over = remaining_over.saturating_sub(saved);
+                    notes.push(format!(
+                        "compacted contract `{}` locally from {before} to {after} lines to stay within the {PLAN_CONTRACT_LINES}-line plan limit",
+                        contract.path
+                    ));
+                    contract.content = compacted;
+                }
+            }
         }
     }
     // One unit owns everything: a contract inside its files has nobody to share with, so it
@@ -374,6 +416,188 @@ pub fn normalize_plan(plan: &mut Plan, drafts: &mut Vec<DraftEntry>) -> Vec<Stri
     }
     *drafts = kept;
     notes
+}
+
+/// Safely compact a contract file that is marginally over `target_lines` (up to
+/// [`CONTRACT_COMPACT_MAX_LINES`]) by removing redundant blank lines, non-directive comment
+/// padding, and (for non-test Python interface files) standalone docstrings and 2-line `...`/`pass`
+/// stubs. Returns `None` if the file cannot be safely brought to `<= target_lines`.
+pub fn compact_contract_locally(path: &str, content: &str, target_lines: usize) -> Option<String> {
+    let initial = content.lines().count();
+    if initial <= target_lines || initial > CONTRACT_COMPACT_MAX_LINES {
+        return None;
+    }
+
+    // Pass 1: trim trailing whitespace, drop leading/trailing blank lines, collapse multiple blanks.
+    let mut lines: Vec<String> = Vec::with_capacity(initial);
+    let mut prev_blank = true;
+    for raw in content.lines() {
+        let trimmed_end = raw.trim_end();
+        if trimmed_end.is_empty() {
+            if !prev_blank {
+                lines.push(String::new());
+                prev_blank = true;
+            }
+        } else {
+            lines.push(trimmed_end.to_string());
+            prev_blank = false;
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    if !lines.is_empty() && lines.len() <= target_lines {
+        return Some(format!("{}\n", lines.join("\n")));
+    }
+
+    // Pass 2: drop blank lines and standalone non-directive comments outside triple-quoted strings.
+    let mut pass2: Vec<String> = Vec::with_capacity(lines.len());
+    let mut in_triple: Option<&'static str> = None;
+    for line in &lines {
+        let trimmed = line.trim();
+        if in_triple.is_none() {
+            if trimmed.is_empty() || is_strip_comment(trimmed) {
+                continue;
+            }
+            if let Some(q) = starts_unclosed_triple(trimmed) {
+                in_triple = Some(q);
+            }
+            pass2.push(line.clone());
+        } else {
+            let q = in_triple.unwrap();
+            if trimmed.contains(q) {
+                in_triple = None;
+            }
+            pass2.push(line.clone());
+        }
+    }
+    if !pass2.is_empty() && pass2.len() <= target_lines {
+        return Some(format!("{}\n", pass2.join("\n")));
+    }
+
+    // Pass 3: for non-test Python interface contracts only, strip standalone triple-quoted
+    // docstrings (inserting `...` if that empties a block) and fold 2-line `def ...:\n    ...` stubs.
+    let is_py_interface = path.ends_with(".py") && !crate::types::is_test_path(path);
+    if !is_py_interface {
+        return None;
+    }
+    let no_docs = strip_python_docstrings(&pass2);
+    if !no_docs.is_empty() && no_docs.len() <= target_lines {
+        return Some(format!("{}\n", no_docs.join("\n")));
+    }
+    let folded = fold_python_stubs(&no_docs);
+    if !folded.is_empty() && folded.len() <= target_lines {
+        return Some(format!("{}\n", folded.join("\n")));
+    }
+    None
+}
+
+fn is_strip_comment(trimmed: &str) -> bool {
+    if trimmed.starts_with('#') {
+        let keep = trimmed.starts_with("#!")
+            || trimmed.starts_with("# -*-")
+            || trimmed.starts_with("# coding:")
+            || trimmed.contains("type:")
+            || trimmed.contains("noqa")
+            || trimmed.contains("pylint:")
+            || trimmed.contains("pyright:")
+            || trimmed.contains("fmt:");
+        return !keep;
+    }
+    if trimmed.starts_with("//") {
+        let keep = trimmed.starts_with("///")
+            || trimmed.starts_with("//!")
+            || trimmed.contains("@ts-")
+            || trimmed.contains("eslint-");
+        return !keep;
+    }
+    false
+}
+
+fn starts_unclosed_triple(trimmed: &str) -> Option<&'static str> {
+    for q in ["\"\"\"", "'''"] {
+        let count = trimmed.matches(q).count();
+        if count % 2 == 1 {
+            return Some(q);
+        }
+    }
+    None
+}
+
+fn indent_width(line: &str) -> usize {
+    line.bytes().take_while(|&b| b == b' ' || b == b'\t').count()
+}
+
+fn strip_python_docstrings(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        let trimmed = line.trim();
+        let quote = if trimmed.starts_with("\"\"\"") {
+            Some("\"\"\"")
+        } else if trimmed.starts_with("'''") {
+            Some("'''")
+        } else {
+            None
+        };
+        if let Some(q) = quote {
+            let doc_indent = indent_width(line);
+            let mut end = i;
+            if trimmed[q.len()..].contains(q) {
+                // Single-line docstring
+            } else {
+                end += 1;
+                while end < lines.len() && !lines[end].contains(q) {
+                    end += 1;
+                }
+            }
+            // If this docstring was the ONLY statement inside a `def`/`class` header, leave `...`.
+            let prev_opens_block = out.last().is_some_and(|prev| {
+                let pt = prev.trim();
+                pt.ends_with(':') && indent_width(prev) < doc_indent
+            });
+            let next_indent = lines.get(end + 1).map(|l| indent_width(l)).unwrap_or(0);
+            if prev_opens_block && next_indent < doc_indent {
+                let pad = &line[..doc_indent];
+                out.push(format!("{pad}..."));
+            }
+            i = end + 1;
+            continue;
+        }
+        out.push(line.clone());
+        i += 1;
+    }
+    out
+}
+
+fn fold_python_stubs(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let cur = &lines[i];
+        let cur_trim = cur.trim();
+        if (cur_trim.starts_with("def ") || cur_trim.starts_with("async def "))
+            && cur_trim.ends_with(':')
+            && let Some(next) = lines.get(i + 1)
+        {
+            let next_trim = next.trim();
+            let cur_indent = indent_width(cur);
+            let next_indent = indent_width(next);
+            let after_indent = lines.get(i + 2).map(|l| indent_width(l)).unwrap_or(0);
+            if next_indent > cur_indent
+                && matches!(next_trim, "..." | "pass")
+                && after_indent <= cur_indent
+            {
+                out.push(format!("{cur} {next_trim}"));
+                i += 2;
+                continue;
+            }
+        }
+        out.push(cur.clone());
+        i += 1;
+    }
+    out
 }
 
 /// Effective phase index (0-indexed) of a contract file in a multi-phase plan.
@@ -689,5 +913,44 @@ mod tests {
         );
         assert!(check_plan(&hard, &[], &BTreeMap::new()).is_err());
         assert!(plan_warnings(&hard).is_empty(), "over hard cap is an error, not a soft warning");
+    }
+
+    #[test]
+    fn local_contract_compaction_trims_near_miss_without_weakening_dense_hard_cap() {
+        // 225-line Python interface contract with blank lines, comments, docstrings, and 2-line stubs.
+        let mut body = String::from("# Shared interface\n\nclass Engine:\n    \"\"\"\n    Database engine interface.\n    \"\"\"\n\n");
+        for i in 0..44 {
+            body.push_str(&format!(
+                "    # Method {i}\n    def op_{i}(self, x: int) -> int:\n        \"\"\"Run operation {i}.\"\"\"\n        ...\n\n"
+            ));
+        }
+        assert!(body.lines().count() > CONTRACT_LINES && body.lines().count() <= CONTRACT_COMPACT_MAX_LINES);
+        let mut plan = Plan {
+            kind: ProjectKind::Library,
+            contracts: vec![ContractFile { path: "pkg/contract.py".into(), content: body, phase: 0 }],
+            pages: vec![module("engine", "pkg/engine.py")],
+            ..Default::default()
+        };
+        let notes = normalize_plan(&mut plan, &mut Vec::new());
+        assert!(notes.iter().any(|n| n.contains("compacted contract `pkg/contract.py` locally")), "{notes:?}");
+        assert!(plan.contracts[0].content.lines().count() <= CONTRACT_LINES);
+        assert!(plan.contracts[0].content.contains("def op_0(self, x: int) -> int:"));
+        assert!(plan.contracts[0].content.contains("def op_43(self, x: int) -> int:"));
+        check_plan(&plan, &[], &BTreeMap::new()).unwrap();
+
+        // A genuinely dense 201-line contract with no blank lines/comments/docstrings stays rejected.
+        let mut dense = Plan {
+            kind: ProjectKind::Library,
+            contracts: vec![ContractFile {
+                path: "pkg/dense.py".into(),
+                content: "def f() -> None: ...\n".repeat(CONTRACT_LINES + 1),
+                phase: 0,
+            }],
+            pages: vec![module("engine", "pkg/engine.py")],
+            ..Default::default()
+        };
+        let dense_notes = normalize_plan(&mut dense, &mut Vec::new());
+        assert!(dense_notes.iter().all(|n| !n.contains("compacted")));
+        assert!(check_plan(&dense, &[], &BTreeMap::new()).is_err());
     }
 }

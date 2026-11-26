@@ -476,6 +476,16 @@ fn repo(name: &str) -> Tmp {
     Tmp(dir)
 }
 
+#[cfg(unix)]
+fn socket_temp_dir() -> PathBuf {
+    let temp = std::env::temp_dir();
+    if temp.as_os_str().len() > 50 && Path::new("/tmp").is_dir() {
+        PathBuf::from("/tmp")
+    } else {
+        temp
+    }
+}
+
 /// A repository that already has a commit, so a run gets a branch of its own.
 fn seeded(name: &str) -> Tmp {
     let tmp = repo(name);
@@ -2135,7 +2145,7 @@ mod http {
     async fn h3_the_next_daemon_takes_a_handed_off_run_over_by_itself() {
         let tmp = seeded("h3-server");
         choose_roles(&tmp.0);
-        let side = std::env::temp_dir().join(format!("tm-h3-server-{}", std::process::id()));
+        let side = socket_temp_dir().join(format!("tm-h3-server-{}", std::process::id()));
         let (bin, go, started) = fake_claude(&side);
         let holder = tm_harness::hold::in_process(&side.join("hold")).unwrap();
         let options = |holder: tm_harness::hold::Holder| {
@@ -3780,7 +3790,7 @@ mod http {
         let (status, opened) = client.post("/api/open", json!({ "path": "app/home/page.tsx", "line": 3 })).await;
         assert_eq!(status, 202, "{opened}");
         for _ in 0..200 {
-            if log.is_file() {
+            if std::fs::read_to_string(&log).is_ok_and(|s| s.contains('\n')) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -6597,6 +6607,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
         fresh_briefs: Mutex<Vec<String>>,
         resumed_calls: Mutex<Vec<(String, String)>>,
         interrupt_once: std::sync::atomic::AtomicBool,
+        cancelled: Arc<tokio::sync::Notify>,
     }
     #[async_trait]
     impl Harness for ResumingHarness {
@@ -6614,8 +6625,9 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
                 .send(HarnessEvent::SessionStarted { session_id: "sess-h2-restart".into() })
                 .await;
             if self.interrupt_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                // Simulate daemon crash/restart mid-turn right after recording the session id.
-                tokio::time::sleep(Duration::from_millis(80)).await;
+                // Wait for the test to observe `sess-h2-restart` and cancel the first drive,
+                // instead of racing a fixed sleep against the 50ms transcript flush interval.
+                let _ = tokio::time::timeout(Duration::from_secs(5), self.cancelled.notified()).await;
                 anyhow::bail!("simulated daemon restart mid-worker");
             }
             let page_file = task.cwd.join("app/a/page.ts");
@@ -6655,10 +6667,12 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
         }
     }
 
+    let cancelled = Arc::new(tokio::sync::Notify::new());
     let rh = Arc::new(ResumingHarness {
         fresh_briefs: Mutex::new(Vec::new()),
         resumed_calls: Mutex::new(Vec::new()),
         interrupt_once: std::sync::atomic::AtomicBool::new(true),
+        cancelled: cancelled.clone(),
     });
     let h: Arc<dyn Harness> = rh.clone();
     let harnesses = Harnesses {
@@ -6688,6 +6702,7 @@ async fn h2_interrupted_worker_resumes_with_recorded_session_id_without_resendin
         let (_, entries) = live_check.read("r-h2", 0);
         if entries.iter().any(|e| e.get("session_id").and_then(|v| v.as_str()) == Some("sess-h2-restart")) {
             let _ = cancel_tx.send(true);
+            cancelled.notify_one();
             break;
         }
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -7332,7 +7347,7 @@ impl Harness for Plain {
 #[tokio::test]
 async fn h3_a_builder_handed_off_mid_turn_goes_on_in_the_next_daemon_without_starting_again() {
     let tmp = repo("h3-handoff");
-    let side = std::env::temp_dir().join(format!("tm-h3-side-{}", std::process::id()));
+    let side = socket_temp_dir().join(format!("tm-h3-side-{}", std::process::id()));
     let (bin, go, started) = fake_claude(&side);
     let plain: Arc<dyn Harness> = Arc::new(Plain);
     let worker: Arc<dyn Harness> = Arc::new(tm_harness::claude::ClaudeCode { binary: bin.display().to_string(), sandbox: None });
@@ -8611,4 +8626,608 @@ async fn judge_refuses_locked_contract_and_policy_denied_files_even_under_wildca
     assert!(seen[2].contains("policy denied write to `.env`"), "{}", seen[2]);
     assert_eq!(read(&tmp.0.join("tests/test_contract.py")), contract_body);
     assert!(!tmp.0.join(".env").exists(), "policy-denied .env must never be merged");
+}
+
+#[tokio::test]
+async fn contract_soft_cap_warns_without_repair_while_hard_cap_triggers_repair() {
+    struct CapPlanner {
+        initial_lines: usize,
+        planner_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for CapPlanner {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let reply = if task.brief.contains("Plan this") || task.brief.contains("Repair this plan") {
+                let n = self.planner_calls.fetch_add(1, Ordering::SeqCst);
+                let lines = if n == 0 { self.initial_lines } else { 80 };
+                let body = "def f() -> None: ...\n".repeat(lines);
+                serde_json::json!({
+                    "kind": "library",
+                    "summary": "Small lib",
+                    "contracts": [{ "path": "pkg/contracts.py", "content": body }],
+                    "units": [
+                        { "id": "core", "owned_glob": "pkg/core.py", "brief": "Implement core using pkg/contracts.py.", "done": "done" }
+                    ],
+                    "estimate": { "tokens": 0, "usd": 0 },
+                    "dictionary": []
+                })
+                .to_string()
+            } else {
+                std::fs::create_dir_all(task.cwd.join("pkg"))?;
+                std::fs::write(task.cwd.join("pkg/core.py"), "x = 1\n")?;
+                "done\nRELEASE unit:core\n".into()
+            };
+            let _ = events.send(HarnessEvent::Text { text: reply }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    // 1. Soft overrun (125 lines: > 120 soft cap, <= 200 hard cap) -> 1 planner call (no repair), emits warning.
+    let tmp_soft = seeded("c2-soft-cap");
+    let soft_calls = Arc::new(AtomicUsize::new(0));
+    let h_soft: Arc<dyn Harness> = Arc::new(CapPlanner {
+        initial_lines: 125,
+        planner_calls: soft_calls.clone(),
+    });
+    let mut cfg = prompt_config(&tmp_soft.0, "Build a small library package.", true);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h_soft.clone(),
+        mid: h_soft.clone(),
+        worker: h_soft.clone(),
+        reviewer: h_soft.clone(),
+        verifier: h_soft,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(soft_calls.load(Ordering::SeqCst), 1, "125-line contract must not force planner repair");
+    let agents_log = read(&run_directory(&tmp_soft.0, "current").join("agents.jsonl"));
+    assert!(agents_log.contains("\"category\":\"contract_size\""), "soft cap warning should be emitted: {agents_log}");
+
+    // 2. Hard overrun (205 lines: > 200 hard cap) -> rejected and triggers planner repair (2 planner calls).
+    let tmp_hard = seeded("c2-hard-cap");
+    let hard_calls = Arc::new(AtomicUsize::new(0));
+    let h_hard: Arc<dyn Harness> = Arc::new(CapPlanner {
+        initial_lines: 205,
+        planner_calls: hard_calls.clone(),
+    });
+    let mut cfg_hard = prompt_config(&tmp_hard.0, "Build a small library package.", true);
+    cfg_hard.checks = false;
+    cfg_hard.runtime_checks = false;
+    let harnesses_hard = Harnesses {
+        master: h_hard.clone(),
+        mid: h_hard.clone(),
+        worker: h_hard.clone(),
+        reviewer: h_hard.clone(),
+        verifier: h_hard,
+    };
+    let outcome_hard = drive(cfg_hard, harnesses_hard).await.unwrap();
+    assert_eq!(outcome_hard, Outcome::Finished { ok: true });
+    assert_eq!(hard_calls.load(Ordering::SeqCst), 2, "205-line contract must trigger planner repair");
+}
+
+#[tokio::test]
+async fn scheduling_wave_starts_long_pole_unit_first_under_parallel_limit() {
+    struct OrderRecorder {
+        started: Arc<Mutex<Vec<String>>>,
+        wave1_barrier: Arc<tokio::sync::Barrier>,
+        wave1_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for OrderRecorder {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let slot = self.wave1_count.fetch_add(1, Ordering::SeqCst);
+            self.started.lock().unwrap().push(unit.clone());
+            // Hold the first two wave-1 workers together briefly so both wave-1 slots are clearly observed.
+            if slot < 2 {
+                let _ = tokio::time::timeout(Duration::from_secs(5), self.wave1_barrier.wait()).await;
+            }
+            let file = task.cwd.join(format!("pkg/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            let _ = events.send(HarnessEvent::Text { text: format!("done\nRELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp = repo("c3-wave-order");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![ContractFile {
+            path: "pkg/contracts.py".into(),
+            content: "class Core: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![
+            PagePlan {
+                id: "short_leaf".into(),
+                owned_glob: "pkg/short_leaf.py".into(),
+                brief: "Tiny.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "small_mid".into(),
+                owned_glob: "pkg/small_mid.py".into(),
+                brief: "Small.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "big_mid".into(),
+                owned_glob: "{pkg/big_mid.py,pkg/big_mid_helper.py,tests/test_big_mid.py}".into(),
+                brief: "Large complex execution unit with joins, grouping, sorting, and error handling.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "root_pole".into(),
+                owned_glob: "pkg/root_pole.py".into(),
+                brief: "Foundation.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "middle".into(),
+                owned_glob: "pkg/middle.py".into(),
+                brief: "Imports pkg/root_pole.py directly.".into(),
+                depends_on: vec!["root_pole".into()],
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "pkg/cli.py".into(),
+                brief: "Imports pkg/middle.py, pkg/big_mid.py, pkg/small_mid.py.".into(),
+                depends_on: vec!["middle".into(), "big_mid".into(), "small_mid".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(OrderRecorder {
+        started: started.clone(),
+        wave1_barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        wave1_count: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut cfg = config(&tmp.0, p, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    let order = started.lock().unwrap().clone();
+    assert_eq!(order.len(), 6, "{order:?}");
+    let mut wave1: Vec<String> = order[..2].to_vec();
+    wave1.sort();
+    assert_eq!(
+        wave1,
+        vec!["big_mid".to_string(), "root_pole".to_string()],
+        "wave 1 (parallel=2) must start root_pole (downstream=2) and big_mid (downstream=1, largest), got full order: {order:?}"
+    );
+}
+
+#[tokio::test]
+async fn worker_brief_deduplicates_contracts_full_when_used_and_signatures_otherwise() {
+    struct BriefCapturer {
+        briefs: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Harness for BriefCapturer {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let unit = task
+                .brief
+                .split("Build unit `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown")
+                .to_string();
+            self.briefs.lock().unwrap().push((unit.clone(), task.brief.clone()));
+            let file = task.cwd.join(format!("tinydb/{unit}.py"));
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, format!("# {unit}\n"))?;
+            let _ = events.send(HarnessEvent::Text { text: format!("done\nRELEASE unit:{unit}\n") }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let contracts_py = concat!(
+        "\"\"\"Core shared protocols.\"\"\"\n",
+        "class BTreeProtocol:\n",
+        "    # SHARED_BODY_MARKER_ALPHA\n",
+        "    def search(self, key: str) -> bytes | None: ...\n",
+        "    def insert(self, key: str, value: bytes) -> None: ...\n",
+    );
+    let ast_nodes_py = concat!(
+        "\"\"\"AST node definitions.\"\"\"\n",
+        "class SelectStmt:\n",
+        "    # AST_BODY_MARKER_BETA\n",
+        "    columns: tuple[str, ...]\n",
+        "    table: str\n",
+        "    limit: int | None\n",
+        "class InsertStmt:\n",
+        "    # AST_BODY_MARKER_GAMMA\n",
+        "    table: str\n",
+        "    values: tuple[str, ...]\n",
+    );
+    let acceptance_py = format!(
+        concat!(
+            "\"\"\"End-to-end acceptance tests.\"\"\"\n",
+            "def test_end_to_end_cli() -> None:\n",
+            "    # ACCEPTANCE_BODY_MARKER_DELTA\n",
+            "{}",
+            "    assert True\n",
+        ),
+        "    x = 'padding line for realistic acceptance test size'\n".repeat(30),
+    );
+
+    let tmp = repo("c4-brief-dedup");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Library,
+        contracts: vec![
+            ContractFile { path: "tinydb/contracts.py".into(), content: contracts_py.into(), phase: 0 },
+            ContractFile { path: "tinydb/ast_nodes.py".into(), content: ast_nodes_py.into(), phase: 0 },
+            ContractFile { path: "tests/test_acceptance_contract.py".into(), content: acceptance_py.clone(), phase: 0 },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "btree".into(),
+                owned_glob: "tinydb/btree.py".into(),
+                brief: "Implement BTreeProtocol from tinydb.contracts.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "parser".into(),
+                owned_glob: "tinydb/parser.py".into(),
+                brief: "Implement SQL parser using tinydb.contracts and tinydb.ast_nodes.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "tinydb/cli.py".into(),
+                brief: "Wire CLI using tinydb.contracts.".into(),
+                done: "All tests including tests/test_acceptance_contract.py pass.".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let briefs = Arc::new(Mutex::new(Vec::new()));
+    let h: Arc<dyn Harness> = Arc::new(BriefCapturer { briefs: briefs.clone() });
+    let mut cfg = config(&tmp.0, p, true, 3);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+
+    let captured = briefs.lock().unwrap().clone();
+    let get = |id: &str| captured.iter().find(|(u, _)| u == id).map(|(_, b)| b.clone()).unwrap();
+    let btree = get("btree");
+    let parser = get("parser");
+    let cli = get("cli");
+
+    // Shared prefix remains byte-identical across workers for prompt caching.
+    let prefix = |b: &str| b.split("--- Your task ---").next().unwrap().to_string();
+    assert_eq!(prefix(&btree), prefix(&parser));
+    assert_eq!(prefix(&btree), prefix(&cli));
+
+    // `tinydb/contracts.py` is used by all units -> appears ONCE in full, never repeated in context pack.
+    for (name, b) in [("btree", &btree), ("parser", &parser), ("cli", &cli)] {
+        assert_eq!(
+            b.matches("class BTreeProtocol").count(),
+            1,
+            "{name} brief must contain tinydb/contracts.py exactly once (not full + signatures): {b}"
+        );
+        assert!(b.contains("SHARED_BODY_MARKER_ALPHA"), "{name} brief should have full tinydb/contracts.py");
+        assert!(
+            !b.contains("### `tinydb/contracts.py`"),
+            "{name} brief must not duplicate tinydb/contracts.py in context pack"
+        );
+    }
+
+    // `tinydb/ast_nodes.py` is used by `parser` only:
+    // - `parser` gets full text ONCE (never signatures too).
+    // - `btree` and `cli` get signatures ONLY ONCE (never full body).
+    assert_eq!(parser.matches("class SelectStmt").count(), 1, "parser must see SelectStmt once: {parser}");
+    assert!(parser.contains("AST_BODY_MARKER_BETA"), "parser must get full ast_nodes.py");
+    assert!(!parser.contains("### `tinydb/ast_nodes.py`"));
+
+    assert_eq!(btree.matches("class SelectStmt").count(), 1, "btree must see SelectStmt signature once: {btree}");
+    assert!(!btree.contains("AST_BODY_MARKER_BETA"), "btree must NOT get full body of unused ast_nodes.py");
+
+    // `tests/test_acceptance_contract.py` is referenced by `cli` only:
+    // - `cli` gets full text ONCE.
+    // - `btree` and `parser` get signatures ONLY ONCE (saving the full acceptance body).
+    assert_eq!(cli.matches("def test_end_to_end_cli").count(), 1, "cli must see acceptance test once: {cli}");
+    assert!(cli.contains("ACCEPTANCE_BODY_MARKER_DELTA"), "cli must get full acceptance test");
+    assert_eq!(btree.matches("def test_end_to_end_cli").count(), 1, "btree must see acceptance test signature once: {btree}");
+    assert!(!btree.contains("ACCEPTANCE_BODY_MARKER_DELTA"), "btree must NOT get full body of unused acceptance test");
+    assert!(!parser.contains("ACCEPTANCE_BODY_MARKER_DELTA"), "parser must NOT get full body of unused acceptance test");
+
+    // Deduplicated brief for `btree` is strictly smaller than the old brief that pasted
+    // all full contracts AND all contract signatures.
+    let old_extra_bytes = ast_nodes_py.len() + acceptance_py.len();
+    assert!(
+        btree.len() + 1000 < cli.len() + old_extra_bytes,
+        "btree brief ({}) should be materially smaller than pasting all contracts + signatures",
+        btree.len()
+    );
+    assert!(
+        btree.len() < cli.len(),
+        "btree ({}) should be smaller than cli ({}) because cli needs full acceptance test",
+        btree.len(),
+        cli.len()
+    );
+}
+
+#[tokio::test]
+async fn ownership_gate_drops_stray_junk_files_but_still_refuses_contracts_and_policy_denied() {
+    // 1. Worker writes its owned file PLUS stray junk files (e.g. accidental quoted file and scratch note):
+    //    stray files are ignored (not merged), a warning is logged, and the owned file merges on attempt 1.
+    struct StrayWriter {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for StrayWriter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/cli.py"), "def main():\n    return 0\n")?;
+            // Stray files outside `pkg/cli.py` (neither a locked contract nor policy-denied).
+            std::fs::write(task.cwd.join("\"README.md\""), "accidental quoted file\n")?;
+            std::fs::write(task.cwd.join("scratch_notes.tmp"), "junk\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp = repo("c5-stray-drop");
+    let p = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![ContractFile {
+            path: "pkg/contracts.py".into(),
+            content: "class Api: ...\n".into(),
+            phase: 0,
+        }],
+        pages: vec![PagePlan {
+            id: "cli".into(),
+            owned_glob: "pkg/cli.py".into(),
+            brief: "Write pkg/cli.py.".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let h: Arc<dyn Harness> = Arc::new(StrayWriter { attempts: attempts.clone() });
+    let mut cfg = config(&tmp.0, p.clone(), true, 1);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    let harnesses = Harnesses {
+        master: h.clone(),
+        mid: h.clone(),
+        worker: h.clone(),
+        reviewer: h.clone(),
+        verifier: h,
+    };
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "owned work must merge on attempt 1 without discard/repair");
+    assert_eq!(read(&tmp.0.join("pkg/cli.py")), "def main():\n    return 0\n");
+    assert!(!tmp.0.join("\"README.md\"").exists(), "stray quoted file must not be merged");
+    assert!(!tmp.0.join("scratch_notes.tmp").exists(), "stray temp file must not be merged");
+    let agents_log = read(&run_directory(&tmp.0, "current").join("agents.jsonl"));
+    assert!(agents_log.contains("\"kind\":\"stray_files_ignored\""), "warning event should be logged: {agents_log}");
+    assert!(agents_log.contains("scratch_notes.tmp"), "{agents_log}");
+
+    // 2. Worker writes owned file PLUS a locked contract (attempt 1) and then owned file PLUS a
+    //    policy-denied `.env` outside its glob (attempt 2): BOTH must still be refused until attempt 3.
+    struct SensitiveOutsideWriter {
+        attempts: Arc<AtomicUsize>,
+        briefs: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Harness for SensitiveOutsideWriter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.briefs.lock().unwrap().push(task.brief.clone());
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/cli.py"), format!("v = {n}\n"))?;
+            match n {
+                0 => {
+                    // Attempt 1: touches locked contract outside glob -> must refuse entire unit.
+                    std::fs::write(task.cwd.join("pkg/contracts.py"), "# tampered\n")?;
+                }
+                1 => {
+                    // Attempt 2: touches policy-denied `.env` outside glob -> must refuse entire unit.
+                    std::fs::write(task.cwd.join(".env"), "SECRET=bad\n")?;
+                }
+                _ => {
+                    // Attempt 3: clean owned file + harmless stray file -> merges cleanly.
+                    std::fs::write(task.cwd.join("harmless.tmp"), "ignored\n")?;
+                }
+            }
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp2 = repo("c5-sensitive-refused");
+    let attempts2 = Arc::new(AtomicUsize::new(0));
+    let briefs2 = Arc::new(Mutex::new(Vec::new()));
+    let h2: Arc<dyn Harness> = Arc::new(SensitiveOutsideWriter {
+        attempts: attempts2.clone(),
+        briefs: briefs2.clone(),
+    });
+    let mut cfg2 = config(&tmp2.0, p, true, 1);
+    cfg2.checks = false;
+    cfg2.runtime_checks = false;
+    let harnesses2 = Harnesses {
+        master: h2.clone(),
+        mid: h2.clone(),
+        worker: h2.clone(),
+        reviewer: h2.clone(),
+        verifier: h2,
+    };
+    let outcome2 = drive(cfg2, harnesses2).await.unwrap();
+    assert_eq!(outcome2, Outcome::Finished { ok: true });
+    assert_eq!(attempts2.load(Ordering::SeqCst), 3, "locked contract and .env must both be refused");
+    assert_eq!(read(&tmp2.0.join("pkg/contracts.py")), "class Api: ...\n");
+    assert!(!tmp2.0.join(".env").exists());
+    assert!(!tmp2.0.join("harmless.tmp").exists());
+    assert_eq!(read(&tmp2.0.join("pkg/cli.py")), "v = 2\n");
+    let seen = briefs2.lock().unwrap().clone();
+    assert!(seen[1].contains("pkg/contracts.py") && seen[1].contains("were not merged"), "{}", seen[1]);
+    assert!(seen[2].contains("policy denied write to `.env`"), "{}", seen[2]);
+
+    // 3. Worker writes ONLY a stray file and no owned files -> fails (does not silently pass).
+    struct OnlyStrayWriter;
+
+    #[async_trait]
+    impl Harness for OnlyStrayWriter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            std::fs::write(task.cwd.join("only_stray.tmp"), "junk\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "done\nRELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 20, output: 10, cache_read: 0, cache_write: 0 },
+                cost_usd: Some(0.01),
+                denied: 0,
+                freed: None,
+            })
+        }
+    }
+
+    let tmp3 = repo("c5-only-stray");
+    let h3: Arc<dyn Harness> = Arc::new(OnlyStrayWriter);
+    let mut cfg3 = config(&tmp3.0, Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![],
+        pages: vec![PagePlan {
+            id: "cli".into(),
+            owned_glob: "pkg/cli.py".into(),
+            brief: "Write pkg/cli.py.".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }, true, 1);
+    cfg3.checks = false;
+    cfg3.runtime_checks = false;
+    let harnesses3 = Harnesses {
+        master: h3.clone(),
+        mid: h3.clone(),
+        worker: h3.clone(),
+        reviewer: h3.clone(),
+        verifier: h3,
+    };
+    let outcome3 = drive(cfg3, harnesses3).await.unwrap();
+    assert_eq!(outcome3, Outcome::Finished { ok: false });
+    assert!(!tmp3.0.join("only_stray.tmp").exists());
 }

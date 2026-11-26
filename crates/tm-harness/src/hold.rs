@@ -961,7 +961,14 @@ mod unix {
     /// A holder served on a tokio task, for tests: its socket in `dir`, never idle-exiting.
     pub fn in_process(dir: &Path) -> io::Result<Holder> {
         std::fs::create_dir_all(dir)?;
-        let socket = dir.join("hold.sock");
+        let candidate = dir.join("hold.sock");
+        let socket = if candidate.as_os_str().len() >= 96 && Path::new("/tmp").is_dir() {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PathBuf::from("/tmp").join(format!("tm-hold-{}-{seq}.sock", std::process::id()))
+        } else {
+            candidate
+        };
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket)?;
         tokio::spawn(async move {
@@ -995,7 +1002,13 @@ mod tests {
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tm-hold-{name}-{}", std::process::id()));
+        let temp = std::env::temp_dir();
+        let base = if temp.as_os_str().len() > 50 && Path::new("/tmp").is_dir() {
+            PathBuf::from("/tmp")
+        } else {
+            temp
+        };
+        let dir = base.join(format!("tm-hold-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

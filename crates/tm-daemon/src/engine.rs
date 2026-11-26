@@ -1077,12 +1077,15 @@ impl Driver {
         }
     }
 
-    /// Index of the first leading `SpawnWorker` command whose `depends_on` upstream units have
-    /// already passed or are satisfied by a locked interface contract (ignoring unknown IDs).
-    /// Only scans the leading contiguous `SpawnWorker` prefix so ordering barriers (checks/merge)
-    /// are never bypassed.
+    /// Index of the highest-priority ready `SpawnWorker` command in the leading contiguous
+    /// `SpawnWorker` prefix (so ordering barriers like checks/merge are never bypassed).
+    /// A unit is ready when its `depends_on` upstream units have passed or are satisfied by a
+    /// locked interface contract. Among ready units, picks the one with the longest downstream
+    /// dependency chain, tie-breaking by estimated unit size then queue position.
     fn next_ready_spawn(&self) -> Option<usize> {
         let plan = self.run.plan.as_ref();
+        let downstream = plan.map(tm_core::downstream_chain_lengths);
+        let mut best: Option<(usize, usize, usize)> = None;
         for (idx, cmd) in self.pending.iter().enumerate() {
             let Command::SpawnWorker { page, .. } = cmd else {
                 break;
@@ -1102,10 +1105,22 @@ impl Driver {
                 }
             });
             if ready {
-                return Some(idx);
+                let chain = downstream
+                    .as_ref()
+                    .and_then(|m| m.get(page))
+                    .copied()
+                    .unwrap_or(0);
+                let size = unit.map(tm_core::estimated_unit_size).unwrap_or(0);
+                let better = match best {
+                    None => true,
+                    Some((best_chain, best_size, _)) => (chain, size) > (best_chain, best_size),
+                };
+                if better {
+                    best = Some((chain, size, idx));
+                }
             }
         }
-        None
+        best.map(|(_, _, idx)| idx)
     }
 
     async fn idle(&mut self) -> anyhow::Result<Step> {
@@ -1360,6 +1375,10 @@ impl Driver {
         };
         if let Err(found) = check_plan(&checked, &drafts, &existing) {
             errors.extend(found);
+        } else {
+            for warning in tm_core::plan_warnings(&checked) {
+                eprintln!("taskmaster: warning: {warning}");
+            }
         }
         // Plan-vs-prompt consistency check: flag contract constants contradicting the user prompt
         // and require a locked acceptance contract test when the prompt specifies literal I/O examples.
@@ -3311,11 +3330,12 @@ impl Driver {
         let units = self.page(page)?.work_units();
         let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut dropped_stray: Vec<String> = Vec::new();
         for (index, product) in products {
             // A file the same as the run's tree is no change: a warm worktree holds what other
             // units built since, and a rewrite of a file to what it already was is nothing.
             let ignored = self.setup_artifacts.get(&product.worktree);
-            let changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
+            let mut changes: Vec<git::Change> = git::worktree_changes(&product.worktree)?
                 .into_iter()
                 .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
                 .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
@@ -3345,10 +3365,42 @@ impl Driver {
             }
             if !outside.is_empty() {
                 let glob = if units.len() > 1 { unit_glob } else { self.page(page)?.owned_glob.clone() };
-                return Ok(failed(format!(
-                    "these files are outside `{glob}` and were not merged: {}",
-                    outside.join(", ")
-                )));
+                let mut locked_outside: Vec<&str> = Vec::new();
+                let mut denied_outside: Vec<(&str, String)> = Vec::new();
+                for path in &outside {
+                    if self.is_locked_contract(path) {
+                        locked_outside.push(path);
+                    } else if let crate::policy::PathVerdict::Denied(denied_glob) = policy.check_path(path) {
+                        denied_outside.push((path, denied_glob));
+                    }
+                }
+                if !locked_outside.is_empty() {
+                    return Ok(failed(format!(
+                        "these files are outside `{glob}` and were not merged (locked contracts are read-only for workers): {}",
+                        locked_outside.join(", ")
+                    )));
+                }
+                if let Some((path, denied_glob)) = denied_outside.first() {
+                    return Ok(failed(format!(
+                        "policy denied write to `{path}` (matched `{denied_glob}`)"
+                    )));
+                }
+                // Non-sensitive stray files outside the unit's owned glob: log a warning and
+                // drop them instead of discarding the unit's valid owned work.
+                let stray_list: Vec<String> = outside.iter().map(|s| (*s).to_string()).collect();
+                eprintln!(
+                    "taskmaster: warning: ignoring stray file(s) outside `{glob}` from {page}: {}",
+                    stray_list.join(", ")
+                );
+                self.live.push(
+                    &self.id,
+                    &serde_json::json!({ "id": self.agent_id(page, None), "page": page }),
+                    "stray_files_ignored",
+                    serde_json::json!({ "glob": glob, "files": stray_list }),
+                );
+                let stray_set: BTreeSet<&str> = outside.iter().copied().collect();
+                changes.retain(|c| !stray_set.contains(c.path.as_str()));
+                dropped_stray.extend(stray_list);
             }
             for change in &changes {
                 if self.is_locked_contract(&change.path) {
@@ -3372,6 +3424,13 @@ impl Driver {
             }
         }
         if all.is_empty() {
+            if !dropped_stray.is_empty() {
+                let glob = self.page(page)?.owned_glob.clone();
+                return Ok(failed(format!(
+                    "these files are outside `{glob}` and were not merged (no owned files were changed): {}",
+                    dropped_stray.join(", ")
+                )));
+            }
             let ok = products.iter().all(|(_, p)| p.answer.ok);
             // The files were already right, from an earlier run, the plan, or a template: the
             // unit is done. Its tests and the project's checks still run at verify. A run told
@@ -5125,11 +5184,15 @@ impl Driver {
     }
 
     /// The opening every builder, reviewer, and verifier of this run shares, word for word:
-    /// the project, plan summary, repository map, locked contracts in full and in a fixed
-    /// order, design, shared project memory, Code Mode, and the master's decisions. Providers
-    /// cache a prompt's leading text, so keeping this identical across workers, repairs,
-    /// reviewers, and verifiers is what makes their cache hit. Nothing unit-specific goes here.
+    /// the project, plan summary, repository map, locked contracts in a fixed order, design,
+    /// shared project memory, Code Mode, and the master's decisions. Providers cache a prompt's
+    /// leading text, so keeping this identical across workers, repairs, reviewers, and verifiers
+    /// is what makes their cache hit. Nothing unit-specific goes here.
     fn shared_prefix(&self) -> anyhow::Result<String> {
+        self.shared_prefix_with_contracts(None)
+    }
+
+    fn shared_prefix_with_contracts(&self, partition: Option<&WorkerContractPartition<'_>>) -> anyhow::Result<String> {
         let plan = self.plan()?;
         let mut out = format!("Shared context for every agent of this run (a {} project); your own task follows it.\n", plan.kind.id());
         if !self.project_md.is_empty() {
@@ -5150,6 +5213,19 @@ impl Driver {
         contracts.sort_by(|a, b| a.path.cmp(&b.path));
         if contracts.is_empty() {
             out.push_str("\nLocked contracts: none.\n");
+        } else if let Some(part) = partition {
+            if !part.shared_full.is_empty() {
+                out.push_str("\nLocked contracts, already in the tree and given here in full, so there is no need to read them. Never edit them:\n");
+                for c in &part.shared_full {
+                    out.push_str(&format_contract_full(c, plan, self.run.phase_at));
+                }
+            }
+            if !part.shared_sigs.is_empty() {
+                out.push_str("\nLocked contracts (signatures only; read from the tree if needed, never edit them):\n");
+                for c in &part.shared_sigs {
+                    out.push_str(&format_contract_signatures(c, plan, self.run.phase_at));
+                }
+            }
         } else if contracts.iter().map(|c| c.content.len()).sum::<usize>() <= CONTRACTS_INLINE {
             out.push_str("\nLocked contracts, already in the tree and given here in full, so there is no need to read them. Never edit them:\n");
             for c in &contracts {
@@ -5231,22 +5307,78 @@ impl Driver {
         Ok(crate::web_access::strip_untrusted_frames(&out))
     }
 
+    fn classify_worker_contracts<'a>(&self, plan: &'a Plan) -> WorkerContractPartition<'a> {
+        let mut contracts: Vec<&'a tm_core::ContractFile> = plan.contracts.iter().collect();
+        contracts.sort_by(|a, b| a.path.cmp(&b.path));
+        let locked: BTreeSet<&str> = plan.contracts.iter().map(|c| c.path.as_str()).collect();
+        let tracked = git::tracked_files(&self.tree).unwrap_or_default();
+
+        let mut consumers: Vec<(&tm_core::PagePlan, Option<tm_core::WorkUnit>, Vec<String>)> = Vec::new();
+        for page in &plan.pages {
+            let wu = page.work_units();
+            if wu.len() > 1 {
+                for u in wu {
+                    let owned = read_owned_texts(&self.tree, &tracked, &locked, &u.owned_glob);
+                    consumers.push((page, Some(u), owned));
+                }
+            } else {
+                let owned = read_owned_texts(&self.tree, &tracked, &locked, &page.owned_glob);
+                consumers.push((page, None, owned));
+            }
+        }
+
+        let mut shared_full = Vec::new();
+        let mut shared_sigs = Vec::new();
+        let mut per_unit = Vec::new();
+        let mut inline_bytes = 0usize;
+        let mut shared_truncated = false;
+
+        for c in contracts {
+            let used = consumers
+                .iter()
+                .filter(|(p, split, owned)| unit_uses_contract(p, split.as_ref(), owned, c))
+                .count();
+            if !consumers.is_empty() && used == consumers.len() {
+                if inline_bytes + c.content.len() <= CONTRACTS_INLINE {
+                    inline_bytes += c.content.len();
+                    shared_full.push(c);
+                } else {
+                    shared_truncated = true;
+                    shared_sigs.push(c);
+                }
+            } else if used == 0 {
+                shared_sigs.push(c);
+            } else {
+                per_unit.push(c);
+            }
+        }
+
+        WorkerContractPartition {
+            shared_full,
+            shared_sigs,
+            per_unit,
+            inline_bytes,
+            shared_truncated,
+        }
+    }
+
     /// One agent's whole context: the shared prefix, then its own task, the files it owns,
     /// the Dictionary entries it cites, what failed last time, and when it is done.
     fn worker_brief(&self, page_id: &str, unit: usize, units: usize, tier: Tier, errors: Option<&str>, owned: &[String]) -> anyhow::Result<String> {
         let page = self.page(page_id)?.clone();
-        let contracts = &self.plan()?.contracts;
-        let inline = contracts.iter().map(|c| c.content.len()).sum::<usize>() <= CONTRACTS_INLINE;
+        let plan = self.plan()?;
+        let contracts = &plan.contracts;
+        let partition = self.classify_worker_contracts(plan);
         let cites = if page.cites.is_empty() { "none".to_string() } else { page.cites.join(", ") };
         let split = if units > 1 { page.work_units().get(unit).cloned() } else { None };
-        let ui = self.plan()?.is_ui(&page);
+        let ui = plan.is_ui(&page);
         // A page of a web app opens at a route; a module of anything else has none.
         let opening = if ui {
             format!("Build page `{}` for route `{}`.", page.id, page.route)
         } else {
-            format!("Build unit `{}` of this {} project.", page.id, self.plan()?.kind.id())
+            format!("Build unit `{}` of this {} project.", page.id, plan.kind.id())
         };
-        let mut brief = self.shared_prefix()?;
+        let mut brief = self.shared_prefix_with_contracts(Some(&partition))?;
         brief.push_str(&format!(
             "{opening}\nYou may create or edit only files matching `{glob}`.\nCite only these Dictionary keys, and follow them: {cites}.\n\n{body}\n",
             glob = split.as_ref().map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str()),
@@ -5255,8 +5387,46 @@ impl Driver {
         if !page.context.trim().is_empty() {
             brief.push_str(&format!("\nContext from planner:\n{}\n", page.context.trim()));
         }
-        let contract_paths: Vec<String> = contracts.iter().map(|c| c.path.clone()).collect();
-        let pack = crate::lsp::build_context_pack(&self.tree, &contract_paths, owned, 3072);
+        let contract_set: BTreeSet<&str> = contracts.iter().map(|c| c.path.as_str()).collect();
+        let non_contract_owned: Vec<String> = owned
+            .iter()
+            .filter(|p| !contract_set.contains(p.as_str()))
+            .cloned()
+            .collect();
+        let owned_texts = load_texts(&self.tree, &non_contract_owned);
+        let mut unit_full: Vec<&tm_core::ContractFile> = Vec::new();
+        let mut unit_sigs: Vec<&tm_core::ContractFile> = Vec::new();
+        let mut inline_bytes = partition.inline_bytes;
+        let mut unit_truncated = false;
+        for c in &partition.per_unit {
+            if unit_uses_contract(&page, split.as_ref(), &owned_texts, c) {
+                if inline_bytes + c.content.len() <= CONTRACTS_INLINE {
+                    inline_bytes += c.content.len();
+                    unit_full.push(c);
+                } else {
+                    unit_truncated = true;
+                    unit_sigs.push(c);
+                }
+            } else {
+                unit_sigs.push(c);
+            }
+        }
+        if !unit_full.is_empty() {
+            brief.push_str("\nLocked contracts for this unit (given here in full; never edit them):\n");
+            for c in &unit_full {
+                brief.push_str(&format_contract_full(c, plan, self.run.phase_at));
+            }
+        }
+        if !unit_sigs.is_empty() {
+            brief.push_str("\nOther locked contracts (signatures only; read from the tree if needed, never edit them):\n");
+            for c in &unit_sigs {
+                brief.push_str(&format_contract_signatures(c, plan, self.run.phase_at));
+            }
+        }
+        let inline = !partition.shared_truncated && !unit_truncated;
+        // Contracts are already deduplicated above (full if used, signatures-only otherwise),
+        // so pass only non-contract neighbour/owned files to the context pack.
+        let pack = crate::lsp::build_context_pack(&self.tree, &[], &non_contract_owned, 3072);
         if !pack.is_empty() {
             brief.push('\n');
             brief.push_str(&pack);
@@ -6501,6 +6671,196 @@ const RELEASE: &str = "RELEASE";
 
 /// Contracts up to this many bytes in total are given in full in each worker's brief.
 const CONTRACTS_INLINE: usize = 24_000;
+
+/// Partition of a plan's locked contracts so every worker brief mentions each contract
+/// exactly once: in full for contracts the unit imports/owns, and signatures-only otherwise,
+/// while keeping the leading shared prefix byte-identical across all workers.
+struct WorkerContractPartition<'a> {
+    shared_full: Vec<&'a tm_core::ContractFile>,
+    shared_sigs: Vec<&'a tm_core::ContractFile>,
+    per_unit: Vec<&'a tm_core::ContractFile>,
+    inline_bytes: usize,
+    shared_truncated: bool,
+}
+
+fn contract_phase_tag(c: &tm_core::ContractFile, plan: &Plan, phase_at: usize) -> String {
+    if !c.is_test() {
+        return String::new();
+    }
+    let p = tm_core::effective_contract_phase(c, &plan.phases);
+    if p > phase_at {
+        format!(" (acceptance test, phase {} — checked in a later phase)", p + 1)
+    } else {
+        " (acceptance test)".to_string()
+    }
+}
+
+fn format_contract_full(c: &tm_core::ContractFile, plan: &Plan, phase_at: usize) -> String {
+    let tag = contract_phase_tag(c, plan, phase_at);
+    format!("- `{}`{tag}:\n```\n{}\n```\n", c.path, c.content.trim_end())
+}
+
+fn format_contract_signatures(c: &tm_core::ContractFile, plan: &Plan, phase_at: usize) -> String {
+    let tag = contract_phase_tag(c, plan, phase_at);
+    let symbols = crate::lsp::extract_symbols(&c.path, &c.content);
+    let exported: Vec<&crate::lsp::SymbolInfo> = symbols.iter().filter(|s| s.exported).collect();
+    let mut out = format!("- `{}`{tag} (signatures):\n", c.path);
+    if !exported.is_empty() {
+        for sym in exported {
+            out.push_str(&format!("  - L{}: `{}`\n", sym.line, sym.signature));
+        }
+    } else {
+        let preview: Vec<&str> = c
+            .content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
+            .take(4)
+            .collect();
+        if preview.is_empty() {
+            out.push_str("  - (no exported symbols)\n");
+        } else {
+            for line in preview {
+                out.push_str(&format!("  - `{}`\n", clip(line, 120)));
+            }
+        }
+    }
+    out
+}
+
+fn read_owned_texts(tree: &Path, tracked: &[String], locked: &BTreeSet<&str>, glob: &str) -> Vec<String> {
+    let Ok(glob) = globset::Glob::new(glob.trim()) else {
+        return Vec::new();
+    };
+    let matcher = glob.compile_matcher();
+    let paths: Vec<String> = tracked
+        .iter()
+        .filter(|f| matcher.is_match(f.as_str()) && !locked.contains(f.as_str()))
+        .take(40)
+        .cloned()
+        .collect();
+    load_texts(tree, &paths)
+}
+
+fn load_texts(tree: &Path, paths: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut budget = 64 * 1024usize;
+    for rel in paths {
+        if budget == 0 {
+            break;
+        }
+        if let Ok(text) = fs::read_to_string(tree.join(rel)) {
+            let take = text.len().min(budget);
+            let mut end = take;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push(text[..end].to_string());
+            budget = budget.saturating_sub(end);
+        }
+    }
+    out
+}
+
+/// True when a unit owns, imports, or explicitly references `contract` (by path, module name,
+/// or exported interface symbol), so its worker brief should include the contract's full text
+/// rather than signatures only.
+fn unit_uses_contract(
+    page: &tm_core::PagePlan,
+    split: Option<&tm_core::WorkUnit>,
+    owned_texts: &[String],
+    contract: &tm_core::ContractFile,
+) -> bool {
+    let glob = split.map_or(page.owned_glob.as_str(), |u| u.owned_glob.as_str());
+    let path = contract.path.trim().trim_start_matches("./");
+    if globset::Glob::new(glob.trim()).is_ok_and(|g| g.compile_matcher().is_match(path)) {
+        return true;
+    }
+    let mut text = String::with_capacity(page.brief.len() + page.context.len() + page.done.len() + 64);
+    text.push_str(&page.brief);
+    text.push('\n');
+    text.push_str(&page.context);
+    text.push('\n');
+    text.push_str(&page.done);
+    if let Some(u) = split {
+        text.push('\n');
+        text.push_str(&u.brief);
+        text.push('\n');
+        text.push_str(&u.context);
+        text.push('\n');
+        text.push_str(&u.done);
+    }
+    for owned in owned_texts {
+        text.push('\n');
+        text.push_str(owned);
+    }
+    if text.contains(path) {
+        return true;
+    }
+    if let Some(py_stem) = path.strip_suffix(".py") {
+        let dotted = py_stem.replace('/', ".");
+        if !dotted.is_empty() && contains_word(&text, &dotted) {
+            return true;
+        }
+        if let Some(pkg) = py_stem.strip_suffix("/__init__") {
+            let dotted_pkg = pkg.replace('/', ".");
+            if !dotted_pkg.is_empty() && contains_word(&text, &dotted_pkg) {
+                return true;
+            }
+        }
+    }
+    for ext in [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".rs", ".go"] {
+        if let Some(stem) = path.strip_suffix(ext) {
+            if !stem.is_empty() && text.contains(stem) {
+                return true;
+            }
+            if let Some(file_stem) = Path::new(stem).file_name().and_then(|s| s.to_str())
+                && !file_stem.is_empty()
+                && (text.contains(&format!("/{file_stem}'"))
+                    || text.contains(&format!("/{file_stem}\""))
+                    || text.contains(&format!("::{file_stem}")))
+            {
+                return true;
+            }
+        }
+    }
+    if !contract.is_test() {
+        for sym in crate::lsp::extract_symbols(path, &contract.content) {
+            if !sym.exported {
+                continue;
+            }
+            let meaningful = sym.name.len() >= 3
+                || (sym.name.len() >= 2 && sym.name.chars().next().is_some_and(char::is_uppercase));
+            if meaningful && contains_word(&text, &sym.name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut offset = 0;
+    while let Some(pos) = haystack[offset..].find(needle) {
+        let start = offset + pos;
+        let end = start + needle.len();
+        let left_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+        let right_ok = end >= bytes.len() || !is_word_byte(bytes[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
 
 /// Taskmaster's sketch of a phased run, at the project root.
 const PROJECT_FILE: &str = "PROJECT.md";

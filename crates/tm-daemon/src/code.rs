@@ -502,7 +502,13 @@ impl CodeTools {
                 Ok(json!(String::from_utf8_lossy(&bytes)))
             }
             "write" => {
-                let file = path("path")?;
+                let raw = args["path"].as_str().context("a path is required")?;
+                let clean = sanitize_file_path(raw)?;
+                let file = if Path::new(&clean).is_absolute() {
+                    PathBuf::from(&clean)
+                } else {
+                    scope.cwd.join(&clean)
+                };
                 check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 if let Some(dir) = file.parent() {
@@ -1481,18 +1487,79 @@ fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Sanitize a file path coming from Code Mode `files` map keys or `writeFile`/`write` arguments.
+///
+/// Models sometimes wrap JSON map keys in literal quotes (e.g. `"\"tinydb/x.py\""` or `"'README.md'"`)
+/// or pad them with spaces. Strip surrounding whitespace and matching quote pairs, then reject any
+/// path that is still empty or invalid (unmatched/embedded quotes, control characters, parent
+/// directory traversal `..`, trailing separators, or no normal filename component).
+pub(crate) fn sanitize_file_path(raw: &str) -> anyhow::Result<String> {
+    if raw.chars().any(|c| c.is_control() && c != '\t') {
+        bail!("invalid file path {raw:?}: control characters are not allowed");
+    }
+    let mut s = raw.trim();
+    loop {
+        let stripped = s
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| s.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')))
+            .or_else(|| s.strip_prefix('`').and_then(|rest| rest.strip_suffix('`')));
+        match stripped {
+            Some(inner) => s = inner.trim(),
+            None => break,
+        }
+    }
+    if s.is_empty() {
+        bail!("a path is required");
+    }
+    if s.contains(['"', '`']) || s.starts_with('\'') || s.ends_with('\'') {
+        bail!("invalid file path `{s}`: quote characters are not allowed");
+    }
+    if s.chars().any(char::is_control) {
+        bail!("invalid file path `{s}`: control characters are not allowed");
+    }
+    if s.ends_with('/') || s.ends_with('\\') {
+        bail!("invalid file path `{s}`: path must name a file, not a directory");
+    }
+    let path = Path::new(s);
+    let mut has_normal = false;
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                bail!("invalid file path `{s}`: parent directory `..` is not allowed");
+            }
+            std::path::Component::Normal(part) => {
+                has_normal = true;
+                let part = part.to_string_lossy();
+                if part.trim() != part
+                    || part.contains(['"', '`'])
+                    || part.starts_with('\'')
+                    || part.ends_with('\'')
+                {
+                    bail!("invalid file path `{s}`: path segment `{part}` has invalid whitespace or quotes");
+                }
+            }
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if !has_normal {
+        bail!("invalid file path `{s}`: path must name a file");
+    }
+    Ok(s.to_string())
+}
+
 impl CodeTools {
-    async fn write_raw_file(&self, scope: &Scope, rel_path: &str, content: &str) -> anyhow::Result<()> {
+    async fn write_raw_file(&self, scope: &Scope, rel_path: &str, content: &str) -> anyhow::Result<String> {
         if scope.read_only {
             bail!("refused: `writeFile` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
         }
-        if rel_path.trim().is_empty() {
-            bail!("a path is required");
-        }
-        let file = if Path::new(rel_path).is_absolute() {
-            PathBuf::from(rel_path)
+        let clean = sanitize_file_path(rel_path)?;
+        let file = if Path::new(&clean).is_absolute() {
+            PathBuf::from(&clean)
         } else {
-            scope.cwd.join(rel_path)
+            scope.cwd.join(&clean)
         };
         check_policy_write(scope, &file)?;
         self.allowed(scope, "write", ToolKind::Edit, Some(&file), None).await?;
@@ -1500,7 +1567,7 @@ impl CodeTools {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&file, content)?;
-        Ok(())
+        Ok(clean)
     }
 }
 
@@ -1535,7 +1602,7 @@ impl Extension for CodeTools {
                 "files": {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
-                    "description": "Optional map of relative path -> raw UTF-8 file content written directly before `code` runs; avoids JS string escaping for Python triple quotes, backticks, or backslashes"
+                    "description": "Optional map of unquoted relative path (e.g. `src/app.py`, not `\"src/app.py\"`) -> raw UTF-8 file content written directly before `code` runs; avoids JS string escaping for Python triple quotes, backticks, or backslashes"
                 },
                 "writeFile": {
                     "type": "object",
@@ -1578,7 +1645,14 @@ impl Extension for CodeTools {
                 .or_else(|| args["text"].as_str())
                 .unwrap_or("");
             return Some(match self.write_raw_file(&scope, rel_path, content).await {
-                Ok(()) => json!({ "content": [{ "type": "text", "text": format!("wrote {rel_path}") }], "isError": false }),
+                Ok(clean) => {
+                    let msg = if clean != rel_path {
+                        format!("wrote {clean} (sanitized path from {rel_path:?})")
+                    } else {
+                        format!("wrote {clean}")
+                    };
+                    json!({ "content": [{ "type": "text", "text": msg }], "isError": false })
+                }
                 Err(err) => json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }),
             });
         }
@@ -1586,6 +1660,7 @@ impl Extension for CodeTools {
             return None;
         }
         let mut wrote: Vec<String> = Vec::new();
+        let mut sanitized_notes: Vec<String> = Vec::new();
         let has_files = args.get("files").and_then(Value::as_object).is_some_and(|m| !m.is_empty());
         let has_write_file = args.get("writeFile").and_then(Value::as_object).is_some();
         if has_files || has_write_file {
@@ -1606,35 +1681,69 @@ impl Extension for CodeTools {
                     .or_else(|| obj.get("raw").and_then(Value::as_str))
                     .or_else(|| obj.get("text").and_then(Value::as_str))
                     .unwrap_or("");
-                if let Err(err) = self.write_raw_file(&scope, rel_path, content).await {
-                    return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                let clean = match self.write_raw_file(&scope, rel_path, content).await {
+                    Ok(clean) => clean,
+                    Err(err) => {
+                        return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                    }
+                };
+                if clean != rel_path {
+                    sanitized_notes.push(format!("{rel_path:?} -> {clean}"));
                 }
-                wrote.push(rel_path.to_string());
+                wrote.push(clean);
             }
             if let Some(map) = args.get("files").and_then(Value::as_object) {
-                for (rel_path, value) in map {
+                for (raw_path, value) in map {
+                    let clean_path = match sanitize_file_path(raw_path) {
+                        Ok(clean) => clean,
+                        Err(err) => {
+                            return Some(json!({
+                                "content": [{ "type": "text", "text": format!("invalid `files` key {raw_path:?}: {err:#}") }],
+                                "isError": true
+                            }));
+                        }
+                    };
                     let Some(content) = value.as_str() else {
                         return Some(json!({
-                            "content": [{ "type": "text", "text": format!("`files[\"{rel_path}\"]` must be a string") }],
+                            "content": [{ "type": "text", "text": format!("`files[\"{clean_path}\"]` must be a string") }],
                             "isError": true
                         }));
                     };
-                    if let Err(err) = self.write_raw_file(&scope, rel_path, content).await {
-                        return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                    let written = match self.write_raw_file(&scope, &clean_path, content).await {
+                        Ok(written) => written,
+                        Err(err) => {
+                            return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                        }
+                    };
+                    if written != *raw_path {
+                        sanitized_notes.push(format!("{raw_path:?} -> {written}"));
                     }
-                    wrote.push(rel_path.clone());
+                    wrote.push(written);
                 }
             }
         }
         let code = args["code"].as_str().unwrap_or("");
+        let note_suffix = if sanitized_notes.is_empty() {
+            String::new()
+        } else {
+            format!(" (sanitized quoted/padded key(s): {})", sanitized_notes.join(", "))
+        };
         if code.trim().is_empty() && !wrote.is_empty() {
             return Some(json!({
-                "content": [{ "type": "text", "text": format!("wrote {} file(s): {}", wrote.len(), wrote.join(", ")) }],
+                "content": [{ "type": "text", "text": format!("wrote {} file(s): {}{note_suffix}", wrote.len(), wrote.join(", ")) }],
                 "isError": false
             }));
         }
         Some(match self.run(grant, code).await {
-            Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": text.contains("\nError: ") || text.starts_with("Error: ") }),
+            Ok(text) => {
+                let is_err = text.contains("\nError: ") || text.starts_with("Error: ");
+                let body = if sanitized_notes.is_empty() {
+                    text
+                } else {
+                    format!("note: sanitized quoted/padded path key(s): {}\n{text}", sanitized_notes.join(", "))
+                };
+                json!({ "content": [{ "type": "text", "text": body }], "isError": is_err })
+            }
             Err(err) => json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }),
         })
     }
@@ -2150,6 +2259,109 @@ mod tests {
             assert_eq!(tools.tools(&rev_grant).len(), 1);
             tools.detach("reviewer");
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_raw_file_and_files_map_sanitize_quoted_keys_and_reject_invalid_paths() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("sanitize-keys");
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: None,
+            read_only: false,
+            warm: tokio::sync::Mutex::new(None),
+        };
+        tools.attach("home", &dir, scope.gate.clone(), None);
+
+        // Site 1: write_raw_file strips literal surrounding quotes and whitespace.
+        tools
+            .write_raw_file(&scope, "  \"tinydb/direct.py\"  ", "x = 1\n")
+            .await
+            .expect("quoted path should be sanitized and written");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/direct.py")).unwrap(), "x = 1\n");
+        assert!(!dir.join("\"tinydb/direct.py\"").exists());
+        assert!(!dir.join("  \"tinydb/direct.py\"  ").exists());
+
+        tools
+            .write_raw_file(&scope, "'tinydb/single.py'", "y = 2\n")
+            .await
+            .expect("single-quoted path should be sanitized");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/single.py")).unwrap(), "y = 2\n");
+        assert!(!dir.join("'tinydb/single.py'").exists());
+
+        // Site 1: write_raw_file rejects paths that remain invalid after sanitization.
+        for bad in [
+            "",
+            "   ",
+            "\"\"",
+            "\"tinydb/unmatched.py",
+            "tinydb/\"inner.py\"",
+            "../escape.py",
+            "\"../escape.py\"",
+            "tinydb/dir/",
+            ".",
+            "tinydb/bad\nname.py",
+        ] {
+            let err = tools.write_raw_file(&scope, bad, "nope").await;
+            assert!(err.is_err(), "write_raw_file should reject invalid path {bad:?}");
+        }
+
+        // Site 2: run_code `files` map sanitizes quoted keys and writes to the clean path.
+        let reply = tools
+            .call(
+                &grant(),
+                "mcp_dictionary_run_code",
+                &json!({
+                    "files": {
+                        "\"tinydb/x.py\"": "def x():\n    return 42\n",
+                        "  \"README.md\"  ": "# TinyDB\n"
+                    },
+                    "code": "return await read('tinydb/x.py');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["isError"], false, "{reply}");
+        assert!(reply["content"][0]["text"].as_str().unwrap_or("").contains("return 42"), "{reply}");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/x.py")).unwrap(), "def x():\n    return 42\n");
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "# TinyDB\n");
+        assert!(!dir.join("\"tinydb/x.py\"").exists(), "must not create literal quoted directory/file");
+        assert!(!dir.join("\"README.md\"").exists(), "must not create literal quoted README.md");
+
+        // Site 2: run_code `files` map rejects keys that are still invalid paths.
+        for bad in [
+            "\"\"",
+            "\"tinydb/unmatched.py",
+            "tinydb/\"inner.py\"",
+            "\"../escape.py\"",
+            "tinydb/",
+            "tinydb/bad\0null.py",
+        ] {
+            let res = tools
+                .call(&grant(), "run_code", &json!({ "files": { bad: "nope" } }))
+                .await
+                .unwrap();
+            assert_eq!(res["isError"], true, "files map should reject invalid key {bad:?}: {res}");
+        }
+
+        // Also via direct writeFile tool and run_code writeFile argument.
+        let wf = tools
+            .call(
+                &grant(),
+                "writeFile",
+                &json!({ "path": "\"tinydb/wf.py\"", "content": "z = 3\n" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wf["isError"], false, "{wf}");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/wf.py")).unwrap(), "z = 3\n");
+        assert!(!dir.join("\"tinydb/wf.py\"").exists());
+
+        tools.detach_all();
         std::fs::remove_dir_all(dir).ok();
     }
 }

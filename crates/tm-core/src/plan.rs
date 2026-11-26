@@ -23,9 +23,12 @@ pub struct DraftEntry {
     pub stack: String,
 }
 
-/// The most lines one contract file may have. A contract is an interface; a body belongs to
-/// the unit that owns the file.
-pub const CONTRACT_LINES: usize = 120;
+/// Soft per-contract line target: going past this emits a warning so contracts stay concise
+/// interfaces without forcing a planner repair on a small overrun.
+pub const CONTRACT_LINES_SOFT: usize = 120;
+/// Hard per-contract line cap: exceeding this rejects the plan and triggers planner repair.
+/// A contract is an interface; a body belongs to the unit that owns the file.
+pub const CONTRACT_LINES: usize = 200;
 /// The most contract lines a whole plan may lock.
 pub const PLAN_CONTRACT_LINES: usize = 400;
 
@@ -76,7 +79,7 @@ impl Rule {
             Rule::Cites => "every key in `cites` is cited once and is a stored Dictionary entry or one of the plan's `dictionary` items",
             Rule::ContractPaths => "contract paths are unique, relative and without `..`",
             Rule::ContractContent => "every contract has content",
-            Rule::ContractSize => "a contract is an interface, never an implementation: signatures, types, constants, error strings, wire formats and file schemas, with every body left as `...`, `pass` or `raise NotImplementedError` (or the language's own stub); at most 120 lines per contract and 400 across the plan",
+            Rule::ContractSize => "a contract is an interface, never an implementation: signatures, types, constants, error strings, wire formats and file schemas, with every body left as `...`, `pass` or `raise NotImplementedError` (or the language's own stub); target at most 120 lines per contract (hard limit 200 per contract, 400 across the plan)",
             Rule::ContractNotOwned => "no contract path matches any unit's `owned_glob`: a file a unit must write is never locked as a contract",
             Rule::DictionaryKeys => "dictionary keys are unique and use only letters, digits, `_` and `-`",
             Rule::DictionaryContent => "every dictionary item has a summary and content, and a stored key repeats its stored content exactly",
@@ -113,6 +116,22 @@ impl std::fmt::Display for Rejection {
 pub fn check_plan(plan: &Plan, drafts: &[DraftEntry], existing: &BTreeMap<DictKey, String>) -> Result<(), Vec<String>> {
     let found = rejections(plan, drafts, existing);
     if found.is_empty() { Ok(()) } else { Err(found.into_iter().map(|r| r.detail).collect()) }
+}
+
+/// Non-fatal warnings for a plan that passes [`check_plan`], such as contracts that slightly
+/// exceed the soft [`CONTRACT_LINES_SOFT`] target while staying within [`CONTRACT_LINES`].
+pub fn plan_warnings(plan: &Plan) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for contract in &plan.contracts {
+        let lines = contract.content.lines().count();
+        if lines > CONTRACT_LINES_SOFT && lines <= CONTRACT_LINES {
+            warnings.push(format!(
+                "contract `{}` has {lines} lines, past the {CONTRACT_LINES_SOFT}-line soft cap (hard cap {CONTRACT_LINES}): keep contracts concise interfaces",
+                contract.path
+            ));
+        }
+    }
+    warnings
 }
 
 /// Every reason the draft cannot be locked, each with its rule.
@@ -628,5 +647,47 @@ mod tests {
         for rule in Rule::ALL.iter().filter(|r| **r != Rule::AtLeastOneUnit) {
             assert!(rules.contains(&format!("{rule:?}")), "{rule:?} was not found in {found:#?}");
         }
+    }
+
+    #[test]
+    fn contract_size_under_soft_and_hard_caps() {
+        let make = |lines: usize| Plan {
+            kind: ProjectKind::Library,
+            contracts: vec![ContractFile {
+                path: "tinydb/contracts.py".into(),
+                content: "def f() -> None: ...\n".repeat(lines),
+                phase: 0,
+            }],
+            pages: vec![module("engine", "tinydb/engine.py")],
+            ..Default::default()
+        };
+
+        // Under/at soft cap (120 lines): accepted with no warning.
+        let under = make(120);
+        check_plan(&under, &[], &BTreeMap::new()).unwrap();
+        assert!(plan_warnings(&under).is_empty());
+
+        // Between soft cap (120) and hard cap (200): accepted with a warning only (no repair).
+        for lines in [121, 125, 200] {
+            let soft = make(lines);
+            check_plan(&soft, &[], &BTreeMap::new())
+                .unwrap_or_else(|errs| panic!("expected {lines}-line contract to pass soft cap, got: {errs:?}"));
+            let warnings = plan_warnings(&soft);
+            assert_eq!(warnings.len(), 1, "expected 1 warning for {lines} lines: {warnings:?}");
+            assert!(
+                warnings[0].contains("tinydb/contracts.py") && warnings[0].contains(&lines.to_string()),
+                "{warnings:?}"
+            );
+        }
+
+        // Over hard cap (201 lines): rejected with Rule::ContractSize so planner repair triggers.
+        let hard = make(201);
+        let found = rejections(&hard, &[], &BTreeMap::new());
+        assert!(
+            found.iter().any(|r| r.rule == Rule::ContractSize && r.detail.contains("tinydb/contracts.py")),
+            "expected hard cap rejection, got: {found:?}"
+        );
+        assert!(check_plan(&hard, &[], &BTreeMap::new()).is_err());
+        assert!(plan_warnings(&hard).is_empty(), "over hard cap is an error, not a soft warning");
     }
 }

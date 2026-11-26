@@ -11,7 +11,7 @@
 //!           [--worker-model <m>] [--mid-model <m>] [--master-model <m>]
 //!           [--reviewer-model <m>] [--verifier-model <m>]
 //!           [--parallel <n>] [--timeout <secs>] [--dictionary <dir>] [--commons <dir>]
-//!           [--run <id>] [--template <next | dir>] [--eval] [--baseline <h>] [--pair]
+//!           [--run <id>] [--template <next | dir>] [--prices <file>] [--eval] [--baseline <h>] [--pair]
 //!           [--no-runtime-checks]
 //! ```
 //!
@@ -63,6 +63,7 @@ struct Args {
     timeout: Option<u64>,
     dictionary: Option<PathBuf>,
     commons: Option<PathBuf>,
+    prices: Option<PathBuf>,
     run_id: String,
     template: Option<String>,
     eval: bool,
@@ -269,7 +270,8 @@ async fn run() -> anyhow::Result<Outcome> {
     config.run_id = args.run_id.clone();
     config.template = args.template.clone();
     config.models = args.models;
-    let settings = Settings::load(&args.project.canonicalize().unwrap_or_else(|_| args.project.clone()))?;
+    let project_root = args.project.canonicalize().unwrap_or_else(|_| args.project.clone());
+    let settings = Settings::load(&project_root)?;
     config.store = settings.store(&config.project.canonicalize().unwrap_or_else(|_| config.project.clone()))?;
     config.checker = settings.checker.enabled;
     config.code_mode = settings.code_mode.enabled;
@@ -282,7 +284,7 @@ async fn run() -> anyhow::Result<Outcome> {
     } else {
         tm_daemon::settings::effective_effort_routing(settings.agents.effort_routing)
     };
-    config.prices = tm_daemon::settings::price_table(&settings);
+    config.prices = tm_daemon::settings::load_price_table(&settings, &project_root, args.prices.as_deref())?;
     config.remote = settings.remote();
     let phone = if args.pair {
         let ip = tailscale_ipv4()?;
@@ -733,6 +735,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
         timeout: None,
         dictionary: None,
         commons: None,
+        prices: None,
         run_id: "current".into(),
         template: None,
         eval: false,
@@ -770,6 +773,7 @@ fn args_from(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
             }
             "--dictionary" => args.dictionary = Some(need(&mut argv, "--dictionary", usage)?.into()),
             "--commons" => args.commons = Some(need(&mut argv, "--commons", usage)?.into()),
+            "--prices" => args.prices = Some(need(&mut argv, "--prices", usage)?.into()),
             "--run" => args.run_id = need(&mut argv, "--run", usage)?,
             "--template" => args.template = Some(need(&mut argv, "--template", usage)?),
             "--eval" => args.eval = true,

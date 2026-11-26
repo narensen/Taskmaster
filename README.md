@@ -146,6 +146,16 @@ Taskmaster improves the more you run it because every failure and fix feeds back
 - **Workflow integrations** — import prompts directly from GitHub/GitLab issue URLs, attach mockups/images/files to runs, connect custom user MCP servers with vaulted secrets, sync PR CI failures and review comments back into repair loops, configure webhook notifications, and schedule recurring runs.
 - **Production hardening** — OS keychain secret vault with universal redaction, Policy-as-Code rules, Preflight Doctor checks before spending tokens, egress allow/deny policy and audit log, supply-chain dependency checks, Flight Recorder debug bundles, run checkpoints and forking, one-click Undo of merged runs, retention GC, `Idempotency-Key` support, Prometheus `/metrics`, and a remote runner mesh.
 
+## Pricing table hook
+
+Harnesses that do not report USD costs stay unpriced by default (no model prices are invented). To price forecasts and `ledger.jsonl` rows by actual `model_used` (falling back to `model_requested` then harness id), configure dollars per 1M tokens via inline `"prices"` or `"prices_file"` in `.taskmaster/config.json` / `~/.taskmaster/config.json`, `TASKMASTER_PRICES=/path/to/prices.json`, or `--prices /path/to/prices.json`:
+
+```json
+{
+  "my-model-id": { "input": 2.0, "output": 8.0, "cached_input": 0.5 }
+}
+```
+
 ## Develop
 
 ```bash

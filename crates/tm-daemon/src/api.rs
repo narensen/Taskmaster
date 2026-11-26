@@ -1081,7 +1081,8 @@ impl App {
         config.code_sh_secs = saved.code_mode.sh_secs;
         config.worker_shell = saved.sandbox.shell;
         config.package_indexes = saved.sandbox.package_indexes;
-        config.prices = crate::settings::price_table(&saved);
+        config.prices = crate::settings::load_price_table(&saved, &self.project(), None)
+            .unwrap_or_else(|_| crate::settings::price_table(&saved));
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
         config.warm_idle = std::time::Duration::from_secs(saved.agents.warm_idle_secs);
         config.effort_routing = crate::settings::effective_effort_routing(saved.agents.effort_routing);

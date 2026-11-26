@@ -7212,14 +7212,14 @@ impl Driver {
         let effective_model = model_used.clone().or_else(|| model_requested.clone());
         // A harness that reports no price is priced from the table, by actual model used,
         // then requested model, then harness.
-        let table = [
-            model_used.as_deref(),
-            model_requested.as_deref(),
-            Some(bill.harness.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|key| self.config.prices.get(key).copied());
+        let table = tm_core::lookup_price(
+            &self.config.prices,
+            &[
+                model_used.as_deref(),
+                model_requested.as_deref(),
+                Some(bill.harness.as_str()),
+            ],
+        );
         let (cost_usd, priced_by) = match (answer.cost_usd, table) {
             (Some(cost), _) => (Some(cost), Some("provider".to_string())),
             (None, Some(prices)) => (Some(prices.cost(answer.usage.input, answer.usage.output, answer.usage.cache_read)), Some("prices".to_string())),
@@ -7271,8 +7271,10 @@ impl Driver {
             contract_bytes: plan.contracts.iter().map(|c| c.content.len()).sum(),
             small: self.small,
         };
-        let worker = [self.config.models.worker.as_deref(), Some(self.harnesses.worker.id())];
-        let prices = worker.into_iter().flatten().find_map(|key| self.config.prices.get(key).copied());
+        let prices = tm_core::lookup_price(
+            &self.config.prices,
+            &[self.config.models.worker.as_deref(), Some(self.harnesses.worker.id())],
+        );
         // Review is on demand, so a run's own cost is its planning so far and its builds.
         let (mut estimate, basis) = forecast(&history, &shape, prices);
         let planning = self.records.ledger(&self.id)?;

@@ -1216,9 +1216,9 @@ async fn every_agent_call_is_charged_to_the_run() {
     assert_eq!(status["spent"]["unpriced_calls"], 0);
     // One web page and no review, sized from the plan because nothing ran here before,
     // with the cache reads counted apart.
-    assert_eq!(status["estimate"]["tokens"], 40_000);
+    assert_eq!(status["estimate"]["tokens"], 30_000);
     // (plus the contract every builder carries in its prompt)
-    assert!((120_000..120_100).contains(&status["estimate"]["cache_read"].as_u64().unwrap()), "{status}");
+    assert!((80_000..80_100).contains(&status["estimate"]["cache_read"].as_u64().unwrap()), "{status}");
 }
 
 #[tokio::test]
@@ -1867,11 +1867,11 @@ async fn the_estimate_comes_from_what_earlier_runs_here_cost() {
     let mut second = config(&tmp.0, plan(&[("b", &[]), ("c", &[])]), true, 1);
     second.run_id = "two".into();
     assert_eq!(run(second, &world).await.unwrap(), Outcome::Finished { ok: true });
-    // Every fake call is 120 tokens and one cent: two pages at 1.3 calls each, no review.
+    // Every fake call is 120 tokens and one cent: two pages at 1.15 calls each, no review.
     let status = Records::files(&tmp.0).status("two").unwrap().unwrap();
-    assert_eq!(status["estimate"]["tokens"], 312);
+    assert_eq!(status["estimate"]["tokens"], 276);
     // A cent per 120 tokens, over the fresh tokens and the contract read from the cache.
-    assert!((0.026..0.03).contains(&status["estimate"]["usd"].as_f64().unwrap()), "{status}");
+    assert!((0.023..0.028).contains(&status["estimate"]["usd"].as_f64().unwrap()), "{status}");
     assert_eq!(status["estimate"]["priced"], true);
     assert_eq!(status["spent"]["fresh"], 2 * 120);
 }
@@ -2637,7 +2637,7 @@ mod http {
         assert!(tmp.0.join("app/a/page.ts").is_file() && tmp.0.join("app/b/page.ts").is_file());
         assert!(done["pages"].as_array().unwrap().iter().all(|page| page["state"] == "passed"));
         assert_eq!(done["cancelled"], false);
-        assert_eq!(done["estimate"]["tokens"], 2 * 40_000);
+        assert_eq!(done["estimate"]["tokens"], 2 * 30_000);
         let calls = done["spent"]["calls"].as_u64().unwrap();
         assert!(calls >= 2 && done["spent"]["tokens"] == calls * 120, "{done}");
         assert_eq!(client.post("/api/runs/web/approve", json!({})).await.0, 409);
@@ -13717,4 +13717,80 @@ async fn fix_n9_quota_429_stops_planner_without_retry_loop_reports_reset_and_exi
         "error message must include provider and reset time: {}",
         limit.sentence()
     );
+}
+
+#[tokio::test]
+async fn fix_n9_price_table_hook_prices_unpriced_harness_calls_and_estimates() {
+    let tmp = seeded("n9-price-hook");
+    let prices_path = tmp.0.join("my-prices.json");
+    std::fs::write(
+        &prices_path,
+        r#"{"gemini-4-hydrogen-medium":{"input":2.0,"output":8.0,"cached_input":0.5}}"#,
+    )
+    .unwrap();
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Library,
+        pages: vec![PagePlan {
+            id: "core".into(),
+            owned_glob: "pkg/core.py".into(),
+            brief: "Write pkg/core.py.".into(),
+            difficulty: Some("normal".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    struct UnpricedRoutedFake;
+    #[async_trait]
+    impl Harness for UnpricedRoutedFake {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let _ = events.send(HarnessEvent::SessionStarted { session_id: "s-price".into() }).await;
+            let _ = events
+                .send(HarnessEvent::ModelSelected {
+                    requested: task.model.clone(),
+                    used: "gemini-4-hydrogen-medium".into(),
+                })
+                .await;
+            std::fs::create_dir_all(task.cwd.join("pkg"))?;
+            std::fs::write(task.cwd.join("pkg/core.py"), "X = 1\n")?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:core\n".into() }).await;
+            Ok(RunSummary {
+                ok: true,
+                usage: Usage { input: 50_000, output: 10_000, cache_read: 100_000, cache_write: 0 },
+                cost_usd: None,
+                denied: 0,
+                freed: None,
+                requests: Some(1),
+            })
+        }
+    }
+
+    let h: Arc<dyn Harness> = Arc::new(UnpricedRoutedFake);
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = config(&tmp.0, plan, true, 1);
+    cfg.run_id = "n9-fix5".into();
+    cfg.models.worker = Some("gemini-4-hydrogen-high".into());
+    cfg.prices = crate::settings::load_price_table(&crate::Settings::default(), &tmp.0, Some(&prices_path)).unwrap();
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
+    let ledger = Records::files(&tmp.0).ledger("n9-fix5").unwrap();
+    assert_eq!(ledger.len(), 1);
+    let row = &ledger[0];
+    assert_eq!(row.model_used.as_deref(), Some("gemini-4-hydrogen-medium"));
+    assert_eq!(row.priced_by.as_deref(), Some("prices"));
+    // 50k * $2/M ($0.10) + 10k * $8/M ($0.08) + 100k * $0.50/M ($0.05) = $0.23.
+    let cost = row.cost_usd.expect("priced from external table");
+    assert!((cost - 0.23).abs() < 1e-6, "expected $0.23, got {cost}");
 }

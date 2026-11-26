@@ -233,7 +233,7 @@ pub fn totals(entries: &[LedgerEntry]) -> Totals {
 pub struct Prices {
     pub input: f64,
     /// Input served from the provider's cache. Missing means the same as `input`.
-    #[serde(default)]
+    #[serde(default, alias = "cache", alias = "cache_read")]
     pub cached_input: Option<f64>,
     pub output: f64,
 }
@@ -245,6 +245,15 @@ impl Prices {
         let per = |n: u64, price: f64| n as f64 * price / 1_000_000.0;
         per(input, self.input) + per(cache_read, self.cached_input.unwrap_or(self.input)) + per(output, self.output)
     }
+}
+
+/// Look up the first matching price entry in `table` across candidate keys in precedence order
+/// (for example `[model_used, model_requested, Some(harness)]`).
+pub fn lookup_price(table: &BTreeMap<String, Prices>, keys: &[Option<&str>]) -> Option<Prices> {
+    keys.iter()
+        .copied()
+        .flatten()
+        .find_map(|key| table.get(key).copied())
 }
 
 /// What a plan asks for, as far as cost goes.
@@ -262,18 +271,23 @@ pub struct Shape {
     pub small: bool,
 }
 
-/// Fresh tokens and cache reads one unit's builder uses before this project has history,
-/// from the November 2026 benchmark runs: a module with its tests, and a web page.
-const DEFAULT_MODULE: (u64, u64) = (110_000, 330_000);
-const DEFAULT_PAGE: (u64, u64) = (40_000, 120_000);
-/// One unit of a small job, from the v0.1.5 smoke runs (a file and its test).
-const DEFAULT_SMALL: (u64, u64) = (20_000, 60_000);
+/// Fresh tokens and cache reads one unit's builder uses before this project has history.
+///
+/// Recalibrated from the 12 completed `n8`, `n8b`, and `tb15` benchmark ledgers
+/// (`tinydb`, `tinyfeat`, `calcx`, `mdtodo`, `notesapi`):
+/// - per-unit fresh tokens (`input + output`): mean 51.3k, median 56.9k (range 24k–78k) -> `50_000`
+/// - per-unit cache reads: mean 128.0k, median 130.5k -> `130_000`
+/// - web pages and small jobs scale below full modules with test suites.
+const DEFAULT_MODULE: (u64, u64) = (50_000, 130_000);
+const DEFAULT_PAGE: (u64, u64) = (30_000, 80_000);
+/// One unit of a small job (a file and its test).
+const DEFAULT_SMALL: (u64, u64) = (18_000, 45_000);
 /// Planning one later phase of a sketch.
 const DEFAULT_PHASE_PLAN: (u64, u64) = (25_000, 50_000);
-/// Builder calls per unit: the first attempt and the repairs a unit needs on average.
-const CALLS_PER_UNIT: f64 = 1.3;
-/// Of a call's fresh tokens, the share that is output when only the total is known.
-const OUTPUT_SHARE: f64 = 0.1;
+/// Builder calls per unit: first attempt plus occasional repair (measured mean 1.12 across `n8`/`n8b`/`tb15`).
+const CALLS_PER_UNIT: f64 = 1.15;
+/// Of a call's fresh tokens, the share that is output (measured mean 0.26 across `n8`/`n8b`/`tb15`).
+const OUTPUT_SHARE: f64 = 0.25;
 
 /// What building a plan of `shape` should cost, from what build calls cost in `history`,
 /// or from defaults sized to the plan when there is none. Fresh tokens and cache reads are
@@ -771,7 +785,7 @@ mod tests {
         let module = Shape { units: 1, web: false, phases: 0, contract_bytes: 0, small: false };
         let (one, basis) = forecast(&[], &module, None);
         assert_eq!(basis, 0);
-        assert!((100_000..=120_000).contains(&one.tokens), "{one:?}");
+        assert!((45_000..=55_000).contains(&one.tokens), "{one:?}");
         assert!(one.cache_read > one.tokens && !one.priced && one.usd == 0.0);
         // Three units, a sketch of two phases and 8 KB of contracts cost more, in both counts.
         let big = Shape { units: 3, web: false, phases: 2, contract_bytes: 8_000, small: false };
@@ -793,9 +807,36 @@ mod tests {
         build.cache_read = 40_000;
         let (seen, basis) = forecast(&[build.clone(), build], &module, None);
         assert_eq!(basis, 2);
-        assert_eq!(seen.tokens, 13_000);
-        assert_eq!(seen.cache_read, 52_000);
-        assert!(seen.priced && (seen.usd - 0.026).abs() < 1e-6, "{seen:?}");
+        assert_eq!(seen.tokens, 11_500);
+        assert_eq!(seen.cache_read, 46_000);
+        assert!(seen.priced && (seen.usd - 0.023).abs() < 1e-6, "{seen:?}");
+    }
+
+    #[test]
+    fn fix_n9_recalibrated_forecast_matches_tb15_and_n8_ledgers() {
+        // 2-unit mdtodo shape (plus ~32.5k planner spend added by driver):
+        // previously estimated ~252k fresh + ~664k cache vs actual 133.7k fresh + 260.9k cache.
+        let mdtodo = Shape { units: 2, web: false, phases: 0, contract_bytes: 6_000, small: false };
+        let (est, basis) = forecast(&[], &mdtodo, None);
+        assert_eq!(basis, 0);
+        assert_eq!(est.tokens, 100_000, "2 units * 50k = 100k builder fresh tokens: {est:?}");
+        assert!((260_000..=270_000).contains(&est.cache_read), "cache estimate should track ~260k: {est:?}");
+
+        // 3-unit calcx / tinydb shape: 150k builder fresh + ~390k cache (down from 330k + 990k).
+        let three = Shape { units: 3, web: false, phases: 0, contract_bytes: 5_000, small: false };
+        let (est3, _) = forecast(&[], &three, None);
+        assert_eq!(est3.tokens, 150_000, "{est3:?}");
+        assert!((390_000..=400_000).contains(&est3.cache_read), "{est3:?}");
+
+        // Price lookup helper prefers exact model_used, then model_requested, then harness.
+        let mut table = BTreeMap::new();
+        table.insert("gemini-4-hydrogen-medium".into(), Prices { input: 1.5, cached_input: Some(0.3), output: 6.0 });
+        table.insert("antigravity".into(), Prices { input: 3.0, cached_input: Some(0.6), output: 12.0 });
+        let picked = lookup_price(&table, &[Some("gemini-4-hydrogen-medium"), Some("gemini-4-hydrogen-high"), Some("antigravity")]).unwrap();
+        assert_eq!(picked.input, 1.5);
+        let fallback = lookup_price(&table, &[Some("unknown-model"), None, Some("antigravity")]).unwrap();
+        assert_eq!(fallback.input, 3.0);
+        assert!(lookup_price(&table, &[Some("unknown")]).is_none());
     }
 
     #[test]

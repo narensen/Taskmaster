@@ -3536,11 +3536,12 @@ impl Driver {
                     test_files.iter().all(|tf| {
                         crate::gates::standalone_test_command(tf)
                             .map(|cmd| {
-                                std::process::Command::new(&cmd[0])
-                                    .args(&cmd[1..])
-                                    .current_dir(&p.worktree)
-                                    .status()
-                                    .is_ok_and(|s| s.success())
+                                let mut c = std::process::Command::new(&cmd[0]);
+                                c.args(&cmd[1..]).current_dir(&p.worktree);
+                                if tf.to_ascii_lowercase().ends_with(".py") {
+                                    c.env("PYTHONPATH", crate::runtime::pythonpath_for_tree(&p.worktree, None));
+                                }
+                                c.status().is_ok_and(|s| s.success())
                             })
                             .unwrap_or(true)
                     })
@@ -5614,7 +5615,7 @@ impl Driver {
                 wt.display()
             ));
         }
-        let shell = self.shell_for(&harness, "master-repair");
+        let shell = self.shell_for(&harness, "master-repair", &worktree);
         let mut request = AgentRequest {
             model: self.config.models.master.clone(),
             dictionary: Some(self.access(&self.master_token.clone())),
@@ -5773,7 +5774,7 @@ impl Driver {
                 wt.display()
             ));
         }
-        let shell = self.shell_for(&harness, "master-shared");
+        let shell = self.shell_for(&harness, "master-shared", &worktree);
         let mut request = AgentRequest {
             model: self.config.models.master.clone(),
             dictionary: Some(self.access(&self.master_token.clone())),
@@ -6034,7 +6035,7 @@ impl Driver {
         };
         let harness = self.harness_for(tier);
         let label = if units > 1 { format!("{page}-{unit}") } else { page.to_string() };
-        let shell = self.shell_for(&harness, &label);
+        let shell = self.shell_for(&harness, &label, &cwd);
         let effort = self.worker_effort(page, harness.id(), errors);
         Ok(AgentRequest {
             model: self.model_for(tier),
@@ -6115,7 +6116,7 @@ impl Driver {
     /// The sandboxed shell an agent gets: its own scratch directory and the run's package
     /// caches, writable, and nothing else outside its worktree. `None` when the setting is
     /// off or the harness cannot be confined here, which is said once per harness.
-    fn shell_for(&mut self, harness: &Arc<dyn Harness>, label: &str) -> Option<ShellScope> {
+    fn shell_for(&mut self, harness: &Arc<dyn Harness>, label: &str, cwd: &Path) -> Option<ShellScope> {
         if !self.config.worker_shell {
             return None;
         }
@@ -6177,6 +6178,7 @@ impl Driver {
         if let Some(first) = candidate_venvs.first() {
             env.push(("TASKMASTER_SHARED_VENV".into(), at(first)));
         }
+        crate::runtime::prepend_pythonpath(&mut env, cwd);
         readable.extend(candidate_venvs);
         Some(ShellScope { writable: vec![scratch, cache], readable, env })
     }

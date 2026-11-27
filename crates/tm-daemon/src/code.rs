@@ -743,7 +743,9 @@ impl CodeTools {
         let sh = std::fs::canonicalize("/bin/sh").context("no /bin/sh")?;
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
-        let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(shell));
+        let mut shell = shell.clone();
+        crate::runtime::prepend_pythonpath(&mut shell.env, &scope.cwd);
+        let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(&shell));
         let mut cmd = tokio::process::Command::new("bwrap");
         cmd.args(args).current_dir(&scope.cwd).stdin(Stdio::null());
         let output = tokio::time::timeout(self.sh_limit, tm_harness::spawn_grouped(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?.0.wait_with_output())
@@ -1659,13 +1661,11 @@ async fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>
             {
                 // Shared read-only venv already has working pytest and the worktree declares no
                 // third-party packages or console scripts: keep reusing `shared` directly with
-                // `PYTHONPATH=.` rather than building an offline scratch venv.
+                // an absolute per-worktree `PYTHONPATH` rather than building an offline scratch venv.
                 let mut test_only: Vec<crate::runtime::Step> =
                     candidate.into_iter().filter(|s| !s.setup).collect();
                 for step in &mut test_only {
-                    if !step.env.iter().any(|(k, _)| k == "PYTHONPATH") {
-                        step.env.push(("PYTHONPATH".into(), ".".into()));
-                    }
+                    crate::runtime::prepend_pythonpath(&mut step.env, &scope.cwd);
                 }
                 (shared, test_only)
             } else {
@@ -1682,7 +1682,17 @@ async fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>
 
 fn test_command(steps: &[crate::runtime::Step]) -> String {
     let line = |step: &crate::runtime::Step| {
-        let mut parts: Vec<String> = step.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();
+        let mut parts: Vec<String> = step
+            .env
+            .iter()
+            .map(|(k, v)| {
+                if k == "PYTHONPATH" {
+                    format!("PYTHONPATH={}${{PYTHONPATH:+:\"$PYTHONPATH\"}}", quote(v))
+                } else {
+                    format!("{k}={}", quote(v))
+                }
+            })
+            .collect();
         parts.push(quote(&step.program));
         parts.extend(step.args.iter().map(|a| quote(a)));
         parts.join(" ")
@@ -3437,7 +3447,19 @@ mod tests {
         let (chosen_stale, steps_stale) = select_test_steps(&scope).await;
         assert_eq!(chosen_stale, shared, "stdlib repo with working shared pytest must not fall back to scratch");
         assert!(steps_stale.iter().all(|s| !s.setup));
-        assert!(steps_stale.iter().any(|s| s.env.iter().any(|(k, v)| k == "PYTHONPATH" && v == ".")));
+        let expected_pypath = crate::runtime::pythonpath_for_tree(&dir, None);
+        assert!(Path::new(&expected_pypath).is_absolute());
+        assert!(
+            steps_stale
+                .iter()
+                .any(|s| s.env.iter().any(|(k, v)| k == "PYTHONPATH" && v == &expected_pypath)),
+            "expected absolute PYTHONPATH={expected_pypath}, got: {steps_stale:?}"
+        );
+        let cmd_str = test_command(&steps_stale);
+        assert!(
+            cmd_str.contains(&format!("PYTHONPATH={}${{PYTHONPATH:+:\"$PYTHONPATH\"}}", quote(&expected_pypath))),
+            "test_command must prepend absolute PYTHONPATH while preserving existing PYTHONPATH: {cmd_str}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

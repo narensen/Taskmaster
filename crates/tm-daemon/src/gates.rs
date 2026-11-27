@@ -179,6 +179,28 @@ pub fn contract_mutation_sanity_with_env(
 
     let is_pytest = is_pytest_cmd(test_cmd);
     let is_cargo = is_cargo_test_cmd(test_cmd);
+    let mut copy_env: Vec<(String, String)> = extra_env.to_vec();
+    if is_pytest || is_python_cmd(test_cmd) || copy_env.iter().any(|(k, _)| k == "PYTHONPATH") {
+        // Re-root PYTHONPATH from the unmutated `worktree` to the isolated temp copy `tmp.0`
+        // so stubbed files are actually imported even when tests spawn subprocesses from other cwds.
+        let orig_abs = if worktree.is_absolute() {
+            worktree.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(worktree))
+                .unwrap_or_else(|_| worktree.to_path_buf())
+        };
+        let orig_src = orig_abs.join("src");
+        if let Some((_, val)) = copy_env.iter_mut().find(|(k, _)| k == "PYTHONPATH") {
+            let filtered: Vec<std::path::PathBuf> = std::env::split_paths(val.as_str())
+                .filter(|p| !p.as_os_str().is_empty() && p != &orig_abs && p != &orig_src)
+                .collect();
+            let rest = std::env::join_paths(&filtered).ok().and_then(|s| s.into_string().ok());
+            *val = crate::runtime::pythonpath_for_tree(&tmp.0, rest.as_deref());
+        } else {
+            crate::runtime::prepend_pythonpath(&mut copy_env, &tmp.0);
+        }
+    }
     let augmented = if is_pytest {
         augment_pytest_cmd(test_cmd)
     } else {
@@ -188,7 +210,7 @@ pub fn contract_mutation_sanity_with_env(
 
     // 1. Baseline check on the unmutated copy: if baseline fails or zero tests pass
     //    (e.g., all tests skipped via skipif), the gate is inconclusive rather than vacuous.
-    let baseline = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    let baseline = run_cmd_output_with_env(&tmp.0, &effective_refs, &copy_env)?;
     if !baseline.status.success() {
         return Ok(MutationVerdict::Inconclusive);
     }
@@ -199,7 +221,7 @@ pub fn contract_mutation_sanity_with_env(
     // 2. Replace target implementation with a failing stub and re-run.
     let target = tmp.0.join(impl_rel_path);
     std::fs::write(&target, stub_content)?;
-    let mutated = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    let mutated = run_cmd_output_with_env(&tmp.0, &effective_refs, &copy_env)?;
     if !mutated.status.success() {
         return Ok(MutationVerdict::Caught);
     }
@@ -207,6 +229,16 @@ pub fn contract_mutation_sanity_with_env(
         return Ok(MutationVerdict::Inconclusive);
     }
     Ok(MutationVerdict::Vacuous)
+}
+
+fn is_python_cmd(cmd: &[&str]) -> bool {
+    let Some(first) = cmd.first() else { return false };
+    let prog = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    matches!(prog, "python" | "python3" | "python.exe" | "python3.exe")
+        || prog.starts_with("python3.")
 }
 
 fn is_pytest_cmd(cmd: &[&str]) -> bool {
@@ -505,7 +537,11 @@ pub fn mutation_test_command(
 }
 
 fn run_cmd_ok(dir: &Path, cmd: &[&str]) -> anyhow::Result<bool> {
-    Ok(run_cmd_output_with_env(dir, cmd, &[])?.status.success())
+    let mut env = Vec::new();
+    if is_pytest_cmd(cmd) || is_python_cmd(cmd) {
+        crate::runtime::prepend_pythonpath(&mut env, dir);
+    }
+    Ok(run_cmd_output_with_env(dir, cmd, &env)?.status.success())
 }
 
 fn run_cmd_output_with_env(

@@ -459,6 +459,56 @@ fn test_extras(pyproject: &str) -> Vec<String> {
     out
 }
 
+/// Absolute `PYTHONPATH` entries for importing Python packages from `tree` regardless of a child
+/// process's working directory (e.g. acceptance tests running `python -m pkg` with `cwd=tmpdir`).
+///
+/// Includes `<abs_tree>/src` first when `tree` uses a PEP 517 `src/` layout (`src/` directory
+/// without `src/__init__.py`), followed by `<abs_tree>`, followed by any non-empty entries from
+/// `existing` (deduplicated, preserving order).
+pub fn pythonpath_for_tree(tree: &Path, existing: Option<&str>) -> String {
+    let abs = if tree.is_absolute() {
+        tree.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(tree))
+            .unwrap_or_else(|_| tree.to_path_buf())
+    };
+    let mut entries: Vec<PathBuf> = Vec::new();
+    let src = abs.join("src");
+    if src.is_dir() && !src.join("__init__.py").is_file() {
+        entries.push(src);
+    }
+    entries.push(abs);
+    if let Some(prev) = existing {
+        for p in std::env::split_paths(prev) {
+            if !p.as_os_str().is_empty() && !entries.contains(&p) {
+                entries.push(p);
+            }
+        }
+    }
+    std::env::join_paths(&entries)
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            entries
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(sep)
+        })
+}
+
+/// Prepend [`pythonpath_for_tree`] into `env`'s `PYTHONPATH` entry (updating in place if present,
+/// or appending a new entry). Idempotent when called repeatedly for the same `tree`.
+pub fn prepend_pythonpath(env: &mut Vec<(String, String)>, tree: &Path) {
+    if let Some((_, val)) = env.iter_mut().find(|(k, _)| k == "PYTHONPATH") {
+        *val = pythonpath_for_tree(tree, Some(val.as_str()));
+    } else {
+        env.push(("PYTHONPATH".into(), pythonpath_for_tree(tree, None)));
+    }
+}
+
 /// How a Python project's tests are run, in its own runner where it has one, in `venv`.
 fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
     let pyproject = std::fs::read_to_string(tree.join("pyproject.toml")).unwrap_or_default();
@@ -550,9 +600,10 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         install.push(with_env(Step::new("setup", venv_python.clone(), &refs)));
         let mut run = with_env(Step::new("test", venv_python, &["-m", "pytest", "-q", "-x", "--tb=short"]));
-        if !has_external {
-            run.env.push(("PYTHONPATH".into(), ".".into()));
-        }
+        // Always set an absolute per-tree PYTHONPATH (never relative `.`) so subprocesses spawned
+        // from other working directories (e.g. `python -m pkg` with `cwd=tmpdir`) import this tree's
+        // package reliably even when `-e .` is skipped or a shared read-only venv is reused.
+        prepend_pythonpath(&mut run.env, tree);
         run
     };
     if !ready {
@@ -1849,6 +1900,130 @@ mod tests {
         assert!(!pip_ext.args.iter().any(|a| a == "--no-deps"), "{pip_ext:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tb18_stdlib_python_package_imports_from_other_cwd_via_absolute_pythonpath() {
+        let Some(py_mm) = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        else {
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("tm-tb18-abs-pypath-{}", std::process::id()));
+        let other_cwd = std::env::temp_dir().join(format!("tm-tb18-abs-pypath-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_cwd);
+        std::fs::create_dir_all(dir.join("mdtodo")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(&other_cwd).unwrap();
+
+        // Stdlib-only package with NO `[project.scripts]` (the exact n10bm-mdtodo-tmhcode layout).
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"setuptools\"]\n\n[project]\nname = \"mdtodo\"\nversion = \"0.1.0\"\ndependencies = []\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("mdtodo/__init__.py"), "VERSION = '0.1.0'\n").unwrap();
+        std::fs::write(dir.join("mdtodo/__main__.py"), "print('mdtodo-ok')\n").unwrap();
+
+        // Acceptance-style test that launches `python -m mdtodo` from ANOTHER cwd (`other_cwd`).
+        let test_script = format!(
+            "import subprocess, sys\n\
+def test_cli_from_other_cwd():\n\
+\x20   res = subprocess.run([sys.executable, '-m', 'mdtodo'], cwd={:?}, capture_output=True, text=True)\n\
+\x20   assert res.returncode == 0, res.stderr\n\
+\x20   assert 'mdtodo-ok' in res.stdout, res.stdout\n\
+if __name__ == '__main__':\n\
+\x20   test_cli_from_other_cwd()\n",
+            other_cwd.display().to_string()
+        );
+        std::fs::write(dir.join("tests/test_cli.py"), &test_script).unwrap();
+
+        // 1. Prove the test FAILS on the old relative `PYTHONPATH="."` code path.
+        let old_broken = std::process::Command::new("python3")
+            .arg(dir.join("tests/test_cli.py"))
+            .current_dir(&dir)
+            .env("PYTHONPATH", ".")
+            .output()
+            .unwrap();
+        assert!(!old_broken.status.success(), "relative PYTHONPATH='.' must fail from other_cwd");
+        let old_stderr = String::from_utf8_lossy(&old_broken.stderr);
+        assert!(old_stderr.contains("No module named mdtodo"), "expected No module named mdtodo, got: {old_stderr}");
+
+        // 2. Build a real local venv with a lightweight offline pytest runner shim so `run_steps`
+        //    executes the exact generated `Step` (including `clean_env` + `step.env`).
+        let venv = dir.join(".venv-test");
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", &venv.display().to_string()])
+            .status()
+            .unwrap();
+        if !mk.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&other_cwd);
+            return;
+        }
+        let pytest_pkg = venv.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&pytest_pkg).unwrap();
+        std::fs::write(pytest_pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            pytest_pkg.join("__main__.py"),
+            "import runpy, sys\nrunpy.run_path('tests/test_cli.py', run_name='__main__')\n",
+        )
+        .unwrap();
+        std::fs::write(venv.join(".taskmaster-deps"), python_stamp(&dir)).unwrap();
+
+        let py_steps = python_steps(&dir, &venv);
+        assert!(py_steps.iter().all(|s| !s.setup), "ready venv must need zero setup steps: {py_steps:?}");
+        let test_step = py_steps.iter().find(|s| s.name == "test").expect("test step");
+        let pypath = test_step
+            .env
+            .iter()
+            .find(|(k, _)| k == "PYTHONPATH")
+            .map(|(_, v)| v.as_str())
+            .expect("PYTHONPATH must be set");
+        assert_ne!(pypath, ".", "PYTHONPATH must be absolute, never relative '.'");
+        assert!(Path::new(pypath).is_absolute(), "expected absolute PYTHONPATH, got: {pypath}");
+        assert_eq!(pypath, pythonpath_for_tree(&dir, None));
+
+        // 3. Running the generated steps via `run_steps` passes the other-cwd `python -m mdtodo` test!
+        let (_, failure) = run_steps(&dir, &py_steps, Duration::from_secs(20)).await;
+        assert!(failure.is_none(), "expected run_steps to pass with absolute PYTHONPATH, got: {failure:?}");
+
+        // 4. `pythonpath_for_tree` prepends `src/` for src-layout repos and preserves existing entries.
+        let src_repo = dir.join("src-layout-check");
+        std::fs::create_dir_all(src_repo.join("src/pkg")).unwrap();
+        let combined = pythonpath_for_tree(&src_repo, Some("/opt/extra"));
+        let parts: Vec<PathBuf> = std::env::split_paths(&combined).collect();
+        assert_eq!(parts, vec![src_repo.join("src"), src_repo.clone(), PathBuf::from("/opt/extra")]);
+
+        // 5. Contract mutation sanity rewrites `PYTHONPATH` from original tree to the isolated temp copy,
+        //    so stubbing `mdtodo/__main__.py` is Caught rather than masked by the unmutated original tree.
+        let (_, mut_env) = crate::gates::mutation_test_command(&dir, &venv, "tests/test_cli.py")
+            .expect("mutation command");
+        let cmd_owned = [
+            venv.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" })
+                .display()
+                .to_string(),
+            "tests/test_cli.py".to_string(),
+        ];
+        let cmd_refs: Vec<&str> = cmd_owned.iter().map(String::as_str).collect();
+        let verdict = crate::gates::contract_mutation_sanity_with_env(
+            &dir,
+            "mdtodo/__main__.py",
+            "raise SystemExit(1)\n",
+            &cmd_refs,
+            &mut_env,
+        )
+        .unwrap();
+        assert_eq!(verdict, crate::gates::MutationVerdict::Caught);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_cwd);
     }
 
     /// Opens a real app in Chrome when `TM_BROWSER_TEST_APP` names a built Next.js app with

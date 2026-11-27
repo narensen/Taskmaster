@@ -14774,3 +14774,300 @@ async fn tb18_live_sync_reaches_only_dependents_and_isolates_independent_sibling
         let _ = std::fs::remove_dir_all(wt);
     }
 }
+
+#[tokio::test]
+async fn tb18_parked_early_integrator_waits_for_deps_before_acceptance_and_repair() {
+    use crate::FileStore;
+    use crate::live::Live;
+    use std::sync::atomic::AtomicBool;
+    use tm_core::WorkerOutcome;
+    use tm_harness::{Freed, Session};
+
+    let Some(py_mm) = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        return;
+    };
+
+    struct RepairableCliSession {
+        worktree: PathBuf,
+        follow_count: Arc<AtomicUsize>,
+        saw_synced_deps_on_repair: Arc<AtomicBool>,
+        last_prompt: Arc<Mutex<String>>,
+    }
+    #[async_trait]
+    impl Session for RepairableCliSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.follow_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_prompt.lock().unwrap() = text;
+            let has_parser = self.worktree.join("calcx/parser.py").is_file();
+            let has_eval = self.worktree.join("calcx/evaluator.py").is_file();
+            if has_parser && has_eval {
+                self.saw_synced_deps_on_repair.store(true, Ordering::SeqCst);
+            }
+            // Fix the bug in `calcx/cli.py`.
+            std::fs::write(
+                self.worktree.join("calcx/cli.py"),
+                "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run_cli() -> int:\n    return eval_val(parse('x'))\n",
+            )?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+        async fn close(self: Box<Self>) -> Freed {
+            Freed::default()
+        }
+    }
+
+    struct EarlyFinishCliHarness {
+        started: Arc<tokio::sync::Barrier>,
+        cli_done_tx: tokio::sync::watch::Sender<bool>,
+        cli_done_rx: tokio::sync::watch::Receiver<bool>,
+        cli_buggy_first: bool,
+        cli_fresh_calls: Arc<AtomicUsize>,
+        cli_follow_calls: Arc<AtomicUsize>,
+        saw_synced_deps_on_repair: Arc<AtomicBool>,
+        last_repair_prompt: Arc<Mutex<String>>,
+    }
+    #[async_trait]
+    impl Harness for EarlyFinishCliHarness {
+        fn id(&self) -> &'static str {
+            "tb18-parked-integrator"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
+            if task.brief.contains("Build unit `cli`") {
+                let n = self.cli_fresh_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // All 3 units start concurrently in wave 1 via shared `calcx/contract.py`.
+                    tokio::time::timeout(Duration::from_secs(5), self.started.wait())
+                        .await
+                        .expect("frontend, evaluator, and early-started cli must overlap");
+                }
+                let _ = std::fs::create_dir_all(task.cwd.join("calcx"));
+                let body = if self.cli_buggy_first {
+                    "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run_cli() -> int:\n    _ = (parse, eval_val)\n    return 999\n"
+                } else {
+                    "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run_cli() -> int:\n    return eval_val(parse('x'))\n"
+                };
+                let _ = std::fs::write(task.cwd.join("calcx/cli.py"), body);
+                let _ = std::fs::write(
+                    task.cwd.join("calcx/__main__.py"),
+                    "from calcx.cli import run_cli\nprint(run_cli())\n",
+                );
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+                let _ = self.cli_done_tx.send(true);
+                let session: Box<dyn Session> = Box::new(RepairableCliSession {
+                    worktree: task.cwd.clone(),
+                    follow_count: self.cli_follow_calls.clone(),
+                    saw_synced_deps_on_repair: self.saw_synced_deps_on_repair.clone(),
+                    last_prompt: self.last_repair_prompt.clone(),
+                });
+                return (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) }),
+                    Some(session),
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), self.started.wait())
+                .await
+                .expect("frontend, evaluator, and early-started cli must overlap");
+            // Wait until `cli` has ALREADY finished its worker turn (plus a grace margin so any
+            // unparked driver would prematurely run acceptance check & fail `cli` right here).
+            let mut rx = self.cli_done_rx.clone();
+            tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|&done| done))
+                .await
+                .expect("cli should finish first")
+                .expect("watch channel open");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = std::fs::create_dir_all(task.cwd.join("calcx"));
+            if task.brief.contains("Build unit `frontend`") {
+                let _ = std::fs::write(task.cwd.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:frontend\n".into() }).await;
+            } else if task.brief.contains("Build unit `evaluator`") {
+                let _ = std::fs::write(task.cwd.join("calcx/evaluator.py"), "def eval_val(x: int) -> int:\n    return x + 1\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:evaluator\n".into() }).await;
+            }
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) }),
+                None,
+            )
+        }
+    }
+
+    let make_plan = || Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+            ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "class Token:\n    pass\nclass Expr:\n    pass\n".into(),
+                phase: 0,
+            },
+            ContractFile {
+                path: "tests/test_calcx_contract.py".into(),
+                content: "from calcx.cli import run_cli\n\ndef test_calcx():\n    got = run_cli()\n    assert got == 43, f'expected 43, got {got}'\n\nif __name__ == '__main__':\n    test_calcx()\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "frontend".into(),
+                owned_glob: "calcx/parser.py".into(),
+                brief: "Parse Token into Expr from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "evaluator".into(),
+                owned_glob: "calcx/evaluator.py".into(),
+                brief: "Evaluate Expr from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "{calcx/cli.py,calcx/__main__.py}".into(),
+                brief: "Build CLI using Token and Expr from calcx/contract.py.".into(),
+                depends_on: vec!["frontend".into(), "evaluator".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let seed_offline_venv = |project: &Path, run_id: &str| -> bool {
+        let venv = crate::run_directory(project, run_id).join("venv");
+        let _ = std::fs::create_dir_all(venv.parent().unwrap());
+        let ok = std::process::Command::new("python3")
+            .args(["-m", "venv", &venv.display().to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return false;
+        }
+        let pytest_pkg = venv.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&pytest_pkg).unwrap();
+        std::fs::write(pytest_pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            pytest_pkg.join("__main__.py"),
+            "import runpy\nrunpy.run_path('tests/test_calcx_contract.py', run_name='__main__')\n",
+        )
+        .unwrap();
+        std::fs::write(venv.join(".taskmaster-deps"), crate::runtime::python_stamp(project)).unwrap();
+        true
+    };
+
+    // Sub-case A: Early-started `cli` finishes first while `frontend` & `evaluator` are still
+    // building -> parked (no premature acceptance check, no CheckFailed, no repair), checked once
+    // both deps land, passes acceptance + final verify (incl. import-boundary rule) with 0 repairs!
+    let tmp_ok = repo("tb18-parked-ok");
+    if !seed_offline_venv(&tmp_ok.0, "parked-ok") {
+        return;
+    }
+    let store_ok = Arc::new(FileStore::in_project(&tmp_ok.0));
+    let live_ok = Arc::new(Live::new(store_ok.clone()));
+    let (cli_done_tx_ok, cli_done_rx_ok) = tokio::sync::watch::channel(false);
+    let h_ok = Arc::new(EarlyFinishCliHarness {
+        started: Arc::new(tokio::sync::Barrier::new(3)),
+        cli_done_tx: cli_done_tx_ok,
+        cli_done_rx: cli_done_rx_ok,
+        cli_buggy_first: false,
+        cli_fresh_calls: Arc::new(AtomicUsize::new(0)),
+        cli_follow_calls: Arc::new(AtomicUsize::new(0)),
+        saw_synced_deps_on_repair: Arc::new(AtomicBool::new(false)),
+        last_repair_prompt: Arc::new(Mutex::new(String::new())),
+    });
+    let harnesses_ok = Harnesses { master: h_ok.clone(), mid: h_ok.clone(), worker: h_ok.clone(), reviewer: h_ok.clone(), verifier: h_ok.clone() };
+    let mut cfg_ok = config(&tmp_ok.0, make_plan(), true, 3);
+    cfg_ok.run_id = "parked-ok".into();
+    cfg_ok.store = Some(store_ok.clone());
+    cfg_ok.live = Some(live_ok.clone());
+    cfg_ok.checks = false;
+    cfg_ok.runtime_checks = true;
+    cfg_ok.code_mode = false;
+    cfg_ok.browser = false;
+    cfg_ok.offline = true;
+    let out_ok = drive(cfg_ok, harnesses_ok).await.unwrap();
+    assert_eq!(out_ok, Outcome::Finished { ok: true });
+    assert_eq!(h_ok.cli_fresh_calls.load(Ordering::SeqCst), 1, "passing parked cli must run once with zero repairs");
+    assert_eq!(h_ok.cli_follow_calls.load(Ordering::SeqCst), 0, "passing parked cli must not be sent to repair");
+
+    let events_ok = Records::files(&tmp_ok.0).events("parked-ok").unwrap();
+    assert!(
+        !events_ok.iter().any(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::CheckFailed { .. } } if page == "cli")),
+        "parked cli must never record CheckFailed while deps were unlanded: {events_ok:?}"
+    );
+    let idx_front = events_ok.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "frontend")).unwrap();
+    let idx_eval = events_ok.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "evaluator")).unwrap();
+    let idx_cli = events_ok.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "cli")).unwrap();
+    assert!(idx_cli > idx_front && idx_cli > idx_eval, "cli must settle Passed strictly after both deps landed");
+
+    // Sub-case B: Early-started `cli` has a real bug -> still parked while deps are unlanded (no
+    // premature failure), then fails acceptance ONCE after both deps land, gets repaired ONCE on
+    // the SAME open session with synced dep files present in its worktree, and passes!
+    let tmp_fix = repo("tb18-parked-repair");
+    if !seed_offline_venv(&tmp_fix.0, "parked-repair") {
+        return;
+    }
+    let store_fix = Arc::new(FileStore::in_project(&tmp_fix.0));
+    let live_fix = Arc::new(Live::new(store_fix.clone()));
+    let (cli_done_tx_fix, cli_done_rx_fix) = tokio::sync::watch::channel(false);
+    let h_fix = Arc::new(EarlyFinishCliHarness {
+        started: Arc::new(tokio::sync::Barrier::new(3)),
+        cli_done_tx: cli_done_tx_fix,
+        cli_done_rx: cli_done_rx_fix,
+        cli_buggy_first: true,
+        cli_fresh_calls: Arc::new(AtomicUsize::new(0)),
+        cli_follow_calls: Arc::new(AtomicUsize::new(0)),
+        saw_synced_deps_on_repair: Arc::new(AtomicBool::new(false)),
+        last_repair_prompt: Arc::new(Mutex::new(String::new())),
+    });
+    let harnesses_fix = Harnesses { master: h_fix.clone(), mid: h_fix.clone(), worker: h_fix.clone(), reviewer: h_fix.clone(), verifier: h_fix.clone() };
+    let mut cfg_fix = config(&tmp_fix.0, make_plan(), true, 3);
+    cfg_fix.run_id = "parked-repair".into();
+    cfg_fix.store = Some(store_fix.clone());
+    cfg_fix.live = Some(live_fix.clone());
+    cfg_fix.checks = false;
+    cfg_fix.runtime_checks = true;
+    cfg_fix.code_mode = false;
+    cfg_fix.browser = false;
+    cfg_fix.offline = true;
+    let out_fix = drive(cfg_fix, harnesses_fix).await.unwrap();
+    assert_eq!(out_fix, Outcome::Finished { ok: true });
+    assert_eq!(h_fix.cli_fresh_calls.load(Ordering::SeqCst), 1, "cli must only start one fresh session");
+    assert_eq!(h_fix.cli_follow_calls.load(Ordering::SeqCst), 1, "failing parked cli must get exactly one same-session repair");
+    assert!(
+        h_fix.saw_synced_deps_on_repair.load(Ordering::SeqCst),
+        "repaired cli's worktree must already contain synced frontend & evaluator files"
+    );
+    let repair_msg = h_fix.last_repair_prompt.lock().unwrap().clone();
+    assert!(repair_msg.contains("expected 43, got 999"), "repair prompt must include real post-dep failure (not ImportError): {repair_msg}");
+
+    let events_fix = Records::files(&tmp_fix.0).events("parked-repair").unwrap();
+    let f_front = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "frontend")).unwrap();
+    let f_eval = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "evaluator")).unwrap();
+    let f_cli_fail = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::CheckFailed { .. } } if page == "cli")).unwrap();
+    let f_cli_pass = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "cli")).unwrap();
+    assert!(
+        f_cli_fail > f_front && f_cli_fail > f_eval && f_cli_pass > f_cli_fail,
+        "cli CheckFailed must occur ONLY after both deps landed, followed by Passed"
+    );
+}

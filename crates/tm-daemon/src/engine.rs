@@ -119,6 +119,20 @@ struct Settling {
     wanted: usize,
 }
 
+/// An early-started unit whose worker finished before all of its soft (contract-only)
+/// dependencies landed. Parked until those dependencies land so acceptance/test checks run
+/// once against the landed siblings instead of triggering a doomed premature repair round.
+struct ParkedPage {
+    page: PageId,
+    cmd: Option<Command>,
+    tier: Tier,
+    errors: Option<String>,
+    products: Vec<(usize, Product)>,
+    shot: Option<Vec<u8>>,
+    wanted: usize,
+    was_race: bool,
+}
+
 /// What [`Driver::join_one`] woke up for.
 enum Joined {
     Job(Result<(PageId, usize, WorkerJob), tokio::task::JoinError>),
@@ -534,6 +548,10 @@ struct Driver {
     /// Units that started immediately on a contract-only `depends_on` before `dep` landed:
     /// `dep -> {dependent units}` so their integration is re-checked once `dep` lands.
     soft_dep_waiters: BTreeMap<PageId, BTreeSet<PageId>>,
+    /// Early-started units that finished before all of their soft dependencies landed (`page -> ParkedPage`).
+    /// Kept out of `self.running` (freeing concurrency slots) while remaining in `self.active_syncs`
+    /// so live sibling sync keeps updating their worktrees until all deps land.
+    parked_waiters: BTreeMap<PageId, ParkedPage>,
     /// Active in-flight worker sync handles (`page -> sync handles`) notified whenever a sibling
     /// lands in `self.tree` so early-started units receive landed siblings safely without races.
     active_syncs: HashMap<PageId, Vec<Arc<crate::code::WorktreeSync>>>,
@@ -892,6 +910,7 @@ pub async fn drive(config: Config, harnesses: Harnesses) -> anyhow::Result<Outco
         last_gate_findings: BTreeMap::new(),
         waived_gate_findings: BTreeSet::new(),
         soft_dep_waiters: BTreeMap::new(),
+        parked_waiters: BTreeMap::new(),
         active_syncs: HashMap::new(),
         worktree_syncs: HashMap::new(),
         started_wall,
@@ -1064,6 +1083,7 @@ impl Driver {
         self.batch_errors.clear();
         self.active_syncs.clear();
         self.worktree_syncs.clear();
+        self.drop_parked_waiters().await;
         for (_, products) in std::mem::take(&mut self.batches) {
             for (_, product) in products {
                 self.drop_worktree(&product.worktree);
@@ -1120,6 +1140,7 @@ impl Driver {
                 self.checks.abort_all();
                 self.early.abort_all();
                 self.pending.clear();
+                self.drop_parked_waiters().await;
                 if !self.running.is_empty() {
                     let mut force_rx = self.force_watcher();
                     let interrupted = tokio::select! {
@@ -1159,9 +1180,14 @@ impl Driver {
                 self.checks.abort_all();
                 self.early.abort_all();
                 self.pending.clear();
+                self.drop_parked_waiters().await;
                 if self.running.is_empty() {
                     self.push_event(Event::Cancelled)?;
                 }
+                continue;
+            }
+            // Unpark and judge any early-started units whose soft dependencies have all landed.
+            if self.drain_ready_parked().await? {
                 continue;
             }
             let room = self.running.len() < self.parallel;
@@ -1186,6 +1212,12 @@ impl Driver {
             if has_spawn && !budget_stopped {
                 let idx = ready_spawn.unwrap_or(0);
                 self.start_spawn(idx).await?;
+                continue;
+            }
+            // Deadlock safety net: if nothing is running or queued to spawn, drain any remaining
+            // parked waiters immediately rather than stalling.
+            if !self.parked_waiters.is_empty() && self.running.is_empty() {
+                self.drain_all_parked().await?;
                 continue;
             }
             if let Some(cmd) = self.pending.pop_front() {
@@ -1249,11 +1281,16 @@ impl Driver {
                 }
             });
             let overlaps_running = unit.is_some_and(|u| {
-                self.running.iter().any(|running_cmd| {
-                    let Command::SpawnWorker { page: running_page, .. } = running_cmd else {
-                        return false;
-                    };
-                    plan.and_then(|p| p.pages.iter().find(|r| r.id == *running_page))
+                let active_pages = self
+                    .running
+                    .iter()
+                    .filter_map(|running_cmd| match running_cmd {
+                        Command::SpawnWorker { page: running_page, .. } => Some(running_page.as_str()),
+                        _ => None,
+                    })
+                    .chain(self.parked_waiters.keys().map(String::as_str));
+                active_pages.into_iter().any(|active_page| {
+                    plan.and_then(|p| p.pages.iter().find(|r| r.id == active_page))
                         .is_some_and(|r| tm_core::owned_globs_overlap(&u.owned_glob, &r.owned_glob))
                 })
             });
@@ -3064,7 +3101,9 @@ impl Driver {
                     self.maybe_run_code_error_followup(&page, index, &mut product).await?;
                     self.maybe_code_mode_refusal_followup(&page, index, &mut product).await?;
                     self.maybe_noop_repair_followup(&page, index, &mut product, repair_errors.as_deref()).await?;
-                    self.maybe_release_gate_nudge(&page, index, &mut product).await?;
+                    if self.pending_soft_deps(&page).is_empty() {
+                        self.maybe_release_gate_nudge(&page, index, &mut product).await?;
+                    }
                 }
                 self.batches.entry(page.clone()).or_default().push((index, product));
             }
@@ -3139,7 +3178,6 @@ impl Driver {
             return Ok(());
         }
         let mut products = self.batches.remove(&page).unwrap_or_default();
-        self.active_syncs.remove(&page);
         let job_errors = self.batch_errors.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
         let cmd = self.take_running(&page);
@@ -3148,6 +3186,7 @@ impl Driver {
             map.lock().unwrap().remove(&page);
         }
         if self.is_stale(&page) {
+            self.active_syncs.remove(&page);
             for (_, product) in &products {
                 self.drop_worktree(&product.worktree);
             }
@@ -3163,6 +3202,7 @@ impl Driver {
         // If any non-race unit failed, or every candidate in a race failed, settle as CheckFailed
         // so the run state machine retries or escalates the page instead of aborting the run.
         if !job_errors.is_empty() && (!was_race || products.is_empty()) {
+            self.active_syncs.remove(&page);
             for (_, product) in &products {
                 self.drop_worktree(&product.worktree);
             }
@@ -3180,6 +3220,136 @@ impl Driver {
         // W3: Pick the best candidate from a Best-of-N race and remove every loser worktree.
         if was_race && products.len() > 1 {
             products = self.select_race_winner(&page, products);
+        }
+        let parked = ParkedPage {
+            page: page.clone(),
+            cmd,
+            tier,
+            errors,
+            products,
+            shot,
+            wanted,
+            was_race,
+        };
+        // If this early-started unit finished while any of its soft (contract-only) dependencies
+        // have not landed yet (and it did not raise a Dictionary objection flag), park it instead
+        // of running a doomed acceptance check / repair round. Keep it in `self.active_syncs` so
+        // live sibling sync keeps bringing landed dep files into its worktree until all deps land.
+        let has_flag = parked
+            .products
+            .iter()
+            .any(|(_, p)| reply::parse_flag(&p.answer.text).is_some());
+        let waiting_deps = self.pending_soft_deps(&page);
+        if !has_flag && !waiting_deps.is_empty() {
+            eprintln!(
+                "taskmaster: parking {page} until soft dependencies land: {}",
+                waiting_deps.join(", ")
+            );
+            self.parked_waiters.insert(page, parked);
+            return Ok(());
+        }
+        self.active_syncs.remove(&page);
+        self.finalize_products(parked).await
+    }
+
+    /// Unlanded soft (contract-only) dependencies of `page` derived from `soft_dep_waiters` and
+    /// `WorktreeSync::pending_deps`, filtered to upstream pages still in progress (not yet `Passed`
+    /// and not already terminal `Failed`/`Blocked`).
+    fn pending_soft_deps(&self, page: &str) -> Vec<PageId> {
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        for (dep, waiters) in &self.soft_dep_waiters {
+            if waiters.contains(page) {
+                deps.insert(dep.clone());
+            }
+        }
+        if let Some(syncs) = self.active_syncs.get(page) {
+            for sync in syncs {
+                for dep in sync.pending_deps() {
+                    deps.insert(dep);
+                }
+            }
+        }
+        deps.into_iter()
+            .filter(|dep| {
+                dep != page
+                    && self.run.pages.get(dep.as_str()).is_some_and(|st| {
+                        !matches!(st.state, tm_core::PageState::Passed | tm_core::PageState::Failed)
+                    })
+            })
+            .collect()
+    }
+
+    /// Close kept sessions and drop worktrees for all currently parked early-started units.
+    async fn drop_parked_waiters(&mut self) {
+        for (page, parked) in std::mem::take(&mut self.parked_waiters) {
+            self.active_syncs.remove(&page);
+            for (_, mut product) in parked.products {
+                if let Some(session) = product.answer.kept.take() {
+                    let _ = session.close().await;
+                }
+                self.drop_worktree(&product.worktree);
+            }
+        }
+    }
+
+    /// Unpark and judge every parked early-started unit whose soft dependencies have all landed.
+    /// Loops so chained parked units (`A -> B -> C`) wake in topological order.
+    async fn drain_ready_parked(&mut self) -> anyhow::Result<bool> {
+        let mut drained = false;
+        loop {
+            let next = self
+                .parked_waiters
+                .keys()
+                .find(|page| self.pending_soft_deps(page).is_empty())
+                .cloned();
+            let Some(page) = next else { break };
+            if let Some(parked) = self.parked_waiters.remove(&page) {
+                self.unpark_and_finalize(parked).await?;
+                drained = true;
+            }
+        }
+        Ok(drained)
+    }
+
+    /// Deadlock safety net: unpark and judge all remaining parked waiters when nothing else can run.
+    async fn drain_all_parked(&mut self) -> anyhow::Result<()> {
+        let keys: Vec<PageId> = self.parked_waiters.keys().cloned().collect();
+        for page in keys {
+            if let Some(parked) = self.parked_waiters.remove(&page) {
+                self.unpark_and_finalize(parked).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync a parked unit's worktree(s) with all landed dependency files, detach it from
+    /// `active_syncs`, and run the standard judge / acceptance / settle pipeline.
+    async fn unpark_and_finalize(&mut self, parked: ParkedPage) -> anyhow::Result<()> {
+        eprintln!("taskmaster: dependencies landed for parked {}; running checks", parked.page);
+        for (_, product) in &parked.products {
+            if let Some(sync) = self.worktree_syncs.get(&product.worktree).cloned() {
+                let _ = sync.mark_dirty_and_try_sync();
+                let _ = sync.sync_if_dirty().await;
+            }
+        }
+        self.active_syncs.remove(&parked.page);
+        self.finalize_products(parked).await
+    }
+
+    /// Judge, optionally start early static checks, and settle one finished (or unparked) page.
+    async fn finalize_products(&mut self, parked: ParkedPage) -> anyhow::Result<()> {
+        let ParkedPage { page, cmd, tier, errors, products, shot, wanted, was_race } = parked;
+        if self.is_stale(&page) {
+            for (_, mut product) in products {
+                if let Some(session) = product.answer.kept.take() {
+                    let _ = session.close().await;
+                }
+                self.drop_worktree(&product.worktree);
+            }
+            self.records.clear_merged(&self.id, &page);
+            eprintln!("taskmaster: {page} was built against an amended entry; discarding it");
+            self.push_event(Event::WorkerFinished { page, outcome: WorkerOutcome::Passed })?;
+            return Ok(());
         }
         let text = products.iter().map(|(_, p)| p.answer.text.as_str()).collect::<Vec<_>>().join("\n");
         let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
@@ -3848,7 +4018,9 @@ impl Driver {
         if !self.config.checks {
             return None;
         }
-        let others = !self.jobs.is_empty() || self.pending.iter().any(|cmd| matches!(cmd, Command::SpawnWorker { .. }));
+        let others = !self.jobs.is_empty()
+            || !self.parked_waiters.is_empty()
+            || self.pending.iter().any(|cmd| matches!(cmd, Command::SpawnWorker { .. }));
         if !others {
             return None;
         }

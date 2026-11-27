@@ -389,7 +389,7 @@ pub(crate) fn project_has_external_deps(tree: &Path) -> bool {
 /// The dependency files that decide what a Python environment holds, as one stamp.
 /// Only dependency-affecting fields of `pyproject.toml` are hashed so cosmetic metadata or
 /// `[tool.pytest.ini_options]` changes never invalidate an existing venv.
-fn python_stamp(tree: &Path) -> String {
+pub(crate) fn python_stamp(tree: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     if let Ok(raw) = std::fs::read_to_string(tree.join("pyproject.toml")) {

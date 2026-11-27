@@ -19,7 +19,8 @@ test("Settings Web access persists provider, vaulted key, roles, allowlist and R
   await enableSwitch.click();
   await expect(enableSwitch).toHaveAttribute("aria-checked", "true");
 
-  await section.getByTestId("web-access-provider").selectOption("brave");
+  await section.getByTestId("web-access-provider").click();
+  await page.locator(".select-pop").getByRole("option", { name: /Brave/ }).click();
   await section.getByTestId("web-access-key").fill("brv-secret-e2e-987654");
   await section.getByTestId("web-access-allowlist").fill("docs.rs, react.dev");
   await section.getByRole("switch", { name: "Worker web search" }).click();
@@ -41,7 +42,7 @@ test("Settings Web access persists provider, vaulted key, roles, allowlist and R
   await page.reload();
   const reloaded = page.getByTestId("web-access-section");
   await expect(reloaded.getByRole("switch", { name: "Enable agent web access" })).toHaveAttribute("aria-checked", "true");
-  await expect(reloaded.getByTestId("web-access-provider")).toHaveValue("brave");
+  await expect(reloaded.getByTestId("web-access-provider")).toHaveAttribute("data-value", "brave");
   await expect(reloaded.getByTestId("web-access-allowlist")).toHaveValue("docs.rs, react.dev");
   await expect(reloaded.getByRole("switch", { name: "Worker web search" })).toHaveAttribute("aria-checked", "true");
   await expect(reloaded.getByTestId("web-access-key-saved")).toBeVisible();

@@ -687,6 +687,29 @@ export function App() {
 
   useLastProject(signedIn ? settings.data?.project : undefined);
 
+  // Keep the app layout locked at 1:1 scale — prevent accidental browser/webview zoom.
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) e.preventDefault();
+    };
+    const onZoomKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === "+" || e.key === "=" || e.key === "-" || e.key === "_" || e.key === "0")) {
+        e.preventDefault();
+      }
+    };
+    const onGesture = (e: Event) => e.preventDefault();
+    window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    window.addEventListener("keydown", onZoomKey, true);
+    window.addEventListener("gesturestart", onGesture, { passive: false });
+    window.addEventListener("gesturechange", onGesture, { passive: false });
+    return () => {
+      window.removeEventListener("wheel", onWheel, true);
+      window.removeEventListener("keydown", onZoomKey, true);
+      window.removeEventListener("gesturestart", onGesture);
+      window.removeEventListener("gesturechange", onGesture);
+    };
+  }, []);
+
   const toggleTerm = useCallback(() => {
     setTermMounted(true);
     setTerm((t) => !t);

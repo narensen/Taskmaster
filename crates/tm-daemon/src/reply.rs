@@ -375,18 +375,30 @@ pub fn limit_of(text: &str) -> Option<ProviderLimit> {
         return None;
     }
     let head = raw.lines().find(|line| !line.trim().is_empty()).unwrap_or(raw);
-    let window = if raw.chars().count() <= 1200 { raw } else { head };
-    let lower = window.to_ascii_lowercase();
-    let kind = if balance_failure(&lower) {
-        LimitKind::Balance
-    } else if auth_failure(&lower) {
-        LimitKind::Auth
-    } else if rate_failure(&lower) {
-        LimitKind::RateLimit
-    } else if quota_failure(&lower) {
-        LimitKind::Quota
+    // A harness appends its limit notice after whatever the agent already said, so a long
+    // reply is judged by its first line and by its last.
+    let tail = raw.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or(raw);
+    let short = raw.chars().count() <= 1200;
+    let kind_of = |window: &str| {
+        let lower = window.to_ascii_lowercase();
+        if balance_failure(&lower) {
+            Some(LimitKind::Balance)
+        } else if auth_failure(&lower) {
+            Some(LimitKind::Auth)
+        } else if rate_failure(&lower) {
+            Some(LimitKind::RateLimit)
+        } else if quota_failure(&lower) {
+            Some(LimitKind::Quota)
+        } else {
+            None
+        }
+    };
+    let (kind, window) = if short {
+        (kind_of(raw)?, raw)
+    } else if let Some(kind) = kind_of(head) {
+        (kind, head)
     } else {
-        return None;
+        (kind_of(tail)?, tail)
     };
     let raw = {
         let mut cut = raw.chars().take(2000).collect::<String>();
@@ -461,6 +473,11 @@ fn quota_failure(text: &str) -> bool {
         "out of credits",
         "spend limit",
         "exceeded your current quota",
+        "quota reached",
+        "quota exceeded",
+        "quota exhausted",
+        "quota has been reached",
+        "quota has been exceeded",
     ];
     PHRASES.iter().any(|phrase| text.contains(phrase))
 }
@@ -606,6 +623,16 @@ mod tests {
         let named = ReportedLimit::new("grok", "Worker", hit);
         assert!(named.sentence().contains("no usage balance left (Worker)"), "{}", named.sentence());
         assert_eq!(limit_of("HTTP 402 Payment Required").unwrap().kind, LimitKind::Balance);
+
+        // Recorded from Antigravity in a Horse Tinder repair round: alone, and appended after a
+        // long reply from an earlier part of the same turn.
+        let agy = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 135h35m54s.";
+        let hit = limit_of(agy).unwrap();
+        assert_eq!((hit.kind, hit.reset.as_deref()), (LimitKind::Quota, Some("in 135h35m54s")));
+        let long = format!("{}\n\nRELEASE page:horse-tinder/horse-catalog-data\n\n{agy}\n", "Restored js/horses.js and re-verified every export. ".repeat(40));
+        assert_eq!(limit_of(&long).unwrap().kind, LimitKind::Quota);
+        let prose = format!("Built the catalog.\n{}\nRELEASE page:a", "The quota reached in this test is a sample value. ".repeat(40));
+        assert!(limit_of(&prose).is_none(), "a long reply that only mentions a quota mid-text is not a limit");
 
         assert!(limit_of("{\"pages\":[]}").is_none());
         assert!(parse_plan("{\"pages\":[]}").is_ok());

@@ -5,6 +5,7 @@ import { useState } from "react";
 import { api, type WebAccessPayload, type WebAccessSettings, type WebRoleMatrix } from "../api";
 import { toast } from "../overlay";
 import { Problem, Switch, useLoad } from "../ui";
+import { SelectMenu } from "../components/SelectMenu";
 
 const PROVIDER_LABELS: Record<string, string> = {
   searxng: "SearXNG (local / self-hosted)",
@@ -164,21 +165,16 @@ export function WebAccessSection() {
         </label>
 
         <div className="web-access-grid">
-          <label className="web-access-field">
+          <div className="web-access-field">
             <span className="muted small">Search provider</span>
-            <select
-              aria-label="Web search provider"
-              data-testid="web-access-provider"
+            <SelectMenu
+              ariaLabel="Web search provider"
+              testId="web-access-provider"
               value={cfg.provider}
-              onChange={(e) => patch({ provider: e.target.value })}
-            >
-              {providers.map((id) => (
-                <option key={id} value={id}>
-                  {PROVIDER_LABELS[id] ?? id}
-                </option>
-              ))}
-            </select>
-          </label>
+              options={providers.map((id) => ({ value: id, label: PROVIDER_LABELS[id] ?? id }))}
+              onChange={(v) => patch({ provider: v })}
+            />
+          </div>
 
           <label className="web-access-field">
             <span className="muted small">Provider endpoint (optional)</span>

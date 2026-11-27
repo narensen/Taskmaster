@@ -92,7 +92,7 @@ pub fn select(tree: &Path, changed: &[String]) -> Vec<Check> {
             _ => {}
         }
     }
-    if std::fs::read_to_string(tree.join("package.json")).is_ok_and(|text| text.contains("\"next\"")) {
+    if runtime::can_browse(tree) {
         out.push(Check::Smoke);
     }
     out
@@ -323,8 +323,13 @@ mod tests {
         std::fs::write(tree.join("tsconfig.json"), "{}").unwrap();
         std::fs::write(tree.join("eslint.config.mjs"), "export default []").unwrap();
         let changed = vec!["app/page.tsx".to_string()];
-        // No node_modules: every tool is skipped, quickly, and nothing is installed.
-        assert!(select(&tree, &changed).iter().all(|c| !matches!(c, Check::Tsc | Check::Eslint | Check::Build)));
+        // No node_modules yet: local tsc/eslint bins are skipped, while build (with auto-install) and smoke apply.
+        let initial = select(&tree, &changed);
+        assert!(initial.iter().all(|c| !matches!(c, Check::Tsc | Check::Eslint)));
+        if on_path("npm") {
+            assert!(initial.contains(&Check::Build));
+        }
+        assert_eq!(initial.last(), Some(&Check::Smoke));
         std::fs::create_dir_all(tree.join("node_modules/.bin")).unwrap();
         std::fs::write(tree.join("node_modules/.bin/tsc"), "").unwrap();
         std::fs::write(tree.join("node_modules/.bin/eslint"), "").unwrap();

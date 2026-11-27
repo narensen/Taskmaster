@@ -5,6 +5,7 @@ import { useState } from "react";
 import { api, type GitState, type HostConnection } from "../api";
 import { Problem, useAction, useLoad } from "../ui";
 import { toast } from "../overlay";
+import { SelectMenu } from "../components/SelectMenu";
 
 const HINT: Record<string, string> = {
   github: "Personal access token with repo scope, or sign in with gh. For GitHub Enterprise, set its address.",
@@ -172,14 +173,16 @@ export function Hosts() {
               }}
             >
               {connected.length > 1 && (
-                <select aria-label="Host for the new repository" value={chosen?.id ?? ""} onChange={(e) => setRepoHost(e.target.value)}>
-                  {connected.map((host) => (
-                    <option key={host.id} value={host.id}>
-                      {host.name}
-                      {host.account ? ` · ${host.account}` : ""}
-                    </option>
-                  ))}
-                </select>
+                <SelectMenu
+                  ariaLabel="Host for the new repository"
+                  value={chosen?.id ?? ""}
+                  options={connected.map((host) => ({
+                    value: host.id,
+                    label: host.name,
+                    note: host.account ?? undefined,
+                  }))}
+                  onChange={setRepoHost}
+                />
               )}
               <input
                 aria-label="Repository name"

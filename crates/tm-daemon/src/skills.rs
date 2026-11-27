@@ -268,6 +268,8 @@ impl Store {
                 installs: item.get("installs").and_then(Value::as_u64).unwrap_or(0),
             });
         }
+        hits.sort_by(|a, b| b.installs.cmp(&a.installs).then_with(|| a.name.cmp(&b.name)));
+        hits.truncate(100);
         Ok(hits)
     }
 

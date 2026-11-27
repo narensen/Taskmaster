@@ -272,8 +272,10 @@ pub(crate) fn infer_glob_language(glob: &str) -> Option<String> {
     None
 }
 
-/// Shared-file repairs the master gets in one run.
+/// Shared-file repairs the master gets on the same failure before giving up.
 const MAX_SHARED_REPAIRS: usize = 2;
+/// Total shared/unowned repairs allowed when each repair makes progress (changes the failure key).
+const MAX_SHARED_PROGRESS_REPAIRS: usize = 4;
 
 /// What the build, the tests and the browser found.
 #[derive(Default)]
@@ -2193,19 +2195,15 @@ impl Driver {
             Joined::Early(done) => return self.finish_early(done.context("an early check panicked")?),
             Joined::Job(job) => job.context("a worker task panicked")?,
         };
-        let shot = match (&self.browsers, self.config.checker && !self.checked.contains(&page)) {
-            (Some(browsers), true) => browsers.snapshot(&page).await,
-            _ => None,
-        };
-        if let Some(browsers) = &self.browsers {
-            browsers.detach(&page);
-        }
-        if let Some(code) = &self.code {
-            code.detach_page(&page);
-        }
         let mut product = match result {
             Ok(WorkerJob::Finished(product)) => *product,
             Ok(WorkerJob::Restarted(worktree)) => {
+                if let Some(browsers) = &self.browsers {
+                    browsers.detach(&page);
+                }
+                if let Some(code) = &self.code {
+                    code.detach_page(&page);
+                }
                 self.drop_worktree(&worktree);
                 self.race_pages.remove(&page);
                 if let Some(partial) = self.batches.remove(&page) {
@@ -2231,6 +2229,12 @@ impl Driver {
                 return Ok(());
             }
             Err(err) => {
+                if let Some(browsers) = &self.browsers {
+                    browsers.detach(&page);
+                }
+                if let Some(code) = &self.code {
+                    code.detach_page(&page);
+                }
                 self.race_pages.remove(&page);
                 if let Some(map) = &self.config.worker_restarts {
                     map.lock().unwrap().remove(&page);
@@ -2242,6 +2246,7 @@ impl Driver {
         self.charge(&product.bill, &product.answer)?;
         // W1: Release gate — if a worker with a shell and available tests released without
         // running them, send the nudge once as a follow-up turn before judging/checking.
+        // Keep run_code attached until after this nudge so the worker can still run tests.
         if !self.is_stale(&page)
             && !self.race_pages.contains_key(&page)
             && product.answer.ok
@@ -2254,10 +2259,35 @@ impl Driver {
             .get(&page)
             .copied()
             .unwrap_or_else(|| self.page(&page).map(|p| p.work_units().len()).unwrap_or(1));
+        // For multi-part pages, detach only this finished part's code scope so sibling
+        // parallel workers on the same page keep their run_code worktrees intact.
+        if wanted > 1
+            && let Some(code) = &self.code
+        {
+            let scope = if self.race_pages.contains_key(&page) {
+                format!("{page}/race-{index}")
+            } else {
+                self.page(&page)
+                    .ok()
+                    .and_then(|p| p.work_units().get(index).map(|u| format!("{page}/{}", u.id)))
+                    .unwrap_or_else(|| page.clone())
+            };
+            code.detach(&scope);
+        }
         let batch = self.batches.entry(page.clone()).or_default();
         batch.push((index, product));
         if batch.len() < wanted {
             return Ok(());
+        }
+        let shot = match (&self.browsers, self.config.checker && !self.checked.contains(&page)) {
+            (Some(browsers), true) => browsers.snapshot(&page).await,
+            _ => None,
+        };
+        if let Some(browsers) = &self.browsers {
+            browsers.detach(&page);
+        }
+        if let Some(code) = &self.code {
+            code.detach_page(&page);
         }
         let mut products = self.batches.remove(&page).unwrap_or_default();
         products.sort_by_key(|(index, _)| *index);
@@ -2980,6 +3010,7 @@ impl Driver {
         let units = self.page(page)?.work_units();
         let mut all: Vec<(PathBuf, git::Change)> = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut empty_units: Vec<String> = Vec::new();
         for (index, product) in products {
             // A file the same as the run's tree is no change: a warm worktree holds what other
             // units built since, and a rewrite of a file to what it already was is nothing.
@@ -2989,6 +3020,13 @@ impl Driver {
                 .filter(|c| !git::same_as(&product.worktree, &self.tree, c))
                 .filter(|c| ignored.is_none_or(|set| !set.contains(&c.path)))
                 .collect();
+            if units.len() > 1
+                && changes.is_empty()
+                && let Some(unit) = units.get(*index)
+                && !self.glob_has_files(&unit.owned_glob)
+            {
+                empty_units.push(format!("`{}` (owns `{}`)", unit.id, unit.owned_glob));
+            }
             for change in &changes {
                 if !git::safe_rel(&change.path) {
                     return Ok(failed(format!("refusing to merge `{}`", change.path)));
@@ -3026,14 +3064,35 @@ impl Driver {
                 all.push((product.worktree.clone(), change));
             }
         }
+        if !all.is_empty() && !empty_units.is_empty() {
+            return Ok(failed(format!(
+                "parallel work unit(s) produced no files: {}. Write all required files for every unit.",
+                empty_units.join(", ")
+            )));
+        }
         if all.is_empty() {
             let ok = products.iter().all(|(_, p)| p.answer.ok);
             // The files were already right, from an earlier run, the plan, or a template: the
             // unit is done. Its tests and the project's checks still run at verify. A run told
             // to rebuild every page (an eval's baseline) still expects each to be written.
-            if ok && self.config.incremental && self.owned_files_exist(page) {
+            // A repair is different: it was sent a failure, and changing nothing cannot fix it.
+            let repairing = errors.as_deref().is_some_and(|e| !e.trim().is_empty());
+            if ok && !repairing && self.config.incremental && self.owned_files_exist(page) {
                 eprintln!("taskmaster: {page} already has its files and its agent changed nothing; counting it as done");
                 return Ok(WorkerOutcome::Passed);
+            }
+            if ok && repairing && self.owned_files_exist(page) {
+                let said: String = products.iter().map(|(_, p)| tail_chars(p.answer.text.trim(), 800)).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
+                let mut why = format!(
+                    "The repair changed none of your files, so this failure is still there:\n{}\n\
+                     Change the file that causes it; describing a fix or re-checking is not a fix.",
+                    tail_chars(errors.as_deref().unwrap_or_default().trim(), 1500)
+                );
+                if !said.is_empty() {
+                    why.push_str(&format!("\nWhat it said last:\n{said}"));
+                }
+                eprintln!("taskmaster: {page}: the repair changed no files; the failure stands");
+                return Ok(failed(why));
             }
             let refused: Vec<String> = products.iter().flat_map(|(_, p)| p.answer.refused.iter().cloned()).collect();
             // A refused shell command or fetch is refused again next time, on any tier: retrying
@@ -3516,8 +3575,28 @@ impl Driver {
             let routes: Vec<(PageId, String)> = plan.ui_routes();
             let mut ran = self.runtime_checks(&owners, &routes, built).await?;
             timings.append(&mut ran.timings);
-            // A failure no unit owns goes to the master, for as many repairs as the run has left.
-            while ran.pages.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) && self.shared_repairs() < MAX_SHARED_REPAIRS {
+            // A failure no unit owns goes to the master. Stuck failures stop after
+            // MAX_SHARED_REPAIRS; repairs that change the failure signature (making progress)
+            // may continue up to MAX_SHARED_PROGRESS_REPAIRS.
+            let mut last_shared_key: Option<String> = None;
+            let mut stuck_shared: usize = 0;
+            while ran.pages.is_empty() && (!ran.shared.is_empty() || ran.unowned.is_some()) {
+                let current_text = if ran.shared.is_empty() {
+                    ran.unowned.clone().unwrap_or_default()
+                } else {
+                    ran.shared.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n")
+                };
+                let key = tm_core::run::failure_key(&current_text);
+                let stuck = !key.is_empty() && last_shared_key.as_deref() == Some(key.as_str());
+                if stuck {
+                    stuck_shared += 1;
+                } else {
+                    stuck_shared = 1;
+                    last_shared_key = Some(key);
+                }
+                if stuck_shared > MAX_SHARED_REPAIRS || self.shared_repairs() >= MAX_SHARED_PROGRESS_REPAIRS {
+                    break;
+                }
                 let before = self.checkpoint(&format!("before-repair-{}", self.shared_repairs() + 1));
                 let repaired_before = self.changes.len();
                 if ran.shared.is_empty() {
@@ -3791,12 +3870,14 @@ impl Driver {
                     browsed.pages.len()
                 );
                 ran.pages = browsed.pages;
-                // A UI finding goes to its page once. If the repair did not fix it, it is a
-                // warning from then on, so a check that misreads a page cannot fail it.
+                // Heuristic UI findings go to their page once so a misread page cannot fail
+                // forever. Critical breakage (broken images, blank page, storage crash) keeps
+                // failing verification until actually resolved.
                 for (page, audit) in &browsed.audits {
                     let mut first = Vec::new();
                     for finding in &audit.found {
-                        if self.ui_sent.insert((page.clone(), finding.check.clone())) {
+                        let critical = crate::audit::CRITICAL_CHECKS.contains(&finding.check.as_str());
+                        if critical || self.ui_sent.insert((page.clone(), finding.check.clone())) {
                             first.push(format!("In the browser: {}", finding.text));
                         } else {
                             eprintln!("taskmaster: {page} still has a UI problem after its repair, left as a warning: {}", finding.text);
@@ -3815,7 +3896,18 @@ impl Driver {
                     eprintln!("taskmaster: the UI checks found {flagged} problem(s)");
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if !runtime::can_browse(&self.tree)
+                    && runtime::chrome().is_some()
+                    && (!self.tree.join("package.json").is_file() || steps.is_empty())
+                    && let Some((page, _)) = routes.first()
+                {
+                    let msg = "NO_WEB_ENTRY: this is a web project with UI route(s), but there is no start page (`index.html`, `app/index.html`, `public/index.html`, `dist/index.html`) and no `package.json` `dev`/`start`/`preview` script to serve it. Create the HTML entry page or add a working dev script.".to_string();
+                    eprintln!("taskmaster: {msg}");
+                    self.terminal("output", serde_json::json!({ "ok": false, "text": msg }));
+                    ran.pages.insert(page.clone(), msg);
+                }
+            }
             Err(err) => eprintln!("taskmaster: the browser check did not run: {err:#}"),
         }
         Ok(ran)
@@ -4508,12 +4600,16 @@ impl Driver {
     }
 
     /// Whether the run's tree already has a file the unit owns that is not a locked contract.
-    fn owned_files_exist(&self, page: &str) -> bool {
-        let Ok(unit) = self.page(page) else { return false };
-        let Ok(glob) = globset::Glob::new(&unit.owned_glob) else { return false };
+    fn glob_has_files(&self, pattern: &str) -> bool {
+        let Ok(glob) = globset::Glob::new(pattern) else { return false };
         let matcher = glob.compile_matcher();
         let locked = self.locked_files();
         git::tracked_files(&self.tree).unwrap_or_default().iter().any(|f| matcher.is_match(f) && !locked.contains(f))
+    }
+
+    fn owned_files_exist(&self, page: &str) -> bool {
+        let Ok(unit) = self.page(page) else { return false };
+        self.glob_has_files(&unit.owned_glob)
     }
 
     /// The id a builder of `page` runs under: `page:` for a page a browser shows, `unit:` for

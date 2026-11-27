@@ -42,7 +42,8 @@ pub const QUALITY_BARS: &str = "Quality bars, checked in a browser before the ru
 exactly one `<h1>`; every input, checkbox and icon-only button has a label or aria-label, including ones made in script; \
 form controls use the design's sizes (no stretched or unstyled native checkbox, inputs and buttons inherit the font); \
 a visible `:focus-visible` style; no sideways scroll at 360px wide; the empty state is hidden once a list has items; \
-blank input adds nothing; user text is escaped (`textContent`); corrupted localStorage does not break the page.\n";
+blank input adds nothing; user text is escaped (`textContent`); corrupted localStorage does not break the page; \
+every `<img>` actually loads (`naturalWidth > 0` with zero 404/network errors — never guess image URLs from memory, use verified working URLs or local assets).\n";
 
 /// How decisive a planner is told to be. A planner that works out every file in its head
 /// spends the whole time limit and never writes the plan.

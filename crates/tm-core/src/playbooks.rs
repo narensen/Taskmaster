@@ -99,6 +99,23 @@ pub const PLAYBOOKS: &[Playbook] = &[
         code: "NO-UNUSED-VARS",
         hint: "Unused variable or import: remove dead bindings or prefix intentionally unused parameters with `_`.",
     },
+    // Browser / Web verification
+    Playbook {
+        code: "BROKEN_IMAGE",
+        hint: "An `<img>` failed to load (`naturalWidth === 0`): never invent or guess remote image URLs from memory. Use verified HTTP-200 real image URLs (check with a quick request or use real local image files saved under `public/images/` and referenced by relative/root path).",
+    },
+    Playbook {
+        code: "FAILED_RESOURCE",
+        hint: "A subresource (image, script, stylesheet, or fetch) returned an error or failed to load: verify the file exists at the exact served path, check Vite/bundler asset paths, and confirm external URLs are reachable without hotlink blocking.",
+    },
+    Playbook {
+        code: "BLANK_PAGE",
+        hint: "The page rendered completely blank: inspect runtime/console errors, verify the root mount element (`#root`/`#app`) matches the entry script, and ensure `<script type=\"module\">` paths resolve cleanly.",
+    },
+    Playbook {
+        code: "APP_START_FAILED",
+        hint: "The web app server failed to start: inspect `package.json` `dev`/`start`/`preview` scripts, verify all imported dependencies are listed in `package.json`, and ensure the server listens on `127.0.0.1` and `$PORT`.",
+    },
 ];
 
 /// Extract curated playbooks matching any error codes present in `errors`.
@@ -174,6 +191,10 @@ mod tests {
 
         assert!(match_playbooks("all tests passed").is_empty());
         assert!(format_playbooks("all tests passed").is_empty());
+
+        let browser = "In the browser at /: FAILED_RESOURCE (Image): HTTP 404 loading /horse.jpg\nBROKEN_IMAGE: 1 <img> element(s) failed to load";
+        let browser_codes: Vec<&str> = match_playbooks(browser).iter().map(|p| p.code).collect();
+        assert_eq!(browser_codes, vec!["BROKEN_IMAGE", "FAILED_RESOURCE"]);
     }
 
     #[test]

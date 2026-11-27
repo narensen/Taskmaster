@@ -9,6 +9,7 @@ import { toast } from "../overlay";
 import { prefs, setPrefs, usePrefs } from "../prefs";
 import { globMatch } from "./model";
 import { useReviewComments } from "./reviewDrafts";
+import { SelectMenu } from "../components/SelectMenu";
 
 export type Scope = "attempt" | "page" | "run";
 
@@ -244,22 +245,22 @@ export function DiffTab({
           ))}
         </div>
         {scope !== "run" && (
-          <select value={page} onChange={(e) => setPage(e.target.value)} aria-label="Page">
-            {pages.map((pg) => (
-              <option key={pg.id} value={pg.id}>
-                {pg.id}
-              </option>
-            ))}
-          </select>
+          <SelectMenu
+            variant="inline"
+            ariaLabel="Page"
+            value={page}
+            options={pages.map((pg) => ({ value: pg.id, label: pg.id }))}
+            onChange={setPage}
+          />
         )}
         {scope === "attempt" && (
-          <select value={attempt} onChange={(e) => setAttempt(Number(e.target.value))} aria-label="Attempt">
-            {attempts.map((a, i) => (
-              <option key={i} value={i}>
-                #{i + 1} {a.outcome}
-              </option>
-            ))}
-          </select>
+          <SelectMenu
+            variant="inline"
+            ariaLabel="Attempt"
+            value={String(attempt)}
+            options={attempts.map((a, i) => ({ value: String(i), label: `#${i + 1} ${a.outcome}` }))}
+            onChange={(v) => setAttempt(Number(v))}
+          />
         )}
         <input
           className="find"

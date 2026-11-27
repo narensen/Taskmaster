@@ -103,6 +103,7 @@ fn main() {
                 .title("Taskmaster")
                 .inner_size(1360.0, 860.0)
                 .min_inner_size(880.0, 600.0)
+                .zoom_hotkeys_enabled(false)
                 .initialization_script(&script);
             // The app draws its own title bar on the same surface as everything else. macOS
             // keeps its traffic lights, over the app; elsewhere the app draws the controls.

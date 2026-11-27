@@ -1,11 +1,24 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  Bell,
+  Cpu,
+  Keyboard,
+  Palette,
+  Plug,
+  Search,
+  Wrench,
+  type LucideIcon,
+} from "lucide-react";
 import { APPROVAL_MODES, approvalLabel } from "../format";
 import { api, server, type ApprovalMode, setServer, setToken, type RoleName } from "../api";
+type DaemonSettings = Awaited<ReturnType<typeof api.settings>>;
 import { loadEditors, useEditors } from "../paths";
 import { setPrefs, usePrefs } from "../prefs";
 import { ROLES } from "../roles";
 import { RoleMark } from "../marks";
 import { ProviderPicker } from "../components/ProviderPicker";
+import { SelectMenu } from "../components/SelectMenu";
 import { ALL_ROLES, rememberChoice, savedChoice } from "../rolechoice";
 import { useProviders, useSettings, queryClient, keys as qk } from "../query";
 import { allowNotifications, tick } from "../notify";
@@ -23,6 +36,118 @@ import { WebAccessSection } from "../settings/WebAccessSection";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
 import { appVersion, checkForUpdate, installUpdate, isDesktop, type AvailableUpdate } from "../desktop";
+
+type TabId = "agents" | "connection" | "tools" | "operations" | "appearance" | "alerts" | "help";
+
+interface TabDef {
+  id: TabId;
+  label: string;
+  note: string;
+  icon: LucideIcon;
+  items: [string, string][];
+}
+
+const TABS: TabDef[] = [
+  {
+    id: "agents",
+    label: "Agents",
+    note: "Providers, approvals, sandbox, checker, and web access.",
+    icon: Cpu,
+    items: [
+      ["providers-for-each-role", "Providers for each role"],
+      ["tool-approvals", "Tool approvals"],
+      ["time-limit", "Agent time limit"],
+      ["settle", "Settling runs"],
+      ["labs", "Labs"],
+      ["checker", "Mid-tier checker"],
+      ["code-mode", "Code Mode"],
+      ["sandbox", "Worker sandbox"],
+      ["web-access", "Web access"],
+      ["telemetry", "Telemetry"],
+    ],
+  },
+  {
+    id: "connection",
+    label: "Connection",
+    note: "Account, daemon address, project path, and Commons.",
+    icon: Plug,
+    items: [
+      ["account", "Account"],
+      ["daemon-address", "Daemon address"],
+      ["project-path", "Project path"],
+      ["commons", "Commons"],
+    ],
+  },
+  {
+    id: "tools",
+    label: "Tools",
+    note: "Editor, search, source control, MCP servers, logs, and export.",
+    icon: Wrench,
+    items: [
+      ["editor", "Editor"],
+      ["search", "Search endpoint"],
+      ["source-control", "Source control"],
+      ["mcp-servers", "User MCP servers"],
+      ["logs", "Logs"],
+      ["settings-file", "Settings file"],
+    ],
+  },
+  {
+    id: "operations",
+    label: "Operations",
+    note: "Model scorecard, scheduled runs, remote mesh, spend, and GC.",
+    icon: Activity,
+    items: [
+      ["scorecard", "Model scorecard"],
+      ["schedules", "Scheduled runs"],
+      ["remote-mesh", "Remote mesh"],
+      ["operations", "Spend, GC & egress"],
+    ],
+  },
+  {
+    id: "appearance",
+    label: "Appearance",
+    note: "Chat send behavior, motion, density, and theme.",
+    icon: Palette,
+    items: [
+      ["chat", "Chat"],
+      ["motion", "Motion"],
+      ["density", "Density"],
+      ["theme", "Theme"],
+    ],
+  },
+  {
+    id: "alerts",
+    label: "Alerts",
+    note: "Desktop notifications, daemon webhooks, and sound.",
+    icon: Bell,
+    items: [
+      ["notifications", "Notifications"],
+      ["daemon-alerts", "Daemon webhooks"],
+      ["sound", "Sound"],
+    ],
+  },
+  {
+    id: "help",
+    label: "Keybindings",
+    note: "Keyboard shortcuts across Taskmaster.",
+    icon: Keyboard,
+    items: [["keybindings", "Keybindings"]],
+  },
+];
+
+const SECTION_TO_TAB: Record<string, TabId> = Object.fromEntries(
+  TABS.flatMap((t) => t.items.map(([id]) => [id, t.id])),
+) as Record<string, TabId>;
+
+function initialTab(): TabId {
+  const params = new URLSearchParams(window.location.search);
+  const rawTab = params.get("tab") as TabId | null;
+  if (rawTab && TABS.some((t) => t.id === rawTab)) return rawTab;
+  const hash = decodeURIComponent(window.location.hash.replace(/^#/, ""));
+  if (hash && SECTION_TO_TAB[hash]) return SECTION_TO_TAB[hash];
+  return "agents";
+}
 
 const KEYS: [string, string][] = [
   ...SHORTCUTS.flatMap((g) => g.items.map(([label, combo]) => [combo.join(" "), label] as [string, string])),
@@ -121,7 +246,7 @@ function Logs() {
   );
 }
 
-function SettingsFile({ onImported }: { onImported: (next: Awaited<ReturnType<typeof api.settings>>) => void }) {
+function SettingsFile({ onImported }: { onImported: (next: DaemonSettings) => void }) {
   const file = useRef<HTMLInputElement>(null);
   const [armed, setArmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -298,31 +423,6 @@ function limitLabel(secs: number): string {
   return `${secs} seconds`;
 }
 
-const TOC: { group: string; items: [string, string][] }[] = [
-  { group: "Connection", items: [["account", "Account"], ["daemon-address", "Daemon address"], ["project-path", "Project path"], ["commons", "Commons"]] },
-  {
-    group: "Agents",
-    items: [
-      ["providers-for-each-role", "Providers for each role"],
-      ["time-limit", "Agent time limit"],
-      ["settle", "Settling runs"],
-      ["labs", "Labs"],
-      ["checker", "Mid-tier checker"],
-      ["code-mode", "Code Mode"],
-      ["scorecard", "Model scorecard"],
-      ["sandbox", "Worker sandbox"],
-      ["web-access", "Web access"],
-      ["telemetry", "Telemetry"],
-      ["tool-approvals", "Tool approvals"],
-    ],
-  },
-  { group: "Tools", items: [["editor", "Editor"], ["search", "Search endpoint"], ["source-control", "Source control"], ["mcp-servers", "User MCP servers"], ["logs", "Logs"], ["settings-file", "Settings file"]] },
-  { group: "Operations", items: [["schedules", "Scheduled runs"], ["remote-mesh", "Remote mesh"], ["operations", "Spend, GC & egress"]] },
-  { group: "Appearance", items: [["motion", "Motion"], ["density", "Density"], ["theme", "Theme"]] },
-  { group: "Alerts", items: [["notifications", "Notifications"], ["daemon-alerts", "Daemon webhooks"], ["sound", "Sound"]] },
-  { group: "Help", items: [["keybindings", "Keybindings"]] },
-];
-
 function Keys({ text }: { text: string }) {
   const parts = text.split(" / ");
   return (
@@ -417,117 +517,14 @@ function ProjectYamlCard() {
   );
 }
 
-export function Settings() {
+function ConnectionTab({ daemon }: { daemon: DaemonSettings | undefined }) {
   const p = usePrefs();
   const health = useLoad(api.health, []);
-  // One copy of the daemon's settings, shared with every other page: a toggle, an import or
-  // a reset here shows at once on the role pickers here and on New Run and the home page.
-  const roleSettings = useSettings();
-  const daemon = {
-    data: roleSettings.data,
-    setData: (next: Awaited<ReturnType<typeof api.settings>>) => queryClient.setQueryData(qk.settings, next),
-  };
-  const { list: editorList, fallback } = useEditors();
   const [address, setAddress] = useState(server());
   const [other, setOther] = useState({ url: "", token: "" });
-  const [endpoint, setEndpoint] = useState(p.searchEndpoint);
-  const savedPolicy = daemon.data?.approvals;
-  const [policy, setPolicy] = useState<{ mode: ApprovalMode; timeout: string } | null>(null);
-  const [policyError, setPolicyError] = useState<string | null>(null);
-  // Follow the saved policy (first load, an import, a reset) unless a timeout is being typed.
-  const editingTimeout = useRef(false);
-  useEffect(() => {
-    if (savedPolicy && !editingTimeout.current) setPolicy({ mode: savedPolicy.mode, timeout: String(savedPolicy.timeout_secs) });
-  }, [savedPolicy?.mode, savedPolicy?.timeout_secs]); // eslint-disable-line react-hooks/exhaustive-deps
-  const savePolicy = (next: { mode: ApprovalMode; timeout: string }) => {
-    setPolicy(next);
-    const secs = Number(next.timeout);
-    if (!Number.isInteger(secs) || secs < 1 || secs > 86400) {
-      setPolicyError("Use a whole number of seconds from 1 to 86400.");
-      return;
-    }
-    setPolicyError(null);
-    if (savedPolicy && savedPolicy.mode === next.mode && savedPolicy.timeout_secs === secs) return;
-    api.setApprovals({ approvals: next.mode, approval_timeout_secs: secs }).then(
-      () => {
-        void roleSettings.refetch();
-        toast("Tool approvals saved", `${approvalLabel(next.mode)}, denied after ${secs}s`);
-      },
-      (err) => toast("Tool approvals were not saved", err instanceof Error ? err.message : String(err)),
-    );
-  };
-
-  // A link to one section (#telemetry) waits for the sections that need the daemon's settings.
-  const scrolled = useRef(false);
-  useEffect(() => {
-    if (scrolled.current || !window.location.hash || !daemon.data) return;
-    const target = document.getElementById(decodeURIComponent(window.location.hash.slice(1)));
-    if (target) {
-      scrolled.current = true;
-      target.scrollIntoView();
-    }
-  }, [daemon.data]);
-
-  // Role choices live in the daemon's settings file. A change shows at once and is saved behind it.
-  const roleProviders = useProviders();
-  const saved = savedChoice(roleSettings.data);
-  const saveRole = (role: RoleName, pick: RoleDefault | null) => {
-    const before = roleSettings.data;
-    const next = { ...saved };
-    if (pick) next[role] = pick;
-    else delete next[role];
-    if (before) {
-      queryClient.setQueryData(qk.settings, {
-        ...before,
-        roles: { ...before.roles, [role]: pick?.harness },
-        models: { ...(before.models ?? {}), [role]: pick?.model ?? null },
-      });
-    }
-    const request = pick ? rememberChoice(next) : api.setRoleDefaults({ roles: { [role]: "" } });
-    request.then(
-      (settings) => {
-        queryClient.setQueryData(qk.settings, settings);
-        toast(pick ? "Saved for this project" : "Choice forgotten", `${ROLES.find((r) => r.id === role)?.label}: ${pick ? pick.harness + (pick.model ? ` · ${pick.model}` : "") : "no provider"}`, 2500);
-      },
-      (err) => {
-        if (before) queryClient.setQueryData(qk.settings, before);
-        toast("The choice was not saved", err instanceof Error ? err.message : String(err));
-      },
-    );
-  };
 
   return (
-    <div className="page settings">
-      <header className="page-head">
-        <div className="grow">
-          <h1>Settings</h1>
-          <p className="page-lede">This daemon, its agents and tools, and how this browser looks.</p>
-        </div>
-      </header>
-      <div className="settings-layout">
-      <nav className="settings-toc" aria-label="Settings sections">
-        {TOC.map((g) => (
-          <div key={g.group} className="toc-group">
-            <div className="toc-label">{g.group}</div>
-            {g.items.map(([id, title]) => (
-              <a
-                key={id}
-                href={`#${id}`}
-                onClick={(e) => {
-                  e.preventDefault();
-                  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
-                }}
-              >
-                {title}
-              </a>
-            ))}
-          </div>
-        ))}
-      </nav>
-      <div className="settings-main">
-
-      {isDesktop() && <Updates />}
-
+    <>
       <Section title="Account">
         <div className="row between gap wrap">
           <div>
@@ -591,347 +588,53 @@ export function Settings() {
       </Section>
 
       <Section title="Project path" note="To serve another project, start the daemon there: tm-daemon serve <project>. That is a restart.">
-        <div className="break">{daemon.data?.project ?? "…"}</div>
+        <div className="break">{daemon?.project ?? "…"}</div>
         <ProjectYamlCard />
       </Section>
 
-      <Section title="Commons" note={`Set in ${daemon.data?.config ?? daemon.data?.config_default ?? ".taskmaster/config.json"}; a change needs a config edit and a restart.`}>
-        <div className="break">{daemon.data?.commons ?? "…"}</div>
+      <Section title="Commons" note={`Set in ${daemon?.config ?? daemon?.config_default ?? ".taskmaster/config.json"}; a change needs a config edit and a restart.`}>
+        <div className="break">{daemon?.commons ?? "…"}</div>
         <div className="muted small">
-          {daemon.data ? (daemon.data.commons_remote ? "Shared with a remote Commons." : "Not shared with a remote Commons.") : ""} Records are kept as{" "}
-          {daemon.data?.store ?? "…"}.
+          {daemon ? (daemon.commons_remote ? "Shared with a remote Commons." : "Not shared with a remote Commons.") : ""} Records are kept as{" "}
+          {daemon?.store ?? "…"}.
         </div>
       </Section>
+    </>
+  );
+}
 
-      <Section title="Providers for each role" note="Kept for this project by the daemon. New Run starts from these, and you can change any of them there for one run. Nothing is chosen for you.">
-        <Problem error={roleProviders.error} onRetry={() => void roleProviders.refetch()} />
-        <div className="role-table">
-          {ALL_ROLES.map((role) => {
-            const meta = ROLES.find((r) => r.id === role)!;
-            return (
-              <div key={role} className="role-line">
-                <span className="role-line-name">
-                  <RoleMark role={role} size={13} />
-                  {meta.label}
-                </span>
-                <span className="role-line-hint">{meta.hint}</span>
-                <ProviderPicker label={`${meta.label} provider`} providers={roleProviders.data ?? []} loading={roleProviders.isLoading} value={saved[role] ?? null} onChange={(pick) => saveRole(role, pick)} />
-                <button type="button" className="ghost small" disabled={!saved[role]} onClick={() => saveRole(role, null)}>
-                  Forget
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      </Section>
+function EditorSection() {
+  const p = usePrefs();
+  const { list: editorList, fallback } = useEditors();
+  const options = [
+    { value: "", label: `automatic (${editorList.find((e) => e.id === fallback)?.name ?? fallback})` },
+    ...editorList.filter((e) => e.installed).map((e) => ({ value: e.id, label: e.name })),
+  ];
+  return (
+    <Section title="Editor" note="A path word opens in this editor, on the machine that holds the project.">
+      <div className="row gap wrap">
+        <SelectMenu ariaLabel="Default editor" value={p.editor ?? ""} onChange={(v) => setPrefs({ editor: v || null })} options={options} />
+        <button className="ghost small" onClick={() => void loadEditors(true)}>
+          Rescan
+        </button>
+      </div>
+      <ul className="editor-list small" data-testid="editors">
+        {editorList.map((e) => (
+          <li key={e.id} className={e.installed ? "strong" : "muted"}>
+            {e.name} <span className="muted">{e.command}</span> {e.installed ? "· installed" : "· not found"}
+          </li>
+        ))}
+      </ul>
+    </Section>
+  );
+}
 
-      <Section title="Editor" note="A path word opens in this editor, on the machine that holds the project.">
-        <div className="row gap wrap">
-          <select value={p.editor ?? ""} onChange={(e) => setPrefs({ editor: e.target.value || null })} aria-label="Default editor">
-            <option value="">automatic ({editorList.find((e) => e.id === fallback)?.name ?? fallback})</option>
-            {editorList
-              .filter((e) => e.installed)
-              .map((e) => (
-                <option key={e.id} value={e.id}>
-                  {e.name}
-                </option>
-              ))}
-          </select>
-          <button className="ghost small" onClick={() => void loadEditors(true)}>
-            Rescan
-          </button>
-        </div>
-        <ul className="editor-list small" data-testid="editors">
-          {editorList.map((e) => (
-            <li key={e.id} className={e.installed ? "strong" : "muted"}>
-              {e.name} <span className="muted">{e.command}</span> {e.installed ? "· installed" : "· not found"}
-            </li>
-          ))}
-        </ul>
-      </Section>
-
-      {daemon.data && (
-        <Section
-          id="time-limit"
-          title="Agent time limit"
-          note="Optional cap on how long a single agent call may run. Off by default (No limit) so workers and planners can finish without arbitrary cutoffs."
-        >
-          <label className="row gap small" data-testid="time-limit">
-            <span className="muted">Stop an agent after</span>
-            <select
-              aria-label="Agent time limit"
-              value={String(daemon.data.agents?.timeout_secs ?? 0)}
-              onChange={(e) => {
-                const secs = Number(e.target.value);
-                void api.setAgentTimeout(secs).then(
-                  (next) => {
-                    daemon.setData(next);
-                    toast("Agent time limit saved", secs === 0 ? "No limit for new runs" : `${limitLabel(secs)} for new runs`);
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                );
-              }}
-            >
-              {limitChoices(daemon.data.agents?.timeout_secs ?? 0).map((secs) => (
-                <option key={secs} value={secs}>
-                  {limitLabel(secs)}
-                </option>
-              ))}
-            </select>
-          </label>
-        </Section>
-      )}
-
-      {daemon.data && (
-        <Section
-          id="settle"
-          title="Settling runs"
-          note="Taskmaster moves a finished run to Settled on its own, on every device, once there is nothing left to do with it. Settling stops its preview and removes its leftover worktrees; a new message takes it out again. A run's menu can say Never."
-        >
-          <div className="row gap small" data-testid="settle-settings">
-            <label className="row gap">
-              <span className="muted">After a merge, wait</span>
-              <select
-                aria-label="Minutes after a merge"
-                value={String(daemon.data.settle?.after_merge_mins ?? 60)}
-                onChange={(e) =>
-                  void api.setSettle({ settle_after_merge_mins: Number(e.target.value) }).then(
-                    (next) => daemon.setData(next),
-                    (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                  )
-                }
-              >
-                {[0, 15, 60, 240, 1440].map((m) => (
-                  <option key={m} value={m}>
-                    {m === 0 ? "no time" : m < 60 ? `${m} minutes` : m === 60 ? "1 hour" : m < 1440 ? `${m / 60} hours` : "1 day"}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="row gap">
-              <span className="muted">Settle any run idle for</span>
-              <select
-                aria-label="Days idle"
-                value={String(daemon.data.settle?.idle_days ?? 7)}
-                onChange={(e) =>
-                  void api.setSettle({ settle_idle_days: Number(e.target.value) }).then(
-                    (next) => daemon.setData(next),
-                    (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                  )
-                }
-              >
-                {[0, 1, 3, 7, 14, 30].map((d) => (
-                  <option key={d} value={d}>
-                    {d === 0 ? "never" : d === 1 ? "1 day" : `${d} days`}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-        </Section>
-      )}
-
-      {daemon.data && (
-        <Section id="labs" title="Labs" note="Features still being tried. Each is off until you turn it on.">
-          <label className="row gap" data-testid="labs-suggest">
-            <Switch
-              on={daemon.data.labs?.suggest_next ?? false}
-              label="Suggest the next message after a run finishes"
-              onChange={(on) =>
-                void api.setLabs({ labs_suggest_next: on }).then(
-                  (next) => daemon.setData(next),
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span className="muted small">One small call to the master's provider after each turn; Tab in the empty box takes it.</span>
-          </label>
-        </Section>
-      )}
-
-      {daemon.data && (
-        <Section
-          id="checker"
-          title="Mid-tier checker"
-          note="After a page passes its own checks, the mid model reads its diff, its screenshot, its brief and the worker's last words, and answers pass or a short fix list. It runs beside the build, only on pages that change UI files or large ones, and waits at most 20 seconds at the end. Each page is checked once, so it adds at most one repair. Uses the mid role's harness and model."
-        >
-          <label className="row gap" data-testid="checker-setting">
-            <Switch
-              on={daemon.data.checker?.enabled ?? false}
-              label="Check finished pages with the mid model"
-              onChange={(on) =>
-                void api.setChecker(on).then(
-                  (next) => {
-                    daemon.setData(next);
-                    toast(on ? "The checker is on for new runs" : "The checker is off");
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span>{daemon.data.checker?.enabled ? "On: new runs get a second look per page" : "Off"}</span>
-          </label>
-        </Section>
-      )}
-
-      {daemon.data && (
-        <Section
-          id="code-mode"
-          title="Code Mode"
-          note="Every agent gets run_code: one call runs a short JavaScript program that reads, edits, patches, searches and checks files, instead of a tool call per step. Builders get the full set; the planner, reviewers and verifiers get a read-only one. It runs in Node with no file, process or network access of its own, under the same permissions as the agent's tools. Claude Code workers use Claude Code's own code mode. On by default for every harness."
-        >
-          <label className="row gap" data-testid="code-mode-setting">
-            <Switch
-              on={daemon.data.code_mode?.enabled ?? true}
-              label="Use Code Mode for workers"
-              onChange={(on) =>
-                void api.setCodeMode(on).then(
-                  (next) => {
-                    daemon.setData(next);
-                    toast(on ? "Code Mode is on for new runs" : "Code Mode is off");
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span>{daemon.data.code_mode?.enabled ? "On for new runs" : "Off"}</span>
-          </label>
-        </Section>
-      )}
-
-      <ModelScorecardSection />
-
-      {daemon.data && (
-        <Section
-          id="sandbox"
-          title="Worker sandbox"
-          note="A builder whose provider runs inside the sandbox (bubblewrap for Antigravity, Grok and OpenCode; Codex's own) can run commands: its tests, an install, a lockfile update. It can write only its worktree, its own scratch folder and the run's package caches; the rest of this machine is read-only to it. Claude Code workers have no shell either way."
-        >
-          {daemon.data.sandbox && !daemon.data.sandbox.available && (
-            <p className="muted small" data-testid="sandbox-missing">
-              Bubblewrap cannot run on this machine, so no worker gets a shell whatever is set here.
-            </p>
-          )}
-          <label className="row gap" data-testid="sandbox-shell-setting">
-            <Switch
-              on={daemon.data.sandbox?.shell ?? true}
-              label="Let builders run commands in the sandbox"
-              onChange={(on) =>
-                void api.setSandbox({ shell: on }).then(
-                  (next) => {
-                    daemon.setData(next);
-                    toast(on ? "Builders can run commands in new runs" : "Builders get no shell in new runs");
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span>{daemon.data.sandbox?.shell ?? true ? "On: tests and installs run in the sandbox" : "Off: no commands"}</span>
-          </label>
-          <label className="row gap" data-testid="sandbox-indexes-setting">
-            <Switch
-              on={daemon.data.sandbox?.package_indexes ?? true}
-              label="Let fetch tools reach package indexes"
-              onChange={(on) =>
-                void api.setSandbox({ package_indexes: on }).then(
-                  (next) => {
-                    daemon.setData(next);
-                    toast(on ? "Fetches may reach PyPI, npm and crates.io" : "Fetches are refused");
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span>{daemon.data.sandbox?.package_indexes ?? true ? "On: PyPI, npm and crates.io only" : "Off"}</span>
-          </label>
-        </Section>
-      )}
-
-      <WebAccessSection />
-
-      {daemon.data && (
-        <Section
-          id="telemetry"
-          title="Telemetry"
-          note="Off until you turn it on. When it is on, the daemon records a count in its log. It sends that count only if TASKMASTER_TELEMETRY_URL is an https address you set. Prompts, paths, and tokens are never included. With no address, nothing leaves this machine."
-        >
-          <label className="row gap" data-testid="telemetry-setting">
-            <Switch
-              on={daemon.data.telemetry?.enabled ?? false}
-              label="Send anonymous counts"
-              onChange={(on) =>
-                void api.setTelemetry(on).then(
-                  (next) => {
-                    daemon.setData(next);
-                    toast(on ? "Anonymous counts are on" : "Anonymous counts are off");
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span>{daemon.data.telemetry?.enabled ? "On. Nothing is sent until an https collector is configured." : "Off"}</span>
-          </label>
-        </Section>
-      )}
-
-      <Logs />
-      <SettingsFile onImported={(next) => daemon.setData(next)} />
-
-      {policy && (
-        <Section
-          title="Tool approvals"
-          note="Risky tool calls (a shell command, a write outside the worktree) wait for you on the run page; no answer in time is a denial. Ask on every call stops before each one; Approvals off keeps only the automatic gate."
-        >
-          <div className="row gap wrap" data-testid="approval-policy">
-            <div className="seg" role="radiogroup" aria-label="Approval mode">
-              {APPROVAL_MODES.map((m) => (
-                <button key={m} role="radio" aria-checked={policy.mode === m} className={policy.mode === m ? "on" : ""} onClick={() => savePolicy({ ...policy, mode: m })}>
-                  {approvalLabel(m)}
-                </button>
-              ))}
-            </div>
-            <label className="row gap small">
-              <span className="muted">Deny after</span>
-              <input
-                type="number"
-                min={1}
-                max={86400}
-                style={{ width: 90 }}
-                aria-label="Approval timeout in seconds"
-                value={policy.timeout}
-                onFocus={() => (editingTimeout.current = true)}
-                onChange={(e) => setPolicy({ ...policy, timeout: e.target.value })}
-                onKeyDown={(e) => e.key === "Enter" && (e.currentTarget as HTMLInputElement).blur()}
-                onBlur={() => {
-                  editingTimeout.current = false;
-                  savePolicy(policy);
-                }}
-              />
-              <span className="muted">seconds</span>
-            </label>
-          </div>
-          {policyError && <div className="error-line small">{policyError}</div>}
-          <label className="row gap" data-testid="approvals-master">
-            <Switch
-              on={savedPolicy?.master_answers ?? false}
-              label="Let the master answer a worker's low-risk questions"
-              onChange={(on) =>
-                void api.setApprovals({ approvals_master_answers: on }).then(
-                  () => {
-                    void roleSettings.refetch();
-                    toast(on ? "The master may answer low-risk questions" : "Only you answer questions");
-                  },
-                  (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
-                )
-              }
-            />
-            <span className="muted small">
-              Tests, builds and named installs, with a reason. Anything that deletes, publishes or changes the machine still waits for you, and you can
-              answer first.
-            </span>
-          </label>
-        </Section>
-      )}
+function ToolsTab({ onImported }: { onImported: (next: DaemonSettings) => void }) {
+  const p = usePrefs();
+  const [endpoint, setEndpoint] = useState(p.searchEndpoint);
+  return (
+    <>
+      <EditorSection />
 
       <Section id="search" title="Search endpoint" note="The Web search tab asks the daemon to search here. Empty = the daemon default (local SearXNG at http://127.0.0.1:8888/search?format=json&q={q}). Use {q} for the query, or it is added as ?q=. Kept in this browser.">
         <form
@@ -956,10 +659,27 @@ export function Settings() {
       </Section>
 
       <UserMcpSection />
+      <Logs />
+      <SettingsFile onImported={onImported} />
+    </>
+  );
+}
+
+function OperationsTab() {
+  return (
+    <>
+      <ModelScorecardSection />
       <SchedulesSection />
       <RemoteMeshSection />
       <OperationsSection />
+    </>
+  );
+}
 
+function AppearanceTab() {
+  const p = usePrefs();
+  return (
+    <>
       <Section title="Chat" note="What Enter does in a running run's composer. Ctrl/Cmd+Enter always does the other.">
         <div className="seg" role="radiogroup" aria-label="While a run works">
           {([
@@ -1006,7 +726,14 @@ export function Settings() {
           ))}
         </div>
       </Section>
+    </>
+  );
+}
 
+function AlertsTab() {
+  const p = usePrefs();
+  return (
+    <>
       <Section title="Notifications" note="When a run finishes, fails, or waits on you, and the window is not in front. Clicking one opens the run.">
         <div className="row between gap">
           <span>Desktop notifications</span>
@@ -1034,22 +761,531 @@ export function Settings() {
           </span>
         </div>
       </Section>
+    </>
+  );
+}
 
-      <Section title="Keybindings">
-        <table className="table small">
-          <tbody>
-            {KEYS.map(([k, what]) => (
-              <tr key={k}>
-                <td className="nowrap">
-                  <Keys text={k} />
-                </td>
-                <td>{what}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Section>
-      </div>
+function HelpTab() {
+  return (
+    <Section title="Keybindings">
+      <table className="table small">
+        <tbody>
+          {KEYS.map(([k, what]) => (
+            <tr key={k}>
+              <td className="nowrap">
+                <Keys text={k} />
+              </td>
+              <td>{what}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Section>
+  );
+}
+
+export function Settings() {
+  const [tab, setTab] = useState<TabId>(initialTab);
+  const [filter, setFilter] = useState("");
+  const roleSettings = useSettings();
+  const daemon = {
+    data: roleSettings.data,
+    setData: (next: DaemonSettings) => queryClient.setQueryData(qk.settings, next),
+  };
+
+  const savedPolicy = daemon.data?.approvals;
+  const [policy, setPolicy] = useState<{ mode: ApprovalMode; timeout: string } | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const editingTimeout = useRef(false);
+  useEffect(() => {
+    if (savedPolicy && !editingTimeout.current) setPolicy({ mode: savedPolicy.mode, timeout: String(savedPolicy.timeout_secs) });
+  }, [savedPolicy?.mode, savedPolicy?.timeout_secs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const savePolicy = (next: { mode: ApprovalMode; timeout: string }) => {
+    setPolicy(next);
+    const secs = Number(next.timeout);
+    if (!Number.isInteger(secs) || secs < 1 || secs > 86400) {
+      setPolicyError("Use a whole number of seconds from 1 to 86400.");
+      return;
+    }
+    setPolicyError(null);
+    if (savedPolicy && savedPolicy.mode === next.mode && savedPolicy.timeout_secs === secs) return;
+    api.setApprovals({ approvals: next.mode, approval_timeout_secs: secs }).then(
+      () => {
+        void roleSettings.refetch();
+        toast("Tool approvals saved", `${approvalLabel(next.mode)}, denied after ${secs}s`);
+      },
+      (err) => toast("Tool approvals were not saved", err instanceof Error ? err.message : String(err)),
+    );
+  };
+
+  const selectTab = (next: TabId, scrollToId?: string) => {
+    setTab(next);
+    const url = next === "agents" && !scrollToId ? "/settings" : `/settings?tab=${next}${scrollToId ? `#${scrollToId}` : ""}`;
+    window.history.replaceState(null, "", url);
+    if (scrollToId) {
+      window.requestAnimationFrame(() => {
+        document.getElementById(scrollToId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    } else {
+      document.querySelector(".main")?.scrollTo({ top: 0 });
+    }
+  };
+
+  // A link to one section (#telemetry) switches to that tab and scrolls once loaded.
+  const scrolled = useRef(false);
+  useEffect(() => {
+    if (scrolled.current || !window.location.hash || !daemon.data) return;
+    const id = decodeURIComponent(window.location.hash.slice(1));
+    const owner = SECTION_TO_TAB[id];
+    if (owner && owner !== tab) {
+      setTab(owner);
+      return;
+    }
+    const target = document.getElementById(id);
+    if (target) {
+      scrolled.current = true;
+      target.scrollIntoView();
+    }
+  }, [daemon.data, tab]);
+
+  const roleProviders = useProviders();
+  const saved = savedChoice(roleSettings.data);
+  const saveRole = (role: RoleName, pick: RoleDefault | null) => {
+    const before = roleSettings.data;
+    const next = { ...saved };
+    if (pick) next[role] = pick;
+    else delete next[role];
+    if (before) {
+      queryClient.setQueryData(qk.settings, {
+        ...before,
+        roles: { ...before.roles, [role]: pick?.harness },
+        models: { ...(before.models ?? {}), [role]: pick?.model ?? null },
+      });
+    }
+    const request = pick ? rememberChoice(next) : api.setRoleDefaults({ roles: { [role]: "" } });
+    request.then(
+      (settings) => {
+        queryClient.setQueryData(qk.settings, settings);
+        toast(
+          pick ? "Saved for this project" : "Choice forgotten",
+          `${ROLES.find((r) => r.id === role)?.label}: ${pick ? pick.harness + (pick.model ? ` · ${pick.model}` : "") : "no provider"}`,
+          2500,
+        );
+      },
+      (err) => {
+        if (before) queryClient.setQueryData(qk.settings, before);
+        toast("The choice was not saved", err instanceof Error ? err.message : String(err));
+      },
+    );
+  };
+
+  const activeTabDef = TABS.find((t) => t.id === tab) ?? TABS[0]!;
+  const matches = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return null;
+    return TABS.flatMap((t) =>
+      t.items
+        .filter(([id, title]) => title.toLowerCase().includes(q) || id.includes(q) || t.label.toLowerCase().includes(q))
+        .map(([id, title]) => ({ tabId: t.id, tabLabel: t.label, id, title })),
+    );
+  }, [filter]);
+
+  return (
+    <div className="page settings">
+      <header className="page-head">
+        <div className="grow">
+          <h1>Settings</h1>
+          <p className="page-lede">{activeTabDef.note}</p>
+        </div>
+      </header>
+
+      <div className="settings-layout">
+        <nav className="settings-toc" aria-label="Settings sections">
+          <div className="settings-filter">
+            <Search size={13} aria-hidden />
+            <input
+              type="search"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Find a setting…"
+              aria-label="Find a setting"
+            />
+          </div>
+
+          {matches ? (
+            <div className="toc-group">
+              <div className="toc-label">Matches</div>
+              {matches.length === 0 ? (
+                <div className="muted small" style={{ padding: "4px 8px" }}>
+                  No matching settings.
+                </div>
+              ) : (
+                matches.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className="toc-jump"
+                    onClick={() => {
+                      setFilter("");
+                      selectTab(m.tabId, m.id);
+                    }}
+                  >
+                    <span>{m.title}</span>
+                    <span className="muted">{m.tabLabel}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          ) : (
+            <div className="settings-tabs" role="tablist" aria-label="Settings categories" aria-orientation="vertical">
+              {TABS.map((t) => {
+                const Icon = t.icon;
+                const active = tab === t.id;
+                return (
+                  <div key={t.id} className="toc-cat">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      className={`toc-tab ${active ? "on" : ""}`}
+                      data-testid={`settings-tab-${t.id}`}
+                      onClick={() => selectTab(t.id)}
+                    >
+                      <Icon size={14} aria-hidden />
+                      <span>{t.label}</span>
+                    </button>
+                    {active && t.items.length > 1 && (
+                      <div className="toc-sub">
+                        {t.items.map(([id, title]) => (
+                          <a
+                            key={id}
+                            href={`#${id}`}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+                            }}
+                          >
+                            {title}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </nav>
+
+        <div className="settings-main" role="tabpanel" aria-label={activeTabDef.label}>
+          {tab === "agents" && (
+            <>
+              {isDesktop() && <Updates />}
+
+              <Section title="Providers for each role" note="Kept for this project by the daemon. New Run starts from these, and you can change any of them there for one run. Nothing is chosen for you.">
+                <Problem error={roleProviders.error} onRetry={() => void roleProviders.refetch()} />
+                <div className="role-table">
+                  {ALL_ROLES.map((role) => {
+                    const meta = ROLES.find((r) => r.id === role)!;
+                    return (
+                      <div key={role} className="role-line">
+                        <span className="role-line-name">
+                          <RoleMark role={role} size={13} />
+                          {meta.label}
+                        </span>
+                        <span className="role-line-hint">{meta.hint}</span>
+                        <ProviderPicker label={`${meta.label} provider`} providers={roleProviders.data ?? []} loading={roleProviders.isLoading} value={saved[role] ?? null} onChange={(pick) => saveRole(role, pick)} />
+                        <button type="button" className="ghost small" disabled={!saved[role]} onClick={() => saveRole(role, null)}>
+                          Forget
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Section>
+
+              {policy && (
+                <Section
+                  title="Tool approvals"
+                  note="Risky tool calls (a shell command, a write outside the worktree) wait for you on the run page; no answer in time is a denial. Ask on every call stops before each one; Approvals off keeps only the automatic gate."
+                >
+                  <div className="row gap wrap" data-testid="approval-policy">
+                    <div className="seg" role="radiogroup" aria-label="Approval mode">
+                      {APPROVAL_MODES.map((m) => (
+                        <button key={m} role="radio" aria-checked={policy.mode === m} className={policy.mode === m ? "on" : ""} onClick={() => savePolicy({ ...policy, mode: m })}>
+                          {approvalLabel(m)}
+                        </button>
+                      ))}
+                    </div>
+                    <label className="row gap small">
+                      <span className="muted">Deny after</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={86400}
+                        style={{ width: 90 }}
+                        aria-label="Approval timeout in seconds"
+                        value={policy.timeout}
+                        onFocus={() => (editingTimeout.current = true)}
+                        onChange={(e) => setPolicy({ ...policy, timeout: e.target.value })}
+                        onKeyDown={(e) => e.key === "Enter" && (e.currentTarget as HTMLInputElement).blur()}
+                        onBlur={() => {
+                          editingTimeout.current = false;
+                          savePolicy(policy);
+                        }}
+                      />
+                      <span className="muted">seconds</span>
+                    </label>
+                  </div>
+                  {policyError && <div className="error-line small">{policyError}</div>}
+                  <label className="row gap" data-testid="approvals-master">
+                    <Switch
+                      on={savedPolicy?.master_answers ?? false}
+                      label="Let the master answer a worker's low-risk questions"
+                      onChange={(on) =>
+                        void api.setApprovals({ approvals_master_answers: on }).then(
+                          () => {
+                            void roleSettings.refetch();
+                            toast(on ? "The master may answer low-risk questions" : "Only you answer questions");
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span className="muted small">
+                      Tests, builds and named installs, with a reason. Anything that deletes, publishes or changes the machine still waits for you, and you can
+                      answer first.
+                    </span>
+                  </label>
+                </Section>
+              )}
+
+              {daemon.data && (
+                <Section
+                  id="time-limit"
+                  title="Agent time limit"
+                  note="Optional cap on how long a single agent call may run. Off by default (No limit) so workers and planners can finish without arbitrary cutoffs."
+                >
+                  <div className="row gap small" data-testid="time-limit">
+                    <span className="muted">Stop an agent after</span>
+                    <SelectMenu
+                      ariaLabel="Agent time limit"
+                      value={String(daemon.data.agents?.timeout_secs ?? 0)}
+                      onChange={(v) => {
+                        const secs = Number(v);
+                        void api.setAgentTimeout(secs).then(
+                          (next) => {
+                            daemon.setData(next);
+                            toast("Agent time limit saved", secs === 0 ? "No limit for new runs" : `${limitLabel(secs)} for new runs`);
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        );
+                      }}
+                      options={limitChoices(daemon.data.agents?.timeout_secs ?? 0).map((secs) => ({
+                        value: String(secs),
+                        label: limitLabel(secs),
+                      }))}
+                    />
+                  </div>
+                </Section>
+              )}
+
+              {daemon.data && (
+                <Section
+                  id="settle"
+                  title="Settling runs"
+                  note="Taskmaster moves a finished run to Settled on its own, on every device, once there is nothing left to do with it. Settling stops its preview and removes its leftover worktrees; a new message takes it out again. A run's menu can say Never."
+                >
+                  <div className="row gap wrap small" data-testid="settle-settings">
+                    <div className="row gap">
+                      <span className="muted">After a merge, wait</span>
+                      <SelectMenu
+                        ariaLabel="Minutes after a merge"
+                        value={String(daemon.data.settle?.after_merge_mins ?? 60)}
+                        onChange={(v) =>
+                          void api.setSettle({ settle_after_merge_mins: Number(v) }).then(
+                            (next) => daemon.setData(next),
+                            (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                          )
+                        }
+                        options={[0, 15, 60, 240, 1440].map((m) => ({
+                          value: String(m),
+                          label: m === 0 ? "no time" : m < 60 ? `${m} minutes` : m === 60 ? "1 hour" : m < 1440 ? `${m / 60} hours` : "1 day",
+                        }))}
+                      />
+                    </div>
+                    <div className="row gap">
+                      <span className="muted">Settle any run idle for</span>
+                      <SelectMenu
+                        ariaLabel="Days idle"
+                        value={String(daemon.data.settle?.idle_days ?? 7)}
+                        onChange={(v) =>
+                          void api.setSettle({ settle_idle_days: Number(v) }).then(
+                            (next) => daemon.setData(next),
+                            (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                          )
+                        }
+                        options={[0, 1, 3, 7, 14, 30].map((d) => ({
+                          value: String(d),
+                          label: d === 0 ? "never" : d === 1 ? "1 day" : `${d} days`,
+                        }))}
+                      />
+                    </div>
+                  </div>
+                </Section>
+              )}
+
+              {daemon.data && (
+                <Section id="labs" title="Labs" note="Features still being tried. Each is off until you turn it on.">
+                  <label className="row gap" data-testid="labs-suggest">
+                    <Switch
+                      on={daemon.data.labs?.suggest_next ?? false}
+                      label="Suggest the next message after a run finishes"
+                      onChange={(on) =>
+                        void api.setLabs({ labs_suggest_next: on }).then(
+                          (next) => daemon.setData(next),
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span className="muted small">One small call to the master's provider after each turn; Tab in the empty box takes it.</span>
+                  </label>
+                </Section>
+              )}
+
+              {daemon.data && (
+                <Section
+                  id="checker"
+                  title="Mid-tier checker"
+                  note="After a page passes its own checks, the mid model reads its diff, its screenshot, its brief and the worker's last words, and answers pass or a short fix list. It runs beside the build, only on pages that change UI files or large ones, and waits at most 20 seconds at the end. Each page is checked once, so it adds at most one repair. Uses the mid role's harness and model."
+                >
+                  <label className="row gap" data-testid="checker-setting">
+                    <Switch
+                      on={daemon.data.checker?.enabled ?? false}
+                      label="Check finished pages with the mid model"
+                      onChange={(on) =>
+                        void api.setChecker(on).then(
+                          (next) => {
+                            daemon.setData(next);
+                            toast(on ? "The checker is on for new runs" : "The checker is off");
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span>{daemon.data.checker?.enabled ? "On: new runs get a second look per page" : "Off"}</span>
+                  </label>
+                </Section>
+              )}
+
+              {daemon.data && (
+                <Section
+                  id="code-mode"
+                  title="Code Mode"
+                  note="Every agent gets run_code: one call runs a short JavaScript program that reads, edits, patches, searches and checks files, instead of a tool call per step. Builders get the full set; the planner, reviewers and verifiers get a read-only one. It runs in Node with no file, process or network access of its own, under the same permissions as the agent's tools. Claude Code workers use Claude Code's own code mode. On by default for every harness."
+                >
+                  <label className="row gap" data-testid="code-mode-setting">
+                    <Switch
+                      on={daemon.data.code_mode?.enabled ?? true}
+                      label="Use Code Mode for workers"
+                      onChange={(on) =>
+                        void api.setCodeMode(on).then(
+                          (next) => {
+                            daemon.setData(next);
+                            toast(on ? "Code Mode is on for new runs" : "Code Mode is off");
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span>{daemon.data.code_mode?.enabled ? "On for new runs" : "Off"}</span>
+                  </label>
+                </Section>
+              )}
+
+              {daemon.data && (
+                <Section
+                  id="sandbox"
+                  title="Worker sandbox"
+                  note="A builder whose provider runs inside the sandbox (bubblewrap for Antigravity, Grok and OpenCode; Codex's own) can run commands: its tests, an install, a lockfile update. It can write only its worktree, its own scratch folder and the run's package caches; the rest of this machine is read-only to it. Claude Code workers have no shell either way."
+                >
+                  {daemon.data.sandbox && !daemon.data.sandbox.available && (
+                    <p className="muted small" data-testid="sandbox-missing">
+                      Bubblewrap cannot run on this machine, so no worker gets a shell whatever is set here.
+                    </p>
+                  )}
+                  <label className="row gap" data-testid="sandbox-shell-setting">
+                    <Switch
+                      on={daemon.data.sandbox?.shell ?? true}
+                      label="Let builders run commands in the sandbox"
+                      onChange={(on) =>
+                        void api.setSandbox({ shell: on }).then(
+                          (next) => {
+                            daemon.setData(next);
+                            toast(on ? "Builders can run commands in new runs" : "Builders get no shell in new runs");
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span>{daemon.data.sandbox?.shell ?? true ? "On: tests and installs run in the sandbox" : "Off: no commands"}</span>
+                  </label>
+                  <label className="row gap" data-testid="sandbox-indexes-setting">
+                    <Switch
+                      on={daemon.data.sandbox?.package_indexes ?? true}
+                      label="Let fetch tools reach package indexes"
+                      onChange={(on) =>
+                        void api.setSandbox({ package_indexes: on }).then(
+                          (next) => {
+                            daemon.setData(next);
+                            toast(on ? "Fetches may reach PyPI, npm and crates.io" : "Fetches are refused");
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span>{daemon.data.sandbox?.package_indexes ?? true ? "On: PyPI, npm and crates.io only" : "Off"}</span>
+                  </label>
+                </Section>
+              )}
+
+              <WebAccessSection />
+
+              {daemon.data && (
+                <Section
+                  id="telemetry"
+                  title="Telemetry"
+                  note="Off until you turn it on. When it is on, the daemon records a count in its log. It sends that count only if TASKMASTER_TELEMETRY_URL is an https address you set. Prompts, paths, and tokens are never included. With no address, nothing leaves this machine."
+                >
+                  <label className="row gap" data-testid="telemetry-setting">
+                    <Switch
+                      on={daemon.data.telemetry?.enabled ?? false}
+                      label="Send anonymous counts"
+                      onChange={(on) =>
+                        void api.setTelemetry(on).then(
+                          (next) => {
+                            daemon.setData(next);
+                            toast(on ? "Anonymous counts are on" : "Anonymous counts are off");
+                          },
+                          (err) => toast("Not saved", err instanceof Error ? err.message : String(err)),
+                        )
+                      }
+                    />
+                    <span>{daemon.data.telemetry?.enabled ? "On. Nothing is sent until an https collector is configured." : "Off"}</span>
+                  </label>
+                </Section>
+              )}
+            </>
+          )}
+
+          {tab === "connection" && <ConnectionTab daemon={daemon.data} />}
+          {tab === "tools" && <ToolsTab onImported={(next) => daemon.setData(next)} />}
+          {tab === "operations" && <OperationsTab />}
+          {tab === "appearance" && <AppearanceTab />}
+          {tab === "alerts" && <AlertsTab />}
+          {tab === "help" && <HelpTab />}
+        </div>
       </div>
     </div>
   );

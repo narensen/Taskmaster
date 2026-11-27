@@ -7,8 +7,7 @@ import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, ArrowUp, ChevronRight, 
 import { api, callAt, type PermissionMode, type RunSummary } from "../api";
 import { RoleDeck } from "../components/RoleDeck";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
-import { modelLabel } from "../components/ProviderPicker";
-import { ProviderLogo, providerName } from "../providers/logos";
+import { ProviderPicker, WorkersPicker } from "../components/ProviderPicker";
 import { afterStart, problemWith, SEATS, seatChoice, toRequest, useChoice } from "../rolechoice";
 import { prefetchRun, useProviders, useSettings } from "../query";
 import { ProviderSetup, noneInstalled } from "../components/ProviderSetup";
@@ -350,10 +349,10 @@ export function Gallery() {
     setPrefs({ parallel: v });
   };
   const masterPick = seatChoice(choice, "master");
+  const workerPick = seatChoice(choice, "worker");
   const providerList = providers.data ?? [];
   // First run with no coding CLI: a setup panel takes the place of the role picker.
   const firstRun = noneInstalled(providers.data);
-  const modelPill = masterPick ? `${providerList.find((x) => x.id === masterPick.harness)?.name ?? providerName(masterPick.harness)} · ${modelLabel(providerList, masterPick)}` : "Choose providers";
 
   const strip = useRef<HTMLDivElement>(null);
   const showAllBtn = useRef<HTMLButtonElement>(null);
@@ -544,32 +543,55 @@ export function Gallery() {
           placeholder="Describe a new project to build. @ files, $ skills, / commands"
           onSend={(m) => submit(m)}
           footer={
-            <div className="composer-foot">
-              <div className="composer-actions">
-                <input
-                  ref={fileRef}
-                  type="file"
-                  multiple
-                  className="sr-only"
-                  aria-hidden
-                  tabIndex={-1}
-                  onChange={(e) => {
-                    if (e.target.files?.length) void composer.current?.addFiles(e.target.files);
-                    e.target.value = "";
-                  }}
-                />
-                <button type="button" className="icon attach-btn" aria-label="Attach files" onClick={() => fileRef.current?.click()}>
-                  <Paperclip size={16} />
-                </button>
-                <ModePicker value={runMode} onChange={setRunMode} />
-                <PermissionPicker value={permission} onChange={setPermission} />
-                <GoalButton value={goal} onChange={setGoal} />
+            <div className="composer-foot-stack">
+              <div className="composer-foot-row">
+                <div className="composer-group">
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    multiple
+                    className="sr-only"
+                    aria-hidden
+                    tabIndex={-1}
+                    onChange={(e) => {
+                      if (e.target.files?.length) void composer.current?.addFiles(e.target.files);
+                      e.target.value = "";
+                    }}
+                  />
+                  <button type="button" className="icon composer-util-btn attach-btn" aria-label="Attach files" title="Attach files" onClick={() => fileRef.current?.click()}>
+                    <Paperclip size={15} />
+                  </button>
+                  <ModePicker value={runMode} onChange={setRunMode} />
+                  <PermissionPicker value={permission} onChange={setPermission} />
+                  <GoalButton value={goal} onChange={setGoal} />
+                </div>
               </div>
-              <div className="composer-end">
-                <button type="button" className={`model-pill ${rolesOpen ? "on" : ""}`} aria-expanded={rolesOpen} title="Roles and pages" onClick={() => setRolesOpen((v) => !v)}>
-                  <ProviderLogo id={masterPick?.harness} size={14} />
-                  <span className="clip">{modelPill}</span>
-                </button>
+              <div className="composer-foot-row composer-foot-bottom">
+                <div className="composer-group composer-models">
+                  <ProviderPicker
+                    label="Quick master model"
+                    variant="pill"
+                    prefix="Master"
+                    side="top"
+                    providers={providerList}
+                    loading={providers.isLoading}
+                    value={masterPick}
+                    onChange={(pick) => setSeat("master", pick)}
+                    onMoreRoles={() => setRolesOpen((v) => !v)}
+                    testId="gallery-master-picker"
+                  />
+                  <WorkersPicker
+                    providers={providerList}
+                    loading={providers.isLoading}
+                    value={workerPick}
+                    onChange={(pick) => setSeat("worker", pick)}
+                    pages={pages}
+                    onPages={setPages}
+                    max={max}
+                    side="top"
+                    onMoreRoles={() => setRolesOpen((v) => !v)}
+                  />
+                </div>
                 <button type="button" className="send-btn" aria-label="Create the project" disabled={action.busy !== null} onClick={() => submit()}>
                   {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
                 </button>
@@ -602,21 +624,31 @@ export function Gallery() {
       </div>
       <div className="home-below">
         {firstRun && <ProviderSetup providers={providerList} checking={providers.isFetching} />}
-        {rolesOpen && (
-          <div className="home-roles">
-            <RoleDeck
-              choice={choice}
-              providers={providerList}
-              loading={providers.isLoading}
-              onSeat={setSeat}
-              remember={remember}
-              onRemember={setRemember}
-              fresh={fresh}
-              missing={missing}
-            />
-            <PagesPicker value={pages} onChange={setPages} max={max} />
+        <div className={`options-slide ${rolesOpen ? "open" : ""}`} aria-hidden={!rolesOpen}>
+          <div className="options-slide-inner">
+            {rolesOpen && (
+              <div className="home-roles">
+                <div className="row between">
+                  <strong className="small">All roles and pages</strong>
+                  <button type="button" className="icon" aria-label="Close roles" onClick={() => setRolesOpen(false)}>
+                    <X size={14} />
+                  </button>
+                </div>
+                <RoleDeck
+                  choice={choice}
+                  providers={providerList}
+                  loading={providers.isLoading}
+                  onSeat={setSeat}
+                  remember={remember}
+                  onRemember={setRemember}
+                  fresh={fresh}
+                  missing={missing}
+                />
+                <PagesPicker value={pages} onChange={setPages} max={max} />
+              </div>
+            )}
           </div>
-        )}
+        </div>
       {!settings.data && runs.length === 0 && <Loading rows={2} tall label="Loading the gallery" />}
       {settings.data && list.length === 0 && (
         <section className="home-empty" aria-label="No runs yet">

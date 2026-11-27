@@ -12,9 +12,13 @@ use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, Plan, ReviewS
 
 /// Repair rounds a page gets on one tier before it escalates.
 pub const MAX_REPAIRS: u8 = 2;
-/// Repairs a page gets when every tier is the same model: escalating would only repeat the
-/// attempt, so there is no ladder, just these focused repairs and then a clear failure.
+/// Stuck repairs a page gets when every tier is the same model: escalating would only repeat
+/// the attempt, so there is no ladder, just these focused repairs on the same error and then
+/// a clear failure.
 pub const MAX_FOCUSED_REPAIRS: u8 = 2;
+/// Total repair rounds a page gets in focused mode when each round makes real progress
+/// (produces a different failure signature, e.g. build error -> runtime error -> broken image).
+pub const MAX_FOCUSED_PROGRESS_REPAIRS: u8 = 6;
 /// Dictionary amendments allowed per run. This cap is what bounds fix-and-revert loops.
 pub const MAX_AMENDMENTS: u8 = 1;
 /// Review rounds per run. After the last one the run goes straight to verification.
@@ -66,6 +70,10 @@ pub struct PageRun {
     pub state: PageState,
     pub tier: Tier,
     pub repairs: u8,
+    /// Total repair attempts across this page's lifecycle in the current turn, used to cap
+    /// progress-aware repair loops in focused mode.
+    #[serde(default)]
+    pub total_repairs: u8,
     /// Set when an entry this page cites was amended mid-build; its result is discarded.
     pub stale: bool,
     /// Check output handed to the next attempt.
@@ -222,6 +230,7 @@ impl Run {
                             state: PageState::Queued,
                             tier,
                             repairs: 0,
+                            total_repairs: 0,
                             stale: false,
                             pending_errors: None,
                             last_failure: None,
@@ -361,7 +370,7 @@ impl Run {
                     let tier = if !focused && page.is_hard() { Tier::Mid } else { Tier::Worker };
                     self.pages.insert(
                         page.id.clone(),
-                        PageRun { state: PageState::Queued, tier, repairs: 0, stale: false, pending_errors: None, last_failure: None },
+                        PageRun { state: PageState::Queued, tier, repairs: 0, total_repairs: 0, stale: false, pending_errors: None, last_failure: None },
                     );
                     plan.pages.push(page);
                 }
@@ -379,7 +388,7 @@ impl Run {
                     .pages
                     .iter()
                     .map(|p| {
-                        let page = PageRun { state: PageState::Queued, tier: Tier::Worker, repairs: 0, stale: false, pending_errors: None, last_failure: None };
+                        let page = PageRun { state: PageState::Queued, tier: Tier::Worker, repairs: 0, total_repairs: 0, stale: false, pending_errors: None, last_failure: None };
                         (p.id.clone(), page)
                     })
                     .collect();
@@ -402,6 +411,7 @@ impl Run {
                             page.pending_errors = None;
                             page.last_failure = None;
                             page.repairs = 0;
+                            page.total_repairs = 0;
                             page.tier = Tier::Worker;
                             page.stale = false;
                             self.dirty.insert(id.clone());
@@ -443,6 +453,7 @@ impl Run {
                         if page.state != PageState::Passed {
                             page.state = PageState::Queued;
                             page.repairs = 0;
+                            page.total_repairs = 0;
                             page.stale = false;
                         }
                     }
@@ -462,10 +473,14 @@ impl Run {
     /// Repair on the same tier, then escalate, then give up. A repair that fails exactly as
     /// the attempt before it is stuck: it escalates at once rather than spending the rest of
     /// its tier's repairs on the same mistake. With `focused` (one model on every tier) there
-    /// is nothing to escalate to: a few repairs, then give up.
+    /// is nothing to escalate to: stuck failures stop after `MAX_FOCUSED_REPAIRS`, while
+    /// distinct failures that show real progress (e.g. build error -> runtime error -> broken
+    /// image) continue converging up to `MAX_FOCUSED_PROGRESS_REPAIRS`.
     fn fail_page(p: &mut PageRun, errors: String, focused: bool) {
         let key = failure_key(&errors);
+        let had_previous = p.last_failure.is_some();
         let stuck = !key.is_empty() && p.last_failure.as_deref() == Some(key.as_str());
+        let progressed = had_previous && !stuck && !key.is_empty();
         p.last_failure = Some(key);
         if stuck
             && !focused
@@ -473,13 +488,18 @@ impl Run {
         {
             p.tier = next;
             p.repairs = 0;
+            p.total_repairs = p.total_repairs.saturating_add(1);
             p.state = PageState::Queued;
             p.pending_errors = Some(errors);
             return;
         }
         if focused {
-            if p.repairs < MAX_FOCUSED_REPAIRS {
+            if progressed {
+                p.repairs = 0;
+            }
+            if p.repairs < MAX_FOCUSED_REPAIRS && p.total_repairs < MAX_FOCUSED_PROGRESS_REPAIRS {
                 p.repairs += 1;
+                p.total_repairs += 1;
                 p.state = PageState::Queued;
                 p.pending_errors = Some(errors);
             } else {
@@ -489,9 +509,11 @@ impl Run {
         }
         if p.repairs < MAX_REPAIRS {
             p.repairs += 1;
+            p.total_repairs = p.total_repairs.saturating_add(1);
         } else if let Some(next) = p.tier.next() {
             p.tier = next;
             p.repairs = 0;
+            p.total_repairs = p.total_repairs.saturating_add(1);
         } else {
             p.state = PageState::Failed;
             return;
@@ -885,5 +907,44 @@ mod tests {
         assert_eq!(run.phase, RunPhase::Building);
         assert_eq!(run.pages["a"].state, PageState::Passed);
         assert_eq!(cmds, vec![spawn("b", Tier::Worker, None), spawn("c", Tier::Worker, None)]);
+    }
+
+    #[test]
+    fn focused_mode_converges_across_distinct_errors_until_fixed_or_capped() {
+        let (mut run, _) = started(&[("app", &[])], 1);
+        run.focused = true;
+        // Distinct verify errors across build -> runtime -> broken image -> narrow -> pass.
+        let stages = [
+            "app/page.tsx:1 tsc: TS2307: Cannot find module './horses'",
+            "In the browser at /: uncaught error: TypeError: horses.map is not a function",
+            "In the browser at /: BROKEN_IMAGE: 1 <img> element(s) failed to load (naturalWidth=0)",
+            "In the browser: at 360px wide the page scrolls sideways by 42px",
+        ];
+        for err in stages {
+            assert_eq!(run.step(finished("app", WorkerOutcome::Passed)), vec![Command::RunVerify]);
+            let failing = BTreeMap::from([("app".to_string(), err.to_string())]);
+            let cmds = run.step(Event::VerifyFinished { ok: false, failing });
+            assert_eq!(cmds, vec![spawn("app", Tier::Worker, Some(err))]);
+            assert_eq!(run.phase, RunPhase::Building);
+        }
+        // Final build succeeds and passes verify!
+        assert_eq!(run.step(finished("app", WorkerOutcome::Passed)), vec![Command::RunVerify]);
+        assert_eq!(run.step(Event::VerifyFinished { ok: true, failing: BTreeMap::new() }), vec![Command::Finish { ok: true }]);
+        assert_eq!(run.phase, RunPhase::Done);
+
+        // And distinct errors still hit a hard cap (MAX_FOCUSED_PROGRESS_REPAIRS) so a run cannot loop forever.
+        let (mut capped, _) = started(&[("app", &[])], 1);
+        capped.focused = true;
+        let mut attempts = 0u8;
+        for n in 0..20 {
+            let err = format!("app/page.tsx:1 tsc: TS{}: error {n}", 2300 + n);
+            match capped.step(finished("app", check_failed(&err))).as_slice() {
+                [Command::SpawnWorker { .. }] => attempts += 1,
+                [Command::Finish { ok: false }] => break,
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(attempts, MAX_FOCUSED_PROGRESS_REPAIRS);
+        assert_eq!(capped.phase, RunPhase::Failed);
     }
 }

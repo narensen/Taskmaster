@@ -112,10 +112,51 @@
       return { ran: true, added: after > before, found };
     },
 
-    // A heading, labels, and form controls drawn at the design's size.
+    // Wait briefly for in-DOM <img> elements to finish loading so real network images are not
+    // misreported as broken while still in flight.
+    async waitImages(timeoutMs = 4000) {
+      const imgs = [...document.querySelectorAll("img")].filter((img) => img.getAttribute("src")?.trim());
+      if (!imgs.length) return;
+      const pending = imgs.filter((img) => !img.complete);
+      if (!pending.length) return;
+      await Promise.race([
+        Promise.all(
+          pending.map(
+            (img) =>
+              new Promise((done) => {
+                img.addEventListener("load", done, { once: true });
+                img.addEventListener("error", done, { once: true });
+              }),
+          ),
+        ),
+        sleep(timeoutMs),
+      ]);
+    },
+
+    // A heading, labels, broken images, and form controls drawn at the design's size.
     scan() {
       const found = [];
       if (![...document.querySelectorAll("h1")].some(seen)) found.push(["h1", "the page has no visible <h1>: give it exactly one, naming the page"]);
+      const brokenImgs = [];
+      for (const img of document.querySelectorAll("img")) {
+        const style = getComputedStyle(img);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        const rawSrc = (img.getAttribute("src") || "").trim();
+        if (!rawSrc || !img.complete || img.naturalWidth === 0 || img.naturalHeight === 0) {
+          const alt = (img.getAttribute("alt") || "").trim();
+          const label = alt ? `alt="${alt.slice(0, 40)}"` : name(img);
+          const shownSrc = rawSrc ? rawSrc.slice(0, 120) : "(empty src)";
+          brokenImgs.push(`${label} src="${shownSrc}"`);
+        }
+      }
+      if (brokenImgs.length) {
+        const sample = brokenImgs.slice(0, 4).join(", ");
+        const extra = brokenImgs.length > 4 ? ` (+${brokenImgs.length - 4} more)` : "";
+        found.push([
+          "images",
+          `BROKEN_IMAGE: ${brokenImgs.length} <img> element(s) failed to load (naturalWidth=0): ${sample}${extra}. Replace with verified HTTP-200 real image URLs or local image files in public/.`,
+        ]);
+      }
       for (const el of document.querySelectorAll("input, select, textarea")) {
         const kind = (el.getAttribute("type") || "").toLowerCase();
         if (["hidden", "submit", "button", "reset", "image"].includes(kind) || !seen(el) || labelled(el)) continue;

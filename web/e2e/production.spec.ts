@@ -145,12 +145,14 @@ test("a folder on this machine can be cloned from Home", async ({ open, page, da
 
 test("settings shows one log, and export, import, and reset keep secrets out", async ({ open, page, daemon }) => {
   await open("/settings");
+  const toggle = page.getByTestId("telemetry-setting").getByRole("switch", { name: "Send anonymous counts" });
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+
+  await page.getByTestId("settings-tab-tools").click();
   const log = page.getByTestId("daemon-log");
   await expect(log).toBeVisible();
   await page.getByRole("button", { name: "Refresh" }).click();
   await expect(log).toContainText("serving");
-  const toggle = page.getByTestId("telemetry-setting").getByRole("switch", { name: "Send anonymous counts" });
-  await expect(toggle).toHaveAttribute("aria-checked", "false");
   await page.getByRole("button", { name: "Export" }).click();
   const exported = (await (await fetch(`${daemon.url}/api/settings/export`, { headers: auth(daemon.token) })).json()) as {
     settings: { commons?: { token?: string } };
@@ -163,9 +165,13 @@ test("settings shows one log, and export, import, and reset keep secrets out", a
     mimeType: "application/json",
     buffer: Buffer.from(JSON.stringify({ telemetry: { enabled: true } })),
   });
+  await page.getByTestId("settings-tab-agents").click();
   await expect(toggle).toHaveAttribute("aria-checked", "true");
+
+  await page.getByTestId("settings-tab-tools").click();
   await page.getByRole("button", { name: "Reset choices" }).click();
   await page.getByRole("button", { name: "Click again to reset" }).click();
+  await page.getByTestId("settings-tab-agents").click();
   await expect(toggle).toHaveAttribute("aria-checked", "false");
   const saved = (await (await fetch(`${daemon.url}/api/settings`, { headers: auth(daemon.token) })).json()) as { telemetry: { enabled: boolean } };
   expect(saved.telemetry.enabled).toBe(false);

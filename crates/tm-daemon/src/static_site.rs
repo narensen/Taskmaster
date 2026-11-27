@@ -172,6 +172,33 @@ pub async fn serve(listener: tokio::net::TcpListener, root: PathBuf) {
     let _ = axum::serve(listener, app).await;
 }
 
+async fn serve_spa_file(State(root): State<PathBuf>, uri: Uri) -> Response {
+    let path = uri.path();
+    if let Some(file) = resolve(&root, path) {
+        return match tokio::fs::read(&file).await {
+            Ok(body) => ([(header::CONTENT_TYPE, content_type(&file)), (header::CACHE_CONTROL, "no-store")], body).into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    // Fall back to index.html only for extensionless client routes, never for missing assets
+    // (.js, .css, .png, .jpg, etc.) so broken resources still return 404 and get caught.
+    let last = path.rsplit('/').next().unwrap_or("");
+    let looks_like_asset = last.contains('.');
+    if !looks_like_asset {
+        let index = root.join("index.html");
+        if let Ok(body) = tokio::fs::read(&index).await {
+            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], body).into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// Serve a built SPA (`dist/` or `build/`) with `index.html` fallback for extensionless routes.
+pub async fn serve_spa(listener: tokio::net::TcpListener, root: PathBuf) {
+    let app = Router::new().fallback(serve_spa_file).with_state(root);
+    let _ = axum::serve(listener, app).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

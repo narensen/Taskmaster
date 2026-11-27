@@ -6,6 +6,7 @@ import { api, type ApprovalMode, type Spend } from "../api";
 import { APPROVAL_MODES, approvalLabel, tokens } from "../format";
 import { keys, queryClient, useSettings } from "../query";
 import { useRunChrome } from "../shell/runChrome";
+import { SelectMenu } from "../components/SelectMenu";
 import { TokenLedger } from "./Tokens";
 
 function roleName(key: string): string {
@@ -66,13 +67,15 @@ export function RunBar() {
           {totals && totals.calls > 0 && <TokenLedger totals={totals} open />}
         </div>
       </div>
-      <select className="tb-mode" aria-label="Approval mode" value={shown} onChange={(e) => setMode(e.target.value as ApprovalMode)}>
-        {APPROVAL_MODES.map((m) => (
-          <option key={m} value={m}>
-            {approvalLabel(m)}
-          </option>
-        ))}
-      </select>
+      <SelectMenu
+        variant="inline"
+        align="end"
+        className="tb-mode"
+        ariaLabel="Approval mode"
+        value={shown}
+        options={APPROVAL_MODES.map((m) => ({ value: m, label: approvalLabel(m) }))}
+        onChange={(v) => setMode(v as ApprovalMode)}
+      />
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { api, searchWeb, type AgentEntry, type RunDetail } from "../api";
 import { ExternalLink, Rich } from "../paths";
 import { emit, openMenu, toast } from "../overlay";
 import { usePrefs } from "../prefs";
+import { SelectMenu } from "../components/SelectMenu";
 
 // Browser.
 
@@ -50,14 +51,17 @@ export function BrowserTab({ run, detail, entries }: { run: string; detail: RunD
   return (
     <div className="browser-tab">
       <div className="toolbar">
-        <select value={page} onChange={(e) => setPage(e.target.value)} aria-label="Route">
-          {routes.map((r) => (
-            <option key={r.page} value={r.page}>
-              {r.route} · {r.page}
-              {shots.includes(r.page) ? "" : " (no picture)"}
-            </option>
-          ))}
-        </select>
+        <SelectMenu
+          variant="inline"
+          ariaLabel="Route"
+          value={page}
+          options={routes.map((r) => ({
+            value: r.page,
+            label: `${r.route} · ${r.page}`,
+            note: shots.includes(r.page) ? undefined : "no picture",
+          }))}
+          onChange={setPage}
+        />
         <input
           className="grow"
           placeholder="Preview address, e.g. http://127.0.0.1:3000"

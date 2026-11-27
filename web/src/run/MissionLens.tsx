@@ -39,6 +39,7 @@ import {
 } from "../api";
 import { usd } from "../format";
 import { toast } from "../overlay";
+import { SelectMenu } from "../components/SelectMenu";
 import { GlobFiles } from "./GlobFiles";
 import { shownPageState, type Surface } from "./model";
 
@@ -695,17 +696,19 @@ export function MissionLens({
                         onChange={(e) => updatePage({ owned_glob: e.target.value })}
                       />
                     </label>
-                    <label className="workbench-field">
+                    <div className="workbench-field">
                       <span>Difficulty</span>
-                      <select
+                      <SelectMenu
+                        ariaLabel="Difficulty"
                         value={p.difficulty ?? "normal"}
-                        onChange={(e) => updatePage({ difficulty: e.target.value })}
-                      >
-                        <option value="easy">easy (low effort)</option>
-                        <option value="normal">normal (default)</option>
-                        <option value="hard">hard (mid tier / high effort)</option>
-                      </select>
-                    </label>
+                        onChange={(v) => updatePage({ difficulty: v })}
+                        options={[
+                          { value: "easy", label: "easy (low effort)" },
+                          { value: "normal", label: "normal (default)" },
+                          { value: "hard", label: "hard (mid tier / high effort)" },
+                        ]}
+                      />
+                    </div>
                     {draft.pages.length > 1 && (
                       <button
                         type="button"

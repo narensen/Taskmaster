@@ -1,9 +1,11 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { Download, FolderInput, Puzzle, RefreshCw, Search, SearchX, Trash2 } from "lucide-react";
 import { api, type Skill, type SkillHit } from "../api";
 import { forgetSkills } from "../composer";
 import { toast } from "../overlay";
 import { Empty, Loading, Problem, Switch, useLoad } from "../ui";
+
+const HITS_PAGE_SIZE = 24;
 
 function why(err: unknown) {
   return err instanceof Error ? err.message : String(err);
@@ -15,7 +17,7 @@ function installs(n: number) {
   return `${n} install${n === 1 ? "" : "s"}`;
 }
 
-function InstalledRow({ skill, update, onChanged }: { skill: Skill; update: boolean; onChanged: () => void }) {
+const InstalledRow = memo(function InstalledRow({ skill, update, onChanged }: { skill: Skill; update: boolean; onChanged: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const act = async (what: string, run: () => Promise<unknown>, done: string) => {
     setBusy(what);
@@ -70,11 +72,14 @@ function InstalledRow({ skill, update, onChanged }: { skill: Skill; update: bool
       </div>
     </li>
   );
-}
+});
 
-function HitRow({ hit, onInstalled }: { hit: SkillHit; onInstalled: () => void }) {
+const HitRow = memo(function HitRow({ hit, onInstalled }: { hit: SkillHit; onInstalled: () => void }) {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(hit.installed);
+  useEffect(() => {
+    setDone(hit.installed);
+  }, [hit.installed]);
   const install = async () => {
     setBusy(true);
     try {
@@ -111,29 +116,63 @@ function HitRow({ hit, onInstalled }: { hit: SkillHit; onInstalled: () => void }
       </div>
     </li>
   );
-}
+});
+
+const SkillsSearchForm = memo(function SkillsSearchForm({ initial, onSearch }: { initial: string; onSearch: (q: string) => void }) {
+  const [query, setQuery] = useState(initial);
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    onSearch(query.trim());
+  };
+  return (
+    <form className="search-field skills-search" onSubmit={submit} role="search">
+      <Search size={15} aria-hidden />
+      <input
+        className="search"
+        type="search"
+        value={query}
+        onChange={(e) => {
+          const val = e.target.value;
+          setQuery(val);
+          if (!val.trim()) onSearch("");
+        }}
+        placeholder="Search published skills: react, testing, accessibility"
+        aria-label="Search published skills"
+        autoFocus
+      />
+      <button type="submit" className="small" disabled={query.trim().length < 2}>
+        Search
+      </button>
+    </form>
+  );
+});
 
 export function Skills() {
-  const [query, setQuery] = useState(() => new URLSearchParams(window.location.search).get("q") ?? "");
-  const [searched, setSearched] = useState(query.trim());
+  const [searched, setSearched] = useState(() => (new URLSearchParams(window.location.search).get("q") ?? "").trim());
+  const [visibleHits, setVisibleHits] = useState(HITS_PAGE_SIZE);
   const list = useLoad(() => api.skills(), []);
   const updates = useLoad(() => api.skillUpdates().catch(() => ({}) as Record<string, string>), []);
   const hits = useLoad(() => (searched.length >= 2 ? api.searchSkills(searched) : Promise.resolve(null)), [searched]);
+
   useEffect(() => {
+    setVisibleHits(HITS_PAGE_SIZE);
     const url = searched ? `/skills?q=${encodeURIComponent(searched)}` : "/skills";
     window.history.replaceState(null, "", url);
   }, [searched]);
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    setSearched(query.trim());
-  };
-  const changed = () => {
-    void list.reload();
-    void updates.reload();
-  };
-  const stored = (list.data ?? []).filter((s) => s.place === "store");
-  const found = (list.data ?? []).filter((s) => s.place !== "store");
-  const pending = Object.keys(updates.data ?? {}).length;
+
+  const handleSearch = useCallback((q: string) => setSearched(q), []);
+  const reloadList = list.reload;
+  const reloadUpdates = updates.reload;
+  const changed = useCallback(() => {
+    void reloadList();
+    void reloadUpdates();
+  }, [reloadList, reloadUpdates]);
+
+  const stored = useMemo(() => (list.data ?? []).filter((s) => s.place === "store"), [list.data]);
+  const found = useMemo(() => (list.data ?? []).filter((s) => s.place !== "store"), [list.data]);
+  const pending = useMemo(() => Object.keys(updates.data ?? {}).length, [updates.data]);
+  const shownHits = useMemo(() => (hits.data ?? []).slice(0, visibleHits), [hits.data, visibleHits]);
+  const totalHits = hits.data?.length ?? 0;
 
   return (
     <div className="page">
@@ -150,34 +189,31 @@ export function Skills() {
         </button>
       </header>
 
-      <form className="search-field skills-search" onSubmit={submit} role="search">
-        <Search size={15} aria-hidden />
-        <input
-          className="search"
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search published skills: react, testing, accessibility"
-          aria-label="Search published skills"
-          autoFocus
-        />
-        <button type="submit" className="small" disabled={query.trim().length < 2}>
-          Search
-        </button>
-      </form>
+      <SkillsSearchForm initial={searched} onSearch={handleSearch} />
 
       {searched.length >= 2 && (
         <section aria-labelledby="hits-h" className="skills-section">
-          <h2 id="hits-h">Published</h2>
+          <h2 id="hits-h">
+            Published {totalHits > 0 && <span className="muted">{totalHits}</span>}
+          </h2>
           <Problem error={hits.error} onRetry={hits.reload} />
           {hits.loading && <Loading rows={3} label="Searching" />}
           {!hits.loading && hits.data && hits.data.length === 0 && <Empty title={`Nothing published matches “${searched}”`} icon={<SearchX size={18} strokeWidth={1.5} />} />}
-          {!hits.loading && hits.data && hits.data.length > 0 && (
-            <ul className="skill-list card">
-              {hits.data.map((h) => (
-                <HitRow key={h.id} hit={h} onInstalled={changed} />
-              ))}
-            </ul>
+          {!hits.loading && shownHits.length > 0 && (
+            <>
+              <ul className="skill-list card">
+                {shownHits.map((h) => (
+                  <HitRow key={h.id} hit={h} onInstalled={changed} />
+                ))}
+              </ul>
+              {totalHits > visibleHits && (
+                <div className="row center" style={{ marginTop: 10 }}>
+                  <button type="button" className="ghost small" onClick={() => setVisibleHits((n) => n + HITS_PAGE_SIZE)}>
+                    Show more ({totalHits - visibleHits} remaining)
+                  </button>
+                </div>
+              )}
+            </>
           )}
           <p className="muted small">Results from skills.sh. Installing reads the skill's folder from its GitHub repository.</p>
         </section>

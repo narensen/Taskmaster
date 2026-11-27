@@ -9,6 +9,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Bot, Check, Copy, ExternalLink, Laptop, Link2, Monitor, Pencil, Plug, RefreshCw, Server, Smartphone, Trash2, Wifi } from "lucide-react";
+import { SelectMenu } from "../components/SelectMenu";
 import {
   api,
   callAt,
@@ -197,16 +198,15 @@ function PairCard({ view, devices, onChange }: { view: ConnectView | null; devic
           <span>Name</span>
           <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Naren's phone" maxLength={60} data-testid="pair-label" />
         </label>
-        <label className="connect-field">
+        <div className="connect-field">
           <span>Kind</span>
-          <select value={kind} onChange={(e) => setKind(e.target.value as DeviceKind)} aria-label="Device kind">
-            {(["phone", "browser", "desktop", "machine"] as const).map((k) => (
-              <option key={k} value={k}>
-                {KIND_NAME[k]}
-              </option>
-            ))}
-          </select>
-        </label>
+          <SelectMenu
+            ariaLabel="Device kind"
+            value={kind}
+            options={(["phone", "browser", "desktop", "machine"] as const).map((k) => ({ value: k, label: KIND_NAME[k] }))}
+            onChange={(v) => setKind(v as DeviceKind)}
+          />
+        </div>
         <button type="button" className="primary small" disabled={busy} onClick={() => void make()} data-testid="pair-make">
           {busy ? "Making…" : offer ? "Make another" : "Make pairing link"}
         </button>
@@ -525,16 +525,18 @@ function AgentsCard({ view, devices, onChange }: { view: ConnectView | null; dev
           <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={60} data-testid="agent-label" />
         </label>
         {routes.length > 1 && (
-          <label className="connect-field">
+          <div className="connect-field">
             <span>It runs on</span>
-            <select value={route} onChange={(e) => setRoute(Number(e.target.value))} aria-label="Where the agent runs">
-              {routes.map((r, i) => (
-                <option key={r.url} value={i}>
-                  {r.kind === "this-computer" ? "This computer" : `Another machine (${ROUTE_NAME[r.kind].toLowerCase()})`}
-                </option>
-              ))}
-            </select>
-          </label>
+            <SelectMenu
+              ariaLabel="Where the agent runs"
+              value={String(route)}
+              onChange={(v) => setRoute(Number(v))}
+              options={routes.map((r, i) => ({
+                value: String(i),
+                label: r.kind === "this-computer" ? "This computer" : `Another machine (${ROUTE_NAME[r.kind].toLowerCase()})`,
+              }))}
+            />
+          </div>
         )}
         <button type="button" className="primary small" disabled={busy} onClick={() => void mint()} data-testid="agent-make">
           {busy ? "Making…" : minted ? "Make another token" : "Make a token"}

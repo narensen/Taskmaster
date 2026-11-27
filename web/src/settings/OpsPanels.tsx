@@ -11,6 +11,7 @@ import {
 } from "../api";
 import { Problem, Switch, useLoad } from "../ui";
 import { toast } from "../overlay";
+import { SelectMenu } from "../components/SelectMenu";
 
 function OpsSection({ id, title, note, children }: { id: string; title: string; note?: string; children: ReactNode }) {
   return (
@@ -373,10 +374,15 @@ export function RemoteMeshSection() {
           </ul>
         )}
         <form className="ops-form-grid" onSubmit={(e) => void add(e)}>
-          <select value={kind} onChange={(e) => setKind(e.target.value as "runner" | "environment")} aria-label="Node kind">
-            <option value="runner">Remote runner</option>
-            <option value="environment">Remote environment</option>
-          </select>
+          <SelectMenu
+            ariaLabel="Node kind"
+            value={kind}
+            options={[
+              { value: "runner", label: "Remote runner" },
+              { value: "environment", label: "Remote environment" },
+            ]}
+            onChange={(v) => setKind(v as "runner" | "environment")}
+          />
           <input placeholder="Name (e.g. build-box)" value={name} onChange={(e) => setName(e.target.value)} />
           <input className="mono" placeholder="http://100.x.y.z:8737" value={url} onChange={(e) => setUrl(e.target.value)} />
           <input type="password" placeholder="Bearer token (optional)" value={token} onChange={(e) => setToken(e.target.value)} />

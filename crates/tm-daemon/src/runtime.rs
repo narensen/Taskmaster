@@ -122,6 +122,25 @@ fn walk(dir: &Path, depth: usize) -> Vec<PathBuf> {
     out
 }
 
+/// Standalone Node built-in test files (`*.test.mjs`, `*.test.js`, `*.test.cjs`) in a
+/// project without `package.json`, relative to `tree`.
+pub fn node_test_files(tree: &Path) -> Vec<String> {
+    if tree.join("package.json").is_file() {
+        return Vec::new();
+    }
+    let mut found: Vec<String> = walk(tree, 3)
+        .into_iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(tree).ok()?;
+            let name = p.file_name()?.to_str()?;
+            let is_test = name.ends_with(".test.mjs") || name.ends_with(".test.js") || name.ends_with(".test.cjs");
+            is_test.then(|| rel.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// Whether the project has tests of its own. Such a project must have them run: a verify
 /// that ran nothing is a failure, not a pass.
 pub fn has_tests(tree: &Path) -> bool {
@@ -136,7 +155,7 @@ pub fn has_tests(tree: &Path) -> bool {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|package| package["scripts"]["test"].as_str().map(|s| !s.contains("no test specified")))
         .unwrap_or(false);
-    python_tests(tree) || tree.join("Cargo.toml").is_file() || npm_test
+    python_tests(tree) || tree.join("Cargo.toml").is_file() || npm_test || !node_test_files(tree).is_empty()
 }
 
 /// The dependency files that decide what a Python environment holds, as one stamp.
@@ -261,6 +280,32 @@ fn python_steps(tree: &Path, venv: &Path) -> Vec<Step> {
     out
 }
 
+/// The dependency files that decide what `node_modules` holds, as one stamp.
+fn node_stamp(tree: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for file in ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"] {
+        file.hash(&mut hasher);
+        std::fs::read(tree.join(file)).unwrap_or_default().hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
+fn package_has_deps(package: &Value) -> bool {
+    let lists = |key: &str| package[key].as_object().is_some_and(|deps| !deps.is_empty());
+    lists("dependencies") || lists("devDependencies")
+}
+
+/// Whether a `package.json` script invokes a command that is already on `PATH` (for example
+/// `node --test tests/app.test.mjs`), so it does not require `node_modules/.bin`.
+fn script_runs_without_modules(body: &str) -> bool {
+    let first = body
+        .split_whitespace()
+        .find(|token| !token.contains('=') || token.starts_with('='))
+        .unwrap_or("");
+    !first.is_empty() && on_path(first)
+}
+
 /// What to run in `tree`, in order. A step whose tool is missing is left out. Python runs in
 /// `venv`, an environment of the run's own that is made and filled on first use.
 pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
@@ -274,8 +319,9 @@ pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
     }
     if let Ok(text) = std::fs::read_to_string(tree.join("package.json"))
         && let Ok(package) = serde_json::from_str::<Value>(&text)
-        && tree.join("node_modules").exists()
     {
+        let has_deps = package_has_deps(&package);
+        let has_modules = tree.join("node_modules").exists();
         let manager = if tree.join("pnpm-lock.yaml").is_file() {
             "pnpm"
         } else if tree.join("yarn.lock").is_file() {
@@ -286,15 +332,39 @@ pub fn steps(tree: &Path, venv: &Path) -> Vec<Step> {
             "npm"
         };
         if on_path(manager) {
+            if has_deps {
+                let stamp = node_stamp(tree);
+                let stamp_file = tree.join("node_modules/.taskmaster-deps");
+                let stale = std::fs::read_to_string(&stamp_file).is_ok_and(|have| have != stamp);
+                if !has_modules || stale {
+                    let args: &[&str] = match manager {
+                        "npm" => &["install", "--no-audit", "--no-fund", "--loglevel=error"],
+                        _ => &["install"],
+                    };
+                    let mut install = Step::new("setup", manager, args);
+                    install.setup = true;
+                    install.stamp = Some((stamp_file, stamp));
+                    out.push(install);
+                }
+            }
             for script in ["build", "test"] {
                 let Some(body) = package["scripts"][script].as_str() else { continue };
                 // What `npm init` writes: a test script that only fails.
                 if body.contains("no test specified") {
                     continue;
                 }
+                if !has_modules && !has_deps && !script_runs_without_modules(body) {
+                    continue;
+                }
                 out.push(Step::new(script, manager, &["run", script]));
             }
         }
+    }
+    let node_tests = node_test_files(tree);
+    if !node_tests.is_empty() && on_path("node") {
+        let mut args: Vec<String> = vec!["--test".into()];
+        args.extend(node_tests);
+        out.push(Step { name: "test".into(), program: "node".into(), args, ..Default::default() });
     }
     if tree.join("Cargo.toml").is_file() && on_path("cargo") {
         out.push(Step::new("test", "cargo", &["test", "--quiet"]));
@@ -313,9 +383,29 @@ pub fn missing_runner(tree: &Path) -> Option<String> {
     if tree.join("Cargo.toml").is_file() && !on_path("cargo") {
         return Some("the project is a Rust crate, but cargo is not on PATH".into());
     }
-    let npm_test = std::fs::read_to_string(tree.join("package.json")).is_ok_and(|t| t.contains("\"test\""));
-    if npm_test && !tree.join("node_modules").exists() {
-        return Some("the project has a test script, but its packages are not installed (no node_modules)".into());
+    if let Ok(text) = std::fs::read_to_string(tree.join("package.json"))
+        && let Ok(package) = serde_json::from_str::<Value>(&text)
+        && let Some(body) = package["scripts"]["test"].as_str()
+        && !body.contains("no test specified")
+    {
+        let manager = if tree.join("pnpm-lock.yaml").is_file() {
+            "pnpm"
+        } else if tree.join("yarn.lock").is_file() {
+            "yarn"
+        } else if tree.join("bun.lockb").is_file() || tree.join("bun.lock").is_file() {
+            "bun"
+        } else {
+            "npm"
+        };
+        if !on_path(manager) {
+            return Some(format!("the project has a test script, but {manager} is not on PATH"));
+        }
+        if !tree.join("node_modules").exists()
+            && !package_has_deps(&package)
+            && !script_runs_without_modules(body)
+        {
+            return Some("the project has a test script, but its packages are not installed (no node_modules)".into());
+        }
     }
     None
 }
@@ -484,6 +574,91 @@ pub fn is_built_next(tree: &Path) -> bool {
     next.exists() && package.contains("\"next\"") && tree.join(".next/BUILD_ID").is_file()
 }
 
+/// Whether `tree` declares a Node server/SSR backend that needs its own server process
+/// rather than serving a static `dist/` or `build/` bundle directly.
+fn has_server_backend(tree: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(tree.join("package.json")) else { return false };
+    let Ok(package) = serde_json::from_str::<Value>(&text) else { return false };
+    let has_dep = |name: &str| package["dependencies"][name].is_string() || package["devDependencies"][name].is_string();
+    const BACKEND_DEPS: [&str; 13] = [
+        "express",
+        "fastify",
+        "koa",
+        "hono",
+        "@hono/node-server",
+        "next",
+        "nuxt",
+        "@sveltejs/kit",
+        "remix",
+        "@remix-run/node",
+        "socket.io",
+        "ws",
+        "@nestjs/core",
+    ];
+    if BACKEND_DEPS.iter().any(|dep| has_dep(dep)) {
+        return true;
+    }
+    if let Some(start) = package["scripts"]["start"].as_str() {
+        let lower = start.to_ascii_lowercase();
+        if ["node ", "tsx ", "ts-node ", "bun ", "deno "].iter().any(|k| lower.contains(k)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A built static SPA output directory (`dist/` or `build/`), when there is no backend server.
+fn built_spa_dir(tree: &Path) -> Option<PathBuf> {
+    if has_server_backend(tree) {
+        return None;
+    }
+    ["dist", "build"]
+        .into_iter()
+        .map(|dir| tree.join(dir))
+        .find(|dir| dir.join("index.html").is_file())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebApp {
+    /// Built Next.js app started with `next start`.
+    Next,
+    /// Built static SPA (`dist/` or `build/`) served directly with SPA fallback.
+    BuiltSpa(PathBuf),
+    /// Any web project with a `dev`, `start`, or `preview` script (or `.taskmaster.yaml` preview).
+    DevServer,
+    /// Pure static HTML site (no package.json dev/start/preview scripts).
+    Static(&'static str),
+}
+
+fn detect_web_app(tree: &Path) -> Option<WebApp> {
+    if is_built_next(tree) {
+        return Some(WebApp::Next);
+    }
+    if let Some(dir) = built_spa_dir(tree) {
+        return Some(WebApp::BuiltSpa(dir));
+    }
+    if let Ok(Some(loaded)) = crate::project_config::load(tree)
+        && loaded.trusted
+        && loaded.config.preview.as_deref().is_some_and(|s| !s.trim().is_empty())
+    {
+        return Some(WebApp::DevServer);
+    }
+    if crate::preview::dev_command(tree, "", 1).is_some() {
+        return Some(WebApp::DevServer);
+    }
+    if crate::static_site::has_no_scripts(tree)
+        && let Some(start) = crate::static_site::start_page(tree)
+    {
+        return Some(WebApp::Static(start));
+    }
+    None
+}
+
+/// Whether `browse()` knows how to launch and verify `tree` in a browser.
+pub fn can_browse(tree: &Path) -> bool {
+    detect_web_app(tree).is_some()
+}
+
 #[derive(Debug, Default)]
 pub struct Browsed {
     /// Errors per page, ready to hand to the page's owner.
@@ -522,6 +697,15 @@ struct Server(tokio::process::Child);
 
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.0.start_kill();
     }
 }
@@ -539,49 +723,161 @@ pub(crate) async fn free_port() -> anyhow::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Start the built app and wait until it answers.
-async fn start_app(tree: &Path) -> anyhow::Result<(Server, u16)> {
-    let port = free_port().await?;
-    let mut child = Command::new(tree.join("node_modules/.bin/next"))
-        .args(["start", "-p", &port.to_string(), "-H", "127.0.0.1"])
-        .current_dir(tree)
-        .env("NEXT_TELEMETRY_DISABLED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("could not start the app with `next start`")?;
+/// Wait until `127.0.0.1:port` accepts a TCP connection or the process exits / times out.
+async fn wait_for_server(
+    mut child: tokio::process::Child,
+    port: u16,
+    label: &str,
+    within: Duration,
+) -> anyhow::Result<(Server, u16)> {
+    let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let server = Server(child);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut server = Server(child);
+    let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return Ok((server, port));
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Ok(Some(status)) = server.0.try_wait() {
+            let mut out = String::new();
+            let mut err = String::new();
+            if let Some(mut s) = stdout {
+                let _ = tokio::time::timeout(Duration::from_secs(1), s.read_to_string(&mut out)).await;
+            }
+            if let Some(mut s) = stderr {
+                let _ = tokio::time::timeout(Duration::from_secs(1), s.read_to_string(&mut err)).await;
+            }
+            let combined = format!("{}\n{}", out.trim(), err.trim());
+            bail!("`{label}` exited early ({status}): {}", tail(combined.trim()));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let mut said = String::new();
-    if let Some(mut stderr) = stderr {
-        let _ = tokio::time::timeout(Duration::from_secs(1), stderr.read_to_string(&mut said)).await;
+    let mut out = String::new();
+    let mut err = String::new();
+    if let Some(mut s) = stdout {
+        let _ = tokio::time::timeout(Duration::from_secs(1), s.read_to_string(&mut out)).await;
     }
-    bail!("the app did not start in 60 seconds: {}", tail(said.trim()))
+    if let Some(mut s) = stderr {
+        let _ = tokio::time::timeout(Duration::from_secs(1), s.read_to_string(&mut err)).await;
+    }
+    let combined = format!("{}\n{}", out.trim(), err.trim());
+    bail!("`{label}` did not start in {} seconds: {}", within.as_secs(), tail(combined.trim()))
+}
+
+/// Start a built Next.js app and wait until it answers.
+async fn start_next_app(tree: &Path) -> anyhow::Result<(Server, u16)> {
+    let port = free_port().await?;
+    let mut cmd = Command::new(tree.join("node_modules/.bin/next"));
+    clean_env(&mut cmd);
+    cmd.args(["start", "-p", &port.to_string(), "-H", "127.0.0.1"])
+        .current_dir(tree)
+        .env("NEXT_TELEMETRY_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().context("could not start the app with `next start`")?;
+    wait_for_server(child, port, "next start", Duration::from_secs(60)).await
+}
+
+/// Start a dev/start/preview server (Vite, Express, React, etc.) and wait until it answers.
+async fn start_dev_app(tree: &Path) -> anyhow::Result<(Server, u16)> {
+    let port = free_port().await?;
+    let yaml_preview = crate::project_config::load(tree)
+        .ok()
+        .flatten()
+        .filter(|l| l.trusted)
+        .and_then(|l| l.config.preview.as_deref().map(str::to_string))
+        .map(|cmd| cmd.replace("$PORT", &port.to_string()).replace("${PORT}", &port.to_string()));
+    let command = yaml_preview
+        .or_else(|| crate::preview::dev_command(tree, "", port))
+        .context("no dev/start/preview command available")?;
+    let within = if command.contains(" install") && command.contains(" && ") {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(60)
+    };
+    let mut cmd = Command::new("sh");
+    clean_env(&mut cmd);
+    cmd.args(["-c", &command])
+        .current_dir(tree)
+        .env("PORT", port.to_string())
+        .env("HOST", "127.0.0.1")
+        .env("BROWSER", "none")
+        .env("CI", "1")
+        .env("NEXT_TELEMETRY_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().with_context(|| format!("could not start `{command}`"))?;
+    wait_for_server(child, port, &command, within).await
+}
+
+fn is_checked_subresource(kind: &str) -> bool {
+    matches!(kind, "Image" | "Script" | "Stylesheet" | "Fetch" | "XHR" | "Media")
 }
 
 /// What went wrong on one page, from the events Chrome sent for its session.
 pub(crate) fn problems(events: &[Value], session: &str, url: &str, dynamic: bool) -> Vec<String> {
+    let mut request_urls: BTreeMap<String, String> = BTreeMap::new();
+    for event in events.iter().filter(|e| e["sessionId"] == session) {
+        if event["method"].as_str() == Some("Network.requestWillBeSent") {
+            let params = &event["params"];
+            if let (Some(id), Some(req_url)) = (params["requestId"].as_str(), params["request"]["url"].as_str()) {
+                request_urls.insert(id.to_string(), req_url.to_string());
+            }
+        }
+    }
+    let mut reported_urls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for event in events.iter().filter(|e| e["sessionId"] == session) {
         let params = &event["params"];
         match event["method"].as_str().unwrap_or("") {
-            "Network.responseReceived" if params["type"] == "Document" => {
+            "Network.responseReceived" => {
+                let kind = params["type"].as_str().unwrap_or("");
                 let status = params["response"]["status"].as_u64().unwrap_or(0);
-                if status >= 400 && !(status == 404 && dynamic) {
-                    out.push(format!("the page answered HTTP {status}"));
+                let resp_url = params["response"]["url"].as_str().unwrap_or("");
+                if kind == "Document" {
+                    if status >= 400 && !(status == 404 && dynamic) {
+                        out.push(format!("the page answered HTTP {status}"));
+                    }
+                } else if status >= 400
+                    && is_checked_subresource(kind)
+                    && !resp_url.ends_with("/favicon.ico")
+                    && !resp_url.starts_with("data:")
+                {
+                    if !resp_url.is_empty() {
+                        reported_urls.insert(resp_url.to_string());
+                    }
+                    out.push(format!("FAILED_RESOURCE ({kind}): HTTP {status} loading {resp_url}"));
                 }
             }
-            "Network.loadingFailed" if params["type"] == "Document" => {
-                out.push(format!("the page did not load: {}", params["errorText"].as_str().unwrap_or("unknown error")));
+            "Network.loadingFailed" => {
+                let kind = params["type"].as_str().unwrap_or("");
+                let err_text = params["errorText"].as_str().unwrap_or("unknown error");
+                let canceled = params["canceled"].as_bool().unwrap_or(false);
+                if kind == "Document" {
+                    out.push(format!("the page did not load: {err_text}"));
+                } else if !canceled && err_text != "net::ERR_ABORTED" && is_checked_subresource(kind) {
+                    let req_url = params["requestId"]
+                        .as_str()
+                        .and_then(|id| request_urls.get(id))
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    if req_url.ends_with("/favicon.ico") {
+                        continue;
+                    }
+                    if !req_url.is_empty() {
+                        reported_urls.insert(req_url.to_string());
+                    }
+                    let target = if req_url.is_empty() { String::new() } else { format!(" loading {req_url}") };
+                    out.push(format!("FAILED_RESOURCE ({kind}): {err_text}{target}"));
+                }
             }
             "Runtime.exceptionThrown" => {
                 let details = &params["exceptionDetails"];
@@ -603,9 +899,10 @@ pub(crate) fn problems(events: &[Value], session: &str, url: &str, dynamic: bool
                 let entry = &params["entry"];
                 let source = entry["url"].as_str().unwrap_or("");
                 // The page's own status is reported above. A browser asks for a favicon by
-                // itself, and no page asked for one.
+                // itself, and no page asked for one. Subresources already reported via
+                // Network.responseReceived/loadingFailed are not duplicated.
                 let about_page = source.trim_end_matches('/') == url.trim_end_matches('/');
-                if about_page || source.ends_with("/favicon.ico") {
+                if about_page || source.ends_with("/favicon.ico") || (!source.is_empty() && reported_urls.contains(source)) {
                     continue;
                 }
                 let at = entry["url"].as_str().map(|u| format!(" ({u})")).unwrap_or_default();
@@ -618,33 +915,119 @@ pub(crate) fn problems(events: &[Value], session: &str, url: &str, dynamic: bool
     out
 }
 
-/// Open each page in Chrome. `None` when this is neither a built Next.js app nor a static
-/// site, or there is no Chrome; the reason is printed.
-pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<Option<Browsed>> {
-    let next = is_built_next(tree);
-    let static_start = if next || !crate::static_site::has_no_scripts(tree) { None } else { crate::static_site::start_page(tree) };
-    if !next && static_start.is_none() {
-        return Ok(None);
+/// Wait for in-DOM images to finish loading, then report broken `<img>` tags (`naturalWidth === 0`)
+/// and completely blank rendered pages.
+const DOM_HEALTH_JS: &str = r#"(async () => {
+  const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+  const imgs = [...document.querySelectorAll("img")].filter((img) => (img.getAttribute("src") || "").trim());
+  const pending = imgs.filter((img) => !img.complete);
+  if (pending.length) {
+    await Promise.race([
+      Promise.all(
+        pending.map(
+          (img) =>
+            new Promise((done) => {
+              img.addEventListener("load", done, { once: true });
+              img.addEventListener("error", done, { once: true });
+            }),
+        ),
+      ),
+      sleep(4000),
+    ]);
+  }
+  const issues = [];
+  const broken = [];
+  for (const img of document.querySelectorAll("img")) {
+    const style = getComputedStyle(img);
+    if (style.display === "none" || style.visibility === "hidden") continue;
+    const rawSrc = (img.getAttribute("src") || "").trim();
+    if (!rawSrc || !img.complete || img.naturalWidth === 0 || img.naturalHeight === 0) {
+      const alt = (img.getAttribute("alt") || "").trim().slice(0, 40);
+      const shown = rawSrc ? rawSrc.slice(0, 120) : "(empty src)";
+      broken.push(alt ? `alt="${alt}" src="${shown}"` : `src="${shown}"`);
     }
+  }
+  if (broken.length) {
+    const sample = broken.slice(0, 4).join(", ");
+    const extra = broken.length > 4 ? ` (+${broken.length - 4} more)` : "";
+    issues.push(`BROKEN_IMAGE: ${broken.length} <img> element(s) failed to load (naturalWidth=0): ${sample}${extra}`);
+  }
+  const textLen = (document.body?.innerText || "").trim().length;
+  const hasVisibleMedia = [...document.querySelectorAll("img, svg, canvas, video")].some((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 4 && r.height > 4;
+  });
+  if (textLen === 0 && !hasVisibleMedia) {
+    issues.push("BLANK_PAGE: the page rendered completely blank (no visible text or media)");
+  }
+  return issues;
+})()"#;
+
+async fn dom_health_issues(browser: &mut Browser, session: &str) -> Vec<String> {
+    let Ok(out) = browser
+        .call("Runtime.evaluate", json!({ "expression": DOM_HEALTH_JS, "returnByValue": true, "awaitPromise": true }), Some(session))
+        .await
+    else {
+        return Vec::new();
+    };
+    out["result"]["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Open each page in Chrome. `None` when the project is not a browsable web app, or there
+/// is no Chrome; the reason is printed.
+pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<Option<Browsed>> {
+    let Some(app) = detect_web_app(tree) else {
+        return Ok(None);
+    };
     let Some(chrome) = chrome() else {
         eprintln!("taskmaster: no Chrome or Chromium found, so pages were not opened in a browser (set TASKMASTER_CHROME)");
         return Ok(None);
     };
     let mut browsed = Browsed::default();
-    // A static site is served from here; a Next.js app is started.
-    let (_server, port, _site) = if static_start.is_some() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        let site = tokio::spawn(crate::static_site::serve(listener, tree.to_path_buf()));
-        (None, port, Some(AbortOnDrop(site)))
-    } else {
-        match start_app(tree).await {
+    let static_start = match &app {
+        WebApp::Static(start) => Some(*start),
+        _ => None,
+    };
+    let (_server, port, _site) = match app {
+        WebApp::Static(_) => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let site = tokio::spawn(crate::static_site::serve(listener, tree.to_path_buf()));
+            (None, port, Some(AbortOnDrop(site)))
+        }
+        WebApp::BuiltSpa(dist_dir) => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let site = tokio::spawn(crate::static_site::serve_spa(listener, dist_dir));
+            (None, port, Some(AbortOnDrop(site)))
+        }
+        WebApp::Next => match start_next_app(tree).await {
             Ok((server, port)) => (Some(server), port, None),
             Err(err) => {
-                browsed.notes.push(format!("{err:#}"));
+                let msg = format!("APP_START_FAILED: the app server failed to start:\n{err:#}");
+                browsed.notes.push(msg.clone());
+                if let Some((page, _)) = routes.first() {
+                    browsed.pages.insert(page.clone(), msg);
+                }
                 return Ok(Some(browsed));
             }
-        }
+        },
+        WebApp::DevServer => match start_dev_app(tree).await {
+            Ok((server, port)) => (Some(server), port, None),
+            Err(err) => {
+                let msg = format!("APP_START_FAILED: the app server failed to start:\n{err:#}");
+                browsed.notes.push(msg.clone());
+                if let Some((page, _)) = routes.first() {
+                    browsed.pages.insert(page.clone(), msg);
+                }
+                return Ok(Some(browsed));
+            }
+        },
     };
     let mut browser = Browser::launch(&chrome).await?;
     // A static site has no routes of its own: its start page stands for the first page.
@@ -669,15 +1052,34 @@ pub async fn browse(tree: &Path, routes: &[(PageId, String)]) -> anyhow::Result<
         browser.wait_for(Duration::from_secs(20), move |e| e["sessionId"] == mine.as_str() && e["method"] == "Page.loadEventFired").await;
         // Errors from hydration and effects come just after the load.
         browser.wait_for(Duration::from_millis(1500), |_| false).await;
+        let mut found = problems(&browser.events, &session, &url, dynamic);
+        let doc_ok = found.iter().all(|p| !p.starts_with("the page answered") && !p.starts_with("the page did not load"));
+        let dynamic_404 = dynamic
+            && browser.events.iter().any(|e| {
+                e["sessionId"] == session
+                    && e["method"] == "Network.responseReceived"
+                    && e["params"]["type"] == "Document"
+                    && e["params"]["response"]["status"].as_u64() == Some(404)
+            });
+        // Wait for images and check for broken <img> elements and blank rendered pages before screenshot.
+        if doc_ok && !dynamic_404 {
+            let dom_issues = dom_health_issues(&mut browser, &session).await;
+            // Re-read events so any late image/fetch failures that occurred during waitImages are captured too.
+            found = problems(&browser.events, &session, &url, dynamic);
+            for issue in dom_issues {
+                if !found.contains(&issue) {
+                    found.push(issue);
+                }
+            }
+        }
         if let Ok(shot) = browser.call("Page.captureScreenshot", json!({ "format": "png" }), Some(&session)).await
             && let Some(data) = shot["data"].as_str()
             && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
         {
             browsed.screenshots.push((page.clone(), bytes));
         }
-        let found = problems(&browser.events, &session, &url, dynamic);
         // A page that loaded gets the UI checks; one that failed to has nothing to look at.
-        if found.iter().all(|p| !p.starts_with("the page answered") && !p.starts_with("the page did not load")) {
+        if doc_ok && !dynamic_404 {
             match tokio::time::timeout(AUDIT_TIMEOUT, crate::audit::audit(&mut browser, &session)).await {
                 Ok(Ok(audit)) => {
                     browsed.audits.insert(page.clone(), audit);
@@ -879,5 +1281,142 @@ mod tests {
         for (page, text) in &browsed.pages {
             eprintln!("{page}:\n{text}");
         }
+    }
+
+    #[test]
+    fn node_projects_with_dependencies_emit_a_setup_install_step_when_uninstalled() {
+        let dir = std::env::temp_dir().join(format!("tm-node-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"react":"^18.0.0"},"scripts":{"build":"vite build","dev":"vite"}}"#,
+        )
+        .unwrap();
+        let found = steps(&dir, &dir.join("venv"));
+        if on_path("npm") {
+            let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, vec!["setup", "build"]);
+            assert!(found[0].setup);
+            assert!(found[0].stamp.is_some());
+        }
+        assert!(can_browse(&dir), "a project with a dev script is browsable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subresource_errors_and_failed_image_loads_are_reported() {
+        let s = "S1";
+        let events = vec![
+            json!({ "sessionId": s, "method": "Network.requestWillBeSent", "params": { "requestId": "r1", "request": { "url": "http://127.0.0.1:4173/images/missing-horse.jpg" } } }),
+            json!({ "sessionId": s, "method": "Network.responseReceived", "params": { "type": "Image", "response": { "status": 404, "url": "http://127.0.0.1:4173/images/missing-horse.jpg" } } }),
+            json!({ "sessionId": s, "method": "Log.entryAdded", "params": { "entry": { "level": "error", "text": "Failed to load resource: 404", "url": "http://127.0.0.1:4173/images/missing-horse.jpg" } } }),
+            json!({ "sessionId": s, "method": "Network.requestWillBeSent", "params": { "requestId": "r2", "request": { "url": "https://broken.invalid/horse.jpg" } } }),
+            json!({ "sessionId": s, "method": "Network.loadingFailed", "params": { "requestId": "r2", "type": "Image", "errorText": "net::ERR_NAME_NOT_RESOLVED", "canceled": false } }),
+            json!({ "sessionId": s, "method": "Network.loadingFailed", "params": { "requestId": "r3", "type": "Image", "errorText": "net::ERR_ABORTED", "canceled": true } }),
+            json!({ "sessionId": s, "method": "Network.responseReceived", "params": { "type": "Image", "response": { "status": 404, "url": "http://127.0.0.1:4173/favicon.ico" } } }),
+        ];
+        let found = problems(&events, s, "http://127.0.0.1:4173/", false);
+        assert_eq!(found.len(), 2, "duplicate Log.entryAdded, canceled loads, and favicon are excluded: {found:?}");
+        assert!(found[0].contains("FAILED_RESOURCE (Image): HTTP 404") && found[0].contains("missing-horse.jpg"));
+        assert!(found[1].contains("FAILED_RESOURCE (Image): net::ERR_NAME_NOT_RESOLVED") && found[1].contains("broken.invalid"));
+    }
+
+    #[tokio::test]
+    async fn built_spa_detects_broken_images_blank_pages_and_passes_when_fixed() {
+        if chrome().is_none() {
+            eprintln!("no Chrome here; skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tm-spa-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"dev":"vite","build":"vite build"}}"#).unwrap();
+        // Round 1: broken image (404 -> naturalWidth=0).
+        std::fs::write(
+            dir.join("dist/index.html"),
+            r#"<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font:16px system-ui}</style></head><body><h1>Horse Tinder</h1><img src="/nope.jpg" alt="Thunder"></body></html>"#,
+        )
+        .unwrap();
+        let routes = vec![("app".to_string(), "/".to_string())];
+        let browsed = browse(&dir, &routes).await.unwrap().expect("built SPA is browsed");
+        let err = browsed.pages.get("app").expect("broken image fails verification");
+        assert!(err.contains("BROKEN_IMAGE") && err.contains("nope.jpg"), "{err}");
+        assert!(err.contains("FAILED_RESOURCE (Image): HTTP 404"), "{err}");
+
+        // Round 2: completely blank page.
+        std::fs::write(dir.join("dist/index.html"), "<!doctype html><html><body><div id=\"root\"></div></body></html>").unwrap();
+        let browsed = browse(&dir, &routes).await.unwrap().expect("built SPA is browsed");
+        let err = browsed.pages.get("app").expect("blank page fails verification");
+        assert!(err.contains("BLANK_PAGE"), "{err}");
+
+        // Round 3: fixed with a real valid PNG image!
+        let tiny_png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+            0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+            0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(dir.join("dist/horse.png"), tiny_png).unwrap();
+        std::fs::write(
+            dir.join("dist/index.html"),
+            r#"<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font:16px system-ui}img{width:120px;height:120px}</style></head><body><h1>Horse Tinder</h1><img src="/horse.png" alt="Thunder"></body></html>"#,
+        )
+        .unwrap();
+        let browsed = browse(&dir, &routes).await.unwrap().expect("built SPA is browsed");
+        assert!(browsed.pages.is_empty(), "fixed SPA should pass cleanly: {:?}", browsed.pages);
+        assert!(browsed.audits["app"].found.is_empty(), "{:?}", browsed.audits["app"].found);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn crashing_dev_server_fails_page_verification_instead_of_skipping() {
+        if chrome().is_none() {
+            eprintln!("no Chrome here; skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tm-crash-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"dev":"echo 'SyntaxError: broken config' >&2; exit 1"}}"#).unwrap();
+        let routes = vec![("app".to_string(), "/".to_string())];
+        let browsed = browse(&dir, &routes).await.unwrap().expect("dev app is attempted");
+        let err = browsed.pages.get("app").expect("crashing server must fail verification");
+        assert!(err.contains("APP_START_FAILED") && err.contains("SyntaxError: broken config"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_dep_node_test_scripts_and_standalone_node_tests_run_without_node_modules() {
+        let dir = std::env::temp_dir().join(format!("tm-node-zero-dep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/app.test.mjs"), "import test from 'node:test'; test('ok', () => {});\n").unwrap();
+        let venv = dir.join("venv");
+
+        // Standalone node test file without package.json.
+        assert!(has_tests(&dir));
+        if on_path("node") {
+            let found = steps(&dir, &venv);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].program, "node");
+            assert_eq!(found[0].args, vec!["--test", "tests/app.test.mjs"]);
+        }
+
+        // Zero-dependency package.json invoking node --test (no node_modules needed).
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"app","type":"module","scripts":{"test":"node --test tests/app.test.mjs"}}"#,
+        )
+        .unwrap();
+        assert!(has_tests(&dir));
+        if on_path("npm") && on_path("node") {
+            assert_eq!(missing_runner(&dir), None);
+            let found = steps(&dir, &venv);
+            assert_eq!(found.iter().map(|s| s.line()).collect::<Vec<_>>(), vec!["npm run test"]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

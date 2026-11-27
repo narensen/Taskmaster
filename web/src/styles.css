@@ -8390,3 +8390,746 @@ button.doctor-pill:hover:not(:disabled) {
   }
 }
 
+/* ==========================================================================
+   UI Overhaul: Monochrome Theme, SelectMenu, Composer, Panel Tabs, Settings
+   ========================================================================== */
+
+/* 1. Lock viewport scale against accidental pinch-zoom */
+html,
+body {
+  touch-action: pan-x pan-y;
+}
+
+/* 2. Monochrome theme icon & symbol unification (keep semantic good/bad/warn + diff only) */
+.shell,
+.shell.theme-dark {
+  --sym-info: var(--ink-2);
+  --sym-violet: var(--ink-2);
+  --sym-cyan: var(--ink-2);
+}
+.shell.theme-light {
+  --sym-info: var(--ink-2);
+  --sym-violet: var(--ink-2);
+  --sym-cyan: var(--ink-2);
+}
+.prov-logo.has-brand,
+.theme-light .prov-logo.has-brand {
+  color: var(--ink-2);
+}
+.prov-logo.has-brand:hover,
+button:hover > .prov-logo.has-brand,
+.prov-row:hover .prov-logo.has-brand {
+  color: var(--ink);
+}
+.studio-pill.tone-violet svg,
+.studio-pill.tone-blue svg,
+.studio-pill.tone-cyan svg,
+.dag-node-kind.tone-cyan svg,
+.dag-node-kind.tone-violet svg,
+.kpi-card.tone-indigo .kpi-label svg,
+.kpi-card.tone-cyan .kpi-label svg,
+.kpi-card.tone-violet .kpi-label svg,
+.review-banner svg,
+.merged-into svg {
+  color: var(--ink-2);
+}
+.mission-kpis .studio-pill.tone-blue,
+.lens-badge.live,
+.dag-mini-pill.diff-hard,
+.review-gutter-plus {
+  color: var(--ink);
+}
+.dag-edge.edge-building {
+  stroke: color-mix(in srgb, var(--ink) 55%, transparent);
+}
+.dot.busy,
+.review-dot.st-building {
+  background: var(--ink);
+}
+
+/* 3. Popover opacity-only fade (never animate transform on Radix popovers) */
+@keyframes tm-pop-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* 4. SelectMenu — themed monochrome dropdown replacing native <select> */
+.select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--bg-elev-2);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  max-width: 100%;
+  box-shadow: none;
+}
+.select-trigger:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+}
+.select-trigger:active:not(:disabled) {
+  transform: none;
+}
+.select-trigger.variant-pill {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border-color: var(--line);
+  background: var(--bg-elev);
+  font-size: var(--fs-xs);
+}
+.select-trigger.variant-pill:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+}
+.select-trigger.variant-inline {
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border-color: var(--line);
+  background: var(--bg-elev);
+  font-size: var(--fs-xs);
+}
+.select-trigger-ico {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  flex: none;
+}
+.select-trigger-prefix {
+  color: var(--muted);
+  font-weight: 400;
+}
+.select-trigger-val {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.select-trigger-chev {
+  color: var(--muted);
+  flex: none;
+  margin-left: 2px;
+}
+
+.select-pop {
+  z-index: 90;
+  min-width: max(168px, var(--radix-popover-trigger-width));
+  max-width: min(320px, calc(100vw - 24px));
+  max-height: min(300px, calc(100vh - 40px));
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: var(--r);
+  border: 1px solid var(--line-strong);
+  background: var(--bg-elev-2);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.42);
+  animation: tm-pop-fade 110ms var(--ease);
+}
+.theme-light .select-pop {
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+}
+.select-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.select-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 9px;
+  border: none;
+  border-radius: calc(var(--r) - 4px);
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  font-weight: 450;
+  text-align: left;
+  cursor: pointer;
+}
+.select-item:hover:not(:disabled),
+.select-item:focus-visible {
+  background: var(--bg-hover);
+  color: var(--ink);
+  border-color: transparent;
+  box-shadow: none;
+}
+.select-item:active:not(:disabled) {
+  transform: none;
+}
+.select-item.on {
+  background: var(--bg-active);
+  color: var(--ink);
+  font-weight: 550;
+}
+.select-item-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.select-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select-item-hint {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-weight: 400;
+}
+.select-item-check {
+  flex: none;
+  color: var(--ink);
+}
+
+/* 5. Direct Master & Workers Model Pickers in Composer */
+.prov-pill-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  max-width: 240px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  box-shadow: none;
+  color: var(--ink);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+}
+.prov-pill-trigger:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+}
+.prov-pill-trigger:active:not(:disabled) {
+  transform: none;
+}
+.prov-pill-trigger.empty {
+  color: var(--muted);
+  border-style: dashed;
+}
+.prov-pill-prefix {
+  color: var(--muted);
+  font-weight: 450;
+  flex: none;
+}
+.prov-pill-trigger .prov-trigger-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prov-pill-trigger .prov-trigger-model {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.prov-pop-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px 4px;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+.prov-pop-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  justify-content: center;
+  min-height: 26px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+.prov-pop-more:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--ink);
+  border-color: transparent;
+}
+
+.workers-pop {
+  display: flex;
+  flex-direction: column;
+}
+.workers-count-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-sunken);
+}
+.workers-count-label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--ink);
+}
+.workers-count-label .muted {
+  font-weight: 400;
+  font-size: 11px;
+}
+.workers-count-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+}
+.workers-count-seg button {
+  min-height: 22px;
+  min-width: 26px;
+  padding: 0 7px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+}
+.workers-count-seg button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+.workers-count-seg button.on {
+  background: var(--bg-active);
+  color: var(--ink);
+  font-weight: 600;
+}
+.workers-count-seg button:active:not(:disabled) {
+  transform: none;
+}
+
+/* 6. Structured 2-row Composer Footer */
+.composer-foot-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px 11px;
+  border-top: 1px solid var(--line);
+}
+.composer-foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.composer-foot-row--models,
+.composer-foot-bottom {
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+}
+.composer-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.composer-utils {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.composer-models {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.composer-foot-stack .composer-send {
+  margin-left: auto;
+  min-height: 30px;
+  padding: 0 14px;
+  border-radius: 999px;
+}
+
+/* 7. Beautified Auto-Approve Toggle Switch */
+.auto-approve-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px 6px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.auto-approve-switch:hover {
+  background: var(--bg-hover);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.auto-approve-switch.on {
+  border-color: var(--line-strong);
+  background: var(--bg-active);
+  color: var(--ink);
+}
+.auto-approve-switch input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+.auto-approve-track {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 30px;
+  height: 17px;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-strong);
+  flex: none;
+  transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+.auto-approve-switch.on .auto-approve-track {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+.auto-approve-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: var(--muted);
+  transform: translateX(0);
+  transition: transform var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease);
+}
+.auto-approve-switch.on .auto-approve-thumb {
+  background: var(--bg);
+  transform: translateX(13px);
+}
+.auto-approve-switch:has(input:focus-visible) {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px color-mix(in srgb, var(--ink) 45%, transparent);
+}
+
+/* 8. Smooth Options Slide Open/Close */
+.options-slide {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  margin-top: 0;
+  transition: grid-template-rows 180ms var(--ease), opacity 150ms var(--ease), margin-top 180ms var(--ease);
+}
+.options-slide.open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  margin-top: 12px;
+}
+.options-slide-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* 9. RunView Right Panel Tabs & Diff Segmented Controls (fixes boxy buttons + uneven padding) */
+.panel-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  min-height: 40px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.panel-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.panel-tab:hover {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+.panel-tab.on {
+  background: var(--bg-active);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+.panel-tab-name {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 11px;
+  margin: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  color: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.panel-tab-name:hover:not(:disabled),
+button.panel-tab-name:hover:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--ink);
+}
+.panel-tab-name:active:not(:disabled) {
+  transform: none;
+}
+.panel-tab.on .panel-tab-name {
+  font-weight: 600;
+  color: var(--ink);
+}
+.panel-tabs > button.ghost {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.panel-tabs > button.ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+}
+.seg button,
+.seg button.seg-item {
+  position: relative;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1;
+}
+.seg button:hover:not(:disabled),
+.seg button.seg-item:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--ink);
+}
+.seg button.on,
+.seg button.seg-item.on {
+  background: var(--bg-active);
+  border-color: transparent;
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.seg button:active:not(:disabled),
+.seg button.seg-item:active:not(:disabled) {
+  transform: none;
+}
+.seg.mini button,
+.seg.mini button.seg-item {
+  min-height: 24px;
+  padding: 0 9px;
+}
+.seg-thumb {
+  background: var(--bg-active);
+  border-radius: 6px;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* 10. Settings Category Tabs & Quick-Find Sidebar */
+.settings-filter {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  height: 30px;
+  margin-bottom: 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-sunken);
+  color: var(--muted);
+}
+.settings-filter:focus-within {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.settings-filter input {
+  width: 100%;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: var(--fs-xs);
+  color: var(--ink);
+  box-shadow: none;
+}
+.settings-filter input:focus-visible {
+  box-shadow: none;
+  border-color: transparent;
+}
+.settings-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.toc-cat {
+  display: flex;
+  flex-direction: column;
+}
+.toc-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  text-align: left;
+}
+.toc-tab:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--ink);
+}
+.toc-tab.on {
+  background: var(--bg-active);
+  border-color: var(--line);
+  color: var(--ink);
+  font-weight: 600;
+}
+.toc-tab:active:not(:disabled) {
+  transform: none;
+}
+.toc-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 4px 0 6px 14px;
+  padding-left: 10px;
+  border-left: 1px solid var(--line);
+}
+.toc-sub a {
+  font-size: var(--fs-xs);
+  padding: 4px 8px;
+  border-radius: 5px;
+  color: var(--muted);
+}
+.toc-sub a:hover {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+.toc-jump {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  text-align: left;
+}
+.toc-jump:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+
+@media (max-width: 860px) {
+  .settings-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .settings-toc {
+    display: block;
+    position: static;
+    width: 100%;
+  }
+  .settings-tabs {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .toc-tab {
+    width: auto;
+  }
+  .toc-sub {
+    display: none;
+  }
+}
+
+

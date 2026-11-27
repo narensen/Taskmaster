@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowUp,
   CheckCircle2,
+  ChevronDown,
   Coins,
   GitMerge,
   Link2,
@@ -10,10 +11,7 @@ import {
   Paperclip,
   Settings2,
   ShieldAlert,
-  Sparkles,
-  Users,
   X,
-  Zap,
 } from "lucide-react";
 import { RoleMark } from "../marks";
 import { api, type DoctorReport, type PermissionMode } from "../api";
@@ -26,8 +24,8 @@ import { ModePicker, useRunMode } from "../components/ModePicker";
 import { GoalButton, PermissionPicker, RaceButton, type GoalChoice } from "../components/RunOptions";
 import { promptLink, readPromptLink } from "../promptLink";
 import { PagesPicker, resolvePages, type Pages } from "../components/PagesPicker";
-import { ProviderLogo, providerName } from "../providers/logos";
-import { modelLabel } from "../components/ProviderPicker";
+import { ProviderPicker, WorkersPicker } from "../components/ProviderPicker";
+import { SelectMenu } from "../components/SelectMenu";
 import { afterStart, problemWith, SEATS, seatChoice, toRequest, useChoice } from "../rolechoice";
 import { prefs, setPrefs } from "../prefs";
 import { useProviders, useSettings } from "../query";
@@ -74,16 +72,15 @@ export function NewRun() {
   const list = providers.data ?? [];
   const master = seatChoice(choice, "master");
   const worker = seatChoice(choice, "worker");
-  const masterName = master ? (list.find((p) => p.id === master.harness)?.name ?? providerName(master.harness)) : null;
-  const workerName = worker ? (list.find((p) => p.id === worker.harness)?.name ?? providerName(worker.harness)) : null;
-  const pill = master ? `Master · ${masterName} · ${modelLabel(list, master)}` : "Choose providers";
-  const workersLabel =
-    pages == null
-      ? workerName
-        ? `Workers · ${workerName}`
-        : "Choose workers"
-      : `${pages === "max" ? `Max (${max ?? "…"})` : `${pages} worker${pages === 1 ? "" : "s"}`}${workerName ? ` · ${workerName}` : ""}`;
   const project = settings.data?.project?.split(/[/\\]/).filter(Boolean).pop();
+
+  const budgetOptions = useMemo(() => {
+    const base = BUDGET_PRESETS.map((b) => ({ value: b.value, label: b.label }));
+    if (budgetCap && !base.some((b) => b.value === budgetCap)) {
+      base.push({ value: budgetCap, label: `$${budgetCap}` });
+    }
+    return base;
+  }, [budgetCap]);
 
   const doctorReport: DoctorReport | null = doctor.data ?? null;
   const doctorTone = useMemo(() => {
@@ -236,9 +233,8 @@ export function NewRun() {
               : "A fix or a small change goes to one agent; anything bigger, the master plans and workers build."}
         </p>
 
-        {/* Live Preflight Doctor + Mode Telemetry Strip */}
-        <div className="ask-preflight-row">
-          {doctorReport && (
+        {doctorReport && (
+          <div className="ask-preflight-row">
             <button
               type="button"
               className={`doctor-pill tone-${doctorTone}`}
@@ -255,14 +251,8 @@ export function NewRun() {
               )}
               <span>{doctorReport.summary}</span>
             </button>
-          )}
-          <span className="studio-pill tone-indigo" title="Scoped bugfixes auto-route to 0-planner Direct Fast-Path; larger prompts build a parallel DAG.">
-            <Zap size={12} aria-hidden /> Auto Fast-Path / Parallel DAG
-          </span>
-          <span className="studio-pill tone-cyan" title="Shared prefix caching + Code Mode sandboxes enabled">
-            <Sparkles size={12} aria-hidden /> Code Mode v2
-          </span>
-        </div>
+          </div>
+        )}
 
         {doctorOpen && doctorReport && (
           <section className="doctor-drawer" aria-label="Preflight readiness checks" data-testid="doctor-drawer">
@@ -300,71 +290,101 @@ export function NewRun() {
           }
           onSend={(m) => submit(m)}
           footer={
-            <div className="composer-foot">
-              <div className="composer-actions">
-                <ModePicker value={runMode} onChange={setRunMode} />
-                <PermissionPicker value={permission} onChange={setPermission} />
-                <GoalButton value={goal} onChange={setGoal} />
-                <RaceButton providers={list} value={race} onChange={setRace} />
-                <button
-                  type="button"
-                  className="icon composer-link-btn"
-                  aria-label="Copy a link to this prompt"
-                  title="Copy a link that opens New Run with this prompt (it never sends on its own)"
-                  data-testid="copy-prompt-link"
-                  onClick={() => {
-                    const text = composer.current ? messageText(composer.current.read()) : "";
-                    if (!text.trim()) {
-                      toast("Write a prompt first", "The link carries the text in the composer.");
-                      return;
-                    }
-                    void navigator.clipboard?.writeText(promptLink(text, runMode)).then(() => toast("Prompt link copied", undefined, 2000));
-                  }}
-                >
-                  <Link2 size={14} />
-                </button>
-                <span className="foot-sep" aria-hidden />
-                <button
-                  type="button"
-                  className={`model-pill ${advanced ? "on" : ""}`}
-                  aria-expanded={advanced}
-                  onClick={() => setAdvanced((v) => !v)}
-                  title="Master provider and roles"
-                >
-                  <ProviderLogo id={master?.harness} size={14} />
-                  <span className="clip">{pill}</span>
-                </button>
-                <span className="foot-sep" aria-hidden />
-                <button
-                  type="button"
-                  className={`model-pill composer-worker-pill ${advanced ? "on" : ""}`}
-                  aria-expanded={advanced}
-                  onClick={() => setAdvanced((v) => !v)}
-                  title="Worker pool provider and parallel count"
-                >
-                  <Users size={13} aria-hidden />
-                  {worker?.harness && <ProviderLogo id={worker.harness} size={13} />}
-                  <span className="clip">{workersLabel}</span>
-                </button>
-                <span className="foot-sep" aria-hidden />
-                <label className="model-pill budget-select-pill" title="Maximum USD spend cap for this run">
-                  <Coins size={13} aria-hidden />
-                  <select
-                    aria-label="Run budget cap"
-                    value={budgetCap}
-                    onChange={(e) => setBudgetCap(e.target.value)}
+            <div className="composer-foot-stack">
+              <div className="composer-foot-row">
+                <div className="composer-group">
+                  <ModePicker value={runMode} onChange={setRunMode} />
+                  <PermissionPicker value={permission} onChange={setPermission} />
+                  <GoalButton value={goal} onChange={setGoal} />
+                  <RaceButton providers={list} value={race} onChange={setRace} />
+                </div>
+                <div className="composer-group composer-utils">
+                  <button
+                    type="button"
+                    className="icon composer-util-btn"
+                    aria-label="Attach"
+                    title="Attach files or screenshots"
+                    onClick={() => fileInput.current?.click()}
                   >
-                    {BUDGET_PRESETS.map((b) => (
-                      <option key={b.label} value={b.value}>
-                        Cap: {b.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    <Paperclip size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className={`icon composer-util-btn ${issueOpen ? "on" : ""}`}
+                    aria-label="Import issue"
+                    title="Import a GitHub or GitLab issue URL"
+                    aria-expanded={issueOpen}
+                    onClick={() => setIssueOpen((v) => !v)}
+                  >
+                    <Link2 size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon composer-util-btn"
+                    aria-label="Copy a link to this prompt"
+                    title="Copy a link that opens New Run with this prompt (it never sends on its own)"
+                    data-testid="copy-prompt-link"
+                    onClick={() => {
+                      const text = composer.current ? messageText(composer.current.read()) : "";
+                      if (!text.trim()) {
+                        toast("Write a prompt first", "The link carries the text in the composer.");
+                        return;
+                      }
+                      void navigator.clipboard?.writeText(promptLink(text, runMode)).then(() => toast("Prompt link copied", undefined, 2000));
+                    }}
+                  >
+                    <ListChecks size={14} />
+                  </button>
+                </div>
               </div>
-              <button type="button" className="send-btn" aria-label={runMode === "agent" ? "Start the agent" : "Start planning"} disabled={action.busy !== null} onClick={() => submit()}>
-                {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
-              </button>
+              <div className="composer-foot-row composer-foot-bottom">
+                <div className="composer-group composer-models">
+                  <ProviderPicker
+                    label="Quick master model"
+                    variant="pill"
+                    prefix="Master"
+                    side="top"
+                    providers={list}
+                    loading={providers.isLoading}
+                    value={master}
+                    onChange={(pick) => setSeat("master", pick)}
+                    onMoreRoles={() => setAdvanced(true)}
+                    testId="master-model-picker"
+                  />
+                  <WorkersPicker
+                    providers={list}
+                    loading={providers.isLoading}
+                    value={worker}
+                    onChange={(pick) => setSeat("worker", pick)}
+                    pages={pages}
+                    onPages={setPages}
+                    max={max}
+                    side="top"
+                    onMoreRoles={() => setAdvanced(true)}
+                  />
+                  <SelectMenu
+                    ariaLabel="Run budget cap"
+                    title="Maximum USD spend cap for this run"
+                    variant="pill"
+                    side="top"
+                    icon={<Coins size={13} />}
+                    prefix="Cap: "
+                    value={budgetCap}
+                    options={budgetOptions}
+                    onChange={setBudgetCap}
+                    testId="budget-cap-picker"
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="send-btn"
+                  aria-label={runMode === "agent" ? "Start the agent" : "Start planning"}
+                  disabled={action.busy !== null}
+                  onClick={() => submit()}
+                >
+                  {action.busy ? <span className="spin" aria-hidden /> : <ArrowUp size={16} />}
+                </button>
+              </div>
             </div>
           }
         />
@@ -422,73 +442,88 @@ export function NewRun() {
           </form>
         )}
         <div className="ask-options">
-          <label className={`toggle-chip ${yes ? "on" : ""}`}>
-            <input type="checkbox" checked={yes} onChange={(e) => setYes(e.target.checked)} />
-            Build without asking me to approve the plan
+          <label className={`auto-approve-switch ${yes ? "on" : ""}`}>
+            <input
+              type="checkbox"
+              className="auto-approve-input"
+              checked={yes}
+              onChange={(e) => setYes(e.target.checked)}
+            />
+            <span className="auto-approve-track" aria-hidden>
+              <span className="auto-approve-thumb" />
+            </span>
+            <span className="auto-approve-label">Build without asking me to approve the plan</span>
           </label>
-          <button type="button" className="ghost small" onClick={() => setIssueOpen((v) => !v)} aria-expanded={issueOpen}>
-            <Link2 size={13} aria-hidden /> Import issue
-          </button>
-          <button type="button" className="ghost small" onClick={() => fileInput.current?.click()}>
-            <Paperclip size={13} aria-hidden /> Attach
-          </button>
-          <button type="button" className="ghost small" onClick={() => setAdvanced((v) => !v)} aria-expanded={advanced}>
-            <Settings2 size={13} aria-hidden /> Options
-          </button>
-          <span className="hint ask-keys">
-            <kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line · <kbd>↑</kbd> last prompt
-          </span>
+          <div className="ask-options-end">
+            <button
+              type="button"
+              className={`ghost small ask-options-btn ${advanced ? "on" : ""}`}
+              onClick={() => setAdvanced((v) => !v)}
+              aria-expanded={advanced}
+            >
+              <Settings2 size={13} aria-hidden />
+              <span>Options</span>
+              <ChevronDown size={12} className={`opt-chev ${advanced ? "open" : ""}`} aria-hidden />
+            </button>
+            <span className="hint ask-keys">
+              <kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line · <kbd>↑</kbd> last prompt
+            </span>
+          </div>
         </div>
         <Problem error={action.error} />
         {noneInstalled(providers.data) && <ProviderSetup providers={list} checking={providers.isFetching} />}
-        {advanced && (
-          <section className="ask-advanced" aria-label="Roles and pages">
-            <div className="row between">
-              <h2 className="section-title">Roles and pages</h2>
-              <button type="button" className="icon" aria-label="Close options" onClick={() => setAdvanced(false)}>
-                <X size={15} />
-              </button>
-            </div>
-            <Problem error={providers.error} onRetry={() => void providers.refetch()} />
-            <RoleDeck
-              choice={choice}
-              providers={list}
-              loading={providers.isLoading}
-              onSeat={setSeat}
-              remember={remember}
-              onRemember={setRemember}
-              fresh={fresh}
-              missing={missing}
-            />
-            <PagesPicker value={pages} onChange={setPages} max={max} />
-            <div className="grid two">
-              <Field label="Start from" hint="For a new project. A folder with a template works too.">
-                <input list="templates" value={template} onChange={(e) => setTemplate(e.target.value)} placeholder="the project as it is" spellCheck={false} />
-                <datalist id="templates">
-                  {(templates.data ?? []).map((name) => (
-                    <option key={name} value={name} />
-                  ))}
-                </datalist>
-              </Field>
-              <Field label="Custom budget cap (USD)" hint="Stops the run gracefully once spend reaches this ceiling.">
-                <input
-                  type="number"
-                  min="0.1"
-                  step="0.5"
-                  className="mono"
-                  value={budgetCap}
-                  onChange={(e) => setBudgetCap(e.target.value)}
-                  placeholder="unlimited"
+        <div className={`options-slide ${advanced ? "open" : ""}`} aria-hidden={!advanced}>
+          <div className="options-slide-inner">
+            {advanced && (
+              <section className="ask-advanced" aria-label="Roles and pages">
+                <div className="row between">
+                  <h2 className="section-title">Roles and pages</h2>
+                  <button type="button" className="icon" aria-label="Close options" onClick={() => setAdvanced(false)}>
+                    <X size={15} />
+                  </button>
+                </div>
+                <Problem error={providers.error} onRetry={() => void providers.refetch()} />
+                <RoleDeck
+                  choice={choice}
+                  providers={list}
+                  loading={providers.isLoading}
+                  onSeat={setSeat}
+                  remember={remember}
+                  onRemember={setRemember}
+                  fresh={fresh}
+                  missing={missing}
                 />
-              </Field>
-            </div>
-            <div>
-              <button className="primary" disabled={action.busy !== null} onClick={() => submit()}>
-                {action.busy ? "Starting…" : "Start planning"}
-              </button>
-            </div>
-          </section>
-        )}
+                <PagesPicker value={pages} onChange={setPages} max={max} />
+                <div className="grid two">
+                  <Field label="Start from" hint="For a new project. A folder with a template works too.">
+                    <input list="templates" value={template} onChange={(e) => setTemplate(e.target.value)} placeholder="the project as it is" spellCheck={false} />
+                    <datalist id="templates">
+                      {(templates.data ?? []).map((name) => (
+                        <option key={name} value={name} />
+                      ))}
+                    </datalist>
+                  </Field>
+                  <Field label="Custom budget cap (USD)" hint="Stops the run gracefully once spend reaches this ceiling.">
+                    <input
+                      type="number"
+                      min="0.1"
+                      step="0.5"
+                      className="mono"
+                      value={budgetCap}
+                      onChange={(e) => setBudgetCap(e.target.value)}
+                      placeholder="unlimited"
+                    />
+                  </Field>
+                </div>
+                <div>
+                  <button className="primary" disabled={action.busy !== null} onClick={() => submit()}>
+                    {action.busy ? "Starting…" : "Start planning"}
+                  </button>
+                </div>
+              </section>
+            )}
+          </div>
+        </div>
         {!advanced && (
           <>
             <div className="ask-ideas" aria-label="Starting points">

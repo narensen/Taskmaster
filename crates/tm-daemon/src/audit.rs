@@ -25,7 +25,10 @@ use crate::browser::Browser;
 const SCRIPT: &str = include_str!("audit.js");
 
 /// Every check, in the order a score lists them.
-pub const CHECKS: [&str; 9] = ["h1", "label", "controls", "focus", "narrow", "empty_state", "blank_input", "html_escape", "storage"];
+pub const CHECKS: [&str; 10] = ["h1", "images", "label", "controls", "focus", "narrow", "empty_state", "blank_input", "html_escape", "storage"];
+
+/// Checks that indicate hard runtime/media breakage and must NEVER be downgraded to warnings.
+pub const CRITICAL_CHECKS: [&str; 3] = ["images", "blank", "storage"];
 
 /// Checks that need the page's add form; without one they are not run.
 pub const FORM_CHECKS: [&str; 3] = ["empty_state", "blank_input", "html_escape"];
@@ -92,6 +95,9 @@ pub async fn audit(browser: &mut Browser, session: &str) -> anyhow::Result<Audit
     let _ = browser.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true }), Some(session)).await;
     eval(browser, session, SCRIPT).await?;
     let mut audit = Audit::default();
+
+    // Wait for in-flight images before scanning so real photos have a chance to load.
+    eval(browser, session, "__tmAudit.waitImages(4000)").await?;
 
     // Focus first, before anything else on the page changes.
     eval(browser, session, "__tmAudit.still(true)").await?;
@@ -167,7 +173,7 @@ pub async fn audit(browser: &mut Browser, session: &str) -> anyhow::Result<Audit
 pub async fn score(tree: &std::path::Path) -> anyhow::Result<Value> {
     let routes = vec![("app".to_string(), "/".to_string())];
     let Some(browsed) = crate::runtime::browse(tree, &routes).await? else {
-        bail!("{} is neither a static site nor a built Next.js app, or there is no Chrome", tree.display());
+        bail!("{} is not a browsable web app, or there is no Chrome", tree.display());
     };
     let audit = browsed.audits.values().next().cloned().unwrap_or_default();
     let errors = browsed.pages.values().next().cloned();
@@ -199,6 +205,7 @@ mod tests {
   .wide { width: 900px; }
 </style></head><body>
 <h2>Tasks</h2>
+<img src="/missing-image.png" alt="Broken photo">
 <form id="f"><input id="t"><button>Add</button></form>
 <p class="empty" id="e">Nothing to do yet</p>
 <ul id="l"></ul>

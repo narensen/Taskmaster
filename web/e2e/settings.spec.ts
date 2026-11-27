@@ -29,6 +29,7 @@ test("Code Mode is on by default and can be switched off", async ({ open, page }
 
 test("the model scorecard shows an empty state before any run", async ({ open, page }) => {
   await open("/settings");
+  await page.getByTestId("settings-tab-operations").click();
   const card = page.getByTestId("model-scorecard");
   await expect(card).toBeVisible();
   await expect(card).toContainText(/No runs yet|runs sampled/);

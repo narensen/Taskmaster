@@ -31,6 +31,7 @@ pub mod egress;
 mod engine;
 mod eval;
 pub mod eval_suite;
+pub mod flow_tools;
 pub mod gates;
 mod git;
 pub mod goals;
@@ -58,6 +59,7 @@ mod resume;
 pub mod race;
 pub mod push;
 pub mod run_index;
+pub mod scout;
 pub mod settling;
 pub mod suggest;
 pub mod retention;
@@ -439,6 +441,22 @@ pub struct Config {
     /// H3: start builders in this holder, so a daemon update can hand them to the next daemon.
     /// `None` starts every agent here, as before.
     pub holder: Option<tm_harness::hold::Holder>,
+    /// Optional silence timeout before a stalled agent is restarted. Falls back to
+    /// `TASKMASTER_STALL_SECS` and then the built-in default (150s small / 240s normal).
+    pub stall_timeout: Option<Duration>,
+    /// Route worker thinking effort from unit difficulty (e.g. Antigravity `-low`/`-medium` for
+    /// `easy`/`normal`, keeping `-high` for `hard`, repairs, planner, and reviewer). Set `false`
+    /// to pin explicit `--worker-model` choices verbatim.
+    pub effort_routing: bool,
+    /// Maximum estimated context tokens in a clean warm worker session eligible for reuse on a
+    /// subsequent wave's unit (~65k tokens by default; 0 disables cross-unit warm reuse).
+    pub warm_reuse_max_context: u64,
+    /// Force offline mode: disables web search, web fetch, and OSV advisories (local `docs()` stays available).
+    pub offline: bool,
+    /// Enable the threshold-gated read-only brownfield LLM scope-scout extractor (tb18 #7).
+    pub brownfield_scout: bool,
+    /// Minimum tracked source files required before the brownfield scout runs (default 25).
+    pub brownfield_scout_min_files: usize,
 }
 
 /// How an active run should stop when cancelled.
@@ -520,6 +538,12 @@ impl Config {
             permission_mode: None,
             master_answers: false,
             holder: None,
+            stall_timeout: None,
+            effort_routing: true,
+            warm_reuse_max_context: crate::engine::WARM_REUSE_MAX_CONTEXT,
+            offline: false,
+            brownfield_scout: true,
+            brownfield_scout_min_files: crate::scout::DEFAULT_MIN_FILES,
         }
     }
 }

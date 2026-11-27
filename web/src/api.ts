@@ -351,7 +351,8 @@ export type ChangeKind =
   | "page_repaired"
   | "entry_amended"
   | "review_finding"
-  | "verify_failed";
+  | "verify_failed"
+  | "gate_warning";
 
 export interface ChangeEntry {
   at: string;
@@ -619,6 +620,8 @@ export interface AgentEntry {
     | "end"
     | "command"
     | "output"
+    | "tool_diff"
+    | "mcp_reply"
     | "preview"
     | "approval_requested"
     | "approval_resolved"

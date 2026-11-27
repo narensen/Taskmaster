@@ -119,7 +119,11 @@ impl Policy {
     }
 
     /// Check whether a repo-relative path is allowed, protected, or denied.
+    /// `.flow/` is always denied for worker writes because only Taskmaster writes the graph.
     pub fn check_path(&self, rel: &str) -> PathVerdict {
+        if tm_verify::is_flow_path(rel) {
+            return PathVerdict::Denied(".flow/**".into());
+        }
         if let Some(glob) = first_matching_glob(&self.denied_globs, rel) {
             return PathVerdict::Denied(glob);
         }
@@ -383,14 +387,13 @@ pub fn potential_secret_tail_start(input: &str, extra_literals: &[String]) -> Op
         }
         idx
     };
-    let word = &tail[token_tail_start..];
+    let word = tail.get(token_tail_start..).unwrap_or("");
     if !word.is_empty() {
-        // Check `Bearer <partial>` / `bearer <partial>`
-        if token_tail_start >= 7 {
-            let before = &tail[token_tail_start - 7..token_tail_start];
-            if before == "Bearer " || before == "bearer " {
-                consider(win_start + token_tail_start - 7);
-            }
+        // Check `Bearer <partial>` / `bearer <partial>` without slicing across UTF-8 char boundaries.
+        if let Some(before_start) = token_tail_start.checked_sub(7)
+            && matches!(tail.get(before_start..token_tail_start), Some("Bearer " | "bearer "))
+        {
+            consider(win_start + before_start);
         }
         // Check a word that starts with (or is a >=2-char prefix of) any known secret prefix.
         for prefix in SECRET_PREFIXES {
@@ -405,7 +408,10 @@ pub fn potential_secret_tail_start(input: &str, extra_literals: &[String]) -> Op
     for marker in ["Bearer ", "bearer "] {
         let max_k = marker.len().min(tail.len());
         for k in (2..=max_k).rev() {
-            if tail.ends_with(&marker[..k]) {
+            if let Some(prefix) = marker.get(..k)
+                && tail.ends_with(prefix)
+                && input.is_char_boundary(input.len() - k)
+            {
                 consider(input.len() - k);
                 break;
             }
@@ -419,7 +425,9 @@ pub fn potential_secret_tail_start(input: &str, extra_literals: &[String]) -> Op
         let max_k = (trimmed.len() - 1).min(tail.len());
         for k in (2..=max_k).rev() {
             let start = input.len() - k;
-            if input.is_char_boundary(start) && trimmed.starts_with(&input[start..]) {
+            if let Some(suffix) = input.get(start..)
+                && trimmed.starts_with(suffix)
+            {
                 consider(start);
                 break;
             }
@@ -520,6 +528,8 @@ redact_patterns = ["SUPER_SECRET_42"]
             PathVerdict::Protected("**/auth/**".into())
         );
         assert_eq!(policy.check_path("src/ui/button.tsx"), PathVerdict::Allowed);
+        assert_eq!(policy.check_path(".flow/meta.json"), PathVerdict::Denied(".flow/**".into()));
+        assert_eq!(policy.check_path(".flow/files/app.py.json"), PathVerdict::Denied(".flow/**".into()));
 
         let rendered = render_policy_toml(&policy);
         let again = parse_policy_toml(&rendered).unwrap();
@@ -547,5 +557,45 @@ redact_patterns = ["SUPER_SECRET_42"]
         let res = redact_text_cow(dirty, &[]);
         assert!(matches!(res, Cow::Owned(_)));
         assert_eq!(res, "token •••");
+    }
+
+    #[test]
+    fn potential_secret_tail_start_handles_multibyte_utf8_without_panicking() {
+        // `token_tail_start - 7` lands inside multibyte UTF-8 chars (`€`, `🚀`) and must not panic.
+        let cases = [
+            "é€🚀 sk-ant-123",
+            "é€ Bearer sk-ant-123",
+            "🔑🚀abc",
+            "héllo🎉sk-1234",
+            "日本語テスト token",
+            "é€🚀",
+            "prefix 🚀 Bearer abcd",
+            "prefix 🚀 bearer abcd",
+            "🚀MY_SEC",
+        ];
+        let extras = vec!["MY_SECRET_TOKEN_99".to_string()];
+        for input in cases {
+            let hold = potential_secret_tail_start(input, &extras);
+            if let Some(pos) = hold {
+                assert!(input.is_char_boundary(pos), "hold offset {pos} must be a UTF-8 char boundary for {input:?}");
+            }
+        }
+
+        // Exact hold offsets on multibyte inputs.
+        let bearer_input = "é€ Bearer sk-123";
+        let bearer_pos = bearer_input.find("Bearer ").unwrap();
+        assert_eq!(potential_secret_tail_start(bearer_input, &[]), Some(bearer_pos));
+
+        let emoji_token = "é€🚀 sk-ant-123";
+        let sk_pos = emoji_token.find("sk-ant-").unwrap();
+        assert_eq!(potential_secret_tail_start(emoji_token, &[]), Some(sk_pos));
+
+        let emoji_right_before = "🎉🚀sk-ant-123";
+        let emoji_sk_pos = emoji_right_before.find("sk-ant-").unwrap();
+        assert_eq!(potential_secret_tail_start(emoji_right_before, &[]), Some(emoji_sk_pos));
+
+        // Redaction itself also works cleanly with multibyte UTF-8 right before tokens.
+        assert_eq!(redact_text("é€ Bearer abcdef1234567890", &[]), "é€ Bearer •••");
+        assert_eq!(redact_text("🎉🚀sk-ant-1234567890abcdef", &[]), "🎉🚀•••");
     }
 }

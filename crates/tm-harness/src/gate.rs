@@ -1,6 +1,8 @@
 //! The permission gate: the daemon's answer to "may this worker do that?".
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
@@ -54,6 +56,9 @@ pub struct WorktreeGate {
     /// Extra read-only locations, e.g. the harness's own state directory.
     readable: Vec<PathBuf>,
     read_only: bool,
+    /// Refuse filesystem reads inside the worktree (e.g. brownfield planner already given a `.flow`
+    /// repo summary), while still allowing explicit `readable` harness config directories and MCP.
+    no_file_reads: bool,
     /// The one origin the browser tool may open (`http://127.0.0.1:<port>`). `None` refuses
     /// every browser call.
     browser: Option<String>,
@@ -63,6 +68,10 @@ pub struct WorktreeGate {
     fetch_hosts: Vec<String>,
     /// Allow the harness's built-in web search tool when provider is set to `native`.
     native_search: bool,
+    /// Optional cap on native web search calls for this gate (independent of MCP search budgets).
+    native_search_cap: Option<usize>,
+    /// Shared counter tracking native search calls allowed through this gate.
+    native_search_used: Arc<AtomicUsize>,
     /// Full-access per-run permission mode: bypass confinement refusals for non-read-only tasks.
     full_access: bool,
 }
@@ -76,10 +85,13 @@ impl WorktreeGate {
             allowed_tool_prefixes,
             readable: Vec::new(),
             read_only: false,
+            no_file_reads: false,
             browser: None,
             shell: false,
             fetch_hosts: Vec::new(),
             native_search: false,
+            native_search_cap: None,
+            native_search_used: Arc::new(AtomicUsize::new(0)),
             full_access: false,
         }
     }
@@ -108,6 +120,13 @@ impl WorktreeGate {
         self
     }
 
+    /// Allow the harness's native web search tool up to `max` calls (0 = unlimited).
+    pub fn with_native_search_cap(mut self, max: usize) -> Self {
+        self.native_search = true;
+        self.native_search_cap = (max > 0).then_some(max);
+        self
+    }
+
     pub fn allows_shell(&self) -> bool {
         (self.shell || self.full_access) && !self.read_only
     }
@@ -115,6 +134,14 @@ impl WorktreeGate {
     /// Refuse every edit, for reviewers and verifiers.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// Refuse direct filesystem reads inside the worktree (used when the planner already receives
+    /// a `.flow` repository summary and touched-symbol map). Extra `readable` harness directories
+    /// and allowed MCP tool prefixes remain accessible.
+    pub fn without_file_reads(mut self) -> Self {
+        self.no_file_reads = true;
         self
     }
 
@@ -172,9 +199,23 @@ impl WorktreeGate {
         self.resolve(path).starts_with(&self.root)
     }
 
+    /// True when `path` targets `.flow` or any file under `.flow/` inside the worktree.
+    pub fn is_flow_path(&self, path: &Path) -> bool {
+        let Some(rel) = self.relative(path) else {
+            return false;
+        };
+        matches!(rel.components().next(), Some(Component::Normal(first)) if first == ".flow")
+    }
+
+    /// True when `request` attempts to edit any file inside `.flow/`.
+    pub fn is_flow_edit(&self, request: &PermissionRequest) -> bool {
+        request.kind == ToolKind::Edit && request.paths.iter().any(|p| self.is_flow_path(p))
+    }
+
     fn readable(&self, path: &Path) -> bool {
         let resolved = self.resolve(path);
-        resolved.starts_with(&self.root) || self.readable.iter().any(|r| resolved.starts_with(r))
+        (!self.no_file_reads && resolved.starts_with(&self.root))
+            || self.readable.iter().any(|r| resolved.starts_with(r))
     }
 
     fn resolve(&self, path: &Path) -> PathBuf {
@@ -186,6 +227,10 @@ impl WorktreeGate {
 
 impl PermissionGate for WorktreeGate {
     fn decide(&self, request: &PermissionRequest) -> Decision {
+        // Workers may never write into `.flow/`; only Taskmaster updates the knowledge graph.
+        if request.kind == ToolKind::Edit && request.paths.iter().any(|p| self.is_flow_path(p)) {
+            return Decision::Deny;
+        }
         // Before the prefixes: the browser tool is served beside the Dictionary, but it
         // may only open the run's own preview.
         if request.kind == ToolKind::Browser {
@@ -200,6 +245,23 @@ impl PermissionGate for WorktreeGate {
             return Decision::Allow;
         }
         if self.native_search && is_native_search_tool(request) {
+            if let Some(cap) = self.native_search_cap {
+                let mut cur = self.native_search_used.load(Ordering::Acquire);
+                loop {
+                    if cur >= cap {
+                        return Decision::Deny;
+                    }
+                    match self.native_search_used.compare_exchange_weak(
+                        cur,
+                        cur + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Decision::Allow,
+                        Err(next) => cur = next,
+                    }
+                }
+            }
             return Decision::Allow;
         }
         if self.allowed_tool_prefixes.iter().any(|p| request.tool.starts_with(p.as_str())) {
@@ -226,12 +288,10 @@ impl PermissionGate for WorktreeGate {
     }
 }
 
-/// True when `request` invokes a harness's built-in web search tool (never edits or shell).
-fn is_native_search_tool(request: &PermissionRequest) -> bool {
-    if matches!(request.kind, ToolKind::Edit | ToolKind::Execute | ToolKind::Browser) {
-        return false;
-    }
-    let norm = request.tool.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+/// True when `tool_name` names a harness's built-in web search tool (never fetch/edit/shell).
+/// Shared between [`WorktreeGate`] and daemon transcript/ledger accounting.
+pub fn is_native_search_tool_name(tool_name: &str) -> bool {
+    let norm = tool_name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
     matches!(
         norm.as_str(),
         "web_search"
@@ -241,7 +301,24 @@ fn is_native_search_tool(request: &PermissionRequest) -> bool {
             | "bing_search"
             | "brave_search"
             | "internet_search"
+            | "x_search"
+            | "live_search"
+            | "online_search"
+            | "grok_search"
+            | "gemini_search"
+            | "duckduckgo_search"
+            | "perplexity_search"
+            | "tavily_search"
+            | "exa_search"
     )
+}
+
+/// True when `request` invokes a harness's built-in web search tool (never edits, fetch, or shell).
+fn is_native_search_tool(request: &PermissionRequest) -> bool {
+    if matches!(request.kind, ToolKind::Edit | ToolKind::Execute | ToolKind::Browser) {
+        return false;
+    }
+    is_native_search_tool_name(&request.tool)
 }
 
 /// Whether `url` is on `origin` (`scheme://host:port`), or is a path on it.
@@ -445,5 +522,56 @@ mod tests {
         // Does not widen WebFetch or shell.
         assert_eq!(g.decide(&fetch), Decision::Deny);
         assert_eq!(g.decide(&request("run_command", ToolKind::Execute, &[])), Decision::Deny);
+    }
+
+    #[test]
+    fn denies_worker_edits_into_flow_dir_while_allowing_reads() {
+        let g = gate();
+        let edit_meta = request("write_file", ToolKind::Edit, &["/nonexistent/tm/work-a/.flow/meta.json"]);
+        let edit_rel = request("write_file", ToolKind::Edit, &[".flow/files/app.py.json"]);
+        assert_eq!(g.decide(&edit_meta), Decision::Deny);
+        assert_eq!(g.decide(&edit_rel), Decision::Deny);
+        assert_eq!(g.clone().with_full_access().decide(&edit_meta), Decision::Deny);
+
+        let read_meta = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/.flow/meta.json"]);
+        assert_eq!(g.decide(&read_meta), Decision::Allow);
+    }
+
+    #[test]
+    fn without_file_reads_denies_worktree_reads_but_keeps_harness_state_and_dictionary() {
+        let g = gate()
+            .read_only()
+            .without_file_reads()
+            .with_readable("/nonexistent/home/.claude");
+        let repo_read = request("view_file", ToolKind::Read, &["/nonexistent/tm/work-a/pkg/store.py"]);
+        let state_read = request("view_file", ToolKind::Read, &["/nonexistent/home/.claude/settings.json"]);
+        let dict_call = request("mcp__dictionary__flow_query", ToolKind::Dictionary, &[]);
+        assert_eq!(g.decide(&repo_read), Decision::Deny);
+        assert_eq!(g.decide(&state_read), Decision::Allow);
+        assert_eq!(g.decide(&dict_call), Decision::Allow);
+    }
+
+    #[test]
+    fn tb18_native_search_cap_enforced_and_native_fetch_denied() {
+        let g = gate().read_only().with_native_search_cap(2);
+        let grok_search = request("x_search", ToolKind::Fetch, &[]);
+        let gemini_search = request("live_search", ToolKind::Fetch, &[]);
+        let third_search = request("WebSearch", ToolKind::Fetch, &[]);
+        assert_eq!(g.decide(&grok_search), Decision::Allow);
+        assert_eq!(g.decide(&gemini_search), Decision::Allow);
+        assert_eq!(g.decide(&third_search), Decision::Deny, "cap of 2 must deny 3rd native search");
+        assert!(g.risk(&third_search).is_none(), "capped native search must deny without interactive prompt");
+
+        // Local native fetch tools MUST remain denied even with native_search enabled.
+        for fetch_tool in ["WebFetch", "web_fetch", "read_url_content", "fetch_url"] {
+            let fetch_req = PermissionRequest {
+                tool: fetch_tool.into(),
+                kind: ToolKind::Fetch,
+                paths: vec![],
+                command: None,
+                url: Some("https://example.com".into()),
+            };
+            assert_eq!(g.decide(&fetch_req), Decision::Deny, "{fetch_tool} must remain denied");
+        }
     }
 }

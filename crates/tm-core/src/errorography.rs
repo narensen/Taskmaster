@@ -82,7 +82,7 @@ impl Book {
         }
         self.project_notes.push(ProjectNote { signature: sig, note: clipped, count: 1 });
         if self.project_notes.len() > MAX_PROJECT_NOTES * 2 {
-            self.project_notes.sort_by(|a, b| b.count.cmp(&a.count));
+            self.project_notes.sort_by_key(|a| std::cmp::Reverse(a.count));
             self.project_notes.truncate(MAX_PROJECT_NOTES);
         }
     }

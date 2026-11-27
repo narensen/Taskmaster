@@ -43,7 +43,7 @@ pub fn load(name: &str) -> anyhow::Result<Template> {
         return Ok(Template {
             name: name.into(),
             guide: include_str!("../templates/next/TEMPLATE.md").trim().to_string(),
-            files: NEXT.iter().map(|(path, content)| ContractFile { path: (*path).into(), content: (*content).into() }).collect(),
+            files: NEXT.iter().map(|(path, content)| ContractFile { path: (*path).into(), content: (*content).into(), phase: 0 }).collect(),
         });
     }
     let root = Path::new(name);
@@ -81,7 +81,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<ContractFile>) -> anyhow::Resu
         // A template is source text. A file that is not UTF-8 is not part of one.
         let Ok(content) = std::fs::read_to_string(&path) else { continue };
         let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-        out.push(ContractFile { path: rel, content });
+        out.push(ContractFile { path: rel, content, phase: 0 });
         if out.len() > MAX_FILES {
             bail!("template {} has more than {MAX_FILES} files", root.display());
         }

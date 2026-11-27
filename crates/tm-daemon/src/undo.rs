@@ -72,6 +72,18 @@ pub fn undo_run(project: &Path, records: &Records, run: &str) -> anyhow::Result<
         }
     }
     git::git(project, &["commit", "-q", "-m", &format!("taskmaster: undo run {run}")])?;
+    // Always clear the derived SQLite cache after undo so stale symbols never survive.
+    let flow_dir = project.join(tm_flow::FLOW_DIR);
+    if flow_dir.is_dir() {
+        for name in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+            let _ = std::fs::remove_file(flow_dir.join(name));
+        }
+        if !flow_dir.join("meta.json").is_file() {
+            prune_empty_dirs(&flow_dir);
+        } else {
+            let _ = tm_flow::FlowDb::rebuild(project);
+        }
+    }
     let commit = git::git(project, &["rev-parse", "--short=8", "HEAD"])?.trim().to_string();
     status["undone"] = json!({ "commit": commit, "at": crate::time::rfc3339_now(), "files": files.len() });
     records.save_status(run, &status)?;
@@ -84,4 +96,15 @@ pub fn undo_run(project: &Path, records: &Records, run: &str) -> anyhow::Result<
         records.save_citations(&citations)?;
     }
     Ok(Undo::Done { commit, files: files.len() })
+}
+
+fn prune_empty_dirs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            prune_empty_dirs(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }

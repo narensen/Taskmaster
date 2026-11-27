@@ -1,0 +1,88 @@
+{
+  "kind": "cli",
+  "summary": "Build tinydb as a Python 3.11 standard-library-only SQL database engine anchored by a shared contract (`tinydb/contract.py`) and end-to-end acceptance test (`tests/test_acceptance_contract.py`). Three independent workers run in parallel first: `sql_frontend` builds the tokenizer and recursive-descent parser, `storage_engine` builds the custom B-tree primary-key index and single-file persistent storage layer, and `query_engine` builds the planner and SQL executor strictly against `StorageProtocol`. Once those three complete, `cli_and_docs` wires the package entrypoint, REPL, `-f` script runner, `README.md`, and full pytest verification.",
+  "phases": [],
+  "contracts": [
+    {
+      "path": "tinydb/contract.py",
+      "content": "from typing import Protocol\nclass Stub(Protocol): ...\n"
+    },
+    {
+      "path": "tests/test_acceptance_contract.py",
+      "content": "from typing import Protocol\nclass Stub(Protocol): ...\n"
+    }
+  ],
+  "units": [
+    {
+      "id": "sql_frontend",
+      "owned_glob": "{tinydb/tokenizer.py,tinydb/parser.py,tests/test_parser.py}",
+      "difficulty": "normal",
+      "cites": [
+        "sql-semantics",
+        "module-exports"
+      ],
+      "brief": "Implement the SQL tokenizer (`tinydb/tokenizer.py`), recursive-descent SQL parser (`tinydb/parser.py`), and comprehensive unit tests (`tests/test_parser.py`) covering every required SQL statement, expression, join, aggregate, comment style, and syntax error.",
+      "context": "Import all shared AST dataclasses, `Token`, `ColumnDef`, `COLUMN_TYPES`, `AGGREGATE_FUNCS`, `TokenizerError`, and `ParseError` from `tinydb/contract.py`. Export `tokenize(sql: str) -> list[Token]` from `tinydb/tokenizer.py`, and `parse_sql(sql: str) -> list[Statement]` plus `parse_statement(sql: str) -> Statement` from `tinydb/parser.py`. Support Python 3.11 stdlib only. Tokenizer must handle: case-insensitive SQL keywords, identifiers, integer and real numeric literals, single-quoted string literals with `''` escaping, operators (`=`, `!=`, `<>` normalized to `!=`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`), punctuation `( ) , . ;`, single-line `--` comments, and `/* ... */` block comments; raise `TokenizerError` on unterminated strings/comments or unexpected characters. Parser must support multi-statement input separated by `;` (ignoring empty statements), `CREATE TABLE [IF NOT EXISTS]` with `INTEGER`/`TEXT`/`REAL` and inline `PRIMARY KEY` or table-level `PRIMARY KEY (col)`, `DROP TABLE [IF EXISTS]`, `INSERT INTO` with optional column list and one or more `VALUES (...)` tuples (including negative numeric literals and `NULL`), `SELECT` with `*`/`table.*`/expressions/aggregates (`COUNT(*)`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with optional `AS alias`), `FROM` with optional `[AS] alias`, one or more `[INNER] JOIN ... ON left = right` clauses, `WHERE` with full precedence (`OR` < `AND` < `NOT` < comparisons < parentheses), `GROUP BY`, `ORDER BY ... [ASC|DESC]`, `LIMIT <non-negative int>`, `UPDATE ... SET ... [WHERE ...]`, and `DELETE FROM ... [WHERE ...]`. Normalize `AggregateExpr.func` and `ColumnDef.col_type` and `BinaryExpr.op` (`AND`, `OR`, `!=`, etc.) to uppercase. Raise `ParseError` with a clear message on invalid SQL. Sibling boundaries: do not touch `tinydb/contract.py`, storage, executor, or CLI files.",
+      "done": "Tokenizer and parser handle all required SQL syntax and error cases cleanly, and `python -m pytest tests/test_parser.py` passes."
+    },
+    {
+      "id": "storage_engine",
+      "owned_glob": "{tinydb/btree.py,tinydb/storage.py,tests/test_btree.py,tests/test_storage.py}",
+      "difficulty": "hard",
+      "cites": [
+        "sql-semantics",
+        "module-exports"
+      ],
+      "brief": "Implement a balanced B-tree primary-key index (`tinydb/btree.py`), a single-file persistent storage engine (`tinydb/storage.py`) backed by that B-tree, and thorough unit tests (`tests/test_btree.py`, `tests/test_storage.py`).",
+      "context": "Import `BTreeProtocol`, `StorageProtocol`, `TableSchema`, `ColumnDef`, `Value`, `FILE_MAGIC`, and `StorageError` from `tinydb/contract.py`. Use Python 3.11 stdlib only (never import `sqlite3`). `tinydb/btree.py` exports `BTree(order: int = 32)` implementing `BTreeProtocol`: a real balanced B-tree with node splitting on `insert(key, value)` (raising `StorageError` on duplicate key, with an optional helper or update method for in-place value replacement), `search(key)` in O(log n), full `delete(key) -> bool` with predecessor/successor replacement and sibling borrowing/merging so B-tree invariants hold across large insert/delete sequences, `range_scan(min_key, max_key, include_min, include_max)` pruning out-of-range subtrees, sorted `items()`, and `to_dict()` / `from_dict(data)` preserving the B-tree node hierarchy. `tinydb/storage.py` exports `Storage(db_path: str | Path)` implementing `StorageProtocol`: persists catalog schemas, internal auto-rowid counters (for tables without an explicit `PRIMARY KEY`), and each table's serialized `BTree` into a single file on disk prefixed with `FILE_MAGIC` (`b'TINYDB01'`) + 4-byte big-endian payload length + UTF-8 JSON payload. Treat a non-existent or 0-byte file as a fresh empty database; raise `StorageError` on invalid/corrupted non-empty files. Match table names case-insensitively while preserving declared schema casing. Enforce column types on `insert_row`/`update_rows` (`INTEGER` requires `int` and not `bool`, `REAL` accepts `int` coerced to `float` or `float`, `TEXT` requires `str`, `None` allowed for non-PK columns), reject `None` or duplicate values for declared primary keys, update the B-tree if an `UPDATE` modifies a PK, and persist immediately on every mutating operation (`create_table`, `drop_table`, `insert_row`, `update_rows`, `delete_rows`) without leaving extra sidecar/temp files in the database directory. Sibling boundaries: do not touch `tinydb/contract.py`, parser, executor, or CLI files.",
+      "done": "B-tree invariants, range scans, deletion rebalancing, and single-file persistence across reopen are verified, and `python -m pytest tests/test_btree.py tests/test_storage.py` passes."
+    },
+    {
+      "id": "query_engine",
+      "owned_glob": "{tinydb/planner.py,tinydb/executor.py,tests/test_executor.py}",
+      "difficulty": "hard",
+      "cites": [
+        "sql-semantics",
+        "module-exports"
+      ],
+      "brief": "Implement the query planner (`tinydb/planner.py`) and SQL executor (`tinydb/executor.py`) strictly against `tinydb/contract.py`, along with unit tests (`tests/test_executor.py`) using a lightweight in-memory `StorageProtocol` test double.",
+      "context": "Import all AST dataclasses, `QueryResult`, `TableSchema`, `ColumnDef`, `StorageProtocol`, `ExecutorProtocol`, `Value`, `ExecutionError`, and `TinyDBError` from `tinydb/contract.py`. Do NOT import `tinydb.storage`, `tinydb.btree`, or `tinydb.parser` so this unit builds cleanly in parallel. `tinydb/planner.py` exports `FullScanPlan`, `PKLookupPlan`, `PKRangePlan`, `Plan`, and `Planner` with `plan_select(stmt: SelectStmt, storage: StorageProtocol) -> Plan`: for single-table SELECTs (no joins) whose `WHERE` has a top-level (or `AND`-conjunct) equality predicate on the table's primary key (`pk = literal`), choose `PKLookupPlan` (uses `storage.lookup_by_pk`); for PK range predicates (`>`, `>=`, `<`, `<=`), choose `PKRangePlan` (uses `storage.range_scan_by_pk`); otherwise choose `FullScanPlan` (uses `storage.scan_rows`). `tinydb/executor.py` exports `Executor(storage: StorageProtocol)` implementing `ExecutorProtocol` (`execute(stmt: Statement) -> QueryResult`). Handle: `CreateTableStmt` (validate non-empty columns, unique column names, at most one PK), `DropTableStmt`, `InsertStmt` (map optional column list to full schema-aligned row filling omitted columns with `None`, validate column existence and value counts), `UpdateStmt` (resolve columns, evaluate expressions per row, call `storage.update_rows`), `DeleteStmt` (evaluate `WHERE`, call `storage.delete_rows`), and `SelectStmt` (`FROM`, chained `INNER JOIN ... ON left = right` supporting table aliases and either operand order in `ON`, `WHERE` with `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` both with and without `GROUP BY`, `ORDER BY` supporting aliases/columns/aggregates with `ASC`/`DESC` and safe NULL ordering, and `LIMIT`). Follow `sql-semantics` for output column names, `SUM`/`AVG` numeric types, SQL three-valued/NULL comparisons, and raising `ExecutionError` for unknown tables, unknown/ambiguous columns, or invalid aggregates. Test every query feature and planner path thoroughly in `tests/test_executor.py` using an in-memory `StorageProtocol` fake.",
+      "done": "Planner selects PK B-tree index paths when applicable, executor supports every required SQL feature accurately, and `python -m pytest tests/test_executor.py` passes."
+    },
+    {
+      "id": "cli_and_docs",
+      "owned_glob": "{tinydb/__init__.py,tinydb/cli.py,tinydb/__main__.py,README.md,tests/test_cli.py}",
+      "difficulty": "normal",
+      "depends_on": [
+        "sql_frontend",
+        "storage_engine",
+        "query_engine"
+      ],
+      "cites": [
+        "sql-semantics",
+        "module-exports"
+      ],
+      "brief": "Wire the `tinydb` package entrypoint, REPL, `-f` SQL script runner, pipe-separated output formatter, `Error: <message>` handler, `README.md` documenting design decisions, and CLI/integration tests (`tests/test_cli.py`).",
+      "context": "Import `parse_sql` from `tinydb.parser`, `Storage` from `tinydb.storage`, `Executor` from `tinydb.executor`, and `QueryResult`, `OUTPUT_DELIMITER`, `NULL_DISPLAY`, `TinyDBError` from `tinydb.contract`. `tinydb/__init__.py` re-exports `Storage`, `Executor`, `parse_sql`, `QueryResult`, and `TinyDBError`. `tinydb/cli.py` exports `format_result(result: QueryResult) -> str`, `run_sql(sql: str, storage: StorageProtocol, executor: ExecutorProtocol) -> list[str]`, `run_file(db_path: str, script_path: str) -> int`, `run_repl(db_path: str) -> int`, and `main(argv: list[str] | None = None) -> int`. `tinydb/__main__.py` invokes `raise SystemExit(main())`. CLI arguments via `argparse`: positional `dbfile`, optional `-f`/`--file` script path. `format_result`: for `result.is_select`, return header joined by `|` (`OUTPUT_DELIMITER`, no surrounding spaces, no border lines) followed by one line per row formatting `None` as `NULL_DISPLAY` (`NULL`) and other values with `str(val)`; for non-SELECT results return `""`. In both REPL and `-f` modes, execute statements one by one (splitting statements safely on `;` outside single-quoted strings and comments so a syntax error in one statement does not prevent later statements from running), print formatted SELECT results to stdout, print nothing for DDL/DML, and on `TinyDBError` print `Error: <message>` to stdout without crashing. In REPL mode, print prompt `tinydb> ` only when `sys.stdin.isatty()` is True, support multi-line statements until `;` (executing any trailing non-empty buffer on EOF), and exit cleanly on EOF, `.exit`, or `.quit`. Write `README.md` explaining usage, architecture (tokenizer, parser, planner, executor, storage, B-tree), and documented design decisions (NULL formatting, implicit rowid when PK omitted, case-insensitive identifiers, B-tree single-file format, error handling).",
+      "done": "CLI, REPL, `-f` runner, and `README.md` are complete and the entire test suite `python -m pytest` (including `tests/test_cli.py` and `tests/test_acceptance_contract.py`) exits 0."
+    }
+  ],
+  "estimate": {
+    "tokens": 0,
+    "usd": 0
+  },
+  "dictionary": [
+    {
+      "key": "sql-semantics",
+      "kind": "pattern",
+      "summary": "Shared SQL dialect, NULL/type semantics, header naming, and output/error formatting rules across all tinydb modules.",
+      "content": "1. Case handling: SQL keywords, data types (INTEGER, TEXT, REAL), and aggregate function names (COUNT, SUM, AVG, MIN, MAX) are case-insensitive and normalized to uppercase in AST nodes. Table and column names are matched case-insensitively while preserving declared/requested display casing.\n2. Output formatting: SELECT prints header line `col1|col2` (delimiter `|`, zero extra spaces, no border/divider lines) followed by one line per row. Non-SELECT statements (CREATE TABLE, INSERT, UPDATE, DELETE, DROP TABLE) produce no stdout output. `None` (NULL) prints as `NULL`; int/float/str print with `str(val)`.\n3. SELECT headers: if `AS alias` is given, use `alias`; for `ColumnRef(name, table)` without alias, use bare `name` (matching SQLite, e.g. `SELECT e.name, d.dname` -> `name|dname`); for `AggregateExpr` without alias, use `COUNT(*)` or `FUNC(col)` (e.g. `SUM(salary)`, `AVG(salary)`).\n4. NULL & comparison rules: comparing `None` with `=`, `!=`, `<`, `>`, `<=`, `>=` evaluates to False in WHERE filtering. In ORDER BY, `None` sorts before non-null values in ASC and after non-null values in DESC without raising TypeError. Int and float compare numerically.\n5. Aggregates & GROUP BY: `COUNT(*)` counts all rows in the group (including NULLs); `COUNT(col)` counts non-NULL values; `SUM`, `AVG`, `MIN`, `MAX` ignore NULLs and yield `None` if no non-NULL values exist (`COUNT` yields `0`). `SUM` preserves `int` if all summed values are `int` and returns `float` if any value is `float`; `AVG` always returns `float` when non-empty. Aggregates without GROUP BY collapse all matching rows into a single result row.\n6. Primary keys: if a table declares a `PRIMARY KEY` column, its values must be non-NULL and unique and are indexed directly in the table's B-tree. If no `PRIMARY KEY` is declared, storage assigns a hidden monotonic integer `_rowid` as the B-tree key.\n7. Errors: all engine errors inherit from `TinyDBError`. CLI/REPL prints `Error: <message>` to stdout and continues processing subsequent statements without crashing."
+    },
+    {
+      "key": "module-exports",
+      "kind": "component_api",
+      "summary": "Public symbols and signatures exported by each tinydb module for cross-unit integration.",
+      "content": "- `tinydb.contract`: `TinyDBError`, `TokenizerError`, `ParseError`, `StorageError`, `ExecutionError`, `COLUMN_TYPES`, `AGGREGATE_FUNCS`, `OUTPUT_DELIMITER`, `NULL_DISPLAY`, `FILE_MAGIC`, `Value`, `Token`, `ColumnDef`, `TableSchema`, `LiteralExpr`, `ColumnRef`, `AggregateExpr`, `BinaryExpr`, `UnaryExpr`, `Expr`, `SelectItem`, `TableRef`, `JoinClause`, `OrderByItem`, `CreateTableStmt`, `DropTableStmt`, `InsertStmt`, `SelectStmt`, `UpdateStmt`, `DeleteStmt`, `Statement`, `QueryResult`, `BTreeProtocol`, `StorageProtocol`, `ExecutorProtocol`.\n- `tinydb.tokenizer`: `tokenize(sql: str) -> list[Token]`.\n- `tinydb.parser`: `parse_sql(sql: str) -> list[Statement]`, `parse_statement(sql: str) -> Statement`.\n- `tinydb.btree`: `BTree(order: int = 32)` implementing `BTreeProtocol`.\n- `tinydb.storage`: `Storage(db_path: str | Path)` implementing `StorageProtocol`.\n- `tinydb.planner`: `FullScanPlan`, `PKLookupPlan`, `PKRangePlan`, `Plan`, `Planner` with `plan_select(stmt: SelectStmt, storage: StorageProtocol) -> Plan`.\n- `tinydb.executor`: `Executor(storage: StorageProtocol)` implementing `ExecutorProtocol`.\n- `tinydb.cli`: `format_result(result: QueryResult) -> str`, `run_sql(sql: str, storage: StorageProtocol, executor: ExecutorProtocol) -> list[str]`, `run_file(db_path: str, script_path: str) -> int`, `run_repl(db_path: str) -> int`, `main(argv: list[str] | None = None) -> int`."
+    }
+  ]
+}

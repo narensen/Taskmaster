@@ -157,11 +157,22 @@ pub struct Timing {
     pub took: Duration,
     /// `ok`, `failed`, `timeout` or `skipped`.
     pub status: &'static str,
+    /// Optional detail explaining why a check was skipped or failed to start.
+    pub reason: Option<String>,
 }
 
 impl Timing {
     pub fn new(name: impl Into<String>, took: Duration, status: &'static str) -> Self {
-        Timing { name: name.into(), took, status }
+        Timing { name: name.into(), took, status, reason: None }
+    }
+
+    pub fn with_reason(
+        name: impl Into<String>,
+        took: Duration,
+        status: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Timing { name: name.into(), took, status, reason: Some(reason.into()) }
     }
 }
 
@@ -172,7 +183,12 @@ pub fn report(timings: &[Timing]) -> String {
     }
     let parts: Vec<String> = timings
         .iter()
-        .map(|t| format!("{} {:.1}s {}", t.name, t.took.as_secs_f64(), t.status))
+        .map(|t| match &t.reason {
+            Some(reason) if !reason.trim().is_empty() => {
+                format!("{} {:.1}s {} ({})", t.name, t.took.as_secs_f64(), t.status, reason.trim())
+            }
+            _ => format!("{} {:.1}s {}", t.name, t.took.as_secs_f64(), t.status),
+        })
         .collect();
     format!("verify: {}", parts.join(", "))
 }
@@ -353,6 +369,11 @@ mod tests {
         ]);
         assert_eq!(text, "verify: eslint 1.2s ok, smoke 3.4s failed");
         assert_eq!(report(&[]), "verify: no checks apply");
+
+        let skipped = report(&[
+            Timing::with_reason("smoke", Duration::from_millis(100), "skipped", "failed to start: chrome missing"),
+        ]);
+        assert_eq!(skipped, "verify: smoke 0.1s skipped (failed to start: chrome missing)");
     }
 
     #[test]

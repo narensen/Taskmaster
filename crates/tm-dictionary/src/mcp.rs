@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::store::LocalStore;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Grant {
     pub run: String,
     pub page: String,
@@ -37,6 +37,17 @@ pub struct CiteRecord {
     pub found: bool,
 }
 
+/// Summary of one daemon-served MCP `tools/call` reply, for transcript/ledger instrumentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpReplyRecord {
+    pub grant: Grant,
+    pub tool: String,
+    pub reply_bytes: usize,
+    pub is_error: bool,
+}
+
+pub type ReplyObserver = Arc<dyn Fn(McpReplyRecord) + Send + Sync>;
+
 /// More tools served beside the Dictionary's, under the same tokens. The daemon adds the
 /// browser this way, so every harness that can reach the Dictionary can reach it too.
 #[async_trait::async_trait]
@@ -48,17 +59,43 @@ pub trait Extension: Send + Sync {
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value>;
 }
 
+/// Per-token visibility policy for `tools/list`. Pruning unused tool schemas from worker
+/// sessions cuts per-turn prompt tokens while keeping `tools/call` dispatch intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicy {
+    /// Advertise built-in Dictionary tools (`cite`, `index`, `search`).
+    pub dictionary: bool,
+    /// Specific extension tool names to omit from `tools/list` (e.g. `set_status`, `docs`).
+    pub hidden_tools: Vec<String>,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self { dictionary: true, hidden_tools: Vec::new() }
+    }
+}
+
 pub struct McpState {
     local: LocalStore,
     commons: Option<LocalStore>,
     tokens: Mutex<HashMap<String, Grant>>,
+    policies: Mutex<HashMap<String, ToolPolicy>>,
     cites: Mutex<Vec<CiteRecord>>,
     extension: Mutex<Option<Arc<dyn Extension>>>,
+    observer: Mutex<Option<ReplyObserver>>,
 }
 
 impl McpState {
     pub fn new(store: LocalStore) -> Arc<Self> {
-        Arc::new(McpState { local: store, commons: None, tokens: Mutex::default(), cites: Mutex::default(), extension: Mutex::default() })
+        Arc::new(McpState {
+            local: store,
+            commons: None,
+            tokens: Mutex::default(),
+            policies: Mutex::default(),
+            cites: Mutex::default(),
+            extension: Mutex::default(),
+            observer: Mutex::default(),
+        })
     }
 
     pub fn with_commons(local: LocalStore, commons: LocalStore) -> Arc<Self> {
@@ -66,8 +103,10 @@ impl McpState {
             local,
             commons: Some(commons),
             tokens: Mutex::default(),
+            policies: Mutex::default(),
             cites: Mutex::default(),
             extension: Mutex::default(),
+            observer: Mutex::default(),
         })
     }
 
@@ -75,12 +114,45 @@ impl McpState {
         *self.extension.lock().unwrap() = Some(extension);
     }
 
+    /// Register an observer notified after every MCP `tools/call` reply (built-in or extension).
+    pub fn on_reply(&self, observer: ReplyObserver) {
+        *self.observer.lock().unwrap() = Some(observer);
+    }
+
+    fn record_reply(&self, grant: &Grant, name: &str, result: &Value) {
+        let Some(observer) = self.observer.lock().unwrap().clone() else { return };
+        observer(McpReplyRecord {
+            grant: grant.clone(),
+            tool: strip_dict_prefix(name).to_string(),
+            reply_bytes: reply_text_bytes(result),
+            is_error: result["isError"].as_bool().unwrap_or(false),
+        });
+    }
+
     pub fn grant(&self, token: &str, grant: Grant) {
         self.tokens.lock().unwrap().insert(token.into(), grant);
     }
 
+    /// Rebind an existing bearer token to a new [`Grant`] when a warm ACP session is reused for
+    /// a subsequent unit in a later wave. Returns `true` if `token` was registered and updated.
+    pub fn rebind_grant(&self, token: &str, grant: Grant) -> bool {
+        let mut tokens = self.tokens.lock().unwrap();
+        if let Some(slot) = tokens.get_mut(token) {
+            *slot = grant;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Configure which tool schemas `tools/list` advertises for `token`.
+    pub fn set_tool_policy(&self, token: &str, policy: ToolPolicy) {
+        self.policies.lock().unwrap().insert(token.into(), policy);
+    }
+
     pub fn revoke(&self, token: &str) {
         self.tokens.lock().unwrap().remove(token);
+        self.policies.lock().unwrap().remove(token);
     }
 
     pub fn cites(&self) -> Vec<CiteRecord> {
@@ -104,18 +176,22 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
         .and_then(|v| v.strip_prefix("Bearer "));
     let grant = token.and_then(|t| state.tokens.lock().unwrap().get(t).cloned());
     let Some(grant) = grant else { return StatusCode::UNAUTHORIZED.into_response() };
+    let policy = token
+        .and_then(|t| state.policies.lock().unwrap().get(t).cloned())
+        .unwrap_or_default();
     let Ok(msg) = serde_json::from_str::<Value>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(id) = msg.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response(); // notification
     };
+    let method = msg["method"].as_str().unwrap_or_default();
     let extension = state.extension.lock().unwrap().clone();
     if let Some(extension) = extension {
-        let method = msg["method"].as_str().unwrap_or_default();
         if method == "tools/call" {
             let name = msg["params"]["name"].as_str().unwrap_or_default();
             if let Some(result) = extension.call(&grant, name, &msg["params"]["arguments"]).await {
+                state.record_reply(&grant, name, &result);
                 return Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response();
             }
         }
@@ -124,17 +200,60 @@ async fn handle(State(state): State<Arc<McpState>>, headers: HeaderMap, body: St
         {
             if let Some(tools) = listed["tools"].as_array_mut() {
                 tools.extend(extension.tools(&grant));
+                apply_tool_policy(tools, &policy);
             }
             return Json(json!({ "jsonrpc": "2.0", "id": id, "result": listed })).into_response();
         }
     }
     let reply = match dispatch(&state, &grant, &msg) {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Ok(mut result) => {
+            if method == "tools/list"
+                && let Some(tools) = result["tools"].as_array_mut()
+            {
+                apply_tool_policy(tools, &policy);
+            }
+            if method == "tools/call" {
+                let name = msg["params"]["name"].as_str().unwrap_or_default();
+                state.record_reply(&grant, name, &result);
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
         Err((code, message)) => {
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
         }
     };
     Json(reply).into_response()
+}
+
+fn apply_tool_policy(tools: &mut Vec<Value>, policy: &ToolPolicy) {
+    tools.retain(|tool| {
+        let name = tool["name"].as_str().unwrap_or("");
+        if !policy.dictionary && matches!(name, "cite" | "index" | "search") {
+            return false;
+        }
+        if policy.hidden_tools.iter().any(|h| h == name) {
+            return false;
+        }
+        true
+    });
+}
+
+/// UTF-8 byte length of the text blocks in an MCP tool result (falls back to JSON byte length).
+pub fn reply_text_bytes(result: &Value) -> usize {
+    if let Some(blocks) = result["content"].as_array() {
+        let mut total = 0usize;
+        let mut saw_text = false;
+        for block in blocks {
+            if let Some(text) = block["text"].as_str() {
+                total += text.len();
+                saw_text = true;
+            }
+        }
+        if saw_text {
+            return total;
+        }
+    }
+    result.to_string().len()
 }
 
 fn dispatch(state: &McpState, grant: &Grant, msg: &Value) -> Result<Value, (i32, String)> {
@@ -161,9 +280,29 @@ fn dispatch(state: &McpState, grant: &Grant, msg: &Value) -> Result<Value, (i32,
     }
 }
 
+/// Every MCP tool-name prefix harnesses attach to Taskmaster's Dictionary server.
+pub const DICT_TOOL_PREFIXES: [&str; 6] = [
+    "mcp_dictionary_",
+    "mcp__dictionary__",
+    "dictionary__",
+    "dictionary_",
+    "dict__",
+    "taskmaster__",
+];
+
+/// Strip any known Dictionary MCP server prefix from a tool name so aliases dispatch uniformly.
+pub fn strip_dict_prefix(name: &str) -> &str {
+    for prefix in DICT_TOOL_PREFIXES {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    name
+}
+
 fn call_tool(state: &McpState, grant: &Grant, params: &Value) -> Result<Value, (i32, String)> {
     let text = |s: String, is_error: bool| json!({ "content": [{ "type": "text", "text": s }], "isError": is_error });
-    match params["name"].as_str().unwrap_or_default() {
+    match strip_dict_prefix(params["name"].as_str().unwrap_or_default()) {
         "cite" => {
             let key = params["arguments"]["key"].as_str().unwrap_or_default();
             let entry = resolve(state, key).map_err(|e| (-32602, e.to_string()))?;
@@ -377,5 +516,93 @@ mod tests {
         let (_, app) = setup();
         let (_, r) = rpc(&app, Some("tok-a"), call("../../etc/passwd")).await;
         assert!(r["error"].is_object());
+    }
+
+    #[tokio::test]
+    async fn prefixed_tool_names_are_accepted() {
+        let (_, app) = setup();
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": { "name": "mcp_dictionary_index", "arguments": {} }
+        });
+        let (status, r) = rpc(&app, Some("tok-a"), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r["result"]["isError"], false, "{r}");
+    }
+
+    #[tokio::test]
+    async fn reply_observer_records_builtin_and_extension_reply_bytes() {
+        let (state, app) = setup();
+        state.extend(Arc::new(Echo));
+        let seen: Arc<Mutex<Vec<McpReplyRecord>>> = Arc::default();
+        let sink = seen.clone();
+        state.on_reply(Arc::new(move |rec| sink.lock().unwrap().push(rec)));
+
+        let (_, _) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
+        let echo = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "mcp_dictionary_echo", "arguments": { "say": "hi" } }
+        });
+        // Echo matches bare "echo", so call bare name for extension test.
+        let echo_bare = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "echo", "arguments": { "say": "hi" } }
+        });
+        let _ = rpc(&app, Some("tok-a"), echo).await;
+        let _ = rpc(&app, Some("tok-a"), echo_bare).await;
+
+        let records = seen.lock().unwrap().clone();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tool, "cite");
+        assert_eq!(records[0].reply_bytes, "export const G = 1;".len());
+        assert!(!records[0].is_error);
+        assert_eq!(records[1].tool, "echo");
+        assert_eq!(records[1].reply_bytes, "dashboard \"hi\"".len());
+        assert!(!records[1].is_error);
+    }
+
+    #[tokio::test]
+    async fn rebind_grant_redirects_existing_token_to_new_unit() {
+        let (state, app) = setup();
+        assert!(!state.rebind_grant("missing-token", Grant { run: "r1".into(), page: "b".into(), unit: String::new() }));
+        assert!(state.rebind_grant("tok-a", Grant { run: "r1".into(), page: "unit_b".into(), unit: String::new() }));
+        let (status, _) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
+        assert_eq!(status, StatusCode::OK);
+        let cites = state.cites();
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].grant.page, "unit_b");
+    }
+
+    #[tokio::test]
+    async fn tool_policy_prunes_unused_schemas_from_tools_list_while_keeping_call_dispatch() {
+        let (state, app) = setup();
+        state.extend(Arc::new(Echo));
+        state.set_tool_policy(
+            "tok-a",
+            ToolPolicy { dictionary: false, hidden_tools: vec!["echo".into()] },
+        );
+        let (status, listed) = rpc(&app, Some("tok-a"), json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed["result"]["tools"].as_array().unwrap().is_empty(), "{listed}");
+
+        // Explicit tools/call still dispatches if invoked directly.
+        let (call_status, res) = rpc(&app, Some("tok-a"), call("greeting_contract")).await;
+        assert_eq!(call_status, StatusCode::OK);
+        assert_eq!(res["result"]["isError"], false);
+    }
+
+    #[test]
+    fn strip_dict_prefix_handles_all_known_mcp_prefixes() {
+        for prefix in DICT_TOOL_PREFIXES {
+            assert_eq!(strip_dict_prefix(&format!("{prefix}flow_query")), "flow_query");
+        }
+        assert_eq!(strip_dict_prefix("run_code"), "run_code");
+        assert_eq!(strip_dict_prefix("other__tool"), "other__tool");
     }
 }

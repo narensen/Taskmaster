@@ -482,6 +482,18 @@ impl Records {
         self.save(&format!("runs/{run}/goal.json"), progress)
     }
 
+    pub fn mutation_cache(&self, run: &str) -> anyhow::Result<std::collections::BTreeMap<String, crate::gates::MutationVerdict>> {
+        Ok(self.load(&format!("runs/{run}/mutation-cache.json"))?.unwrap_or_default())
+    }
+
+    pub fn save_mutation_cache(
+        &self,
+        run: &str,
+        cache: &std::collections::BTreeMap<String, crate::gates::MutationVerdict>,
+    ) -> anyhow::Result<()> {
+        self.save(&format!("runs/{run}/mutation-cache.json"), cache)
+    }
+
     /// A damaged line is skipped: losing one price must not stop a run from resuming.
     pub fn ledger(&self, run: &str) -> anyhow::Result<Vec<LedgerEntry>> {
         let Some(bytes) = self.store.read(&format!("runs/{run}/ledger.jsonl"))? else { return Ok(Vec::new()) };

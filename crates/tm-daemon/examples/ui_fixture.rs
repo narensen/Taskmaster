@@ -167,7 +167,7 @@ impl Harness for Scripted {
             Usage { input: 600 + brief.len() as u64 / 4, output, cache_read: 4200, cache_write: if claude { 2600 } else { 0 } }
         };
         let cost = if self.id == "agy" || self.id == "grok" { None } else { Some(0.012) };
-        Ok(RunSummary { ok: true, usage, cost_usd: cost, denied: 1, freed: None })
+        Ok(RunSummary { ok: true, usage, cost_usd: cost, denied: 1, freed: None, requests: Some(1) })
     }
 }
 

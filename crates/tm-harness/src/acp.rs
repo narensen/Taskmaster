@@ -94,6 +94,13 @@ impl AcpHarness {
         // When Code Mode is active with the daemon's MCP server attached, writes and shell
         // commands go through `run_code` (which has its own sandboxed worktree access), so the
         // agent's own sandbox stays read-only even for harnesses that edit without asking.
+        //
+        // Note on tool lists: unlike Claude Code (`--disallowedTools`), ACP servers (`agy acp`,
+        // `grok agent stdio`, `opencode acp`) expose no CLI flag to remove built-in native tools
+        // from their schema list, and `agy acp` auto-approves in-worktree `read_file`/`edit_file`
+        // without sending `session/request_permission`. Keeping the bwrap mount read-only guarantees
+        // native writes fail with `EROFS` (`read-only file system`), which `Session::incoming`
+        // converts into a `(use run_code)` refusal to redirect the worker back to `run_code`.
         let enforce_code_mode = task.code_mode && !task.read_only && task.dictionary.is_some();
         let read_only = task.read_only || enforce_code_mode;
         let shell = (!enforce_code_mode).then_some(task.shell.as_ref()).flatten();
@@ -155,9 +162,12 @@ impl Harness for AcpHarness {
         let mut session = self.session(&task, io, gate, events);
         session.next_id = rebuilt.next_id;
         session.id = rebuilt.session.clone();
+        session.model_used = rebuilt.model_used.or_else(|| task.model.clone());
         session.cost = rebuilt.cost;
         session.tools = rebuilt.tools.clone();
         session.denied = rebuilt.denied;
+        session.requests = rebuilt.requests;
+        session.saw_tool_finish = rebuilt.saw_tool_finish;
         let turn = async {
             let Some(prompt) = rebuilt.prompt else {
                 // The turn ended before this daemon took over: its reply is in the log.
@@ -216,6 +226,7 @@ impl AcpHarness {
     fn session(&self, task: &WorkerTask, io: crate::child::AgentIo, gate: Arc<dyn PermissionGate>, events: mpsc::Sender<HarnessEvent>) -> Session {
         Session {
             io,
+            harness_id: self.id,
             next_id: 0,
             dictionary_prefix: task.dictionary.as_ref().map(|d| self.mcp_tool_prefix.replace("{server}", &d.name)),
             code_mode: task.code_mode && !task.read_only && task.dictionary.is_some(),
@@ -224,8 +235,13 @@ impl AcpHarness {
             denied: 0,
             stall: task.stall,
             tools: BTreeSet::new(),
+            tool_names: std::collections::HashMap::new(),
             id: None,
+            model_used: None,
             cost: None,
+            requests: 0,
+            saw_tool_finish: false,
+            turn_text: String::new(),
         }
     }
 
@@ -282,8 +298,16 @@ impl crate::Session for Kept {
         result
     }
 
+    fn rebind_gate(&mut self, gate: Arc<dyn PermissionGate>) {
+        self.session.gate = gate;
+    }
+
     fn session_id(&self) -> Option<&str> {
         self.session.id.as_deref()
+    }
+
+    fn model_used(&self) -> Option<&str> {
+        self.session.model_used.as_deref()
     }
 
     async fn close(mut self: Box<Self>) -> crate::Freed {
@@ -294,6 +318,26 @@ impl crate::Session for Kept {
     }
 }
 
+/// Verified Antigravity (`agy models`) model families that ship `-low`, `-medium`, and `-high`
+/// thinking variants. Models without full tiered variants (e.g. `gpt-oss-120b-medium`,
+/// `gemini-pro-orchestrator*`) are deliberately omitted so explicit `--worker-model` choices
+/// are never rewritten to nonexistent ids.
+///
+/// Mapping when `effort_routing` is enabled and the session catalog confirms (or omits a list
+/// for one of these verified families):
+/// - `easy` (`effort = "low"`)    -> `*-low`
+/// - `normal` (`effort = "medium"`) -> `*-medium`
+/// - `hard` / repairs / planner / reviewer (`effort = "high"` or `None`) -> unchanged (`*-high` / `*-xhigh`)
+pub const ANTIGRAVITY_EFFORT_FAMILIES: [&str; 7] = [
+    "gemini-4-neon",
+    "gemini-4-carbon",
+    "gemini-4-argon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+];
+
 /// The id of the session option that chooses the model, when the agent has one.
 fn model_option(session: &Value) -> Option<&str> {
     session["configOptions"]
@@ -303,8 +347,131 @@ fn model_option(session: &Value) -> Option<&str> {
         .and_then(|option| option["id"].as_str())
 }
 
+/// Model ids advertised by `session/new` in `models.availableModels` or `configOptions[model].options`.
+fn available_models(session: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = session["models"]["availableModels"].as_array() {
+        for item in arr {
+            let id = item
+                .as_str()
+                .or_else(|| item["modelId"].as_str())
+                .or_else(|| item["id"].as_str());
+            if let Some(id) = id
+                && !id.is_empty()
+                && !out.iter().any(|have| have == id)
+            {
+                out.push(id.to_string());
+            }
+        }
+    }
+    if let Some(opts) = session["configOptions"].as_array() {
+        for opt in opts {
+            if (opt["category"] == "model" || opt["id"] == "model")
+                && let Some(values) = opt["options"].as_array()
+            {
+                for item in values {
+                    let id = item
+                        .as_str()
+                        .or_else(|| item["value"].as_str())
+                        .or_else(|| item["id"].as_str());
+                    if let Some(id) = id
+                        && !id.is_empty()
+                        && !out.iter().any(|have| have == id)
+                    {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Session config option that controls thinking/reasoning effort, if the ACP server exposes one.
+fn effort_option(session: &Value) -> Option<(&str, Vec<String>)> {
+    let opts = session["configOptions"].as_array()?;
+    let opt = opts.iter().find(|o| {
+        matches!(
+            o["category"].as_str().unwrap_or(""),
+            "thought_level" | "reasoning_effort" | "effort" | "thinking"
+        ) || matches!(
+            o["id"].as_str().unwrap_or(""),
+            "effort" | "reasoning_effort" | "thought_level" | "thinking_level"
+        )
+    })?;
+    let id = opt["id"].as_str()?;
+    let mut vals = Vec::new();
+    if let Some(arr) = opt["options"].as_array() {
+        for item in arr {
+            if let Some(v) = item
+                .as_str()
+                .or_else(|| item["value"].as_str())
+                .or_else(|| item["id"].as_str())
+            {
+                vals.push(v.to_string());
+            }
+        }
+    }
+    Some((id, vals))
+}
+
+fn split_effort_suffix(model: &str) -> Option<(&str, &'static str, u8)> {
+    for (suffix, tier, rank) in [
+        ("-xhigh", "xhigh", 4),
+        ("-high", "high", 3),
+        ("-medium", "medium", 2),
+        ("-low", "low", 1),
+    ] {
+        if let Some(base) = model.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return Some((base, tier, rank));
+        }
+    }
+    None
+}
+
+/// Resolve an Antigravity model id for `effort`, preserving explicit choices when the target
+/// variant does not exist or would silently raise thinking cost above `requested`.
+///
+/// - `available` comes from ACP `session/new` (`models.availableModels` / `configOptions`).
+/// - When `available` is non-empty, only a candidate present in `available` is chosen.
+/// - When `available` is empty, only families in [`ANTIGRAVITY_EFFORT_FAMILIES`] are mapped.
+pub fn resolve_antigravity_model(requested: &str, effort: Option<&str>, available: &[String]) -> String {
+    let Some(raw_effort) = effort else {
+        return requested.to_string();
+    };
+    let (target_tier, target_rank) = match raw_effort.trim().to_ascii_lowercase().as_str() {
+        "low" | "easy" => ("low", 1u8),
+        "medium" | "normal" => ("medium", 2u8),
+        // High / hard always preserves the caller's configured tier (`-high`, `-xhigh`, etc.).
+        "high" | "hard" => return requested.to_string(),
+        _ => return requested.to_string(),
+    };
+    let Some((base, _current_tier, current_rank)) = split_effort_suffix(requested) else {
+        return requested.to_string();
+    };
+    // Never silently raise effort above what the user explicitly configured (e.g. keep `-low` as `-low`
+    // and keep `-xhigh` on `"high"`). Only step down to `-low` / `-medium` when requested is higher.
+    if target_rank >= current_rank {
+        return requested.to_string();
+    }
+    let candidate = format!("{base}-{target_tier}");
+    if !available.is_empty() {
+        if available.iter().any(|m| m == &candidate) {
+            return candidate;
+        }
+        return requested.to_string();
+    }
+    if ANTIGRAVITY_EFFORT_FAMILIES.contains(&base) {
+        return candidate;
+    }
+    requested.to_string()
+}
+
 struct Session {
     io: crate::child::AgentIo,
+    harness_id: &'static str,
     next_id: u64,
     dictionary_prefix: Option<String>,
     /// When Code Mode (`run_code`) is active on a builder, steer native shell/edit prompts to `run_code`.
@@ -316,10 +483,20 @@ struct Session {
     stall: Option<std::time::Duration>,
     /// Tool calls started and not yet finished. A running tool may be silent for a long time.
     tools: BTreeSet<String>,
+    /// Tool call id -> tool name for the active prompt (used to map Code Mode `EROFS` tool results).
+    tool_names: std::collections::HashMap<String, String>,
     /// The ACP session, once `session/new` answered.
     id: Option<String>,
+    /// The actual model id selected for this session (after effort routing / catalog check / fallback).
+    model_used: Option<String>,
     /// The session's running cost, from the agent's `usage_update` events, when it sends one.
     cost: Option<f64>,
+    /// Model requests / turns observed in the current `session/prompt`.
+    requests: u32,
+    /// True after a tool batch finishes so the next model emission counts as a new request turn.
+    saw_tool_finish: bool,
+    /// Leading text emitted during the current `session/prompt`, inspected for quota/429 errors.
+    turn_text: String,
 }
 
 impl Session {
@@ -351,8 +528,20 @@ impl Session {
 
         if let Some((session_id, prompt)) = resume {
             let load = json!({ "sessionId": session_id, "cwd": task.cwd, "mcpServers": mcp_servers });
-            self.call("session/load", load).await?;
+            let loaded = self.call("session/load", load).await?;
+            let used = loaded["models"]["currentModelId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| task.model.clone());
+            self.model_used = used.clone();
             let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
+            if let Some(used) = used {
+                let _ = self
+                    .events
+                    .send(HarnessEvent::ModelSelected { requested: task.model.clone(), used })
+                    .await;
+            }
             self.id = Some(session_id);
             return self.prompt(prompt).await;
         }
@@ -362,26 +551,94 @@ impl Session {
         let session_id =
             session["sessionId"].as_str().context("session/new returned no sessionId")?.to_string();
 
-        if let Some(model) = &task.model {
-            // Opencode offers the model as a session option. Antigravity and Grok Build
-            // take `session/set_model`.
-            let (method, params) = match model_option(&session) {
-                Some(option) => (
-                    "session/set_config_option",
-                    json!({ "sessionId": session_id, "configId": option, "value": model }),
-                ),
-                None => ("session/set_model", json!({ "sessionId": session_id, "modelId": model })),
+        let avail = available_models(&session);
+        let mut selected_model = session["models"]["currentModelId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(requested_model) = &task.model {
+            let effective = if self.harness_id == "antigravity" {
+                resolve_antigravity_model(requested_model, task.effort.as_deref(), &avail)
+            } else {
+                requested_model.clone()
             };
-            self.call(method, params).await.with_context(|| format!("could not select model `{model}`"))?;
+            match self.select_model(&session, &session_id, &effective).await {
+                Ok(()) => {
+                    selected_model = Some(effective);
+                }
+                Err(err) => {
+                    if effective != *requested_model {
+                        // The effort-mapped variant was rejected by the live server: fall back cleanly
+                        // to the caller's explicit model so `--worker-model` never breaks.
+                        self.select_model(&session, &session_id, requested_model)
+                            .await
+                            .with_context(|| format!("could not select model `{requested_model}` (after effort variant `{effective}` failed: {err})"))?;
+                        selected_model = Some(requested_model.clone());
+                    } else {
+                        return Err(err).with_context(|| format!("could not select model `{requested_model}`"));
+                    }
+                }
+            }
+        } else if self.harness_id == "antigravity"
+            && let Some(effort) = task.effort.as_deref()
+        {
+            // No explicit model passed: prefer an ACP effort configOption if offered, otherwise
+            // step down the session's reported currentModelId when its variant is available.
+            if let Some((config_id, values)) = effort_option(&session) {
+                let norm = effort.trim().to_ascii_lowercase();
+                if values.is_empty() || values.iter().any(|v| v.eq_ignore_ascii_case(&norm)) {
+                    let _ = self
+                        .call(
+                            "session/set_config_option",
+                            json!({ "sessionId": session_id, "configId": config_id, "value": norm }),
+                        )
+                        .await;
+                }
+            } else if let Some(current) = session["models"]["currentModelId"].as_str() {
+                let effective = resolve_antigravity_model(current, Some(effort), &avail);
+                if effective != current && self.select_model(&session, &session_id, &effective).await.is_ok() {
+                    selected_model = Some(effective);
+                }
+            }
         }
+        self.model_used = selected_model.clone();
 
         let _ = self.events.send(HarnessEvent::SessionStarted { session_id: session_id.clone() }).await;
+        if let Some(used) = selected_model {
+            let _ = self
+                .events
+                .send(HarnessEvent::ModelSelected { requested: task.model.clone(), used })
+                .await;
+        }
         self.id = Some(session_id);
-        self.prompt(task.framed_brief()).await
+        let run_code_tool = match &self.dictionary_prefix {
+            Some(prefix) => format!("{prefix}run_code"),
+            None => "run_code".to_string(),
+        };
+        self.prompt(task.framed_brief_for(&run_code_tool)).await
+    }
+
+    async fn select_model(&mut self, session: &Value, session_id: &str, model: &str) -> anyhow::Result<()> {
+        // Opencode offers the model as a session option. Antigravity and Grok Build
+        // take `session/set_model`.
+        let (method, params) = match model_option(session) {
+            Some(option) => (
+                "session/set_config_option",
+                json!({ "sessionId": session_id, "configId": option, "value": model }),
+            ),
+            None => ("session/set_model", json!({ "sessionId": session_id, "modelId": model })),
+        };
+        self.call(method, params).await?;
+        Ok(())
     }
 
     /// One turn in the open session.
     async fn prompt(&mut self, text: String) -> anyhow::Result<RunSummary> {
+        self.tools.clear();
+        self.tool_names.clear();
+        self.turn_text.clear();
+        self.requests = 0;
+        self.saw_tool_finish = false;
         let session_id = self.id.clone().context("the session is not open")?;
         let prompt = json!({
             "sessionId": session_id,
@@ -389,19 +646,71 @@ impl Session {
         });
         let before = self.cost;
         let result = self.call("session/prompt", prompt).await?;
-        Ok(self.summary(&result, before))
+        let summary = self.summary(&result, before);
+        // Antigravity ACP often surfaces quota exhaustion / HTTP 429 as an agent message
+        // (`⚠ Individual quota reached ... Resets in XhYmZs.`) followed by `stopReason: "end_turn"`.
+        // Detect it directly in the harness so callers never treat it as a valid reply.
+        if let Some(hit) = self.quota_error_in_turn_text() {
+            self.emit_quota_rate_limit(&hit).await;
+            return Err(hit.into());
+        }
+        Ok(summary)
+    }
+
+    async fn emit_quota_rate_limit(&self, hit: &crate::QuotaError) {
+        let _ = self
+            .events
+            .send(HarnessEvent::RateLimit(crate::RateLimitReport {
+                source: Some("acp".into()),
+                window_5h_pct: Some(100.0),
+                reset_5h: hit.reset.clone(),
+                ..Default::default()
+            }))
+            .await;
+    }
+
+    fn quota_error_in_turn_text(&self) -> Option<crate::QuotaError> {
+        let trimmed = self.turn_text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Leave genuine structured replies (plans, findings, releases) alone even if prose quotes a limit.
+        if trimmed.contains("RELEASE ")
+            || (trimmed.contains('{')
+                && (trimmed.contains("\"pages\"")
+                    || trimmed.contains("\"units\"")
+                    || trimmed.contains("\"contracts\"")
+                    || trimmed.contains("\"resolution\"")))
+        {
+            return None;
+        }
+        crate::detect_quota_or_rate_limit(trimmed)
     }
 
     /// A turn's summary from its prompt reply, with `before` the running cost when it began.
     fn summary(&self, result: &Value, before: Option<f64>) -> RunSummary {
         // The reply's own price if it has one, else what the running cost grew by this turn.
         let cost = read_cost(result).or_else(|| self.cost.map(|now| (now - before.unwrap_or(0.0)).max(0.0)));
+        let ok = result["stopReason"] == "end_turn";
+        let reported_requests = result["num_turns"]
+            .as_u64()
+            .or_else(|| result["usage"]["requests"].as_u64())
+            .or_else(|| result["_meta"]["usage"]["requests"].as_u64())
+            .map(|n| n as u32);
+        let requests = reported_requests.or(if self.requests > 0 {
+            Some(self.requests)
+        } else if ok {
+            Some(1)
+        } else {
+            None
+        });
         RunSummary {
-            ok: result["stopReason"] == "end_turn",
+            ok,
             usage: read_usage(result),
             cost_usd: cost,
             denied: self.denied,
             freed: None,
+            requests,
         }
     }
 
@@ -432,6 +741,11 @@ impl Session {
                 self.incoming(msg).await?;
             } else if msg["id"] == id {
                 if let Some(error) = msg.get("error") {
+                    let err_text = error.to_string();
+                    if let Some(hit) = crate::detect_quota_or_rate_limit(&err_text) {
+                        self.emit_quota_rate_limit(&hit).await;
+                        return Err(hit.into());
+                    }
                     bail!("`{method}` failed: {error}");
                 }
                 return Ok(msg["result"].clone());
@@ -443,7 +757,7 @@ impl Session {
         let params = &msg["params"];
         match msg["method"].as_str() {
             Some("session/update") => {
-                track_tool(&mut self.tools, &params["update"]);
+                observe_turn(&mut self.requests, &mut self.saw_tool_finish, &mut self.tools, &params["update"]);
                 if let Some(cost) = running_cost(&params["update"]) {
                     self.cost = Some(cost);
                 }
@@ -451,7 +765,48 @@ impl Session {
                     let _ = self.events.send(HarnessEvent::RateLimit(report)).await;
                 }
                 for event in update_events(&params["update"]) {
+                    let mut erofs_tool: Option<String> = None;
+                    match &event {
+                        HarnessEvent::Text { text } if self.turn_text.len() < 4096 => {
+                            let avail = 4096 - self.turn_text.len();
+                            if text.len() <= avail {
+                                self.turn_text.push_str(text);
+                            } else {
+                                let mut cut = avail;
+                                while cut > 0 && !text.is_char_boundary(cut) {
+                                    cut -= 1;
+                                }
+                                self.turn_text.push_str(&text[..cut]);
+                            }
+                        }
+                        HarnessEvent::ToolCall { id, name, .. } if !id.is_empty() => {
+                            self.tool_names.insert(id.clone(), name.clone());
+                        }
+                        HarnessEvent::ToolResult { id, text, .. }
+                            if self.code_mode && text.to_ascii_lowercase().contains("read-only file system") =>
+                        {
+                            let tool_name = self
+                                .tool_names
+                                .get(id)
+                                .cloned()
+                                .unwrap_or_else(|| "edit_file".to_string());
+                            let is_dict_tool = self
+                                .dictionary_prefix
+                                .as_deref()
+                                .is_some_and(|p| tool_name.starts_with(p));
+                            if !is_dict_tool {
+                                erofs_tool = Some(format!("{tool_name} (use run_code)"));
+                            }
+                        }
+                        _ => {}
+                    }
                     let _ = self.events.send(event).await;
+                    if let Some(tool) = erofs_tool {
+                        let _ = self
+                            .events
+                            .send(HarnessEvent::PermissionDecided { tool, allowed: false })
+                            .await;
+                    }
                 }
             }
             Some("session/request_permission") => {
@@ -464,8 +819,16 @@ impl Session {
                 }
                 let blocked_by_code_mode = self.code_mode && matches!(request.kind, ToolKind::Execute | ToolKind::Edit);
                 let allowed = !blocked_by_code_mode && self.gate.decide_async(&request).await == Decision::Allow;
-                if !allowed && !blocked_by_code_mode {
-                    self.denied += 1;
+                if !allowed {
+                    if let Some(id) = params["toolCall"]["toolCallId"].as_str()
+                        && self.tools.remove(id)
+                        && self.tools.is_empty()
+                    {
+                        self.saw_tool_finish = true;
+                    }
+                    if !blocked_by_code_mode {
+                        self.denied += 1;
+                    }
                 }
                 let reported_tool = if blocked_by_code_mode {
                     format!("{} (use run_code)", request.tool)
@@ -517,6 +880,7 @@ struct Rebuilt {
     /// The highest request id this side sent; the next request takes the one after.
     next_id: u64,
     session: Option<String>,
+    model_used: Option<String>,
     cost: Option<f64>,
     /// The running cost when the last turn began.
     cost_before: Option<f64>,
@@ -529,6 +893,10 @@ struct Rebuilt {
     asked: Vec<Value>,
     /// Permission requests refused this turn.
     denied: u32,
+    /// Model request turns observed in the active prompt so far.
+    requests: u32,
+    /// True after a tool batch completed.
+    saw_tool_finish: bool,
 }
 
 impl Rebuilt {
@@ -536,6 +904,7 @@ impl Rebuilt {
         use crate::hold::Logged;
         let mut out = Rebuilt::default();
         let mut sent: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut sent_model: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
         for entry in history {
             let (line, ours) = match entry {
                 Logged::In(line) => (line, true),
@@ -550,11 +919,25 @@ impl Rebuilt {
                     sent.insert(id, method.to_string());
                     match method {
                         "session/load" => out.session = msg["params"]["sessionId"].as_str().map(str::to_string),
+                        "session/set_model" => {
+                            if let Some(model) = msg["params"]["modelId"].as_str().filter(|s| !s.is_empty()) {
+                                sent_model.insert(id, model.to_string());
+                            }
+                        }
+                        "session/set_config_option" => {
+                            if msg["params"]["configId"].as_str() == Some("model")
+                                && let Some(model) = msg["params"]["value"].as_str().filter(|s| !s.is_empty())
+                            {
+                                sent_model.insert(id, model.to_string());
+                            }
+                        }
                         "session/prompt" => {
                             out.prompt = Some(id);
                             out.answered = None;
                             out.cost_before = out.cost;
                             out.denied = 0;
+                            out.requests = 0;
+                            out.saw_tool_finish = false;
                         }
                         _ => {}
                     }
@@ -565,11 +948,17 @@ impl Rebuilt {
                     let asked = out.asked.remove(at);
                     if asked["method"] == "session/request_permission" && !allowed_by(&asked, &msg) {
                         out.denied += 1;
+                        if let Some(id) = asked["params"]["toolCall"]["toolCallId"].as_str()
+                            && out.tools.remove(id)
+                            && out.tools.is_empty()
+                        {
+                            out.saw_tool_finish = true;
+                        }
                     }
                 }
                 (false, Some("session/update")) => {
                     let update = &msg["params"]["update"];
-                    track_tool(&mut out.tools, update);
+                    observe_turn(&mut out.requests, &mut out.saw_tool_finish, &mut out.tools, update);
                     if let Some(cost) = running_cost(update) {
                         out.cost = Some(cost);
                     }
@@ -579,7 +968,22 @@ impl Rebuilt {
                 (false, None) => {
                     let Some(id) = msg["id"].as_u64() else { continue };
                     match sent.get(&id).map(String::as_str) {
-                        Some("session/new") => out.session = msg["result"]["sessionId"].as_str().map(str::to_string),
+                        Some("session/new") => {
+                            out.session = msg["result"]["sessionId"].as_str().map(str::to_string);
+                            if let Some(model) = msg["result"]["models"]["currentModelId"].as_str().filter(|s| !s.is_empty()) {
+                                out.model_used = Some(model.to_string());
+                            }
+                        }
+                        Some("session/load") if msg.get("error").is_none() => {
+                            if let Some(model) = msg["result"]["models"]["currentModelId"].as_str().filter(|s| !s.is_empty()) {
+                                out.model_used = Some(model.to_string());
+                            }
+                        }
+                        Some("session/set_model" | "session/set_config_option") if msg.get("error").is_none() => {
+                            if let Some(model) = sent_model.get(&id) {
+                                out.model_used = Some(model.clone());
+                            }
+                        }
                         Some("session/prompt") if out.prompt == Some(id) => {
                             out.prompt = None;
                             out.answered = Some(msg["result"].clone());
@@ -613,11 +1017,34 @@ fn trace(way: &str, line: &str) {
     }
 }
 
+/// Track running tool calls and model request/turn boundaries for an ACP `session/update`.
+fn observe_turn(requests: &mut u32, saw_tool_finish: &mut bool, tools: &mut BTreeSet<String>, update: &Value) {
+    let kind = update["sessionUpdate"].as_str();
+    if matches!(kind, Some("agent_thought_chunk" | "agent_message_chunk" | "tool_call"))
+        && (*requests == 0 || *saw_tool_finish)
+    {
+        *requests = requests.saturating_add(1);
+        *saw_tool_finish = false;
+    }
+    let was_running = !tools.is_empty();
+    let finished = matches!(
+        update["status"].as_str(),
+        Some("completed" | "failed" | "cancelled" | "canceled" | "rejected" | "denied" | "error")
+    );
+    track_tool(tools, update);
+    if finished && (was_running || matches!(kind, Some("tool_call" | "tool_call_update"))) && tools.is_empty() {
+        *saw_tool_finish = true;
+    }
+}
+
 /// Keep the set of running tool calls current. A call is running from its first report
-/// until an update says it completed or failed.
+/// until an update says it reached any terminal status.
 fn track_tool(tools: &mut BTreeSet<String>, update: &Value) {
     let Some(id) = update["toolCallId"].as_str() else { return };
-    let finished = matches!(update["status"].as_str(), Some("completed" | "failed"));
+    let finished = matches!(
+        update["status"].as_str(),
+        Some("completed" | "failed" | "cancelled" | "canceled" | "rejected" | "denied" | "error")
+    );
     match update["sessionUpdate"].as_str() {
         Some("tool_call" | "tool_call_update") if finished => {
             tools.remove(id);
@@ -641,33 +1068,41 @@ fn update_events(update: &Value) -> Vec<HarnessEvent> {
                 name: tool_name(update),
                 input: update["rawInput"].clone(),
             }];
-            if let Some(result) = tool_result(&id, update) {
-                events.push(result);
-            }
+            events.extend(tool_result(&id, update));
             events
         }
         // A later update carries the call's output. Status alone is not a result.
         Some("tool_call_update") => {
             let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
-            tool_result(&id, update).into_iter().collect()
+            tool_result(&id, update)
         }
         _ => Vec::new(),
     }
 }
 
-/// Text and a diff from an ACP tool call, only from fields the agent sent.
+/// Text and diffs from an ACP tool call, only from fields the agent sent.
 /// `content` is a list of `{ type: "content", content: { type: "text", text } }`
 /// or `{ type: "diff", path, oldText?, newText }`. `rawOutput` is the fallback.
-fn tool_result(id: &str, update: &Value) -> Option<HarnessEvent> {
+///
+/// Synthetic diffs computed locally from `oldText`/`newText` (e.g. `write_file` preview
+/// blocks that the agent does not feed back to the model as tool output) are returned as
+/// [`HarnessEvent::ToolDiff`] separate from [`HarnessEvent::ToolResult`] so output
+/// analysis never double-counts file writes.
+fn tool_result(id: &str, update: &Value) -> Vec<HarnessEvent> {
     let mut text = String::new();
-    let mut diffs = Vec::new();
+    let mut real_diffs = Vec::new();
+    let mut synthetic_diffs = Vec::new();
     if let Some(blocks) = update["content"].as_array() {
         for block in blocks {
             match block["type"].as_str() {
                 Some("content") => push_text(&mut text, content_text(&block["content"])),
                 Some("diff") => {
-                    if let Some(diff) = acp_diff(block) {
-                        diffs.push(diff);
+                    if let Some((diff, synthetic)) = acp_diff(block) {
+                        if synthetic {
+                            synthetic_diffs.push(diff);
+                        } else {
+                            real_diffs.push(diff);
+                        }
                     }
                 }
                 _ => {}
@@ -680,14 +1115,22 @@ fn tool_result(id: &str, update: &Value) -> Option<HarnessEvent> {
     if text.is_empty() {
         push_text(&mut text, loose_output(&update["output"]));
     }
-    if text.is_empty() && diffs.is_empty() {
-        return None;
+    let mut events = Vec::new();
+    if !text.is_empty() || !real_diffs.is_empty() {
+        events.push(HarnessEvent::ToolResult {
+            id: id.to_string(),
+            text: crate::clip_result(&text),
+            diff: (!real_diffs.is_empty()).then(|| crate::clip_result(&real_diffs.join("\n"))),
+        });
     }
-    Some(HarnessEvent::ToolResult {
-        id: id.to_string(),
-        text: crate::clip_result(&text),
-        diff: (!diffs.is_empty()).then(|| crate::clip_result(&diffs.join("\n"))),
-    })
+    if !synthetic_diffs.is_empty() {
+        events.push(HarnessEvent::ToolDiff {
+            id: id.to_string(),
+            diff: crate::clip_result(&synthetic_diffs.join("\n")),
+            synthetic: true,
+        });
+    }
+    events
 }
 
 fn push_text(into: &mut String, next: String) {
@@ -719,10 +1162,11 @@ fn loose_output(value: &Value) -> String {
     String::new()
 }
 
-/// A unified diff from the `oldText` and `newText` an ACP diff block already carried.
-fn acp_diff(block: &Value) -> Option<String> {
+/// A unified diff from an ACP diff block, plus whether it was synthesized locally from
+/// `oldText`/`newText` (`true`) versus provided directly in `block["diff"]` (`false`).
+fn acp_diff(block: &Value) -> Option<(String, bool)> {
     if let Some(diff) = block["diff"].as_str().filter(|d| !d.is_empty()) {
-        return Some(diff.to_string());
+        return Some((diff.to_string(), false));
     }
     if block.get("newText").is_none() && block.get("oldText").is_none() {
         return None;
@@ -730,7 +1174,7 @@ fn acp_diff(block: &Value) -> Option<String> {
     let path = block["path"].as_str().filter(|p| !p.is_empty()).unwrap_or("file");
     let old = block["oldText"].as_str().unwrap_or("");
     let new = block["newText"].as_str().unwrap_or("");
-    Some(unified(path, old, new))
+    Some((unified(path, old, new), true))
 }
 
 fn unified(path: &str, old: &str, new: &str) -> String {
@@ -892,6 +1336,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         assert_eq!(harness.args_for(&task), ["agent", "stdio"]);
@@ -996,6 +1441,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let (tx, _rx) = mpsc::channel(8);
@@ -1028,6 +1474,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(std::env::temp_dir(), vec![]));
@@ -1109,6 +1556,7 @@ sleep 30"#,
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: Some(crate::hold::HoldSpec { holder: holder.clone(), key: "p/r/unit:a".into(), meta: json!({}) }),
         };
         let (tx, mut rx) = mpsc::channel(32);
@@ -1204,7 +1652,7 @@ sleep 30"#,
     }
 
     #[test]
-    fn a_tool_update_attaches_its_output_and_diff_and_nothing_else() {
+    fn a_tool_update_separates_synthetic_diffs_from_real_tool_output() {
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "call_1",
@@ -1215,16 +1663,48 @@ sleep 30"#,
             ]
         });
         let events = update_events(&update);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             HarnessEvent::ToolResult { id, text, diff } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(text, "ok\n");
-                let diff = diff.as_deref().unwrap();
-                assert!(diff.contains("--- a/a.ts") && diff.contains("-a") && diff.contains("+b"), "{diff}");
+                assert!(diff.is_none(), "synthetic diff must not ride inside ToolResult");
             }
             other => panic!("expected a tool result, got {other:?}"),
         }
+        match &events[1] {
+            HarnessEvent::ToolDiff { id, diff, synthetic } => {
+                assert_eq!(id, "call_1");
+                assert!(*synthetic);
+                assert!(diff.contains("--- a/a.ts") && diff.contains("-a") && diff.contains("+b"), "{diff}");
+            }
+            other => panic!("expected a synthetic tool diff, got {other:?}"),
+        }
+        // A write_file diff block with no output text emits only ToolDiff, never a fake ToolResult.
+        let write_diff_only = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_w",
+            "status": "completed",
+            "content": [
+                { "type": "diff", "path": "pkg/mod.py", "newText": "def hi():\n    return 1\n" }
+            ]
+        });
+        let events = update_events(&write_diff_only);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], HarnessEvent::ToolDiff { id, synthetic: true, diff } if id == "call_w" && diff.contains("+def hi():")));
+        // A direct agent-supplied `block["diff"]` stays on ToolResult (non-synthetic).
+        let direct_diff = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_d",
+            "status": "completed",
+            "content": [
+                { "type": "diff", "diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-1\n+2\n" }
+            ]
+        });
+        let events = update_events(&direct_diff);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], HarnessEvent::ToolResult { id, text, diff: Some(d) } if id == "call_d" && text.is_empty() && d.contains("+2")));
+
         assert!(update_events(&json!({
             "sessionUpdate": "tool_call_update", "toolCallId": "call_1", "status": "completed"
         }))
@@ -1238,6 +1718,30 @@ sleep 30"#,
         assert!(matches!(&events[0], HarnessEvent::ToolCall { name, .. } if name == "write"));
         assert!(matches!(&events[1], HarnessEvent::ToolResult { text, diff: None, .. } if text == "wrote a.ts"));
         assert!(!events.iter().any(|event| matches!(event, HarnessEvent::Thought { .. })));
+    }
+
+    #[test]
+    fn observe_turn_counts_parallel_batches_and_silent_mcp_completions() {
+        let mut requests = 0u32;
+        let mut saw_finish = false;
+        let mut tools = BTreeSet::new();
+        // Turn 1: thought + two parallel tool calls
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "agent_thought_chunk", "content": { "text": "plan" } }));
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "w1", "status": "pending" }));
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "w2", "status": "pending" }));
+        assert_eq!(requests, 1);
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "w1", "status": "completed" }));
+        assert!(!saw_finish, "batch still has w2 running");
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "w2", "status": "completed" }));
+        assert!(saw_finish);
+        // Turn 2: silent flow_query (no content text, only completed status)
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "fq1", "status": "pending" }));
+        assert_eq!(requests, 2);
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "fq1", "status": "completed" }));
+        assert!(saw_finish);
+        // Turn 3: final assistant text
+        observe_turn(&mut requests, &mut saw_finish, &mut tools, &json!({ "sessionUpdate": "agent_message_chunk", "content": { "text": "done" } }));
+        assert_eq!(requests, 3);
     }
 
     #[tokio::test]
@@ -1276,6 +1780,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             code_mode: true,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
@@ -1296,5 +1801,542 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 ("taskmaster__run_code".to_string(), true),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_code_mode_prompt_names_mcp_dictionary_run_code() {
+        assert_eq!(crate::run_code_tool_name("antigravity", "dictionary"), "mcp_dictionary_run_code");
+        assert_eq!(crate::run_code_tool_name("claude", "dictionary"), "mcp__dictionary__run_code");
+        assert_eq!(crate::run_code_tool_name("grok-build", "dictionary"), "dictionary__run_code");
+        assert_eq!(crate::run_code_tool_name("opencode", "dictionary"), "dictionary_run_code");
+
+        let capture = std::env::temp_dir().join(format!("tm-acp-prompt-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; printf '%s\n' "$l" > "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display()
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "implement parser".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:9/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, _rx) = mpsc::channel(16);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        let sent = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert!(
+            sent.contains("mcp_dictionary_run_code"),
+            "expected prompt to name mcp_dictionary_run_code, got: {sent}"
+        );
+        assert!(
+            !sent.contains("`run_code`"),
+            "prompt for antigravity should not tell agent to call bare `run_code`: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_or_cancelled_tool_call_does_not_disable_stall_timer() {
+        let mut tools = BTreeSet::new();
+        for status in ["cancelled", "canceled", "rejected", "denied", "error"] {
+            track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call", "toolCallId": "t1" }));
+            assert!(tools.contains("t1"));
+            track_tool(&mut tools, &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": status }));
+            assert!(!tools.contains("t1"), "status `{status}` must clear tracked tool");
+        }
+
+        // Agent announces tool_call t-denied, requests permission (which is denied), never emits
+        // a completed update, and hangs silently: the stall timer must still fire!
+        let script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}'
+read l
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t-denied","name":"shell","kind":"execute"}}}'
+echo '{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"t-denied","name":"shell","kind":"execute","rawInput":{"command":"id"}},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}'
+read r
+sleep 30
+"#;
+        let harness = AcpHarness {
+            id: "fake",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "{server}__",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: Some(std::time::Duration::from_millis(150)),
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, _rx) = mpsc::channel(16);
+        let err = harness.run(task, gate, tx).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<Stalled>().is_some(),
+            "denied tool call must not permanently suppress stall detection; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_attaches_dictionary_mcp_and_allows_flow_query_in_code_mode_off_and_on() {
+        let cases: &[(&'static str, &'static str, &str)] = &[
+            ("antigravity", "mcp_{server}_", "mcp_dictionary_flow_query"),
+            ("grok-build", "{server}__", "dictionary__flow_query"),
+            ("opencode", "{server}_", "dictionary_flow_query"),
+        ];
+        for &(hid, prefix, flow_tool) in cases {
+            for code_mode in [false, true] {
+                let capture = std::env::temp_dir().join(format!(
+                    "tm-acp-flow-mcp-{hid}-{code_mode}-{}.txt",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&capture);
+                let script = format!(
+                    r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; printf '%s\n' "$l" > "{}"
+echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l
+echo '{{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{{"toolCall":{{"toolCallId":"t-flow","name":"{flow_tool}","kind":"other","rawInput":{{"op":"find","query":"Store"}}}},"options":[{{"optionId":"allow","kind":"allow_once"}},{{"optionId":"deny","kind":"reject_once"}}]}} }}'
+read perm_flow
+printf '%s\n' "$perm_flow" >> "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+                    capture.display(),
+                    capture.display(),
+                );
+                let harness = AcpHarness {
+                    id: hid,
+                    binary: "sh".into(),
+                    args: vec!["-c".into(), script],
+                    sandbox: None,
+                    mcp_tool_prefix: prefix,
+                    effort_flag: None,
+                };
+                let task = WorkerTask {
+                    brief: "build".into(),
+                    cwd: PathBuf::from("/tmp"),
+                    model: None,
+                    effort: None,
+                    dictionary: Some(crate::DictionaryAccess {
+                        name: "dictionary".into(),
+                        url: "http://127.0.0.1:43210/mcp".into(),
+                        bearer_token: "secret-tok".into(),
+                    }),
+                    timeout: std::time::Duration::from_secs(10),
+                    stall: None,
+                    read_only: false,
+                    code_mode,
+                    shell: None,
+                    permission_mode: None,
+            native_search: false,
+                    hold: None,
+                };
+                let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+                let (tx, _rx) = mpsc::channel(16);
+                let summary = harness.run(task, gate, tx).await.unwrap();
+                assert!(summary.ok, "{hid} code_mode={code_mode}");
+                assert_eq!(summary.denied, 0, "{flow_tool} must be allowed on {hid} (code_mode={code_mode})");
+                let log = std::fs::read_to_string(&capture).unwrap();
+                let _ = std::fs::remove_file(&capture);
+                let mut lines = log.lines();
+                let session_new: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+                let servers = session_new["params"]["mcpServers"].as_array().unwrap();
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0]["name"], "dictionary");
+                assert_eq!(servers[0]["url"], "http://127.0.0.1:43210/mcp");
+                assert_eq!(servers[0]["headers"][0]["value"], "Bearer secret-tok");
+                let perm_reply: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+                assert_eq!(
+                    perm_reply["result"]["outcome"]["optionId"], "allow",
+                    "{flow_tool} must be allowed by permission gate on {hid} (code_mode={code_mode}): {perm_reply}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_effort_model_mapping_verifies_catalog_and_preserves_non_tiered_models() {
+        let catalog: Vec<String> = vec![
+            "gemini-4-neon-low".into(),
+            "gemini-4-neon-medium".into(),
+            "gemini-4-neon-high".into(),
+            "gemini-4-neon-xhigh".into(),
+            "gpt-oss-120b-medium".into(),
+            "gemini-pro-orchestrator-neon".into(),
+        ];
+        // Verified family with catalog: easy -> -low, normal -> -medium, hard/None -> unchanged.
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", Some("low"), &catalog), "gemini-4-neon-low");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", Some("medium"), &catalog), "gemini-4-neon-medium");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", Some("high"), &catalog), "gemini-4-neon-high");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-high", None, &catalog), "gemini-4-neon-high");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-xhigh", Some("high"), &catalog), "gemini-4-neon-xhigh");
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-xhigh", Some("medium"), &catalog), "gemini-4-neon-medium");
+        // Never silently upgrades explicit -low model.
+        assert_eq!(resolve_antigravity_model("gemini-4-neon-low", Some("medium"), &catalog), "gemini-4-neon-low");
+        // Models without target variant stay verbatim!
+        assert_eq!(resolve_antigravity_model("gpt-oss-120b-medium", Some("low"), &catalog), "gpt-oss-120b-medium");
+        assert_eq!(resolve_antigravity_model("gemini-pro-orchestrator-neon", Some("low"), &catalog), "gemini-pro-orchestrator-neon");
+        // Empty catalog: only verified ANTIGRAVITY_EFFORT_FAMILIES are mapped.
+        assert_eq!(resolve_antigravity_model("claude-sonnet-5-5-high", Some("low"), &[]), "claude-sonnet-5-5-low");
+        assert_eq!(resolve_antigravity_model("gpt-oss-120b-medium", Some("low"), &[]), "gpt-oss-120b-medium");
+        assert_eq!(resolve_antigravity_model("custom-model-high", Some("low"), &[]), "custom-model-high");
+    }
+
+    #[tokio::test]
+    async fn acp_antigravity_wires_effort_variant_and_falls_back_to_explicit_model() {
+        let capture = std::env::temp_dir().join(format!("tm-acp-effort-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        // Script returns availableModels with neon-{low,medium,high}, rejects the first set_model
+        // only on the fallback test case, and logs every set_model call.
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s","models":{{"currentModelId":"gemini-4-neon-high","availableModels":[{{"modelId":"gemini-4-neon-low"}},{{"modelId":"gemini-4-neon-medium"}},{{"modelId":"gemini-4-neon-high"}}]}}}}}}'
+read l; printf '%s\n' "$l" >> "{}"
+echo '{{"jsonrpc":"2.0","id":3,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display(),
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: Some("gemini-4-neon-high".into()),
+            effort: Some("medium".into()),
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, mut rx) = mpsc::channel(8);
+        let (summary, kept) = harness.run_kept(task, gate, tx).await;
+        assert!(summary.unwrap().ok);
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                HarnessEvent::SessionStarted { session_id: "s".into() },
+                HarnessEvent::ModelSelected {
+                    requested: Some("gemini-4-neon-high".into()),
+                    used: "gemini-4-neon-medium".into(),
+                },
+            ],
+            "routed ACP effort variant must emit ModelSelected with requested + effective model",
+        );
+        let kept = kept.expect("kept session");
+        assert_eq!(kept.model_used(), Some("gemini-4-neon-medium"));
+        let _ = kept.close().await;
+        let sent: Value = serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert_eq!(sent["method"], "session/set_model");
+        assert_eq!(sent["params"]["modelId"], "gemini-4-neon-medium");
+
+        // Fallback test: if the mapped variant fails on set_model, fall back to the explicit model.
+        let capture2 = std::env::temp_dir().join(format!("tm-acp-effort-fb-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture2);
+        let script2 = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; printf '%s\n' "$l" >> "{}"
+echo '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32000,"message":"variant unavailable"}}}}'
+read l; printf '%s\n' "$l" >> "{}"
+echo '{{"jsonrpc":"2.0","id":4,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":5,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture2.display(),
+            capture2.display(),
+        );
+        let harness2 = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script2],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task2 = WorkerTask {
+            brief: "build".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: Some("gemini-4-neon-high".into()),
+            effort: Some("low".into()),
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        let gate2 = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx2, mut rx2) = mpsc::channel(8);
+        let summary2 = harness2.run(task2, gate2, tx2).await.unwrap();
+        assert!(summary2.ok);
+        let mut events2 = Vec::new();
+        while let Some(ev) = rx2.recv().await {
+            events2.push(ev);
+        }
+        assert_eq!(
+            events2,
+            vec![
+                HarnessEvent::SessionStarted { session_id: "s".into() },
+                HarnessEvent::ModelSelected {
+                    requested: Some("gemini-4-neon-high".into()),
+                    used: "gemini-4-neon-high".into(),
+                },
+            ],
+            "fallback to explicit model must report the fallback model in ModelSelected",
+        );
+        let log2 = std::fs::read_to_string(&capture2).unwrap();
+        let _ = std::fs::remove_file(&capture2);
+        let calls: Vec<Value> = log2.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["params"]["modelId"], "gemini-4-neon-low");
+        assert_eq!(calls[1]["params"]["modelId"], "gemini-4-neon-high");
+    }
+
+    #[tokio::test]
+    async fn acp_kept_session_rebind_gate_enforces_new_gate_on_follow_up() {
+        let capture = std::env::temp_dir().join(format!("tm-acp-rebind-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let script = format!(
+            r#"
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+read l
+echo '{{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{{"toolCall":{{"toolCallId":"t1","name":"shell","kind":"execute","rawInput":{{"command":"echo hi"}}}},"options":[{{"optionId":"allow","kind":"allow_once"}},{{"optionId":"deny","kind":"reject_once"}}]}} }}'
+read perm
+printf '%s\n' "$perm" > "{}"
+echo '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            capture.display(),
+        );
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "unit 1".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        // Turn 1 gate allows shell; turn 2 rebinds to a read-only gate that denies shell.
+        let allow_gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).with_shell());
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (res1, kept) = harness.run_kept(task, allow_gate, tx1).await;
+        assert!(res1.unwrap().ok);
+        let mut session = kept.expect("session kept");
+        let deny_gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).read_only());
+        session.rebind_gate(deny_gate);
+        let (tx2, _rx2) = mpsc::channel(8);
+        let res2 = session.follow_up("unit 2".into(), tx2, std::time::Duration::from_secs(10)).await.unwrap();
+        assert!(res2.ok);
+        assert_eq!(res2.denied, 1, "rebound read-only gate must deny shell call");
+        let perm_reply: Value = serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
+        let _ = std::fs::remove_file(&capture);
+        assert_eq!(perm_reply["result"]["outcome"]["optionId"], "deny");
+        let _ = session.close().await;
+    }
+
+    #[tokio::test]
+    async fn fix_n9_code_mode_erofs_tool_result_emits_use_run_code_refusal() {
+        let script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-erofs"}}'
+read l
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"edit_file","rawInput":{"path":"mdtodo/storage.py"}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"failed","content":[{"type":"content","content":{"type":"text","text":"open /tmp/wt/mdtodo/storage.py: read-only file system"}}]}}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "fix storage".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: Some(crate::DictionaryAccess {
+                name: "dictionary".into(),
+                url: "http://127.0.0.1:1/mcp".into(),
+                bearer_token: "tok".into(),
+            }),
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: false,
+            code_mode: true,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]));
+        let (tx, mut rx) = mpsc::channel(16);
+        let summary = harness.run(task, gate, tx).await.unwrap();
+        assert!(summary.ok);
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                HarnessEvent::PermissionDecided { tool, allowed: false } if tool == "edit_file (use run_code)"
+            )),
+            "native edit_file EROFS in Code Mode must emit (use run_code) refusal: {events:?}"
+        );
+        let msg = crate::code_mode_redirect_message(&["edit_file (use run_code)".into()], "mcp_dictionary_run_code")
+            .expect("redirect message");
+        assert!(msg.contains("mcp_dictionary_run_code") && msg.contains("edit"));
+    }
+
+    #[tokio::test]
+    async fn fix_n9_acp_detects_antigravity_individual_quota_and_429_without_returning_ok() {
+        // 1. Text-delivered Antigravity quota stop with `stopReason: "end_turn"` (tb15-calcx-plus-tmh).
+        let text_quota_script = r#"
+read l; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-q1"}}'
+read l
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m23s.\n"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        let harness = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), text_quota_script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let task = WorkerTask {
+            brief: "plan".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            effort: None,
+            dictionary: None,
+            timeout: std::time::Duration::from_secs(10),
+            stall: None,
+            read_only: true,
+            code_mode: false,
+            shell: None,
+            permission_mode: None,
+            native_search: false,
+            hold: None,
+        };
+        let gate = Arc::new(crate::gate::WorktreeGate::new(PathBuf::from("/tmp"), vec![]).read_only());
+        let (tx, mut rx) = mpsc::channel(16);
+        let err = harness.run(task.clone(), gate.clone(), tx).await.unwrap_err();
+        let quota = err.downcast_ref::<crate::QuotaError>().expect("QuotaError from ACP harness");
+        assert!(!quota.is_rate_limit);
+        assert_eq!(quota.reset.as_deref(), Some("in 1h1m23s"));
+        let mut saw_rl = false;
+        while let Some(ev) = rx.recv().await {
+            if let HarnessEvent::RateLimit(r) = ev {
+                assert_eq!(r.window_5h_pct, Some(100.0));
+                assert_eq!(r.reset_5h.as_deref(), Some("in 1h1m23s"));
+                saw_rl = true;
+            }
+        }
+        assert!(saw_rl, "expected RateLimit event on quota stop");
+
+        // 2. JSON-RPC error with RESOURCE_EXHAUSTED (code 429) from tb15b-calcx-agy.log.
+        let rpc_429_script = r#"
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-q2"}}'
+read l
+echo '{"jsonrpc":"2.0","id":3,"error":{"code":429,"message":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m7s."}}'
+"#;
+        let harness2 = AcpHarness {
+            id: "antigravity",
+            binary: "sh".into(),
+            args: vec!["-c".into(), rpc_429_script.into()],
+            sandbox: None,
+            mcp_tool_prefix: "mcp_{server}_",
+            effort_flag: None,
+        };
+        let (tx2, _rx2) = mpsc::channel(16);
+        let err2 = harness2.run(task, gate, tx2).await.unwrap_err();
+        let quota2 = err2.downcast_ref::<crate::QuotaError>().expect("QuotaError from JSON-RPC 429");
+        assert_eq!(quota2.reset.as_deref(), Some("in 1h1m7s"));
     }
 }

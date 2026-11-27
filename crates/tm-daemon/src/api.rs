@@ -211,6 +211,8 @@ pub struct ServerOptions {
     /// Where phone notifications (Web Push, ntfy) keep their key and subscriptions. `None` turns
     /// them off; `tm-daemon serve` uses `~/.taskmaster/push.json`.
     pub push: Option<PathBuf>,
+    /// Force offline mode for every run started by this server (`--offline` / `TASKMASTER_OFFLINE=1`).
+    pub offline: bool,
 }
 
 impl ServerOptions {
@@ -233,6 +235,7 @@ impl ServerOptions {
             skills_fetch: Arc::new(crate::skills::Web),
             holder: None,
             push: None,
+            offline: false,
         }
     }
 }
@@ -332,6 +335,8 @@ struct App {
     router: std::sync::OnceLock<Router>,
     /// The listener on the local-network address, when Connect opened one.
     network: Mutex<Option<(SocketAddr, tokio::task::JoinHandle<()>)>>,
+    /// Force offline mode on runs started by this server.
+    offline: bool,
 }
 
 type IdempotencyEntry = (Instant, StatusCode, Vec<u8>);
@@ -438,6 +443,7 @@ impl Server {
             }),
             router: std::sync::OnceLock::new(),
             network: Mutex::new(None),
+            offline: options.offline,
         });
         app.close_interrupted_reviews();
         // H3: runs whose agents the last daemon handed to this one go on at once.
@@ -1081,9 +1087,14 @@ impl App {
         config.code_sh_secs = saved.code_mode.sh_secs;
         config.worker_shell = saved.sandbox.shell;
         config.package_indexes = saved.sandbox.package_indexes;
-        config.prices = crate::settings::price_table(&saved);
+        config.prices = crate::settings::load_price_table(&saved, &self.project(), None)
+            .unwrap_or_else(|_| crate::settings::price_table(&saved));
         config.timeout = crate::settings::agent_limit(saved.agents.timeout_secs);
         config.warm_idle = std::time::Duration::from_secs(saved.agents.warm_idle_secs);
+        config.effort_routing = crate::settings::effective_effort_routing(saved.agents.effort_routing);
+        config.offline = self.offline || crate::settings::offline_env_enabled();
+        config.brownfield_scout = saved.scout.enabled;
+        config.brownfield_scout_min_files = saved.scout.min_files;
         let policy = crate::policy::Policy::load(&self.project());
         let policy_cap = policy.max_run_cost_usd.filter(|v| v.is_finite() && *v > 0.0);
         let req_or_saved = request

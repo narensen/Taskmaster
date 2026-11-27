@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, Plan, ReviewScope};
+use crate::types::{DictKey, Finding, Flag, FlagResolution, PageId, PagePlan, Plan, ReviewScope};
 
 /// Repair rounds a page gets on one tier before it escalates.
 pub const MAX_REPAIRS: u8 = 2;
@@ -374,7 +374,10 @@ impl Run {
                     );
                     plan.pages.push(page);
                 }
-                for contract in added.contracts {
+                for mut contract in added.contracts {
+                    if contract.phase == 0 {
+                        contract.phase = next;
+                    }
                     if !plan.contracts.iter().any(|c| c.path == contract.path) {
                         plan.contracts.push(contract);
                     }
@@ -536,23 +539,77 @@ impl Run {
         }
     }
 
-    /// Start queued pages up to the parallel limit, then advance the phase if nothing is left.
+    /// Start queued pages up to the parallel limit, prioritizing critical-path units (longest
+    /// downstream dependency chain, tie-breaking by estimated size), then advance the phase if
+    /// nothing is left.
+    ///
+    /// Independent unblocked units (no unsatisfied dependency edge and no overlapping owned files)
+    /// share a wave up to `max_parallel` and are never starved by blocked units sitting in the
+    /// daemon's pending queue waiting on earlier dependencies.
     fn settle(&mut self, out: &mut Vec<Command>) {
-        let mut running = self.count(PageState::Building);
-        // Units of a later phase wait for theirs; a repair of an earlier one may run.
-        let order: Vec<PageId> = match &self.plan {
-            Some(plan) => plan.pages.iter().filter(|p| p.phase <= self.phase_at).map(|p| p.id.clone()).collect(),
-            None => return,
+        let Some(plan) = self.plan.clone() else { return };
+        let is_unblocked = |page: &crate::types::PagePlan, pages: &BTreeMap<PageId, PageRun>| {
+            page.depends_on.iter().all(|dep| {
+                dep == &page.id
+                    || pages.get(dep).is_none_or(|st| st.state == PageState::Passed)
+            })
         };
-        for id in order {
-            if running >= self.max_parallel {
+
+        let mut unblocked_building = 0usize;
+        let mut active_globs: Vec<String> = Vec::new();
+        let mut all_building_globs: Vec<String> = Vec::new();
+        for p in &plan.pages {
+            if self.pages.get(&p.id).is_some_and(|st| st.state == PageState::Building) {
+                all_building_globs.push(p.owned_glob.clone());
+                if is_unblocked(p, &self.pages) {
+                    unblocked_building += 1;
+                    active_globs.push(p.owned_glob.clone());
+                }
+            }
+        }
+
+        let downstream = downstream_chain_lengths(&plan);
+        let mut unblocked: Vec<(usize, usize, usize, PageId, String)> = Vec::new();
+        let mut blocked: Vec<(usize, usize, usize, PageId, String)> = Vec::new();
+        // Units of a later phase wait for theirs; a repair of an earlier one may run.
+        for (idx, p) in plan.pages.iter().enumerate() {
+            if p.phase > self.phase_at {
+                continue;
+            }
+            if !self.pages.get(&p.id).is_some_and(|st| st.state == PageState::Queued) {
+                continue;
+            }
+            let chain = downstream.get(&p.id).copied().unwrap_or(0);
+            let size = estimated_unit_size(p);
+            let item = (chain, size, idx, p.id.clone(), p.owned_glob.clone());
+            if is_unblocked(p, &self.pages) {
+                unblocked.push(item);
+            } else {
+                blocked.push(item);
+            }
+        }
+        let sort_key = |a: &(usize, usize, usize, PageId, String), b: &(usize, usize, usize, PageId, String)| {
+            b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2))
+        };
+        unblocked.sort_by(sort_key);
+        blocked.sort_by(sort_key);
+
+        // Pass 1: fill wave slots with all independent unblocked units whose owned files do not
+        // overlap an already-active unit.
+        for (_, _, _, id, glob) in unblocked {
+            if unblocked_building >= self.max_parallel {
                 break;
+            }
+            if active_globs.iter().any(|g| crate::types::owned_globs_overlap(g, &glob)) {
+                continue;
             }
             let p = self.pages.get_mut(&id).expect("every planned page has a PageRun");
             if p.state == PageState::Queued {
                 p.state = PageState::Building;
                 self.dirty.insert(id.clone());
-                running += 1;
+                unblocked_building += 1;
+                active_globs.push(glob.clone());
+                all_building_globs.push(glob);
                 out.push(Command::SpawnWorker {
                     page: id,
                     tier: p.tier,
@@ -560,7 +617,63 @@ impl Run {
                 });
             }
         }
-        let open = running + self.count(PageState::Flagged);
+
+        // Pass 2: when locked interface contracts exist and spare slots remain, speculatively
+        // hand non-overlapping blocked units to the daemon so contract-only dependents can start
+        // in parallel with their upstream. Because Pass 1 counts only `unblocked_building`, these
+        // speculative entries never starve newly-unblocked independent units later.
+        let has_interface_contracts = plan.contracts.iter().any(|c| !c.is_test());
+        let mut total_building = self.count(PageState::Building);
+        if has_interface_contracts && total_building < self.max_parallel {
+            for (_, _, _, id, glob) in &blocked {
+                if total_building >= self.max_parallel {
+                    break;
+                }
+                if all_building_globs.iter().any(|g| crate::types::owned_globs_overlap(g, glob)) {
+                    continue;
+                }
+                let p = self.pages.get_mut(id).expect("every planned page has a PageRun");
+                if p.state == PageState::Queued {
+                    p.state = PageState::Building;
+                    self.dirty.insert(id.clone());
+                    total_building += 1;
+                    all_building_globs.push(glob.clone());
+                    out.push(Command::SpawnWorker {
+                        page: id.clone(),
+                        tier: p.tier,
+                        errors: p.pending_errors.take(),
+                    });
+                }
+            }
+        }
+
+        // Fallback for cyclic dependency graphs where nothing is unblocked and nothing failed:
+        // start non-overlapping queued units so the run never skips queued work.
+        let mut open = self.count(PageState::Building) + self.count(PageState::Flagged);
+        if open == 0 && self.count(PageState::Failed) == 0 && !blocked.is_empty() {
+            let mut started = 0usize;
+            for (_, _, _, id, glob) in blocked {
+                if started >= self.max_parallel {
+                    break;
+                }
+                if all_building_globs.iter().any(|g| crate::types::owned_globs_overlap(g, &glob)) {
+                    continue;
+                }
+                let p = self.pages.get_mut(&id).expect("every planned page has a PageRun");
+                if p.state == PageState::Queued {
+                    p.state = PageState::Building;
+                    self.dirty.insert(id.clone());
+                    started += 1;
+                    all_building_globs.push(glob);
+                    out.push(Command::SpawnWorker {
+                        page: id,
+                        tier: p.tier,
+                        errors: p.pending_errors.take(),
+                    });
+                }
+            }
+            open = self.count(PageState::Building) + self.count(PageState::Flagged);
+        }
         if open == 0 {
             if self.count(PageState::Failed) == 0 {
                 self.after_build(out);
@@ -582,6 +695,83 @@ impl Run {
     fn count(&self, state: PageState) -> usize {
         self.pages.values().filter(|p| p.state == state).count()
     }
+}
+
+/// Longest downstream dependency chain length (in edges) from each unit in `plan`.
+/// A unit with no dependents has length 0; `A <- B` gives `A: 1, B: 0`; `A <- B <- C` gives
+/// `A: 2, B: 1, C: 0`. Cycles are broken safely.
+pub fn downstream_chain_lengths(plan: &Plan) -> BTreeMap<PageId, usize> {
+    let known: BTreeSet<&str> = plan.pages.iter().map(|p| p.id.as_str()).collect();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for page in &plan.pages {
+        for dep in &page.depends_on {
+            if dep.as_str() != page.id.as_str() && known.contains(dep.as_str()) {
+                dependents.entry(dep.as_str()).or_default().push(page.id.as_str());
+            }
+        }
+    }
+    fn longest<'a>(
+        id: &'a str,
+        dependents: &BTreeMap<&'a str, Vec<&'a str>>,
+        visiting: &mut BTreeSet<&'a str>,
+        memo: &mut BTreeMap<&'a str, usize>,
+    ) -> usize {
+        if let Some(&len) = memo.get(id) {
+            return len;
+        }
+        if !visiting.insert(id) {
+            return 0;
+        }
+        let mut best = 0usize;
+        if let Some(children) = dependents.get(id) {
+            for child in children {
+                if !visiting.contains(child) {
+                    best = best.max(1 + longest(child, dependents, visiting, memo));
+                }
+            }
+        }
+        visiting.remove(id);
+        memo.insert(id, best);
+        best
+    }
+    let mut memo = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    plan.pages
+        .iter()
+        .map(|p| {
+            let len = longest(p.id.as_str(), &dependents, &mut visiting, &mut memo);
+            (p.id.clone(), len)
+        })
+        .collect()
+}
+
+/// Estimated work size for tie-breaking critical-path wave scheduling: combines owned file
+/// count (brace alternatives / split sub-units) with specification length (`brief`, `context`,
+/// `done`, and sub-unit specs). Units with identical glob cardinality and empty specs tie.
+pub fn estimated_unit_size(page: &PagePlan) -> usize {
+    let file_count = glob_item_count(&page.owned_glob).max(page.units.len());
+    let spec_len = page.brief.len()
+        + page.context.len()
+        + page.done.len()
+        + page
+            .units
+            .iter()
+            .map(|u| u.brief.len() + u.context.len() + u.done.len())
+            .sum::<usize>();
+    spec_len.saturating_add(file_count.saturating_mul(256))
+}
+
+fn glob_item_count(glob: &str) -> usize {
+    let trimmed = glob.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    if let Some(inner) = trimmed.strip_prefix('{').and_then(|g| g.strip_suffix('}'))
+        && !inner.contains(['{', '}'])
+    {
+        return inner.split(',').filter(|s| !s.trim().is_empty()).count();
+    }
+    1
 }
 
 #[cfg(test)]
@@ -910,6 +1100,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn focused_mode_converges_across_distinct_errors_until_fixed_or_capped() {
         let (mut run, _) = started(&[("app", &[])], 1);
         run.focused = true;
@@ -946,5 +1137,152 @@ mod tests {
         }
         assert_eq!(attempts, MAX_FOCUSED_PROGRESS_REPAIRS);
         assert_eq!(capped.phase, RunPhase::Failed);
+=======
+    fn wave_starts_critical_path_and_largest_units_first_under_parallel_limit() {
+        // Mirror the n4 tinydb shape: 4 ready units competing for 2 slots.
+        // - `leaf` has no dependents (downstream = 0) and small brief
+        // - `tokenizer` has 1 dependent (`cli`, downstream = 1) and small brief
+        // - `executor` has 1 dependent (`cli`, downstream = 1) and larger brief + 3 owned files
+        // - `btree` has a 2-hop downstream chain (`btree -> storage -> cli`, downstream = 2)
+        // Declaration order puts the short units first, so without critical-path ordering
+        // `leaf` and `tokenizer` would consume both slots ahead of `btree` and `executor`.
+        let planned = Plan {
+            pages: vec![
+                PagePlan {
+                    id: "leaf".into(),
+                    owned_glob: "tinydb/leaf.py".into(),
+                    brief: "Small helper.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "tokenizer".into(),
+                    owned_glob: "{tinydb/tokenizer.py,tests/test_tokenizer.py}".into(),
+                    brief: "Short lexer.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "executor".into(),
+                    owned_glob: "{tinydb/planner.py,tinydb/executor.py,tests/test_executor.py}".into(),
+                    brief: "Implement full query planner and SQL execution engine with joins, aggregates, sorting, limits, updates, deletes.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "btree".into(),
+                    owned_glob: "{tinydb/btree.py,tests/test_btree.py}".into(),
+                    brief: "Balanced B-tree.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "storage".into(),
+                    owned_glob: "{tinydb/storage.py,tests/test_storage.py}".into(),
+                    brief: "Persistent storage using BTree.".into(),
+                    depends_on: vec!["btree".into()],
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "{tinydb/cli.py,tests/test_cli.py}".into(),
+                    brief: "Wire CLI.".into(),
+                    depends_on: vec!["tokenizer".into(), "executor".into(), "storage".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut run = Run::new(2);
+        run.step(Event::PlanReady(planned));
+        let cmds = run.step(Event::PlanApproved);
+        let spawned: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::SpawnWorker { page, .. } => Some(page.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Wave 1 (2 slots): `btree` (longest downstream chain = 2) and `executor` (downstream = 1, largest size).
+        assert_eq!(spawned, vec!["btree", "executor"], "long-pole units must fill wave 1 first");
+
+        // Once `btree` finishes, `storage` becomes unblocked alongside `tokenizer` and `leaf`.
+        // `storage` (downstream = 1, larger brief than `tokenizer`) beats `tokenizer` and `leaf`.
+        let next = run.step(finished("btree", WorkerOutcome::Passed));
+        assert_eq!(next, vec![spawn("storage", Tier::Worker, None)]);
+
+        // Next slot goes to `tokenizer` (downstream = 1) ahead of `leaf` (downstream = 0).
+        let next = run.step(finished("executor", WorkerOutcome::Passed));
+        assert_eq!(next, vec![spawn("tokenizer", Tier::Worker, None)]);
+    }
+
+    #[test]
+    fn fix_n9_independent_units_share_wave_without_starvation_from_blocked_units() {
+        // 1. With an interface contract, wave 1 speculatively emits blocked `b` and `c` alongside `a`.
+        //    When `a` finishes, `c` is STILL blocked on `b`, while `b`, `d`, and `e` are all
+        //    unblocked, independent, and own disjoint files — so all 3 must share wave 2 (`parallel=3`).
+        let planned = Plan {
+            contracts: vec![crate::types::ContractFile {
+                path: "pkg/contract.py".into(),
+                content: "class Base: ...\n".into(),
+                phase: 0,
+            }],
+            pages: vec![
+                PagePlan { id: "a".into(), owned_glob: "pkg/a.py".into(), brief: "a".into(), ..Default::default() },
+                PagePlan { id: "b".into(), owned_glob: "pkg/b.py".into(), brief: "b".into(), depends_on: vec!["a".into()], ..Default::default() },
+                PagePlan { id: "c".into(), owned_glob: "pkg/c.py".into(), brief: "c".into(), depends_on: vec!["b".into()], ..Default::default() },
+                PagePlan { id: "d".into(), owned_glob: "pkg/d.py".into(), brief: "d".into(), depends_on: vec!["a".into()], ..Default::default() },
+                PagePlan { id: "e".into(), owned_glob: "pkg/e.py".into(), brief: "e".into(), depends_on: vec!["a".into()], ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let mut run = Run::new(3);
+        run.step(Event::PlanReady(planned));
+        let wave1 = run.step(Event::PlanApproved);
+        assert!(wave1.iter().any(|c| matches!(c, Command::SpawnWorker { page, .. } if page == "a")));
+        let wave2 = run.step(finished("a", WorkerOutcome::Passed));
+        let spawned: Vec<&str> = wave2
+            .iter()
+            .filter_map(|c| match c {
+                Command::SpawnWorker { page, .. } => Some(page.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spawned,
+            vec!["d", "e"],
+            "blocked `c` must not starve independent unblocked `d` and `e` out of wave 2"
+        );
+
+        // 2. Units sharing an owned file inside brace globs do NOT share a wave, whereas disjoint
+        //    independent units immediately share a wave.
+        assert!(crate::owned_globs_overlap(
+            "{pkg/a.py,pkg/shared.py}",
+            "{pkg/shared.py,pkg/b.py}"
+        ));
+        assert!(!crate::owned_globs_overlap(
+            "{pkg/a.py,tests/test_a.py}",
+            "{pkg/b.py,tests/test_b.py}"
+        ));
+        let overlap_plan = Plan {
+            pages: vec![
+                PagePlan { id: "u1".into(), owned_glob: "{pkg/a.py,pkg/shared.py}".into(), brief: "u1".into(), ..Default::default() },
+                PagePlan { id: "u2".into(), owned_glob: "{pkg/shared.py,pkg/b.py}".into(), brief: "u2".into(), ..Default::default() },
+                PagePlan { id: "u3".into(), owned_glob: "{pkg/c.py,tests/test_c.py}".into(), brief: "u3".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let mut run2 = Run::new(3);
+        run2.step(Event::PlanReady(overlap_plan));
+        let cmds = run2.step(Event::PlanApproved);
+        let w1: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::SpawnWorker { page, .. } => Some(page.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(w1, vec!["u1", "u3"], "disjoint u1 and u3 share wave 1 while overlapping u2 waits");
+        assert_eq!(run2.pages["u2"].state, PageState::Queued);
+        let after_u1 = run2.step(finished("u1", WorkerOutcome::Passed));
+        assert_eq!(after_u1, vec![spawn("u2", Tier::Worker, None)]);
+>>>>>>> f8ec87c12ada48009934f58c4b44d40e66c801e3
     }
 }

@@ -54,10 +54,14 @@ pub struct DictionaryEntry {
     pub stats: Option<EntryStats>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContractFile {
     pub path: String,
     pub content: String,
+    /// The phase of the sketch this contract belongs to (0-indexed).
+    /// Defaults to 0 (first phase) for single-phase plans or phase-1 contracts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub phase: usize,
 }
 
 impl ContractFile {
@@ -284,7 +288,7 @@ pub fn units_disjoint(units: &[WorkUnit]) -> bool {
 }
 
 /// Split one top-level `{a,b}` group into its alternatives; any other glob is its own.
-fn glob_alternatives(glob: &str) -> Vec<String> {
+pub fn glob_alternatives(glob: &str) -> Vec<String> {
     let glob = glob.trim();
     if let Some(inner) = glob.strip_prefix('{').and_then(|g| g.strip_suffix('}'))
         && !inner.contains(['{', '}'])
@@ -292,6 +296,26 @@ fn glob_alternatives(glob: &str) -> Vec<String> {
         return inner.split(',').map(|g| g.trim().to_string()).collect();
     }
     vec![glob.to_string()]
+}
+
+/// True when two unit `owned_glob` patterns may match the same file, expanding top-level
+/// `{a,b}` brace groups and checking literal/wildcard overlap. Empty globs never overlap.
+pub fn owned_globs_overlap(a: &str, b: &str) -> bool {
+    let norm = |g: &str| -> Vec<String> {
+        glob_alternatives(g)
+            .into_iter()
+            .map(|s| s.trim().trim_start_matches("./").to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let alts_a = norm(a);
+    let alts_b = norm(b);
+    if alts_a.is_empty() || alts_b.is_empty() {
+        return false;
+    }
+    alts_a
+        .iter()
+        .any(|x| alts_b.iter().any(|y| globs_may_overlap(x, y)))
 }
 
 /// Conservative: true unless the two globs are provably disjoint by literal prefix, or by
@@ -481,6 +505,8 @@ pub enum ChangeKind {
     EntryAmended,
     ReviewFinding,
     VerifyFailed,
+    /// A verify gate finding was waived after a no-op repair produced an identical failure.
+    GateWarning,
 }
 
 /// One line of the change log: what changed, where, and who changed it.
@@ -497,6 +523,23 @@ pub struct ChangeEntry {
     /// Dictionary keys the change touches or depends on.
     pub keys: Vec<DictKey>,
     pub summary: String,
+}
+
+/// True when `path` is a non-empty relative path with only normal components (no `/`, `..`, or `.`
+/// traversal). Globs such as `app/home/**` pass.
+pub fn safe_rel(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    !path.is_absolute()
+        && !path.as_os_str().is_empty()
+        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// True when `path` refers to `.flow` itself or any file inside `.flow/` (Taskmaster's managed
+/// code knowledge graph).
+pub fn is_flow_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    let trimmed = norm.trim_start_matches("./").trim_end_matches('/');
+    trimmed == ".flow" || trimmed.starts_with(".flow/")
 }
 
 #[cfg(test)]
@@ -575,5 +618,23 @@ mod unit_tests {
         assert_eq!(page(vec![unit("a", "a.js"), unit("b", "../b.js")]).work_units().len(), 1);
         let too_many: Vec<_> = (0..=MAX_UNITS).map(|i| unit(&format!("u{i}"), &format!("f{i}.js"))).collect();
         assert_eq!(page(too_many).work_units().len(), 1);
+    }
+
+    #[test]
+    fn safe_rel_and_is_flow_path_handle_traversal_and_separators() {
+        assert!(safe_rel("app/home/**"));
+        assert!(safe_rel("contracts/types.ts"));
+        assert!(!safe_rel(""));
+        assert!(!safe_rel("/etc/passwd"));
+        assert!(!safe_rel("../outside.py"));
+        assert!(!safe_rel("app/../outside.py"));
+        assert!(!safe_rel("./app/main.py"));
+
+        assert!(is_flow_path(".flow"));
+        assert!(is_flow_path(".flow/meta.json"));
+        assert!(is_flow_path("./.flow/files/a.py.json"));
+        assert!(is_flow_path(".flow\\index.sqlite"));
+        assert!(!is_flow_path(".flow2/meta.json"));
+        assert!(!is_flow_path("src/.flow/meta.json"));
     }
 }

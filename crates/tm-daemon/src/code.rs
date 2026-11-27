@@ -16,7 +16,8 @@
 //! await grep(text, glob?)             ["path:line: text", ...]
 //! await ls(glob?)                     project files
 //! await sh(command)                   {code, output}; only inside bubblewrap, when the gate allows a shell
-//! await test()                        {ok, failed, output}: the project's tests, in the sandbox
+//! await test(paths?)                  {ok, failed, output, targets, interpreter}: project tests (or explicit paths), in the sandbox
+//! await testAffected(paths?)          {ok, affectedFiles, testFiles, failed, output}: runs only affected tests matching paths/git status
 //! await check()                       problems the static checks find in the worktree
 //! await browser(action, args)         open | click | type | screenshot | console on the page's preview
 //! console.log(...)                    lines returned with the result
@@ -25,14 +26,16 @@
 //! The tool is served beside the Dictionary under the page's token, so a page that is not
 //! being built has none.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tm_dictionary::{Extension, Grant};
 use tm_harness::{Decision, PermissionGate, PermissionRequest, ToolKind};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -43,6 +46,7 @@ pub const SCRIPT_SECS: u64 = 600;
 pub const SH_SECS: u64 = 300;
 const MAX_READ: usize = 256 * 1024;
 const MAX_REPLY: usize = 24 * 1024;
+const MAX_TOOL_OUTPUT: usize = 4096;
 const MAX_CALLS: usize = 200;
 
 /// Persistent warm Node sandbox worker script: executes multiple `run_code` bodies over
@@ -54,15 +58,51 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const lines = readline.createInterface({ input: process.stdin });
 const waiting = new Map();
 let next = 1;
-const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
-const call = (op, args) => new Promise((resolve, reject) => {
-  const id = next++;
-  waiting.set(id, { resolve, reject });
-  send({ id, op, args });
+let activeState = null;
+process.on("unhandledRejection", (reason) => {
+  if (activeState) {
+    activeState.unhandled.push(String((reason && reason.stack) || reason).split("\n").slice(0, 4).join("\n"));
+  }
 });
+process.on("uncaughtException", (err) => {
+  if (activeState) {
+    activeState.unhandled.push(String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"));
+  }
+});
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+const call = (op, args) => {
+  let markDone;
+  const done = new Promise((r) => { markDone = r; });
+  if (activeState) {
+    activeState.pending.push(done);
+  }
+  return new Promise((resolve, reject) => {
+    const id = next++;
+    waiting.set(id, { resolve, reject, markDone });
+    send({ id, op, args });
+  });
+};
 const read = (path) => call("read", { path });
-const write = (path, text) => call("write", { path, text: String(text) });
-const edit = (path, find, replace, all = false) => call("edit", { path, find, replace, all });
+const extractText = (value) => {
+  if (value && typeof value === "object") {
+    if (typeof value.raw === "string") return value.raw;
+    if (typeof value.content === "string") return value.content;
+  }
+  return String(value ?? "");
+};
+const write = (path, text) => call("write", { path, text: extractText(text) });
+const writeFile = (path, text) => call("write", { path, text: extractText(text) });
+const edit = (path, find, replace, all = false) => {
+  if (find && typeof find === "object") {
+    return call("edit", {
+      path,
+      find: find.find ?? find.target,
+      replace: find.replace ?? find.replacement ?? "",
+      all: Boolean(find.all),
+    });
+  }
+  return call("edit", { path, find, replace, all });
+};
 const patch = (path, edits) => call("patch", { path, edits });
 const applyPatch = (diff) => call("applyPatch", { diff: String(diff) });
 const tryPatch = (diff) => call("tryPatch", { diff: String(diff) });
@@ -70,9 +110,16 @@ const grep = (text, glob) => call("grep", { text, glob });
 const ls = (glob) => call("ls", { glob });
 const diff = (glob) => call("diff", { glob });
 const symbols = (glob) => call("symbols", { glob });
+const flow = (op, args = {}) => call("flow", { op: String(op ?? ""), args: args && typeof args === "object" ? args : {} });
 const readMany = (globs) => call("readMany", { globs: Array.isArray(globs) ? globs : [globs] });
-const test = () => call("test", {});
-const testAffected = (paths) => call("testAffected", { files: Array.isArray(paths) ? paths : (paths ? [paths] : []) });
+const test = (...paths) => {
+  const flat = paths.flat().filter((p) => p !== undefined && p !== null && String(p).trim() !== "").map(String);
+  return call("test", flat.length ? { files: flat } : {});
+};
+const testAffected = (...paths) => {
+  const flat = paths.flat().filter((p) => p !== undefined && p !== null && String(p).trim() !== "").map(String);
+  return call("testAffected", { files: flat });
+};
 const probe = {
   ast: (path) => call("probeAst", { path }),
 };
@@ -94,7 +141,7 @@ async function runBody(code) {
   let fn;
   try {
     fn = new AsyncFunction(
-      "read", "write", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols",
+      "read", "write", "writeFile", "edit", "patch", "applyPatch", "tryPatch", "grep", "ls", "diff", "symbols", "flow",
       "readMany", "test", "testAffected", "probe", "diagnostics", "outline", "definition", "references",
       "sh", "check", "browser", "status", "wait", "console", "require",
       `return (async () => {\n${code}\n})();`
@@ -103,15 +150,36 @@ async function runBody(code) {
     send({ done: true, syntaxError: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") });
     return;
   }
+  const state = { pending: [], unhandled: [] };
+  activeState = state;
   try {
     const result = await fn(
-      read, write, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols,
+      read, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow,
       readMany, test, testAffected, probe, diagnostics, outline, definition, references,
       sh, check, browser, status, wait, scopedConsole, require
     );
-    send({ done: true, result: result === undefined ? null : result, logs });
+    if (state.pending.length > 0) {
+      await Promise.all(state.pending);
+      await new Promise((r) => setImmediate(r));
+    }
+    if (state.unhandled.length > 0) {
+      send({
+        done: true,
+        error: "Unawaited call failed (always `await` every helper call):\n" + state.unhandled.join("\n"),
+        logs,
+      });
+    } else {
+      send({ done: true, result: result === undefined ? null : result, logs });
+    }
   } catch (err) {
-    send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n"), logs });
+    if (state.pending.length > 0) {
+      await Promise.all(state.pending);
+      await new Promise((r) => setImmediate(r));
+    }
+    const extra = state.unhandled.length > 0 ? "\nUnawaited errors:\n" + state.unhandled.join("\n") : "";
+    send({ done: true, error: String((err && err.stack) || err).split("\n").slice(0, 4).join("\n") + extra, logs });
+  } finally {
+    if (activeState === state) activeState = null;
   }
 }
 
@@ -131,6 +199,7 @@ lines.on("line", (line) => {
   waiting.delete(m.id);
   if (m.error !== undefined) w.reject(new Error(m.error));
   else w.resolve(m.result);
+  w.markDone();
 });
 lines.on("close", () => process.exit(0));
 "#;
@@ -141,6 +210,7 @@ struct WarmNode {
     _guard: tm_harness::GroupGuard,
     stdin: tokio::process::ChildStdin,
     out: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_buf: Arc<Mutex<String>>,
     scratch: PathBuf,
 }
 
@@ -178,11 +248,41 @@ impl WarmNode {
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let (mut child, guard) = tm_harness::spawn_grouped(&mut cmd).context("could not start node")?;
         let stdin = child.stdin.take().context("no stdin")?;
         let out = BufReader::new(child.stdout.take().context("no stdout")?).lines();
-        Ok(WarmNode { child, _guard: guard, stdin, out, scratch })
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let sink = stderr_buf.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stderr;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let piece = String::from_utf8_lossy(&chunk[..n]);
+                            let mut buf = sink.lock().unwrap();
+                            buf.push_str(&piece);
+                            if buf.len() > 4096 {
+                                let trimmed = tail(&buf, 4096);
+                                *buf = trimmed;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Ok(WarmNode { child, _guard: guard, stdin, out, stderr_buf, scratch })
+    }
+
+    fn take_stderr(&self) -> String {
+        let mut buf = self.stderr_buf.lock().unwrap();
+        let out = buf.trim().to_string();
+        buf.clear();
+        out
     }
 
     fn is_alive(&mut self) -> bool {
@@ -197,6 +297,134 @@ impl Drop for WarmNode {
     }
 }
 
+/// Race-safe live-sync coordinator shared between [`crate::engine::Driver`] and a worker's
+/// [`CodeTools`] [`Scope`].
+///
+/// Invariant: sibling files are NEVER copied into `worktree` while a sandboxed shell/test process
+/// (`sh`, `test`, `testAffected`) is executing. Sandboxed commands hold a shared `rw.read()` guard;
+/// live sync from `Driver::settle` uses `rw.try_write()` and defers via `dirty = true` when busy,
+/// and `lock_for_exec()` flushes any deferred sync under `rw.write()` before starting the next
+/// command.
+pub struct WorktreeSync {
+    worktree: PathBuf,
+    tree: PathBuf,
+    exclude_globs: Vec<String>,
+    rw: tokio::sync::RwLock<()>,
+    dirty: AtomicBool,
+    snapshots: Mutex<HashMap<String, Option<[u8; 32]>>>,
+    pending_deps: Mutex<BTreeSet<String>>,
+}
+
+impl WorktreeSync {
+    pub fn new(
+        worktree: PathBuf,
+        tree: PathBuf,
+        exclude_globs: Vec<String>,
+        pending_deps: BTreeSet<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            worktree,
+            tree,
+            exclude_globs,
+            rw: tokio::sync::RwLock::new(()),
+            dirty: AtomicBool::new(false),
+            snapshots: Mutex::new(HashMap::new()),
+            pending_deps: Mutex::new(pending_deps),
+        })
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Record that an upstream dependency has landed in `self.tree`.
+    pub fn mark_dep_landed(&self, dep: &str) {
+        self.pending_deps.lock().unwrap().remove(dep);
+    }
+
+    /// Upstream dependencies that have not landed yet.
+    pub fn pending_deps(&self) -> Vec<String> {
+        self.pending_deps.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn record_snapshots(&self, report: &crate::git::SyncReport) {
+        let mut map = self.snapshots.lock().unwrap();
+        for snap in &report.snapshots {
+            map.insert(snap.path.clone(), if snap.deleted { None } else { snap.sha256 });
+        }
+    }
+
+    /// Mark the worktree dirty after a sibling lands in `tree`, and copy immediately ONLY if no
+    /// sandboxed command (`test`/`sh`) is currently running in this worktree. When busy, leaves
+    /// `dirty = true` so the next `test()`/`sh()`/read flushes safely before running.
+    pub fn mark_dirty_and_try_sync(&self) -> Vec<String> {
+        self.dirty.store(true, Ordering::Release);
+        let Ok(_write_guard) = self.rw.try_write() else {
+            return Vec::new();
+        };
+        match crate::git::sync_worktree_excluding_globs(&self.worktree, &self.tree, &self.exclude_globs) {
+            Ok(report) => {
+                self.record_snapshots(&report);
+                self.dirty.store(false, Ordering::Release);
+                report.updated
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Flush any deferred sibling sync under the exclusive write lock before a read or exec.
+    pub async fn sync_if_dirty(&self) -> Vec<String> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let _write_guard = self.rw.write().await;
+        if !self.dirty.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let worktree = self.worktree.clone();
+        let tree = self.tree.clone();
+        let globs = self.exclude_globs.clone();
+        match tokio::task::spawn_blocking(move || crate::git::sync_worktree_excluding_globs(&worktree, &tree, &globs)).await {
+            Ok(Ok(report)) => {
+                self.record_snapshots(&report);
+                self.dirty.store(false, Ordering::Release);
+                report.updated
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Flush any pending sibling sync, then hold a shared exec guard so no sibling copy can race
+    /// with an in-flight `sh`/`test`/`testAffected` process.
+    pub async fn lock_for_exec(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        let _ = self.sync_if_dirty().await;
+        self.rw.read().await
+    }
+
+    /// True when `change` in `self.worktree` still matches the exact file state last written by
+    /// daemon live sync (protecting against false ownership failures if `tree` later moves on).
+    pub fn matches_synced(&self, change: &crate::git::Change) -> bool {
+        let expected = match self.snapshots.lock().unwrap().get(&change.path) {
+            Some(entry) => *entry,
+            None => return false,
+        };
+        let path = self.worktree.join(&change.path);
+        match expected {
+            None => change.status == 'D' && !path.exists(),
+            Some(hash) => {
+                if change.status == 'D' {
+                    return false;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    return false;
+                };
+                let actual: [u8; 32] = Sha256::digest(&bytes).into();
+                actual == hash
+            }
+        }
+    }
+}
+
 /// What a page's scripts may touch, and through which gate.
 struct Scope {
     cwd: PathBuf,
@@ -205,6 +433,8 @@ struct Scope {
     shell: Option<tm_harness::ShellScope>,
     /// Read-only agents (planners, reviewers, verifiers) may only call read/search/diff/symbols/check.
     read_only: bool,
+    /// Optional race-safe live sibling sync coordinator for active worker worktrees.
+    sync: Option<Arc<WorktreeSync>>,
     /// Persistent warm Node sandbox process, lazily started on first `run_code` call.
     warm: tokio::sync::Mutex<Option<WarmNode>>,
 }
@@ -226,6 +456,19 @@ impl StatusTools {
         self.tags.lock().unwrap().insert(scope.to_string(), tag);
     }
 
+    /// Resolve the transcript agent tag registered for `grant` (falling back to a minimal tag).
+    pub fn tag_for(&self, grant: &Grant) -> Value {
+        let scope = grant.agent();
+        self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
+            let id = match scope.as_str() {
+                "master" | "reviewer" | "verifier" => scope.clone(),
+                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
+                other => format!("page:{other}"),
+            };
+            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
+        })
+    }
+
     /// Publish a one-line status update into the run's transcript for `grant`.
     pub fn set_status(&self, grant: &Grant, raw: &str) -> String {
         let first_line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
@@ -239,15 +482,7 @@ impl StatusTools {
         if cleaned.is_empty() {
             return String::new();
         }
-        let scope = grant.agent();
-        let tag = self.tags.lock().unwrap().get(&scope).cloned().unwrap_or_else(|| {
-            let id = match scope.as_str() {
-                "master" | "reviewer" | "verifier" => scope.clone(),
-                other if other.starts_with("page:") || other.starts_with("unit:") => other.to_string(),
-                other => format!("page:{other}"),
-            };
-            json!({ "id": id, "role": if scope == "master" { "master" } else { "worker" } })
-        });
+        let tag = self.tag_for(grant);
         self.live.push(&grant.run, &tag, "status", json!({ "text": cleaned }));
         cleaned
     }
@@ -270,7 +505,7 @@ impl Extension for StatusTools {
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if name != "set_status" {
+        if tm_dictionary::strip_dict_prefix(name) != "set_status" {
             return None;
         }
         let text = args["text"].as_str().unwrap_or("");
@@ -295,6 +530,8 @@ pub struct CodeTools {
     scopes: Mutex<HashMap<String, Arc<Scope>>>,
     browsers: Option<Arc<crate::browser::PageBrowsers>>,
     runtime: Mutex<Option<CodeRuntimeCtx>>,
+    flow_root: Mutex<Option<PathBuf>>,
+    project_root: Mutex<Option<PathBuf>>,
     /// How long one script may run.
     script_limit: Duration,
     /// How long one `sh` or `test` call may run.
@@ -305,16 +542,28 @@ impl CodeTools {
     /// `None` when Node is not installed: there is nothing to run scripts with.
     pub fn new(browsers: Option<Arc<crate::browser::PageBrowsers>>) -> Option<Arc<CodeTools>> {
         let node = tm_harness::sandbox::resolve_binary("node").ok()?;
-        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| bwrap_works() && tm_harness::sandbox::bwrap_usable());
+        let bwrap = tm_harness::sandbox::resolve_binary("bwrap").ok().filter(|_| tm_harness::sandbox::bwrap_usable());
         Some(Arc::new(CodeTools {
             node,
             bwrap,
             scopes: Mutex::new(HashMap::new()),
             browsers,
             runtime: Mutex::new(None),
+            flow_root: Mutex::new(None),
+            project_root: Mutex::new(None),
             script_limit: Duration::from_secs(SCRIPT_SECS),
             sh_limit: Duration::from_secs(SH_SECS),
         }))
+    }
+
+    /// Set the run's live `.flow` tree root (e.g. `driver.tree`) used by `flow(op, args)`.
+    pub fn set_flow_root(&self, root: PathBuf) {
+        *self.flow_root.lock().unwrap() = Some(root);
+    }
+
+    /// Set the project root used to relativize paths written to `.flow/env.json`.
+    pub fn set_project_root(&self, root: PathBuf) {
+        *self.project_root.lock().unwrap() = Some(root);
     }
 
     /// Attach run-scoped `Live`, `Records`, and `StatusTools` so `status()` and `wait()` work.
@@ -330,6 +579,17 @@ impl CodeTools {
     }
 
     pub fn attach(&self, page: &str, cwd: &Path, gate: Arc<dyn PermissionGate>, shell: Option<tm_harness::ShellScope>) {
+        self.attach_with_sync(page, cwd, gate, shell, None);
+    }
+
+    pub fn attach_with_sync(
+        &self,
+        page: &str,
+        cwd: &Path,
+        gate: Arc<dyn PermissionGate>,
+        shell: Option<tm_harness::ShellScope>,
+        sync: Option<Arc<WorktreeSync>>,
+    ) {
         self.scopes.lock().unwrap().insert(
             page.to_string(),
             Arc::new(Scope {
@@ -337,6 +597,7 @@ impl CodeTools {
                 gate,
                 shell,
                 read_only: false,
+                sync,
                 warm: tokio::sync::Mutex::new(None),
             }),
         );
@@ -351,6 +612,7 @@ impl CodeTools {
                 gate,
                 shell: None,
                 read_only: true,
+                sync: None,
                 warm: tokio::sync::Mutex::new(None),
             }),
         );
@@ -400,6 +662,7 @@ impl CodeTools {
     }
 
     async fn drive_warm(&self, grant: &Grant, scope: &Scope, worker: &mut WarmNode, code: &str) -> Result<String, DriveError> {
+        let _ = worker.take_stderr();
         let req = json!({ "exec": true, "code": code });
         worker
             .stdin
@@ -408,32 +671,61 @@ impl CodeTools {
             .context("could not send script to warm node worker")
             .map_err(DriveError::Broken)?;
         let mut calls = 0usize;
+        let mut applied: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         while let Some(line) = worker.out.next_line().await.map_err(|e| DriveError::Broken(e.into()))? {
             let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
             if message["done"] == true {
                 if let Some(syntax) = message["syntaxError"].as_str() {
                     return Err(DriveError::Syntax(syntax.to_string()));
                 }
-                return Ok(summary(&message));
+                let mut text = summary(&message);
+                if message["error"].as_str().is_some() {
+                    if !applied.is_empty() {
+                        text.push_str(&format!(
+                            "\nPartial edits already applied on disk: {}. Inspect/continue from those edits and retry `run_code` rather than ending.",
+                            applied.join(", ")
+                        ));
+                    } else {
+                        text.push_str(
+                            "\nNo file edits were applied by this call. Fix the script error and retry `run_code` (always `await` every helper call) rather than ending.",
+                        );
+                    }
+                    text = tail(&text, MAX_REPLY);
+                }
+                return Ok(text);
             }
             calls += 1;
             let id = message["id"].clone();
+            let op_name = message["op"].as_str().unwrap_or("");
+            let op_args = &message["args"];
             let reply = if calls > MAX_CALLS {
-                json!({ "id": id, "error": format!("more than {MAX_CALLS} calls in one script") })
+                let msg = format!("more than {MAX_CALLS} calls in one script");
+                failed.push(format!("{op_name}: {msg}"));
+                json!({ "id": id, "error": msg })
             } else {
-                match self.op(grant, scope, message["op"].as_str().unwrap_or(""), &message["args"]).await {
-                    Ok(result) => json!({ "id": id, "result": result }),
-                    Err(err) => json!({ "id": id, "error": format!("{err:#}") }),
+                match self.op(grant, scope, op_name, op_args).await {
+                    Ok(result) => {
+                        record_applied_op(&mut applied, op_name, op_args, &result);
+                        json!({ "id": id, "result": result })
+                    }
+                    Err(err) => {
+                        let target = op_args["path"].as_str().map(|p| format!(" {p}")).unwrap_or_default();
+                        failed.push(format!("{op_name}{target}: {err:#}"));
+                        json!({ "id": id, "error": format!("{err:#}") })
+                    }
                 }
             };
-            worker
-                .stdin
-                .write_all(format!("{reply}\n").as_bytes())
-                .await
-                .context("warm node worker stopped accepting replies")
-                .map_err(DriveError::Broken)?;
+            if let Err(err) = worker.stdin.write_all(format!("{reply}\n").as_bytes()).await {
+                return Err(DriveError::Broken(format_aborted_run_code(
+                    worker,
+                    &applied,
+                    &failed,
+                    Some(&format!("worker stopped accepting replies ({err})")),
+                ).await));
+            }
         }
-        Err(DriveError::Broken(anyhow::anyhow!("the script stopped before it finished")))
+        Err(DriveError::Broken(format_aborted_run_code(worker, &applied, &failed, None).await))
     }
 
     /// Run `command` with `sh -c` in the agent's sandbox: the worktree and its scratch are
@@ -442,10 +734,18 @@ impl CodeTools {
         let (Some(_), Some(shell)) = (&self.bwrap, &scope.shell) else {
             bail!("refused: sh needs the sandbox, and this agent has none");
         };
+        // Flush any deferred sibling sync cleanly before running, and hold the read guard for
+        // the entire subprocess so live sibling sync never mutates files mid-test or mid-sh.
+        let _exec_guard = match &scope.sync {
+            Some(sync) => Some(sync.lock_for_exec().await),
+            None => None,
+        };
         let sh = std::fs::canonicalize("/bin/sh").context("no /bin/sh")?;
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let sandbox = tm_harness::sandbox::Sandbox { home, state_dirs: vec![] };
-        let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(shell));
+        let mut shell = shell.clone();
+        crate::runtime::prepend_pythonpath(&mut shell.env, &scope.cwd);
+        let args = sandbox.bwrap_args_with(&sh, &["-c".to_string(), command.to_string()], &scope.cwd, false, Some(&shell));
         let mut cmd = tokio::process::Command::new("bwrap");
         cmd.args(args).current_dir(&scope.cwd).stdin(Stdio::null());
         let output = tokio::time::timeout(self.sh_limit, tm_harness::spawn_grouped(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?.0.wait_with_output())
@@ -454,6 +754,75 @@ impl CodeTools {
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         Ok((output.status.code(), text))
+    }
+
+    /// Run the project's test steps (optionally narrowed to explicit `targets` via
+    /// [`crate::runtime::filter_test_steps`]) in the worker's sandbox. Shared by both `test`
+    /// and `testAffected` so bare `test()` always runs the full suite (preserving acceptance
+    /// checks) while targeted calls run only the requested/affected test paths.
+    async fn execute_test_steps(&self, scope: &Scope, targets: &[String], record_env: bool) -> anyhow::Result<Value> {
+        if let Some(sync) = &scope.sync {
+            let _ = sync.sync_if_dirty().await;
+        }
+        let (venv, raw_steps) = select_test_steps(scope).await;
+        if !raw_steps.iter().any(|step| !step.setup) {
+            return Ok(json!({
+                "ok": true,
+                "ran": false,
+                "targets": targets,
+                "failed": [],
+                "output": "no tests were found to run"
+            }));
+        }
+        let mut steps = raw_steps.clone();
+        crate::runtime::filter_test_steps(&mut steps, targets);
+        let interpreter = steps
+            .iter()
+            .rev()
+            .find(|s| s.name == "test" && !s.setup)
+            .map(|s| s.program.clone());
+        let command = test_command(&steps);
+        let (code, mut text) = self.sandboxed(scope, &command).await?;
+        let pending_upstreams = scope
+            .sync
+            .as_ref()
+            .map(|s| s.pending_deps())
+            .unwrap_or_default();
+        if code != Some(0) && !pending_upstreams.is_empty() {
+            text.push_str(&format!(
+                "\nNote: upstream unit(s) still building: {}. Their files will sync into this worktree automatically once they land; do not reimplement them inline.",
+                pending_upstreams.join(", ")
+            ));
+        }
+        if record_env && code == Some(0) {
+            let flow_root = self.flow_root.lock().unwrap().clone();
+            let rel_base = self
+                .project_root
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| flow_root.clone());
+            if let (Some(root), Some(base)) = (flow_root, rel_base)
+                && tm_flow::read_env(&root).ok().flatten().is_none()
+                && let Some(facts) = crate::runtime::env_facts_from_steps_rel(&raw_steps, &venv, &base)
+            {
+                let _ = tm_flow::write_env(&root, &facts);
+            }
+        }
+        let mut out = json!({
+            "ok": code == Some(0),
+            "ran": true,
+            "targets": targets,
+            "failed": failed_tests(&text),
+            "output": tail(&text, MAX_TOOL_OUTPUT)
+        });
+        if let Some(interp) = interpreter {
+            out["interpreter"] = json!(interp);
+        }
+        if !pending_upstreams.is_empty() {
+            out["pendingUpstreams"] = json!(pending_upstreams);
+        }
+        Ok(out)
     }
 
     async fn allowed(&self, scope: &Scope, op: &str, kind: ToolKind, path: Option<&Path>, command: Option<&str>) -> anyhow::Result<()> {
@@ -477,7 +846,16 @@ impl CodeTools {
                 "write" | "edit" | "patch" | "applyPatch" | "tryPatch" | "sh" | "test" | "testAffected" | "browser"
             )
         {
-            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
+            bail!("refused: `{op}` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, flow, probe.ast, check)");
+        }
+        if matches!(
+            op,
+            "read" | "readMany" | "ls" | "grep" | "symbols" | "probeAst" | "check" | "outline" | "definition" | "references" | "diagnostics"
+        )
+            && let Some(sync) = &scope.sync
+            && sync.is_dirty()
+        {
+            let _ = sync.sync_if_dirty().await;
         }
         let path = |key: &str| -> anyhow::Result<PathBuf> {
             let raw = args[key].as_str().context("a path is required")?;
@@ -494,7 +872,14 @@ impl CodeTools {
                 Ok(json!(String::from_utf8_lossy(&bytes)))
             }
             "write" => {
-                let file = path("path")?;
+                let raw = args["path"].as_str().context("a path is required")?;
+                let clean = sanitize_file_path(raw)?;
+                let file = if Path::new(&clean).is_absolute() {
+                    PathBuf::from(&clean)
+                } else {
+                    scope.cwd.join(&clean)
+                };
+                check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 if let Some(dir) = file.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -504,6 +889,7 @@ impl CodeTools {
             }
             "edit" => {
                 let file = path("path")?;
+                check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 let find = args["find"].as_str().filter(|f| !f.is_empty()).context("`find` is required")?;
                 let replace = args["replace"].as_str().unwrap_or("");
@@ -522,6 +908,7 @@ impl CodeTools {
             }
             "patch" => {
                 let file = path("path")?;
+                check_policy_write(scope, &file)?;
                 self.allowed(scope, op, ToolKind::Edit, Some(&file), None).await?;
                 let edits = args["edits"].as_array().context("`edits` must be an array of {find, replace, all?}")?;
                 if edits.is_empty() {
@@ -559,6 +946,7 @@ impl CodeTools {
                 for file_patch in &patches {
                     let rel = file_patch.target_path();
                     let full = if Path::new(rel).is_absolute() { PathBuf::from(rel) } else { scope.cwd.join(rel) };
+                    check_policy_write(scope, &full)?;
                     self.allowed(scope, op, ToolKind::Edit, Some(&full), None).await?;
                     if file_patch.is_delete() {
                         let existing = std::fs::read_to_string(&full).with_context(|| format!("cannot read {rel} to delete"))?;
@@ -610,6 +998,30 @@ impl CodeTools {
                 let syms = crate::repomap::extract_symbols(&scope.cwd, args["glob"].as_str())?;
                 Ok(json!(syms))
             }
+            "flow" => {
+                self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
+                let sub_op = args["op"].as_str().unwrap_or("").trim().to_string();
+                if sub_op.is_empty() {
+                    bail!("flow(op, args) requires `op` (`find`, `node`, `neighbors`, or `source`)");
+                }
+                let sub_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+                let root = self
+                    .flow_root
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .filter(|r| r.join(tm_flow::FLOW_DIR).is_dir())
+                    .unwrap_or_else(|| scope.cwd.clone());
+                let out = tokio::task::spawn_blocking(move || {
+                    if !root.join(tm_flow::FLOW_DIR).is_dir() {
+                        let _ = tm_flow::build(&root);
+                    }
+                    tm_flow::execute_op(&root, &sub_op, &sub_args)
+                })
+                .await
+                .context("flow query task panicked")??;
+                Ok(out.json)
+            }
             "ls" | "grep" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
                 let files = files(&scope.cwd, args["glob"].as_str())?;
@@ -635,18 +1047,13 @@ impl CodeTools {
                 let command = args["command"].as_str().context("`command` is required")?;
                 self.allowed(scope, op, ToolKind::Execute, None, Some(command)).await?;
                 let (code, text) = self.sandboxed(scope, command).await?;
-                Ok(json!({ "code": code, "output": tail(&text, 8000) }))
+                Ok(json!({ "code": code, "output": tail(&text, MAX_TOOL_OUTPUT) }))
             }
             "test" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("the project's tests")).await?;
-                let venv = scope.shell.as_ref().and_then(|s| s.writable.first()).map(|scratch| scratch.join("venv")).unwrap_or_else(|| scope.cwd.join(".venv"));
-                let steps = crate::runtime::steps(&scope.cwd, &venv);
-                if !steps.iter().any(|step| !step.setup) {
-                    return Ok(json!({ "ok": true, "ran": false, "failed": [], "output": "no tests were found to run" }));
-                }
-                let command = test_command(&steps);
-                let (code, text) = self.sandboxed(scope, &command).await?;
-                Ok(json!({ "ok": code == Some(0), "ran": true, "failed": failed_tests(&text), "output": tail(&text, 6000) }))
+                let targets = parse_test_targets(args)?;
+                let res = self.execute_test_steps(scope, &targets, true).await?;
+                Ok(res)
             }
             "readMany" => {
                 self.allowed(scope, op, ToolKind::Read, Some(&scope.cwd), None).await?;
@@ -713,6 +1120,14 @@ impl CodeTools {
                 let mut staged: Vec<(PathBuf, Option<String>, String)> = Vec::new();
                 for file_patch in &patches {
                     let rel = file_patch.target_path();
+                    if tm_flow::is_flow_path(rel) {
+                        return Ok(json!({
+                            "applied": false,
+                            "error": format!("policy denied write to `{rel}` (`.flow/` is managed by Taskmaster)"),
+                            "files": [],
+                            "diagnostics": [],
+                        }));
+                    }
                     if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
                         return Ok(json!({
                             "applied": false,
@@ -789,10 +1204,7 @@ impl CodeTools {
             }
             "testAffected" => {
                 self.allowed(scope, op, ToolKind::Execute, None, Some("affected project tests")).await?;
-                let requested: Vec<String> = args["files"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                    .unwrap_or_default();
+                let requested = parse_test_targets(args)?;
                 let changed: Vec<String> = if !requested.is_empty() {
                     requested
                 } else {
@@ -812,49 +1224,13 @@ impl CodeTools {
                     .unwrap_or_default()
                 };
                 let all_files = files(&scope.cwd, None).unwrap_or_default();
-                let stems: Vec<String> = changed
-                    .iter()
-                    .filter_map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()).map(str::to_ascii_lowercase))
-                    .collect();
-                let matched_tests: Vec<String> = all_files
-                    .into_iter()
-                    .filter(|f| {
-                        let lower = f.to_ascii_lowercase();
-                        let looks_test = lower.contains(".test.")
-                            || lower.contains(".spec.")
-                            || lower.contains("test_")
-                            || lower.ends_with("_test.rs");
-                        looks_test && (stems.is_empty() || stems.iter().any(|st| lower.contains(st)))
-                    })
-                    .take(12)
-                    .collect();
-                let venv = scope
-                    .shell
-                    .as_ref()
-                    .and_then(|s| s.writable.first())
-                    .map(|scratch| scratch.join("venv"))
-                    .unwrap_or_else(|| scope.cwd.join(".venv"));
-                let steps = crate::runtime::steps(&scope.cwd, &venv);
-                if !steps.iter().any(|step| !step.setup) {
-                    return Ok(json!({
-                        "ok": true,
-                        "ran": false,
-                        "affectedFiles": changed,
-                        "testFiles": matched_tests,
-                        "failed": [],
-                        "output": "no tests were found to run"
-                    }));
+                let matched_tests = resolve_affected_test_targets(&changed, &all_files);
+                let mut res = self.execute_test_steps(scope, &matched_tests, false).await?;
+                if let Some(obj) = res.as_object_mut() {
+                    obj.insert("affectedFiles".into(), json!(changed));
+                    obj.insert("testFiles".into(), json!(matched_tests));
                 }
-                let command = test_command(&steps);
-                let (code, text) = self.sandboxed(scope, &command).await?;
-                Ok(json!({
-                    "ok": code == Some(0),
-                    "ran": true,
-                    "affectedFiles": changed,
-                    "testFiles": matched_tests,
-                    "failed": failed_tests(&text),
-                    "output": tail(&text, 6000)
-                }))
+                Ok(res)
             }
             "probeAst" => {
                 let file = path("path")?;
@@ -1144,12 +1520,179 @@ async fn probe_local_http(url: &str) -> Option<u16> {
     first.split_whitespace().nth(1)?.parse::<u16>().ok()
 }
 
+/// Validate and normalize one test target path (or pytest `path::node_id` selector).
+/// Rejects flag injection (`-...`), traversal (`..`), quotes, and control characters.
+fn sanitize_test_target(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("empty test target");
+    }
+    if trimmed.starts_with('-') {
+        bail!("invalid test target `{trimmed}`: option flags are not allowed");
+    }
+    if let Some((file_part, node_part)) = trimmed.split_once("::") {
+        let clean_file = sanitize_file_path(file_part)?;
+        if clean_file.starts_with('-') {
+            bail!("invalid test target `{trimmed}`: option flags are not allowed");
+        }
+        if node_part.is_empty()
+            || node_part.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ';' | '|' | '&' | '$' | '\\'))
+        {
+            bail!("invalid pytest node selector in `{trimmed}`");
+        }
+        Ok(format!("{clean_file}::{node_part}"))
+    } else {
+        let clean = sanitize_file_path(trimmed)?;
+        if clean.starts_with('-') {
+            bail!("invalid test target `{trimmed}`: option flags are not allowed");
+        }
+        Ok(clean)
+    }
+}
+
+/// Extract validated test target paths from `{ files: [...] }` or `{ path: "..." }`.
+fn parse_test_targets(args: &Value) -> anyhow::Result<Vec<String>> {
+    let mut raw: Vec<&str> = Vec::new();
+    match &args["files"] {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(s) = item.as_str().filter(|s| !s.trim().is_empty()) {
+                    raw.push(s);
+                }
+            }
+        }
+        Value::String(one) if !one.trim().is_empty() => raw.push(one.as_str()),
+        _ => {}
+    }
+    if raw.is_empty()
+        && let Some(one) = args["path"].as_str().filter(|s| !s.trim().is_empty())
+    {
+        raw.push(one);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        let clean = sanitize_test_target(item)?;
+        if !out.contains(&clean) {
+            out.push(clean);
+        }
+    }
+    Ok(out)
+}
+
+/// Map changed or requested files to concrete test file targets for `testAffected`:
+/// - Direct test paths (or pytest `file::node` selectors) in `changed` are kept directly.
+/// - Non-test source files match test files in `all_files` whose filename contains the stem.
+fn resolve_affected_test_targets(changed: &[String], all_files: &[String]) -> Vec<String> {
+    let looks_like_test = |p: &str| {
+        let base = p.split("::").next().unwrap_or(p);
+        let lower = base.to_ascii_lowercase();
+        lower.contains(".test.")
+            || lower.contains(".spec.")
+            || lower.contains("test_")
+            || lower.ends_with("_test.rs")
+            || lower.ends_with("_test.py")
+            || lower.ends_with("_test.go")
+            || tm_core::is_test_path(base)
+    };
+    let mut matched: Vec<String> = Vec::new();
+    let mut stems: Vec<String> = Vec::new();
+    for path in changed {
+        if looks_like_test(path) {
+            if !matched.contains(path) {
+                matched.push(path.clone());
+            }
+        } else if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+            let low = stem.to_ascii_lowercase();
+            if !low.is_empty() && !stems.contains(&low) {
+                stems.push(low);
+            }
+        }
+    }
+    if !stems.is_empty() || (changed.is_empty() && matched.is_empty()) {
+        for f in all_files {
+            if matched.len() >= 12 {
+                break;
+            }
+            if !looks_like_test(f) {
+                continue;
+            }
+            let lower = f.to_ascii_lowercase();
+            if (stems.is_empty() || stems.iter().any(|st| lower.contains(st))) && !matched.contains(f) {
+                matched.push(f.clone());
+            }
+        }
+    }
+    matched.truncate(12);
+    matched
+}
+
 /// Project files under `cwd` (tracked and new, not ignored), filtered by `glob`.
 /// One shell line that runs the project's test steps: setup steps may fail and are reported,
 /// the checks must all pass.
+async fn select_test_steps(scope: &Scope) -> (PathBuf, Vec<crate::runtime::Step>) {
+    let fallback_venv = scope
+        .shell
+        .as_ref()
+        .and_then(|s| s.writable.first())
+        .map(|scratch| scratch.join("venv"))
+        .unwrap_or_else(|| scope.cwd.join(".venv"));
+    // Prefer an already-prepared shared read-only venv mounted into the worker's sandbox
+    // when it needs zero setup writes AND its pytest is actually importable under the worker
+    // sandbox view (never masked by host `~/.local/lib`); otherwise fall back to the writable scratch venv.
+    let shared_venv = scope
+        .shell
+        .as_ref()
+        .and_then(|s| s.readable.iter().find(|d| d.join("pyvenv.cfg").is_file()))
+        .cloned();
+    match shared_venv {
+        Some(shared) => {
+            let candidate = crate::runtime::steps(&scope.cwd, &shared);
+            let needs_pytest = candidate.iter().any(crate::runtime::is_pytest_step);
+            let has_pytest = !needs_pytest || crate::runtime::venv_has_pytest(&shared).await;
+            let ready = candidate.iter().any(|s| !s.setup)
+                && !candidate.iter().any(|s| s.setup)
+                && has_pytest;
+            if ready {
+                (shared, candidate)
+            } else if needs_pytest
+                && has_pytest
+                && !crate::runtime::project_has_external_deps(&scope.cwd)
+                && !crate::runtime::pyproject_has_scripts(&scope.cwd)
+            {
+                // Shared read-only venv already has working pytest and the worktree declares no
+                // third-party packages or console scripts: keep reusing `shared` directly with
+                // an absolute per-worktree `PYTHONPATH` rather than building an offline scratch venv.
+                let mut test_only: Vec<crate::runtime::Step> =
+                    candidate.into_iter().filter(|s| !s.setup).collect();
+                for step in &mut test_only {
+                    crate::runtime::prepend_pythonpath(&mut step.env, &scope.cwd);
+                }
+                (shared, test_only)
+            } else {
+                let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+                (fallback_venv, steps)
+            }
+        }
+        None => {
+            let steps = crate::runtime::steps(&scope.cwd, &fallback_venv);
+            (fallback_venv, steps)
+        }
+    }
+}
+
 fn test_command(steps: &[crate::runtime::Step]) -> String {
     let line = |step: &crate::runtime::Step| {
-        let mut parts: Vec<String> = step.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();
+        let mut parts: Vec<String> = step
+            .env
+            .iter()
+            .map(|(k, v)| {
+                if k == "PYTHONPATH" {
+                    format!("PYTHONPATH={}${{PYTHONPATH:+:\"$PYTHONPATH\"}}", quote(v))
+                } else {
+                    format!("{k}={}", quote(v))
+                }
+            })
+            .collect();
         parts.push(quote(&step.program));
         parts.extend(step.args.iter().map(|a| quote(a)));
         parts.join(" ")
@@ -1241,6 +1784,69 @@ fn summary(done: &Value) -> String {
         out.push_str(&shown);
     }
     tail(&out, MAX_REPLY)
+}
+
+fn record_applied_op(applied: &mut Vec<String>, op: &str, args: &Value, result: &Value) {
+    let entry = match op {
+        "write" | "edit" | "patch" => args["path"].as_str().map(|p| format!("{op}({p})")),
+        "applyPatch" => result["files"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                let paths: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+                format!("applyPatch({})", paths.join(", "))
+            }),
+        "tryPatch" if result["applied"] == true => result["files"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                let paths: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+                format!("tryPatch({})", paths.join(", "))
+            }),
+        _ => None,
+    };
+    if let Some(item) = entry
+        && !applied.contains(&item)
+    {
+        applied.push(item);
+    }
+}
+
+async fn format_aborted_run_code(
+    worker: &mut WarmNode,
+    applied: &[String],
+    failed: &[String],
+    extra: Option<&str>,
+) -> anyhow::Error {
+    // Give the stderr drain task and child exit status a brief moment to settle.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let status = worker
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map(|s| format!(" (exit {s})"))
+        .unwrap_or_default();
+    let stderr = worker.take_stderr();
+    let mut msg = format!("run_code script aborted before finishing{status} (the script stopped before it finished).");
+    if let Some(reason) = extra {
+        msg.push_str(&format!(" Cause: {reason}."));
+    }
+    if !stderr.is_empty() {
+        msg.push_str(&format!("\nStderr:\n{}", tail(&stderr, 1200)));
+    }
+    if applied.is_empty() {
+        msg.push_str("\nApplied edits on disk before abort: none (worktree unchanged by this call).");
+    } else {
+        msg.push_str(&format!("\nApplied edits on disk before abort: {}.", applied.join(", ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("\nFailed ops before abort:\n- {}", failed.join("\n- ")));
+    }
+    msg.push_str(
+        "\nRecovery: fix the script error and call `run_code` again (always `await` every helper call; use `edit(path, find, replace)` or `files`/`writeFile`, and end with `return await test()`). Do NOT end your turn or switch to native shell/edit tools.",
+    );
+    anyhow::anyhow!(msg)
 }
 
 /// Internal drive failure distinction: syntax errors leave the warm Node worker healthy;
@@ -1421,14 +2027,119 @@ fn find_hunk_pos(lines: &[String], expected: &[&str], hint: isize) -> Option<usi
     None
 }
 
-/// Whether bubblewrap can make a sandbox here; some containers forbid user namespaces.
-fn bwrap_works() -> bool {
-    std::process::Command::new("bwrap")
-        .args(["--ro-bind", "/", "/", "--unshare-net", "--die-with-parent", "true"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// Accept both the canonical MCP name (`run_code`) and harness-prefixed aliases
+/// (such as `mcp_dictionary_run_code` on Antigravity or `mcp__dictionary__run_code` on Claude).
+fn is_run_code_tool(name: &str) -> bool {
+    tm_dictionary::strip_dict_prefix(name) == "run_code"
+}
+
+/// Accept `writeFile` / `write_file` (with or without a Dictionary prefix) taking `{path, content}`
+/// as separate MCP arguments so raw files bypass JS string escaping.
+fn is_write_file_tool(name: &str) -> bool {
+    matches!(tm_dictionary::strip_dict_prefix(name), "writeFile" | "write_file")
+}
+
+/// Refuse writes into Taskmaster's `.flow/` directory or matching `Policy::denied_globs`
+/// (such as `.env`, `*.pem`, `*.key`) across every Code Mode write/edit primitive, matching `tryPatch`.
+fn check_policy_write(scope: &Scope, file: &Path) -> anyhow::Result<()> {
+    let rel = file
+        .strip_prefix(&scope.cwd)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rel = rel.trim_start_matches("./");
+    if tm_flow::is_flow_path(rel) {
+        bail!("policy denied write to `{rel}` (`.flow/` is managed by Taskmaster)");
+    }
+    let policy = crate::policy::Policy::load(&scope.cwd);
+    if let crate::policy::PathVerdict::Denied(glob) = policy.check_path(rel) {
+        bail!("policy denied write to `{rel}` (matched `{glob}`)");
+    }
+    Ok(())
+}
+
+/// Sanitize a file path coming from Code Mode `files` map keys or `writeFile`/`write` arguments.
+///
+/// Models sometimes wrap JSON map keys in literal quotes (e.g. `"\"tinydb/x.py\""` or `"'README.md'"`)
+/// or pad them with spaces. Strip surrounding whitespace and matching quote pairs, then reject any
+/// path that is still empty or invalid (unmatched/embedded quotes, control characters, parent
+/// directory traversal `..`, trailing separators, or no normal filename component).
+pub(crate) fn sanitize_file_path(raw: &str) -> anyhow::Result<String> {
+    if raw.chars().any(|c| c.is_control() && c != '\t') {
+        bail!("invalid file path {raw:?}: control characters are not allowed");
+    }
+    let mut s = raw.trim();
+    loop {
+        let stripped = s
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| s.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')))
+            .or_else(|| s.strip_prefix('`').and_then(|rest| rest.strip_suffix('`')));
+        match stripped {
+            Some(inner) => s = inner.trim(),
+            None => break,
+        }
+    }
+    if s.is_empty() {
+        bail!("a path is required");
+    }
+    if s.contains(['"', '`']) || s.starts_with('\'') || s.ends_with('\'') {
+        bail!("invalid file path `{s}`: quote characters are not allowed");
+    }
+    if s.chars().any(char::is_control) {
+        bail!("invalid file path `{s}`: control characters are not allowed");
+    }
+    if s.ends_with('/') || s.ends_with('\\') {
+        bail!("invalid file path `{s}`: path must name a file, not a directory");
+    }
+    let path = Path::new(s);
+    let mut has_normal = false;
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                bail!("invalid file path `{s}`: parent directory `..` is not allowed");
+            }
+            std::path::Component::Normal(part) => {
+                has_normal = true;
+                let part = part.to_string_lossy();
+                if part.trim() != part
+                    || part.contains(['"', '`'])
+                    || part.starts_with('\'')
+                    || part.ends_with('\'')
+                {
+                    bail!("invalid file path `{s}`: path segment `{part}` has invalid whitespace or quotes");
+                }
+            }
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if !has_normal {
+        bail!("invalid file path `{s}`: path must name a file");
+    }
+    Ok(s.to_string())
+}
+
+impl CodeTools {
+    async fn write_raw_file(&self, scope: &Scope, rel_path: &str, content: &str) -> anyhow::Result<String> {
+        if scope.read_only {
+            bail!("refused: `writeFile` is disabled in a read-only scope (use read, readMany, grep, ls, diff, symbols, probe.ast, check)");
+        }
+        let clean = sanitize_file_path(rel_path)?;
+        let file = if Path::new(&clean).is_absolute() {
+            PathBuf::from(&clean)
+        } else {
+            scope.cwd.join(&clean)
+        };
+        check_policy_write(scope, &file)?;
+        self.allowed(scope, "write", ToolKind::Edit, Some(&file), None).await?;
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&file, content)?;
+        Ok(clean)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1438,33 +2149,162 @@ impl Extension for CodeTools {
             return Vec::new();
         };
         let description = if scope.read_only {
-            "Run a short read-only JavaScript program (async; use await and return) over the repo in one call instead of many read/search calls. \
-             Functions: read(path), readMany(globs), grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), check(), status(text), wait({url, port, log, agent, timeout}), and console.log. \
-             Paths are relative to the worktree. Batch all discovery into 1-2 scripts."
+            "Async JS body over repo (relative paths). Helpers: read, readMany, grep, ls, diff, symbols, flow(op, args), probe.ast, check, status, wait, console.log."
         } else {
-            "Run a short JavaScript program (async; use await and return) over your worktree in one call, instead of many tool calls. \
-             Functions: read(path), readMany(globs), write(path, text), edit(path, find, replace, all?), patch(path, [{find, replace, all?}]), \
-             applyPatch(diff) or transactional tryPatch(diff) (validates policy/permissions & returns same-turn diagnostics), \
-             grep(text, glob?), ls(glob?), diff(glob?), symbols(glob?), probe.ast(path), sh(command), \
-             test() / testAffected(files?) which run tests and return {ok, failed, output}, check(), browser(action, args), \
-             status(text) to set a live one-line status, wait({url, port, log, agent, timeout}) to wait for a server/port/log/sibling unit, \
-             and console.log. Paths are relative to your worktree. The same permissions as your own tools apply. \
-             Batch steps into one script and end with `return await test()`. Returns the log lines and the returned value."
+            "Async JS body over worktree (relative paths; await/return). Helpers: read, readMany, write, writeFile, edit, patch, applyPatch, tryPatch, grep, ls, diff, symbols, flow(op, args), probe.ast, sh, test(paths?), testAffected(paths?), check, browser, status, wait, console.log. Use `files` or `writeFile` for raw multi-line files; end with `return await test(...)`."
+        };
+        let properties = if scope.read_only {
+            json!({
+                "code": { "type": "string", "description": "Async JS body" }
+            })
+        } else {
+            json!({
+                "code": { "type": "string", "description": "Async JS body (optional if files/writeFile set)" },
+                "files": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Relative path -> raw UTF-8 content written before code runs"
+                },
+                "writeFile": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" },
+                        "raw": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "description": "Single raw write {path, content} before code runs"
+                }
+            })
         };
         vec![json!({
             "name": "run_code",
             "description": description,
-            "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The body of an async function" } }, "required": ["code"] },
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": if scope.read_only { json!(["code"]) } else { json!([]) }
+            },
         })]
     }
 
     async fn call(&self, grant: &Grant, name: &str, args: &Value) -> Option<Value> {
-        if name != "run_code" {
+        if is_write_file_tool(name) {
+            let scope = match self.scopes.lock().unwrap().get(&grant.agent()).cloned() {
+                Some(scope) => scope,
+                None => {
+                    return Some(json!({
+                        "content": [{ "type": "text", "text": "this agent has no worktree to write files in" }],
+                        "isError": true
+                    }));
+                }
+            };
+            let rel_path = args["path"].as_str().unwrap_or("");
+            let content = args["content"]
+                .as_str()
+                .or_else(|| args["raw"].as_str())
+                .or_else(|| args["text"].as_str())
+                .unwrap_or("");
+            return Some(match self.write_raw_file(&scope, rel_path, content).await {
+                Ok(clean) => {
+                    let msg = if clean != rel_path {
+                        format!("wrote {clean} (sanitized path from {rel_path:?})")
+                    } else {
+                        format!("wrote {clean}")
+                    };
+                    json!({ "content": [{ "type": "text", "text": msg }], "isError": false })
+                }
+                Err(err) => json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }),
+            });
+        }
+        if !is_run_code_tool(name) {
             return None;
         }
+        let mut wrote: Vec<String> = Vec::new();
+        let mut sanitized_notes: Vec<String> = Vec::new();
+        let has_files = args.get("files").and_then(Value::as_object).is_some_and(|m| !m.is_empty());
+        let has_write_file = args.get("writeFile").and_then(Value::as_object).is_some();
+        if has_files || has_write_file {
+            let scope = match self.scopes.lock().unwrap().get(&grant.agent()).cloned() {
+                Some(scope) => scope,
+                None => {
+                    return Some(json!({
+                        "content": [{ "type": "text", "text": "this agent has no worktree to run code in" }],
+                        "isError": true
+                    }));
+                }
+            };
+            if let Some(obj) = args.get("writeFile").and_then(Value::as_object) {
+                let rel_path = obj.get("path").and_then(Value::as_str).unwrap_or("");
+                let content = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .or_else(|| obj.get("raw").and_then(Value::as_str))
+                    .or_else(|| obj.get("text").and_then(Value::as_str))
+                    .unwrap_or("");
+                let clean = match self.write_raw_file(&scope, rel_path, content).await {
+                    Ok(clean) => clean,
+                    Err(err) => {
+                        return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                    }
+                };
+                if clean != rel_path {
+                    sanitized_notes.push(format!("{rel_path:?} -> {clean}"));
+                }
+                wrote.push(clean);
+            }
+            if let Some(map) = args.get("files").and_then(Value::as_object) {
+                for (raw_path, value) in map {
+                    let clean_path = match sanitize_file_path(raw_path) {
+                        Ok(clean) => clean,
+                        Err(err) => {
+                            return Some(json!({
+                                "content": [{ "type": "text", "text": format!("invalid `files` key {raw_path:?}: {err:#}") }],
+                                "isError": true
+                            }));
+                        }
+                    };
+                    let Some(content) = value.as_str() else {
+                        return Some(json!({
+                            "content": [{ "type": "text", "text": format!("`files[\"{clean_path}\"]` must be a string") }],
+                            "isError": true
+                        }));
+                    };
+                    let written = match self.write_raw_file(&scope, &clean_path, content).await {
+                        Ok(written) => written,
+                        Err(err) => {
+                            return Some(json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }));
+                        }
+                    };
+                    if written != *raw_path {
+                        sanitized_notes.push(format!("{raw_path:?} -> {written}"));
+                    }
+                    wrote.push(written);
+                }
+            }
+        }
         let code = args["code"].as_str().unwrap_or("");
+        let note_suffix = if sanitized_notes.is_empty() {
+            String::new()
+        } else {
+            format!(" (sanitized quoted/padded key(s): {})", sanitized_notes.join(", "))
+        };
+        if code.trim().is_empty() && !wrote.is_empty() {
+            return Some(json!({
+                "content": [{ "type": "text", "text": format!("wrote {} file(s): {}{note_suffix}", wrote.len(), wrote.join(", ")) }],
+                "isError": false
+            }));
+        }
         Some(match self.run(grant, code).await {
-            Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": text.contains("\nError: ") || text.starts_with("Error: ") }),
+            Ok(text) => {
+                let is_err = text.contains("\nError: ") || text.starts_with("Error: ");
+                let body = if sanitized_notes.is_empty() {
+                    text
+                } else {
+                    format!("note: sanitized quoted/padded path key(s): {}\n{text}", sanitized_notes.join(", "))
+                };
+                json!({ "content": [{ "type": "text", "text": body }], "isError": is_err })
+            }
             Err(err) => json!({ "content": [{ "type": "text", "text": format!("{err:#}") }], "isError": true }),
         })
     }
@@ -1571,7 +2411,7 @@ mod tests {
         let scratch = dir.with_extension("scratch");
         let outside = dir.with_extension("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![("TASKMASTER_SCRATCH".into(), scratch.display().to_string())] };
         tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
         let script = format!(
             r#"return await sh("echo in > made.txt && echo s > $TASKMASTER_SCRATCH/s.txt && (echo out > {}/x.txt || echo refused-outside)");"#,
@@ -1629,7 +2469,7 @@ mod tests {
         std::fs::write(dir.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
         std::fs::write(dir.join("tests/test_calc.py"), "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n").unwrap();
         let scratch = dir.with_extension("scratch");
-        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
+        let shell = tm_harness::ShellScope { writable: vec![scratch.clone()], readable: vec![], env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())] };
         tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).with_shell()), Some(shell));
         let text = tools.run(&grant(), "const r = await test(); return { ok: r.ok, failed: r.failed };").await.unwrap();
         assert!(text.contains("\"ok\": false") && text.contains("tests/test_calc.py::test_add"), "{text}");
@@ -1795,5 +2635,832 @@ mod tests {
         assert!(!dir.join(".env").exists(), "policy denied file must never be created");
         tools.detach("p1");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_prompt_and_alias_match_harness_tool_name() {
+        let guide = crate::engine::code_mode_guide("antigravity");
+        assert!(guide.contains("mcp_dictionary_run_code"), "{guide}");
+        assert!(!guide.contains(" run_code "), "{guide}");
+        assert!(crate::engine::code_mode_guide("claude").contains("mcp__dictionary__run_code"));
+        assert!(crate::engine::code_mode_guide("grok-build").contains("dictionary__run_code"));
+        assert!(crate::engine::code_mode_guide("opencode").contains("dictionary_run_code"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("alias");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+        for name in ["run_code", "mcp_dictionary_run_code", "mcp__dictionary__run_code", "dictionary__run_code"] {
+            let reply = tools
+                .call(&grant(), name, &json!({ "code": "return 2 + 2;" }))
+                .await
+                .unwrap_or_else(|| panic!("expected `{name}` to be handled"));
+            assert_eq!(reply["isError"], false, "{name}: {reply}");
+            assert!(reply["content"][0]["text"].as_str().unwrap_or("").contains('4'), "{name}: {reply}");
+        }
+        assert!(tools.call(&grant(), "unknown_tool", &json!({})).await.is_none());
+        tools.detach("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tok11_code_mode_guide_and_two_call_write_then_fix_discipline() {
+        let guide = crate::engine::code_mode_guide("antigravity");
+        assert!(guide.contains("Write + test (1-2 calls)"), "{guide}");
+        assert!(guide.contains("return await test()"), "{guide}");
+        assert!(guide.contains("test(\"tests/test_<unit>.py\")"), "{guide}");
+        assert!(guide.contains("Fix + re-test"), "{guide}");
+        assert!(guide.contains("mcp_dictionary_run_code"), "{guide}");
+        assert!(!guide.contains(" run_code"), "bare run_code should be rewritten: {guide}");
+
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("1-2 `run_code` calls"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("return await test(\"tests/test_<unit>.py\")"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("return await test()"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("no whole-file rewrites"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("tok11-two-call");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // Call 1: write implementation + unit test via `files` and run script body in ONE call.
+        let call1 = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({
+                    "files": {
+                        "pkg/calc.py": "def add(a, b):\n    return a - b\n",
+                        "tests/test_calc.py": "from pkg.calc import add\ndef test_add(): assert add(2, 3) == 5\n"
+                    },
+                    "code": "return { src: await read('pkg/calc.py'), tst: await read('tests/test_calc.py') };"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call1["isError"], false, "{call1}");
+        assert!(call1["content"][0]["text"].as_str().unwrap().contains("return a - b"));
+
+        // Call 2: targeted `edit` fix in the second call (no whole-file rewrite).
+        let call2 = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({
+                    "code": "await edit('pkg/calc.py', 'return a - b', 'return a + b'); return await read('pkg/calc.py');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call2["isError"], false, "{call2}");
+        assert!(call2["content"][0]["text"].as_str().unwrap().contains("return a + b"));
+
+        tools.detach("home");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn raw_content_write_handles_python_triple_quotes_and_separate_arguments() {
+        assert!(crate::engine::code_mode_guide("antigravity").contains("String.raw"));
+        assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("String.raw"));
+
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("raw-write");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // 1. Inside JS: write(path, { raw }) and writeFile(path, { raw }) with String.raw + Python triple quotes.
+        let js = r#"
+            const py = String.raw`def parse(s):
+    """Parse SQL with 'quotes' and \"\"\"triple quotes\"\"\"."""
+    return r"\d+\n"
+`;
+            await write("app/parser.py", { raw: py });
+            await writeFile("app/btree.py", { raw: String.raw`"""B-tree\nmodule"""` });
+            return { p: await read("app/parser.py"), b: await read("app/btree.py") };
+        "#;
+        let out = tools.run(&grant(), js).await.unwrap();
+        assert!(!out.contains("Error:"), "{out}");
+        let parser_disk = std::fs::read_to_string(dir.join("app/parser.py")).unwrap();
+        assert!(parser_disk.contains(r#""""Parse SQL"#), "{parser_disk}");
+        assert!(parser_disk.contains(r#"r"\d+\n""#), "{parser_disk}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/btree.py")).unwrap(), r#""""B-tree\nmodule""""#);
+
+        // 2. Separate MCP `files` argument on run_code + trailing code execution (zero JS escaping needed).
+        let py_src = "def exec_sql():\n    \"\"\"Triple quotes & `backticks` & ${not_js}\"\"\"\n    return r'\\s+'\n";
+        let reply = tools
+            .call(
+                &grant(),
+                "mcp_dictionary_run_code",
+                &json!({
+                    "files": { "app/executor.py": py_src },
+                    "code": "return (await read('app/executor.py')).includes('Triple quotes');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["isError"], false, "{reply}");
+        assert!(reply["content"][0]["text"].as_str().unwrap_or("").contains("true"), "{reply}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/executor.py")).unwrap(), py_src);
+
+        // 3. Separate MCP `writeFile` argument on run_code (with no `code`) AND direct `writeFile` tool call.
+        let reply_wf = tools
+            .call(
+                &grant(),
+                "run_code",
+                &json!({ "writeFile": { "path": "app/storage.py", "content": "\"\"\"storage\"\"\"\n" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply_wf["isError"], false, "{reply_wf}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/storage.py")).unwrap(), "\"\"\"storage\"\"\"\n");
+
+        let reply_direct = tools
+            .call(
+                &grant(),
+                "mcp_dictionary_writeFile",
+                &json!({ "path": "app/cli.py", "content": "print(\"\"\"hello\"\"\")\n" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply_direct["isError"], false, "{reply_direct}");
+        assert_eq!(std::fs::read_to_string(dir.join("app/cli.py")).unwrap(), "print(\"\"\"hello\"\"\")\n");
+
+        // 4. Gate & read-only scope still refuse unauthorized raw writes.
+        let escaped = tools
+            .call(&grant(), "writeFile", &json!({ "path": "/tmp/tm-escape-should-not-write.py", "content": "x" }))
+            .await
+            .unwrap();
+        assert_eq!(escaped["isError"], true, "{escaped}");
+        assert!(!std::path::Path::new("/tmp/tm-escape-should-not-write.py").exists());
+
+        tools.attach_readonly("ro", &dir, Arc::new(WorktreeGate::new(&dir, vec![]).read_only()));
+        let ro_grant = Grant { run: "r".into(), page: "ro".into(), unit: String::new() };
+        let ro_res = tools
+            .call(&ro_grant, "run_code", &json!({ "files": { "app/ro.py": "x" } }))
+            .await
+            .unwrap();
+        assert_eq!(ro_res["isError"], true, "{ro_res}");
+        assert!(!dir.join("app/ro.py").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_write_and_edit_enforce_policy_denied_globs() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("policy-write");
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        let via_js = tools.run(&grant(), r#"await write(".env", "SECRET=1\n");"#).await.unwrap();
+        assert!(via_js.contains("policy denied write"), "{via_js}");
+        assert!(!dir.join(".env").exists());
+
+        let via_raw = tools
+            .call(&grant(), "writeFile", &json!({ "path": "tls/server.key", "content": "PRIVATE" }))
+            .await
+            .unwrap();
+        assert_eq!(via_raw["isError"], true, "{via_raw}");
+        assert!(
+            via_raw["content"][0]["text"].as_str().unwrap_or("").contains("policy denied write"),
+            "{via_raw}"
+        );
+        assert!(!dir.join("tls/server.key").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_reviewer_and_security_scopes_are_isolated_and_prefixed_tools_work() {
+        assert_eq!(tm_harness::mcp_tool_name("antigravity", "dictionary", "browser_open"), "mcp_dictionary_browser_open");
+        assert_eq!(tm_harness::mcp_tool_name("antigravity", "dictionary", "docs"), "mcp_dictionary_docs");
+        assert_eq!(tm_harness::mcp_tool_name("claude", "dictionary", "web_fetch"), "mcp__dictionary__web_fetch");
+
+        let dir = repo("rev-iso");
+        let store = Arc::new(crate::store::FileStore::in_project(&dir));
+        let live = Arc::new(crate::live::Live::new(store));
+        let status = StatusTools::new(live);
+        let rev_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: String::new() };
+        let sec_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: "security".into() };
+
+        // StatusTools accepts both bare and harness-prefixed tool names.
+        let s1 = status
+            .call(&rev_grant, "mcp_dictionary_set_status", &json!({ "text": "checking connections" }))
+            .await
+            .expect("prefixed set_status must be handled");
+        assert_eq!(s1["isError"], false, "{s1}");
+        assert!(s1["content"][0]["text"].as_str().unwrap_or("").contains("checking connections"));
+
+        // Concurrent reviewer and security CodeTools scopes do not overwrite each other.
+        if let Some(tools) = CodeTools::new(None) {
+            let gate = Arc::new(WorktreeGate::new(&dir, vec![]).read_only());
+            tools.attach_readonly("reviewer", &dir, gate.clone());
+            tools.attach_readonly("reviewer/security", &dir, gate);
+            assert_eq!(tools.tools(&rev_grant).len(), 1);
+            assert_eq!(tools.tools(&sec_grant).len(), 1);
+            let (r_res, s_res) = tokio::join!(
+                tools.run(&rev_grant, "return (await ls('app/**')).length;"),
+                tools.run(&sec_grant, "return (await read('app/data.json')).includes('ok');"),
+            );
+            assert!(r_res.unwrap().contains('2'));
+            assert!(s_res.unwrap().contains("true"));
+            // Detaching security leaves reviewer intact.
+            tools.detach("reviewer/security");
+            assert!(tools.tools(&sec_grant).is_empty());
+            assert_eq!(tools.tools(&rev_grant).len(), 1);
+            tools.detach("reviewer");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_flow_queries_graph_for_workers_and_readonly_roles() {
+        let Some(tools) = CodeTools::new(None) else {
+            eprintln!("no node here; run_code is not exercised");
+            return;
+        };
+        let dir = repo("flow-code");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(
+            dir.join("pkg/lib.py"),
+            "def greet(name: str) -> str:\n    \"\"\"Return greeting.\"\"\"\n    return f'hi {name}'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkg/main.py"),
+            "from pkg.lib import greet\ndef run() -> str:\n    return greet('world')\n",
+        )
+        .unwrap();
+        tm_flow::build(&dir).unwrap();
+
+        let worker_gate = Arc::new(WorktreeGate::new(&dir, vec![]));
+        tools.attach("home", &dir, worker_gate, None);
+        let ro_gate = Arc::new(WorktreeGate::new(&dir, vec![]).read_only());
+        tools.attach_readonly("reviewer", &dir, ro_gate);
+
+        let rev_grant = Grant { run: "r".into(), page: "reviewer".into(), unit: String::new() };
+        assert!(tools.tools(&grant())[0]["description"].as_str().unwrap().contains("flow(op, args)"));
+        assert!(tools.tools(&rev_grant)[0]["description"].as_str().unwrap().contains("flow(op, args)"));
+
+        let script = r#"
+            const found = await flow("find", { query: "greet" });
+            const detail = await flow("node", { id: "py:pkg/main.py#run" });
+            const nbrs = await flow("neighbors", { id: "py:pkg/main.py#run", k: 1, kinds: ["calls"], dir: "out" });
+            const src = await flow("source", { id: "py:pkg/lib.py#greet" });
+            return {
+                foundId: found.nodes[0].id,
+                callees: detail.outgoing.map((e) => e.peer_id),
+                nbrCount: nbrs.nodes.length,
+                srcHasDef: src.code.includes("def greet"),
+            };
+        "#;
+        for g in [grant(), rev_grant] {
+            let reply = tools.run(&g, script).await.unwrap();
+            assert!(reply.contains("py:pkg/lib.py#greet"), "{reply}");
+            assert!(reply.contains("\"srcHasDef\": true"), "{reply}");
+        }
+
+        // Code Mode also denies writing into `.flow/`.
+        let write_flow = tools.run(&grant(), r#"await write(".flow/meta.json", "{}");"#).await.unwrap();
+        assert!(write_flow.contains("policy denied write to `.flow/meta.json`"), "{write_flow}");
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_raw_file_and_files_map_sanitize_quoted_keys_and_reject_invalid_paths() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("sanitize-keys");
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: None,
+            read_only: false,
+            sync: None,
+            warm: tokio::sync::Mutex::new(None),
+        };
+        tools.attach("home", &dir, scope.gate.clone(), None);
+
+        // Site 1: write_raw_file strips literal surrounding quotes and whitespace.
+        tools
+            .write_raw_file(&scope, "  \"tinydb/direct.py\"  ", "x = 1\n")
+            .await
+            .expect("quoted path should be sanitized and written");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/direct.py")).unwrap(), "x = 1\n");
+        assert!(!dir.join("\"tinydb/direct.py\"").exists());
+        assert!(!dir.join("  \"tinydb/direct.py\"  ").exists());
+
+        tools
+            .write_raw_file(&scope, "'tinydb/single.py'", "y = 2\n")
+            .await
+            .expect("single-quoted path should be sanitized");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/single.py")).unwrap(), "y = 2\n");
+        assert!(!dir.join("'tinydb/single.py'").exists());
+
+        // Site 1: write_raw_file rejects paths that remain invalid after sanitization.
+        for bad in [
+            "",
+            "   ",
+            "\"\"",
+            "\"tinydb/unmatched.py",
+            "tinydb/\"inner.py\"",
+            "../escape.py",
+            "\"../escape.py\"",
+            "tinydb/dir/",
+            ".",
+            "tinydb/bad\nname.py",
+        ] {
+            let err = tools.write_raw_file(&scope, bad, "nope").await;
+            assert!(err.is_err(), "write_raw_file should reject invalid path {bad:?}");
+        }
+
+        // Site 2: run_code `files` map sanitizes quoted keys and writes to the clean path.
+        let reply = tools
+            .call(
+                &grant(),
+                "mcp_dictionary_run_code",
+                &json!({
+                    "files": {
+                        "\"tinydb/x.py\"": "def x():\n    return 42\n",
+                        "  \"README.md\"  ": "# TinyDB\n"
+                    },
+                    "code": "return await read('tinydb/x.py');"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["isError"], false, "{reply}");
+        assert!(reply["content"][0]["text"].as_str().unwrap_or("").contains("return 42"), "{reply}");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/x.py")).unwrap(), "def x():\n    return 42\n");
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "# TinyDB\n");
+        assert!(!dir.join("\"tinydb/x.py\"").exists(), "must not create literal quoted directory/file");
+        assert!(!dir.join("\"README.md\"").exists(), "must not create literal quoted README.md");
+
+        // Site 2: run_code `files` map rejects keys that are still invalid paths.
+        for bad in [
+            "\"\"",
+            "\"tinydb/unmatched.py",
+            "tinydb/\"inner.py\"",
+            "\"../escape.py\"",
+            "tinydb/",
+            "tinydb/bad\0null.py",
+        ] {
+            let res = tools
+                .call(&grant(), "run_code", &json!({ "files": { bad: "nope" } }))
+                .await
+                .unwrap();
+            assert_eq!(res["isError"], true, "files map should reject invalid key {bad:?}: {res}");
+        }
+
+        // Also via direct writeFile tool and run_code writeFile argument.
+        let wf = tools
+            .call(
+                &grant(),
+                "writeFile",
+                &json!({ "path": "\"tinydb/wf.py\"", "content": "z = 3\n" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wf["isError"], false, "{wf}");
+        assert_eq!(std::fs::read_to_string(dir.join("tinydb/wf.py")).unwrap(), "z = 3\n");
+        assert!(!dir.join("\"tinydb/wf.py\"").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_mode_refuses_all_writes_and_patches_into_flow_dir() {
+        let Some(tools) = CodeTools::new(None) else {
+            return;
+        };
+        let dir = repo("flow-ro");
+        std::fs::create_dir_all(dir.join(".flow")).unwrap();
+        std::fs::write(dir.join(".flow/meta.json"), "{\"schema_version\":1}\n").unwrap();
+        // Even with a full-access WorktreeGate, Code Mode must refuse every mutation under `.flow/`.
+        let gate = Arc::new(WorktreeGate::new(&dir, vec![]).with_full_access());
+        tools.attach("home", &dir, gate, None);
+
+        // 1. JS write / edit / patch / applyPatch / tryPatch
+        let res = tools
+            .run(
+                &grant(),
+                r#"
+                const errs = [];
+                for (const [label, fn] of [
+                    ["write", () => write(".flow/evil.json", "{}")],
+                    ["edit", () => edit(".flow/meta.json", "1", "2")],
+                    ["patch", () => patch(".flow/meta.json", [{ find: "1", replace: "2" }])],
+                    ["applyPatch", () => applyPatch("--- a/.flow/meta.json\n+++ b/.flow/meta.json\n@@ -1 +1 @@\n-{\"schema_version\":1}\n+{\"schema_version\":2}\n")],
+                ]) {
+                    try { await fn(); errs.push(label + ":ALLOWED"); } catch (e) { errs.push(label + ":" + e.message); }
+                }
+                const tp = await tryPatch("--- a/.flow/meta.json\n+++ b/.flow/meta.json\n@@ -1 +1 @@\n-{\"schema_version\":1}\n+{\"schema_version\":2}\n");
+                return { errs, tp };
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(!res.contains(":ALLOWED"), "Code Mode allowed a `.flow/` write:\n{res}");
+        assert!(res.contains("\"applied\": false"), "tryPatch must refuse `.flow/`:\n{res}");
+
+        // 2. Direct writeFile & run_code `files` argument
+        let wf = tools
+            .call(&grant(), "writeFile", &json!({ "path": ".flow/evil2.json", "content": "{}" }))
+            .await
+            .unwrap();
+        assert_eq!(wf["isError"], true, "{wf}");
+        let fm = tools
+            .call(&grant(), "run_code", &json!({ "files": { ".flow/evil3.json": "{}" } }))
+            .await
+            .unwrap();
+        assert_eq!(fm["isError"], true, "{fm}");
+
+        // Verify disk is untouched.
+        assert_eq!(std::fs::read_to_string(dir.join(".flow/meta.json")).unwrap(), "{\"schema_version\":1}\n");
+        assert!(!dir.join(".flow/evil.json").exists());
+        assert!(!dir.join(".flow/evil2.json").exists());
+        assert!(!dir.join(".flow/evil3.json").exists());
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn select_test_steps_rejects_shared_venv_missing_sandbox_pytest() {
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !has_python3 {
+            return;
+        }
+        let ver_out = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .unwrap();
+        let py_mm = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
+
+        let dir = repo("select-shared-venv");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/test_ok.py"), "def test_ok():\n    assert True\n").unwrap();
+        let scratch = dir.join(".scratch");
+        let shared = dir.join(".shared-venv");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        // Create an isolated shared venv WITHOUT pytest installed in it, then stamp it as if a
+        // buggy host probe had approved it.
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", &shared.display().to_string()])
+            .status()
+            .unwrap();
+        assert!(mk.success());
+        // Write matching `.taskmaster-deps` stamp (compute by letting runtime::steps tell us the stamp).
+        let probe_steps = crate::runtime::steps(&dir, &shared);
+        let stamp_pair = probe_steps.iter().find_map(|s| s.stamp.clone()).expect("stamp on setup step");
+        std::fs::write(&stamp_pair.0, &stamp_pair.1).unwrap();
+
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: Some(tm_harness::ShellScope {
+                writable: vec![scratch.clone()],
+                readable: vec![shared.clone()],
+                env: vec![],
+            }),
+            read_only: false,
+            sync: None,
+            warm: tokio::sync::Mutex::new(None),
+        };
+
+        // Even though `.taskmaster-deps` matches, `select_test_steps` must reject `shared` because
+        // `pytest` is not importable in the sandbox view, falling back to `scratch/venv`.
+        let (chosen_before, _) = select_test_steps(&scope).await;
+        assert_eq!(chosen_before, scratch.join("venv"), "broken shared venv must not be selected");
+
+        // Once pytest exists inside `shared`'s own site-packages, `select_test_steps` selects it.
+        let venv_site = shared.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(venv_site.join("__init__.py"), "__version__ = '0.0.0-venv'\n").unwrap();
+        std::fs::write(venv_site.join("__main__.py"), "print('pytest 0.0.0-venv')\n").unwrap();
+
+        let (chosen_after, steps_after) = select_test_steps(&scope).await;
+        assert_eq!(chosen_after, shared, "self-contained shared venv must be selected");
+        assert!(steps_after.iter().all(|s| !s.setup), "ready shared venv needs no setup writes");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tok14_tool_output_cap_keeps_4kb_traceback_tail() {
+        let prefix = "verbose test output line before failure\n".repeat(300);
+        let traceback = "E       AssertionError: bad checksum\nFAILED tests/test_hash.py::test_digest\n1 failed in 0.08s\n";
+        let full = format!("{prefix}{traceback}");
+        assert!(full.len() > MAX_TOOL_OUTPUT * 2);
+        let kept = tail(&full, MAX_TOOL_OUTPUT);
+        assert!(kept.len() <= MAX_TOOL_OUTPUT + 4, "kept len {} exceeded 4KB cap", kept.len());
+        assert!(kept.starts_with('…'));
+        assert!(kept.ends_with(traceback), "must keep trailing traceback: {kept}");
+    }
+
+    #[tokio::test]
+    async fn fix_n8_aborted_run_code_reports_partial_edits_and_unawaited_errors_without_crashing() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        let dir = repo("n8-recover");
+        std::fs::write(dir.join("app/a.py"), "x = 1\n").unwrap();
+        tools.attach("home", &dir, Arc::new(WorktreeGate::new(&dir, vec![])), None);
+
+        // 1. Object-arg `edit(path, { target, replacement })` works cleanly.
+        let obj_res = tools
+            .run(
+                &grant(),
+                r#"await edit("app/a.py", { target: "x = 1", replacement: "x = 2" }); return await read("app/a.py");"#,
+            )
+            .await
+            .unwrap();
+        assert!(obj_res.contains("x = 2"), "object-arg edit should apply: {obj_res}");
+
+        // 2. Unawaited failing edit() must NOT kill the warm Node process; it reports a clear error
+        //    and names partial edits that already landed on disk.
+        let unawaited = tools
+            .run(
+                &grant(),
+                r#"
+                await write("app/partial.py", "ok = True\n");
+                edit("app/a.py", "does_not_exist", "x = 3");
+                return "finished";
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            unawaited.contains("Unawaited call failed") && unawaited.contains("does not occur"),
+            "expected actionable unawaited error, got:\n{unawaited}"
+        );
+        assert!(
+            unawaited.contains("Partial edits already applied on disk: write(app/partial.py)"),
+            "expected partial-edit report, got:\n{unawaited}"
+        );
+
+        // 3. Genuine script abort (process.exit(1) after writing a file and failing an op) returns
+        //    an actionable error listing applied edits, failed ops, stderr, and recovery advice,
+        //    and the next run_code call spawns a fresh worker and succeeds.
+        let aborted = tools
+            .run(
+                &grant(),
+                r#"
+                await write("app/before_abort.py", "saved = 1\n");
+                try { await edit("app/a.py", "missing_needle", "y"); } catch (_) {}
+                process.stderr.write("fatal boom\n");
+                process.exit(1);
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(aborted.contains("run_code script aborted before finishing"), "{aborted}");
+        assert!(aborted.contains("write(app/before_abort.py)"), "must list applied edits:\n{aborted}");
+        assert!(
+            aborted.contains("Failed ops before abort") && aborted.contains("does not occur"),
+            "must list failed op:\n{aborted}"
+        );
+        assert!(aborted.contains("fatal boom"), "must surface stderr:\n{aborted}");
+        assert!(aborted.contains("Recovery:"), "{aborted}");
+
+        let recovered = tools.run(&grant(), r#"return await read("app/before_abort.py");"#).await.unwrap();
+        assert!(recovered.contains("saved = 1"), "next run_code call must recover cleanly: {recovered}");
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tb18_test_path_args_and_test_affected_run_only_targeted_tests() {
+        let Some(tools) = CodeTools::new(None) else { return };
+        if !tm_harness::sandbox::bwrap_usable() {
+            return;
+        }
+        let npm = std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("npm").is_file()));
+        if !npm {
+            return;
+        }
+        let dir = repo("tb18-test-paths");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("src/alpha.js"), "export const a = 1;\n").unwrap();
+        std::fs::write(dir.join("tests/alpha.test.js"), "// ok\n").unwrap();
+        std::fs::write(dir.join("tests/acceptance.test.js"), "// fails when full suite runs\n").unwrap();
+        // Test runner script: when passed explicit args, only runs those args (fails only if
+        // `acceptance` is among them); when passed NO args (full suite), runs both and fails!
+        std::fs::write(
+            dir.join("run_tests.sh"),
+            "#!/bin/sh\n\
+             if [ \"$#\" -eq 0 ]; then\n\
+               echo 'RAN=FULL_SUITE'\n\
+               echo 'FAILED tests/acceptance.test.js - AssertionError: missing sibling' >&2\n\
+               exit 1\n\
+             fi\n\
+             echo \"RAN=$*\"\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 *acceptance*) echo \"FAILED $arg - AssertionError\" >&2; exit 1 ;;\n\
+               esac\n\
+             done\n\
+             echo '1 passed'\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"tb18-test-paths","private":true,"scripts":{"test":"sh run_tests.sh"}}"#,
+        )
+        .unwrap();
+
+        let scratch = dir.join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let gate = Arc::new(WorktreeGate::new(&dir, vec![]).with_shell());
+        let shell = tm_harness::ShellScope { writable: vec![scratch], readable: vec![], env: vec![] };
+        tools.attach("home", &dir, gate, Some(shell));
+
+        // 1. Targeted `test("tests/alpha.test.js")` runs ONLY that file and passes.
+        let targeted = tools
+            .run(&grant(), r#"return await test("tests/alpha.test.js");"#)
+            .await
+            .unwrap();
+        assert!(targeted.contains("\"ok\": true"), "targeted test should pass:\n{targeted}");
+        assert!(targeted.contains("RAN=tests/alpha.test.js"), "must forward target arg:\n{targeted}");
+        assert!(!targeted.contains("RAN=FULL_SUITE"), "must not run full suite when targeted:\n{targeted}");
+        assert!(targeted.contains("\"interpreter\""), "must report interpreter to avoid probe loops:\n{targeted}");
+
+        // 2. Bare `test()` MUST still run the full suite (preserving acceptance tests).
+        let full = tools.run(&grant(), r#"return await test();"#).await.unwrap();
+        assert!(full.contains("\"ok\": false"), "bare test() must run full suite including acceptance:\n{full}");
+        assert!(full.contains("RAN=FULL_SUITE"), "bare test() must pass no filter args:\n{full}");
+
+        // 3. `testAffected("src/alpha.js")` resolves `tests/alpha.test.js` and runs ONLY it (passes!).
+        let affected = tools
+            .run(&grant(), r#"return await testAffected("src/alpha.js");"#)
+            .await
+            .unwrap();
+        assert!(affected.contains("\"ok\": true"), "testAffected must run only affected test:\n{affected}");
+        assert!(affected.contains("RAN=tests/alpha.test.js"), "testAffected must pass matched test to runner:\n{affected}");
+        assert!(affected.contains("\"testFiles\""), "{affected}");
+
+        // 4. Rejects traversal / option-flag injection in test() targets.
+        let bad_flag = tools
+            .run(&grant(), r#"try { await test("--collect-only"); return "ALLOWED"; } catch (e) { return e.message; }"#)
+            .await
+            .unwrap();
+        assert!(!bad_flag.contains("ALLOWED") && bad_flag.contains("option flags are not allowed"), "{bad_flag}");
+        let bad_trav = tools
+            .run(&grant(), r#"try { await test("../escape.py"); return "ALLOWED"; } catch (e) { return e.message; }"#)
+            .await
+            .unwrap();
+        assert!(!bad_trav.contains("ALLOWED") && bad_trav.contains(".."), "{bad_trav}");
+
+        tools.detach_all();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tb18_worktree_sync_waits_for_inflight_exec_and_syncs_before_test() {
+        let root = std::env::temp_dir().join(format!("tm-code-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap();
+        crate::git::git(&repo, &["config", "user.name", "Test"]).unwrap();
+        crate::git::git(&repo, &["config", "user.email", "test@example.com"]).unwrap();
+        std::fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        crate::git::git(&repo, &["add", "."]).unwrap();
+        crate::git::git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let h1 = crate::git::head(&repo).unwrap();
+        crate::git::add_worktree(&repo, &wt, &h1).unwrap();
+
+        let pending: BTreeSet<String> = ["parser".to_string()].into_iter().collect();
+        let sync = WorktreeSync::new(wt.clone(), repo.clone(), vec!["pkg/cli.py".into()], pending);
+        std::fs::write(wt.join("pkg/cli.py"), "WIP = 1\n").unwrap();
+
+        // Hold an exec read guard (simulating an in-flight `test()`/`sh()`).
+        let exec_guard = sync.lock_for_exec().await;
+
+        // Sibling lands in `repo` while exec is running.
+        std::fs::write(repo.join("pkg/parser.py"), "VAL = 99\n").unwrap();
+        crate::git::git(&repo, &["add", "pkg/parser.py"]).unwrap();
+        crate::git::git(&repo, &["commit", "-q", "-m", "parser landed"]).unwrap();
+
+        sync.mark_dep_landed("parser");
+        let copied_while_busy = sync.mark_dirty_and_try_sync();
+        assert!(copied_while_busy.is_empty(), "must NOT copy while exec guard is held");
+        assert!(sync.is_dirty(), "deferred sync must remain marked dirty");
+        assert!(!wt.join("pkg/parser.py").exists(), "sibling file must not appear mid-exec");
+        assert!(sync.pending_deps().is_empty());
+
+        // Release exec guard -> next `lock_for_exec()` flushes the deferred sync atomically!
+        drop(exec_guard);
+        let _next_guard = sync.lock_for_exec().await;
+        assert!(!sync.is_dirty(), "dirty flag must clear after flush");
+        assert_eq!(std::fs::read_to_string(wt.join("pkg/parser.py")).unwrap(), "VAL = 99\n");
+        assert_eq!(std::fs::read_to_string(wt.join("pkg/cli.py")).unwrap(), "WIP = 1\n");
+        assert!(sync.matches_synced(&crate::git::Change { status: 'A', path: "pkg/parser.py".into() }));
+
+        let _ = crate::git::remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn tb18_select_test_steps_reuses_shared_venv_after_stdlib_pyproject_added() {
+        let Some(py_mm) = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        else {
+            return;
+        };
+        let dir = repo("tb18-shared-venv-reuse");
+        let shared = dir.join("shared-venv");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(dir.join("tests/test_ok.py"), "def test_ok(): assert True\n").unwrap();
+        let mk = std::process::Command::new("python3")
+            .args(["-m", "venv", &shared.display().to_string()])
+            .status()
+            .unwrap();
+        if !mk.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let venv_site = shared.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(venv_site.join("__init__.py"), "__version__ = '0.0.0-venv'\n").unwrap();
+        std::fs::write(venv_site.join("__main__.py"), "print('pytest 0.0.0-venv')\n").unwrap();
+
+        // Stamp was written BEFORE worker added a stdlib-only `pyproject.toml`.
+        let probe = crate::runtime::steps(&dir, &shared);
+        let stamp_pair = probe.iter().find_map(|s| s.stamp.clone()).expect("stamp");
+        std::fs::write(&stamp_pair.0, &stamp_pair.1).unwrap();
+
+        // Worker writes a stdlib-only `pyproject.toml` with pytest config + empty deps.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"calcx\"\ndependencies = []\n\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+        )
+        .unwrap();
+
+        let scope = Scope {
+            cwd: dir.clone(),
+            gate: Arc::new(WorktreeGate::new(&dir, vec![])),
+            shell: Some(tm_harness::ShellScope {
+                writable: vec![scratch.clone()],
+                readable: vec![shared.clone()],
+                env: vec![],
+            }),
+            read_only: false,
+            sync: None,
+            warm: tokio::sync::Mutex::new(None),
+        };
+        let (chosen, chosen_steps) = select_test_steps(&scope).await;
+        assert_eq!(chosen, shared, "stdlib pyproject.toml must keep reusing ready shared RO venv");
+        assert!(chosen_steps.iter().all(|s| !s.setup), "must emit no setup steps: {chosen_steps:?}");
+
+        // Even if the stamp was deliberately stale (e.g. legacy stamp), stdlib repo with working
+        // shared pytest still keeps `shared` instead of falling back to scratch!
+        std::fs::write(&stamp_pair.0, "stale-old-stamp").unwrap();
+        let (chosen_stale, steps_stale) = select_test_steps(&scope).await;
+        assert_eq!(chosen_stale, shared, "stdlib repo with working shared pytest must not fall back to scratch");
+        assert!(steps_stale.iter().all(|s| !s.setup));
+        let expected_pypath = crate::runtime::pythonpath_for_tree(&dir, None);
+        assert!(Path::new(&expected_pypath).is_absolute());
+        assert!(
+            steps_stale
+                .iter()
+                .any(|s| s.env.iter().any(|(k, v)| k == "PYTHONPATH" && v == &expected_pypath)),
+            "expected absolute PYTHONPATH={expected_pypath}, got: {steps_stale:?}"
+        );
+        let cmd_str = test_command(&steps_stale);
+        assert!(
+            cmd_str.contains(&format!("PYTHONPATH={}${{PYTHONPATH:+:\"$PYTHONPATH\"}}", quote(&expected_pypath))),
+            "test_command must prepend absolute PYTHONPATH while preserving existing PYTHONPATH: {cmd_str}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

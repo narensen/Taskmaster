@@ -182,7 +182,7 @@ const CMD_OUTPUT_THROTTLE: Duration = Duration::from_millis(100);
 /// Replace oversized `output` bodies (`text` or `diff` > 2 KiB) with a stub pointing to
 /// `GET /api/runs/{id}/agents/{index}` so large command outputs never ride the main stream.
 pub fn stub_large_output(entry: &Value, index: usize) -> Value {
-    if entry["kind"].as_str() != Some("output") {
+    if !matches!(entry["kind"].as_str(), Some("output" | "tool_diff")) {
         return entry.clone();
     }
     let text_len = entry["text"].as_str().map(str::len).unwrap_or(0);
@@ -1744,6 +1744,8 @@ pub struct SettingsBody {
     agent_timeout_secs: Option<u64>,
     /// Seconds an idle warm session is kept before detaching (O7); 0 disables idle release.
     warm_idle_secs: Option<u64>,
+    /// Effort-based thinking routing on or off.
+    effort_routing: Option<bool>,
     /// Opt-in OAuth usage polling (O4). Off by default.
     usage_oauth_polling: Option<bool>,
     /// A8: minutes a merged run stays out before it settles itself.
@@ -1752,6 +1754,14 @@ pub struct SettingsBody {
     settle_idle_days: Option<u32>,
     /// A5 (Labs): suggest the next message after a turn.
     labs_suggest_next: Option<bool>,
+    /// Brownfield scope-scout extractor: `{enabled?, min_files?}`.
+    scout: Option<ScoutBody>,
+}
+
+#[derive(Deserialize)]
+pub struct ScoutBody {
+    enabled: Option<bool>,
+    min_files: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1846,6 +1856,9 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
         }
         save_setting(&app.project(), "agents", json!({ "warm_idle_secs": secs })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
+    if let Some(on) = body.effort_routing {
+        save_setting(&app.project(), "agents", json!({ "effort_routing": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
     if let Some(on) = body.labs_suggest_next {
         save_setting(&app.project(), "labs", json!({ "suggest_next": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     }
@@ -1863,6 +1876,22 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(body): Json<Setti
     }
     if let Some(on) = body.usage_oauth_polling {
         save_setting(&app.project(), "usage", json!({ "oauth_polling": on })).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    }
+    if let Some(scout) = &body.scout {
+        let mut scout_changes = serde_json::Map::new();
+        if let Some(on) = scout.enabled {
+            scout_changes.insert("enabled".into(), json!(on));
+        }
+        if let Some(min_files) = scout.min_files {
+            if !(1..=10_000).contains(&min_files) {
+                return Err(fail(StatusCode::BAD_REQUEST, "scout.min_files is between 1 and 10000"));
+            }
+            scout_changes.insert("min_files".into(), json!(min_files));
+        }
+        if !scout_changes.is_empty() {
+            save_setting(&app.project(), "scout", Value::Object(scout_changes))
+                .map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        }
     }
     if !changes.is_empty() {
         save_setting(&app.project(), "approvals", Value::Object(changes)).map_err(|err| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
@@ -1949,6 +1978,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
         "agents": {
             "timeout_secs": role_defaults.agents.timeout_secs,
             "warm_idle_secs": role_defaults.agents.warm_idle_secs,
+            "effort_routing": role_defaults.agents.effort_routing,
         },
         "usage": {
             "oauth_polling": role_defaults.usage.oauth_polling,
@@ -1967,9 +1997,16 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
             "allowlist": role_defaults.web_access.allowlist,
             "planner_max_searches": role_defaults.web_access.planner_max_searches,
             "planner_max_fetches": role_defaults.web_access.planner_max_fetches,
+            "worker_max_fetches": role_defaults.web_access.worker_max_fetches,
+            "native_search_max_planner": role_defaults.web_access.native_search_max_planner,
+            "native_search_max_worker": role_defaults.web_access.native_search_max_worker,
             "max_fetch_bytes": role_defaults.web_access.max_fetch_bytes,
             "cache_ttl_secs": role_defaults.web_access.cache_ttl_secs,
             "cache_max_mb": role_defaults.web_access.cache_max_mb,
+        },
+        "scout": {
+            "enabled": role_defaults.scout.enabled,
+            "min_files": role_defaults.scout.min_files,
         },
         "editor": *app.editor.lock().unwrap(),
         "approvals": {
@@ -1983,7 +2020,7 @@ pub async fn settings(State(app): State<Arc<App>>) -> Reply {
 }
 
 const SETTING_KEYS: &[&str] = &[
-    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox", "web_access",
+    "store", "auth", "commons", "approvals", "preview", "search", "editor", "roles", "models", "checker", "code_mode", "telemetry", "agents", "sandbox", "web_access", "scout",
 ];
 
 /// Tokens are not part of an export. Host connections live in another file and stay there.
@@ -2146,7 +2183,7 @@ mod tests {
     #[test]
     fn a_pull_request_is_written_from_the_plan() {
         let plan = tm_core::Plan {
-            contracts: vec![tm_core::ContractFile { path: "app/types.ts".into(), content: "x".into() }],
+            contracts: vec![tm_core::ContractFile { path: "app/types.ts".into(), content: "x".into(), phase: 0 }],
             pages: vec![tm_core::PagePlan {
                 id: "home".into(),
                 route: "/".into(),
@@ -2161,5 +2198,14 @@ mod tests {
         let (title, body) = pr_text("r1", Some("\nA bookshop with a cart\nmore"), &plan);
         assert_eq!(title, "A bookshop with a cart");
         assert!(body.contains("| `home` | `/` | `app/home/**` | theme |") && body.contains("`app/types.ts`"), "{body}");
+    }
+
+    #[test]
+    fn tb18_settings_body_accepts_scout_patch_fields() {
+        let parsed: SettingsBody =
+            serde_json::from_str(r#"{"scout":{"enabled":false,"min_files":40}}"#).unwrap();
+        let scout = parsed.scout.expect("scout patch object");
+        assert_eq!(scout.enabled, Some(false));
+        assert_eq!(scout.min_files, Some(40));
     }
 }

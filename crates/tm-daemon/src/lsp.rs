@@ -573,23 +573,21 @@ pub fn extract_symbols(rel_path: &str, content: &str) -> Vec<SymbolInfo> {
                     }
                 }
             }
-            "py" => {
-                if !raw.starts_with(' ') && !raw.starts_with('\t') {
-                    let rest = line.strip_prefix("async ").unwrap_or(line);
-                    for (prefix, kind) in [("def ", "def"), ("class ", "class")] {
-                        if let Some(after) = rest.strip_prefix(prefix)
-                            && let Some(name) = leading_ident(after)
-                        {
-                            out.push(SymbolInfo {
-                                name: name.to_string(),
-                                kind: kind.to_string(),
-                                path: rel_path.to_string(),
-                                line: idx + 1,
-                                exported: !name.starts_with('_'),
-                                signature: line.trim_end_matches(':').trim().to_string(),
-                            });
-                            break;
-                        }
+            "py" if !raw.starts_with(' ') && !raw.starts_with('\t') => {
+                let rest = line.strip_prefix("async ").unwrap_or(line);
+                for (prefix, kind) in [("def ", "def"), ("class ", "class")] {
+                    if let Some(after) = rest.strip_prefix(prefix)
+                        && let Some(name) = leading_ident(after)
+                    {
+                        out.push(SymbolInfo {
+                            name: name.to_string(),
+                            kind: kind.to_string(),
+                            path: rel_path.to_string(),
+                            line: idx + 1,
+                            exported: !name.starts_with('_'),
+                            signature: line.trim_end_matches(':').trim().to_string(),
+                        });
+                        break;
                     }
                 }
             }
@@ -621,7 +619,7 @@ fn walk_sources(root: &Path, dir: &Path, out: &mut Vec<String>) {
         let name = entry.file_name().to_string_lossy().to_string();
         if matches!(
             name.as_str(),
-            ".git" | ".taskmaster" | "node_modules" | "target" | "dist" | "build" | ".venv" | "__pycache__"
+            ".git" | ".flow" | ".taskmaster" | "node_modules" | "target" | "dist" | "build" | ".venv" | "__pycache__"
         ) {
             continue;
         }

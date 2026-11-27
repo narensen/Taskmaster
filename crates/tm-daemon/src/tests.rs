@@ -14532,3 +14532,245 @@ fn tb18_grok_code_mode_guide_includes_single_search_tool_hint() {
         );
     }
 }
+
+#[tokio::test]
+async fn tb18_live_sync_reaches_only_dependents_and_isolates_independent_siblings() {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::AtomicBool;
+
+    // 1. End-to-end `drive`: independent same-phase units A (`frontend`) and B (`evaluator`) plus
+    //    integrator C (`cli`, depends_on: [frontend, evaluator]) all start concurrently.
+    //    When A lands: C's active worktree gets `calcx/parser.py`, while B's active worktree does NOT.
+    struct SiblingIsolationHarness {
+        started: Arc<tokio::sync::Barrier>,
+        c_saw_a_notify: Arc<tokio::sync::Notify>,
+        c_saw_a: Arc<AtomicBool>,
+        c_saw_b: Arc<AtomicBool>,
+        b_saw_a: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Harness for SiblingIsolationHarness {
+        fn id(&self) -> &'static str {
+            "tb18-live-sync-dependents"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            tokio::time::timeout(Duration::from_secs(5), self.started.wait())
+                .await
+                .expect("A, B, and early-started C must overlap concurrently");
+            if task.brief.contains("Build unit `frontend`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(task.cwd.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:frontend\n".into() }).await;
+            } else if task.brief.contains("Build unit `evaluator`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(task.cwd.join("calcx/evaluator.py"), "def eval_val(x: int) -> int:\n    return x + 1\n")?;
+                // Wait until A has landed AND C has observed A's live-synced file, so `Driver::settle`
+                // for A has definitively finished executing its live-sync loop.
+                tokio::time::timeout(Duration::from_secs(5), self.c_saw_a_notify.notified())
+                    .await
+                    .expect("C should observe A landing");
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                if task.cwd.join("calcx/parser.py").exists() {
+                    self.b_saw_a.store(true, Ordering::SeqCst);
+                }
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:evaluator\n".into() }).await;
+            } else if task.brief.contains("Build unit `cli`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(
+                    task.cwd.join("calcx/cli.py"),
+                    "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run() -> int:\n    return eval_val(parse('x'))\n",
+                )?;
+                for _ in 0..150 {
+                    if task.cwd.join("calcx/parser.py").is_file()
+                        && std::fs::read_to_string(task.cwd.join("calcx/parser.py"))?.contains("return 42")
+                    {
+                        self.c_saw_a.store(true, Ordering::SeqCst);
+                        self.c_saw_a_notify.notify_waiters();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                for _ in 0..150 {
+                    if task.cwd.join("calcx/evaluator.py").is_file()
+                        && std::fs::read_to_string(task.cwd.join("calcx/evaluator.py"))?.contains("return x + 1")
+                    {
+                        self.c_saw_b.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let tmp = repo("tb18-live-sync-dependents");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+            ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "from typing import Protocol\nclass FrontendProtocol(Protocol):\n    def parse(self, expr: str) -> int: ...\nclass EvaluatorProtocol(Protocol):\n    def eval_val(self, x: int) -> int: ...\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "frontend".into(),
+                owned_glob: "calcx/parser.py".into(),
+                brief: "Implement FrontendProtocol from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "evaluator".into(),
+                owned_glob: "calcx/evaluator.py".into(),
+                brief: "Implement EvaluatorProtocol from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "calcx/cli.py".into(),
+                brief: "Wire FrontendProtocol and EvaluatorProtocol from calcx/contract.py.".into(),
+                depends_on: vec!["frontend".into(), "evaluator".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let h = Arc::new(SiblingIsolationHarness {
+        started: Arc::new(tokio::sync::Barrier::new(3)),
+        c_saw_a_notify: Arc::new(tokio::sync::Notify::new()),
+        c_saw_a: Arc::new(AtomicBool::new(false)),
+        c_saw_b: Arc::new(AtomicBool::new(false)),
+        b_saw_a: Arc::new(AtomicBool::new(false)),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h.clone() };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 3);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(h.c_saw_a.load(Ordering::SeqCst), "dependent C (`cli`) must receive A's file via live sync");
+    assert!(h.c_saw_b.load(Ordering::SeqCst), "dependent C (`cli`) must receive B's file via live sync");
+    assert!(
+        !h.b_saw_a.load(Ordering::SeqCst),
+        "independent same-phase sibling B (`evaluator`) must NOT receive A's (`frontend`) files"
+    );
+
+    // 2. Direct `live_sync_dependents` + `sync_exclude_globs` check:
+    //    - Verifies exact log messages (C and transitive D get `live-synced`, B gets none).
+    //    - Verifies `mark_dep_landed` and `dirty` are untouched on non-dependent B.
+    //    - Verifies even when a unit depends on an independent `core` unit (not `frontend`),
+    //      syncing `core` still excludes `frontend`'s files from its worktree.
+    let tmp2 = repo("tb18-live-sync-direct");
+    std::fs::create_dir_all(tmp2.0.join("calcx")).unwrap();
+    std::fs::write(tmp2.0.join("calcx/__init__.py"), "").unwrap();
+    git_out(&tmp2.0, &["add", "."]);
+    git_out(&tmp2.0, &["commit", "-q", "-m", "base"]);
+
+    let wt_b = tmp2.0.parent().unwrap().join("tb18-live-sync-direct-wt-b");
+    let wt_c = tmp2.0.parent().unwrap().join("tb18-live-sync-direct-wt-c");
+    let wt_d = tmp2.0.parent().unwrap().join("tb18-live-sync-direct-wt-d");
+    for wt in [&wt_b, &wt_c, &wt_d] {
+        let _ = std::fs::remove_dir_all(wt);
+        git_out(&tmp2.0, &["worktree", "add", "--detach", "-q", wt.to_str().unwrap(), "HEAD"]);
+    }
+
+    let mut plan2 = plan;
+    plan2.pages.push(PagePlan {
+        id: "core".into(),
+        owned_glob: "calcx/core.py".into(),
+        brief: "Core helpers.".into(),
+        ..Default::default()
+    });
+    // Let `evaluator` depend ONLY on `core` (still independent of `frontend`), and add transitive `app -> cli`.
+    plan2.pages.iter_mut().find(|p| p.id == "evaluator").unwrap().depends_on = vec!["core".into()];
+    plan2.pages.push(PagePlan {
+        id: "app".into(),
+        owned_glob: "calcx/app.py".into(),
+        brief: "Top-level app wiring cli.".into(),
+        depends_on: vec!["cli".into()],
+        ..Default::default()
+    });
+
+    let sync_b = crate::code::WorktreeSync::new(
+        wt_b.clone(),
+        tmp2.0.clone(),
+        crate::engine::sync_exclude_globs(Some(&plan2), "evaluator", "calcx/evaluator.py"),
+        BTreeSet::from(["core".to_string()]),
+    );
+    let sync_c = crate::code::WorktreeSync::new(
+        wt_c.clone(),
+        tmp2.0.clone(),
+        crate::engine::sync_exclude_globs(Some(&plan2), "cli", "calcx/cli.py"),
+        BTreeSet::from(["frontend".to_string(), "evaluator".to_string()]),
+    );
+    let sync_d = crate::code::WorktreeSync::new(
+        wt_d.clone(),
+        tmp2.0.clone(),
+        crate::engine::sync_exclude_globs(Some(&plan2), "app", "calcx/app.py"),
+        BTreeSet::from(["frontend".to_string(), "evaluator".to_string(), "cli".to_string()]),
+    );
+    let mut active_syncs = HashMap::new();
+    active_syncs.insert("evaluator".to_string(), vec![sync_b.clone()]);
+    active_syncs.insert("cli".to_string(), vec![sync_c.clone()]);
+    active_syncs.insert("app".to_string(), vec![sync_d.clone()]);
+
+    // Land `frontend` in main tree.
+    std::fs::write(tmp2.0.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n").unwrap();
+    git_out(&tmp2.0, &["add", "calcx/parser.py"]);
+    git_out(&tmp2.0, &["commit", "-q", "-m", "land frontend"]);
+
+    let logs = crate::engine::live_sync_dependents(Some(&plan2), "frontend", &active_syncs);
+    assert!(wt_c.join("calcx/parser.py").is_file(), "direct dependent C must receive A's file");
+    assert!(wt_d.join("calcx/parser.py").is_file(), "transitive dependent D must receive A's file");
+    assert!(!wt_b.join("calcx/parser.py").exists(), "independent sibling B must NOT receive A's file");
+    assert!(!sync_b.is_dirty(), "independent sibling B must not be marked dirty");
+    assert_eq!(sync_b.pending_deps(), vec!["core".to_string()], "B's pending_deps must stay untouched");
+    assert_eq!(sync_c.pending_deps(), vec!["evaluator".to_string()], "C must mark frontend landed");
+    assert!(
+        logs.iter().any(|l| l.contains("live-synced") && l.contains("into active `cli` worktree")),
+        "expected live-sync log for C: {logs:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("live-synced") && l.contains("into active `app` worktree")),
+        "expected live-sync log for transitive D: {logs:?}"
+    );
+    assert!(
+        !logs.iter().any(|l| l.contains("`evaluator`")),
+        "must NOT emit any live-synced log for independent sibling B: {logs:?}"
+    );
+
+    // Even when `core` later lands and syncs into `evaluator`, `frontend`'s `calcx/parser.py`
+    // remains excluded from `evaluator`'s worktree.
+    std::fs::write(tmp2.0.join("calcx/core.py"), "CONST = 1\n").unwrap();
+    git_out(&tmp2.0, &["add", "calcx/core.py"]);
+    git_out(&tmp2.0, &["commit", "-q", "-m", "land core"]);
+
+    let logs_core = crate::engine::live_sync_dependents(Some(&plan2), "core", &active_syncs);
+    assert!(wt_b.join("calcx/core.py").is_file(), "B must receive its real dependency `core`");
+    assert!(
+        !wt_b.join("calcx/parser.py").exists(),
+        "syncing `core` into B must still exclude unrelated same-phase sibling `frontend`"
+    );
+    assert!(
+        logs_core.iter().any(|l| l.contains("from `core` into active `evaluator` worktree")),
+        "expected live-sync log for `core` -> `evaluator`: {logs_core:?}"
+    );
+
+    for wt in [&wt_b, &wt_c, &wt_d] {
+        let _ = git_out(&tmp2.0, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(wt);
+    }
+}

@@ -171,17 +171,19 @@ pub struct SyncReport {
 
 static SYNC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn compile_exclude_glob(glob: &str) -> Option<globset::GlobSet> {
+fn compile_exclude_globs(globs: &[String]) -> Option<globset::GlobSet> {
     let mut builder = globset::GlobSetBuilder::new();
     let mut any = false;
-    for alt in tm_core::glob_alternatives(glob) {
-        let pat = alt.trim().trim_start_matches("./");
-        if pat.is_empty() {
-            continue;
-        }
-        if let Ok(compiled) = globset::Glob::new(pat) {
-            builder.add(compiled);
-            any = true;
+    for glob in globs {
+        for alt in tm_core::glob_alternatives(glob) {
+            let pat = alt.trim().trim_start_matches("./");
+            if pat.is_empty() {
+                continue;
+            }
+            if let Ok(compiled) = globset::Glob::new(pat) {
+                builder.add(compiled);
+                any = true;
+            }
         }
     }
     if any { builder.build().ok() } else { None }
@@ -219,15 +221,16 @@ fn atomic_write_bytes(src: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<(
 
 /// Bring `worktree` up to date with `tree` by atomically copying every file that changed in
 /// `tree` since `worktree`'s commit, skipping `.flow/index.sqlite*` and any path matching
-/// `exclude_glob` (e.g. an active worker's `owned_glob`). Files whose on-disk bytes already
-/// match `tree` are left untouched so timestamps and test caches are preserved.
-pub fn sync_worktree_excluding(
+/// `exclude_globs` (e.g. an active worker's `owned_glob` plus independent same/later-phase
+/// sibling globs). Files whose on-disk bytes already match `tree` are left untouched so
+/// timestamps and test caches are preserved.
+pub fn sync_worktree_excluding_globs(
     worktree: &Path,
     tree: &Path,
-    exclude_glob: Option<&str>,
+    exclude_globs: &[String],
 ) -> anyhow::Result<SyncReport> {
     let base = head(worktree)?;
-    let exclude = exclude_glob.and_then(compile_exclude_glob);
+    let exclude = compile_exclude_globs(exclude_globs);
     let changed = git(tree, &["diff", "--no-renames", "--name-status", "-z", &base, "HEAD"])?;
     let mut report = SyncReport::default();
     for change in parse_name_status(&changed) {
@@ -261,6 +264,16 @@ pub fn sync_worktree_excluding(
         report.snapshots.push(SyncedFile { path: change.path, deleted: false, sha256: Some(digest) });
     }
     Ok(report)
+}
+
+/// Convenience wrapper around [`sync_worktree_excluding_globs`] for a single optional exclude glob.
+pub fn sync_worktree_excluding(
+    worktree: &Path,
+    tree: &Path,
+    exclude_glob: Option<&str>,
+) -> anyhow::Result<SyncReport> {
+    let globs: Vec<String> = exclude_glob.into_iter().map(str::to_string).collect();
+    sync_worktree_excluding_globs(worktree, tree, &globs)
 }
 
 /// Bring a worktree kept open for a follow-up up to date with `tree`: every file that

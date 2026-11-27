@@ -2895,22 +2895,29 @@ impl Driver {
                 .run
                 .plan
                 .as_ref()
-                .and_then(|p| p.pages.iter().find(|u| u.id == page))
-                .map(|u| {
-                    u.depends_on
-                        .iter()
-                        .filter(|dep| {
-                            dep.as_str() != page
-                                && self.run.pages.get(dep.as_str()).is_some_and(|st| st.state != tm_core::PageState::Passed)
+                .and_then(|p| {
+                    tm_verify::transitive_depends_on(p)
+                        .get(page.as_str())
+                        .map(|deps| {
+                            deps.iter()
+                                .filter(|&&dep| {
+                                    dep != page.as_str()
+                                        && self.run.pages.get(dep).is_some_and(|st| st.state != tm_core::PageState::Passed)
+                                })
+                                .map(|&dep| dep.to_string())
+                                .collect()
                         })
-                        .cloned()
-                        .collect()
                 })
                 .unwrap_or_default();
+            let exclude_globs = sync_exclude_globs(
+                self.run.plan.as_ref(),
+                &page,
+                &units[unit_idx].owned_glob,
+            );
             let sync = crate::code::WorktreeSync::new(
                 worktree.clone(),
                 self.tree.clone(),
-                units[unit_idx].owned_glob.clone(),
+                exclude_globs,
                 pending_deps,
             );
             self.active_syncs.entry(page.clone()).or_default().push(sync.clone());
@@ -3810,22 +3817,11 @@ impl Driver {
             self.start_check(page, tier, wanted, CheckInput { diff, files, shot, said: text });
         }
         if let WorkerOutcome::Passed = &outcome {
-            // Propagate newly landed sibling files into every active worker worktree (race-safe:
-            // deferred via `dirty` whenever a `test()`/`sh()` is currently executing in that worktree).
-            for (other_page, syncs) in &self.active_syncs {
-                if other_page == page {
-                    continue;
-                }
-                for sync in syncs {
-                    sync.mark_dep_landed(page);
-                    let updated = sync.mark_dirty_and_try_sync();
-                    if !updated.is_empty() {
-                        eprintln!(
-                            "taskmaster: live-synced {} file(s) from `{page}` into active `{other_page}` worktree",
-                            updated.len()
-                        );
-                    }
-                }
+            // Propagate newly landed files ONLY into active worker worktrees whose plan unit
+            // depends on `page` (directly or transitively via `tm_verify::transitive_depends_on`).
+            // Independent same-phase siblings stay isolated so they never violate import boundaries.
+            for msg in live_sync_dependents(self.run.plan.as_ref(), page, &self.active_syncs) {
+                eprintln!("{msg}");
             }
             if let Some(waiters) = self.soft_dep_waiters.remove(page) {
                 let landed: Vec<String> = waiters
@@ -9185,6 +9181,79 @@ pub(crate) fn body_duplicated_in(body: &str, contracts: &[&str]) -> bool {
         .filter(|l| normalized_contracts.iter().any(|c| c.contains(l.as_str())))
         .count();
     matched * 10 >= meaningful.len() * 9
+}
+
+/// Build the exclude-glob list for an active worker's [`crate::code::WorktreeSync`]: always
+/// excludes the unit's own `owned_glob`, plus the `owned_glob` of every sibling page in the same
+/// or later phase that `page_id` does not transitively depend on (matching
+/// [`tm_verify::ImportGraph::cross_page_imports`]). That guarantees even when a unit syncs after
+/// one of its real dependencies lands, unrelated same-phase siblings that happened to land earlier
+/// in `tree` cannot bleed into its worktree.
+pub(crate) fn sync_exclude_globs(plan: Option<&Plan>, page_id: &str, owned_glob: &str) -> Vec<String> {
+    let mut globs = vec![owned_glob.to_string()];
+    let Some(plan) = plan else {
+        return globs;
+    };
+    let deps = tm_verify::transitive_depends_on(plan);
+    let page_deps = deps.get(page_id);
+    let page_phase = plan
+        .pages
+        .iter()
+        .find(|p| p.id == page_id)
+        .map(|p| p.phase)
+        .unwrap_or(0);
+    for other in &plan.pages {
+        if other.id == page_id || other.phase < page_phase {
+            continue;
+        }
+        if page_deps.is_some_and(|d| d.contains(other.id.as_str())) {
+            continue;
+        }
+        if !other.owned_glob.trim().is_empty() {
+            globs.push(other.owned_glob.clone());
+        }
+    }
+    globs
+}
+
+/// Propagate newly landed `landed_page` files ONLY into active worktrees whose plan unit depends
+/// on `landed_page` (directly or transitively via [`tm_verify::transitive_depends_on`]).
+/// Independent siblings are never marked or synced, preserving worktree isolation and avoiding
+/// false import-boundary violations.
+///
+/// Returns formatted daemon log lines for each active dependent worktree whose files changed.
+pub(crate) fn live_sync_dependents(
+    plan: Option<&Plan>,
+    landed_page: &str,
+    active_syncs: &HashMap<PageId, Vec<Arc<crate::code::WorktreeSync>>>,
+) -> Vec<String> {
+    let Some(plan) = plan else {
+        return Vec::new();
+    };
+    let deps = tm_verify::transitive_depends_on(plan);
+    let mut logs = Vec::new();
+    for (other_page, syncs) in active_syncs {
+        if other_page == landed_page {
+            continue;
+        }
+        let depends_on_landed = deps
+            .get(other_page.as_str())
+            .is_some_and(|d| d.contains(landed_page));
+        if !depends_on_landed {
+            continue;
+        }
+        for sync in syncs {
+            sync.mark_dep_landed(landed_page);
+            let updated = sync.mark_dirty_and_try_sync();
+            if !updated.is_empty() {
+                logs.push(format!(
+                    "taskmaster: live-synced {} file(s) from `{landed_page}` into active `{other_page}` worktree",
+                    updated.len()
+                ));
+            }
+        }
+    }
+    logs
 }
 
 /// Render `CODE_MODE_GUIDE` with the exact MCP tool name exposed by `harness_id`

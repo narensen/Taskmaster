@@ -308,7 +308,7 @@ impl Drop for WarmNode {
 pub struct WorktreeSync {
     worktree: PathBuf,
     tree: PathBuf,
-    owned_glob: String,
+    exclude_globs: Vec<String>,
     rw: tokio::sync::RwLock<()>,
     dirty: AtomicBool,
     snapshots: Mutex<HashMap<String, Option<[u8; 32]>>>,
@@ -319,13 +319,13 @@ impl WorktreeSync {
     pub fn new(
         worktree: PathBuf,
         tree: PathBuf,
-        owned_glob: String,
+        exclude_globs: Vec<String>,
         pending_deps: BTreeSet<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             worktree,
             tree,
-            owned_glob,
+            exclude_globs,
             rw: tokio::sync::RwLock::new(()),
             dirty: AtomicBool::new(false),
             snapshots: Mutex::new(HashMap::new()),
@@ -362,7 +362,7 @@ impl WorktreeSync {
         let Ok(_write_guard) = self.rw.try_write() else {
             return Vec::new();
         };
-        match crate::git::sync_worktree_excluding(&self.worktree, &self.tree, Some(&self.owned_glob)) {
+        match crate::git::sync_worktree_excluding_globs(&self.worktree, &self.tree, &self.exclude_globs) {
             Ok(report) => {
                 self.record_snapshots(&report);
                 self.dirty.store(false, Ordering::Release);
@@ -383,8 +383,8 @@ impl WorktreeSync {
         }
         let worktree = self.worktree.clone();
         let tree = self.tree.clone();
-        let glob = self.owned_glob.clone();
-        match tokio::task::spawn_blocking(move || crate::git::sync_worktree_excluding(&worktree, &tree, Some(&glob))).await {
+        let globs = self.exclude_globs.clone();
+        match tokio::task::spawn_blocking(move || crate::git::sync_worktree_excluding_globs(&worktree, &tree, &globs)).await {
             Ok(Ok(report)) => {
                 self.record_snapshots(&report);
                 self.dirty.store(false, Ordering::Release);
@@ -3343,7 +3343,7 @@ mod tests {
         crate::git::add_worktree(&repo, &wt, &h1).unwrap();
 
         let pending: BTreeSet<String> = ["parser".to_string()].into_iter().collect();
-        let sync = WorktreeSync::new(wt.clone(), repo.clone(), "pkg/cli.py".into(), pending);
+        let sync = WorktreeSync::new(wt.clone(), repo.clone(), vec!["pkg/cli.py".into()], pending);
         std::fs::write(wt.join("pkg/cli.py"), "WIP = 1\n").unwrap();
 
         // Hold an exec read guard (simulating an in-flight `test()`/`sh()`).

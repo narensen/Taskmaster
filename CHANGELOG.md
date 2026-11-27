@@ -3,6 +3,49 @@
 What changed in each release, for the people who use Taskmaster. The section for a version is
 also its GitHub release notes (`scripts/release-notes.sh` takes it from here).
 
+## 2.0.0
+
+### Code Mode
+
+- Code Mode is on by default. Workers edit and test through `run_code`, using batched writes and
+  targeted `test(paths)` / `testAffected` calls. Refused native tools get a clear redirect, and
+  crashed or partial `run_code` edits can be recovered.
+- `.flow` code intelligence: a deterministic repo graph, the `flow_query` tool and Code Mode
+  `flow()`, unit maps in worker briefs, and a staleness gate that repairs itself.
+
+### Brownfield
+
+- Richer deterministic `.flow` packing, with a Codebase Atlas wired into the planner.
+- A read-only, low-effort brownfield scope scout for larger repos (>= 25 source files,
+  `scout.enabled` / `scout.min_files`). If it fails, planning falls back to deterministic packing.
+
+### Web access
+
+- Native web access is on by default (`provider: "native"`), with per-role search caps that are
+  recorded in the ledger. Every fetch goes through the daemon's SSRF-guarded, cached and budgeted
+  `web_fetch`.
+- `--offline` / `TASKMASTER_OFFLINE=1` turn all web access off. Benchmarks and `tm-daemon eval`
+  use it automatically.
+
+### Faster runs
+
+- Units whose dependencies are covered by locked contracts start right away. If one finishes
+  first, it is held until those dependencies land, and then it is checked against them.
+- A landed unit's files are live-synced only into the active units that depend on it, never into
+  independent siblings.
+- Existing Python venvs are reused (keyed on a dependency-only pyproject hash), and stdlib-only
+  packages get an absolute import path.
+- Leaner prompts, warm worker sessions reused across waves, Antigravity routing by effort level,
+  and quota/429 detection that stops a run cleanly.
+
+### Benchmarks
+
+- On calcx with 2.0 (isolated, offline, single runs, all 24/24): with Gemini workers, standard
+  mode took 199s (TB-15: 245s, but with 30% more input) and Code Mode took 277s (TB-15: 198s,
+  slowed by one imports-check repair). With Grok Build workers, Code Mode took 599s (pre-2.0:
+  1,122s, with 38% less input) and standard mode took 867–1,086s (pre-2.0: 594s). Details are in
+  `docs/BENCHMARKS.md`.
+
 ## 0.1.8
 
 ### Run modes and turns

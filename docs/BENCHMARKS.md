@@ -1,8 +1,8 @@
-# Taskmaster Gemini benchmarks
+# Taskmaster benchmarks
 
 Taskmaster is a local, multi-model coding harness and run studio. You describe a web app, library, CLI, server, or migration once (or import a GitHub/GitLab issue with screenshots and files). The master researches unfamiliar APIs, locks shared contracts and executable contract tests, and splits the build across up to 16 parallel workers in isolated git worktrees. Fast checks run as each unit merges, and a separate reviewer and verifier grade the result before a run is called done. It can drive Claude Code, Codex, Grok Build, Antigravity, and OpenCode.
 
-This note records the Gemini comparison runs: tinydb greenfield and brownfield across Taskmaster generations n5, n7, and n8/n8b, plus the first three greenfield tasks in the TB-15 suite. A later Grok Build comparison was started and then stopped; those runs are not reported here.
+This note records the Gemini comparison runs: tinydb greenfield and brownfield across Taskmaster generations n5, n7, and n8/n8b, plus the first three greenfield tasks in the TB-15 suite. The [Taskmaster 2.0 section](#taskmaster-20-calcx-grok-build-and-gemini) adds calcx on the 2.0 build with Grok Build and Gemini workers.
 
 ## Setups
 
@@ -86,6 +86,35 @@ These are Taskmaster-only runs on calcx (24 checks), mdtodo (24), and notesapi (
 
 calcx and mdtodo used almost only `gemini-4-hydrogen-medium` for workers (mdtodo Code Mode also had one `gemini-4-hydrogen-high` call). notesapi used `gemini-4-neon-high` for the planner and `gemini-4-hydrogen-medium` for the three worker calls.
 
+### Taskmaster 2.0: calcx, Grok Build and Gemini
+
+These runs used the 2.0 build (commit `e999251`) on calcx (24 checks, v2 graders). All of them were `--offline` (`TASKMASTER_OFFLINE=1`), with `--parallel 3`. During each run, graders, reference solutions, earlier runs and logs, and the harness session history were moved into root-only directories the agents could not read. A post-run log scan found no access to them, and the suite's FROZEN hashes checked 117/117 afterwards. Every row is a single run.
+
+**Gemini** (same setup as TB-15: master, reviewer and verifier `gemini-4-neon-high`, workers `gemini-4-hydrogen-high`), against the TB-15 n8b runs above:
+
+| Setup | Build | Score | Time (s) | Uncached in | Output | Cache read | Agent calls |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| tmh | 2.0 | 24/24 | 199.3 | 88,443 | 39,498 | 243,806 | 4 |
+| tmh | n8b | 24/24 | 244.7 | 67,801 | 35,704 | 158,463 | 4 |
+| tmhcode | 2.0 | 24/24 | 277.4 | 102,397 | 48,372 | 304,075 | 7 |
+| tmhcode | n8b | 24/24 | 198.2 | 83,194 | 36,996 | 100,466 | 4 |
+
+Standard mode got faster but used 30% more uncached input. Code Mode got slower: the units finished in 54s, but then about 64s and 3 extra calls went to an imports-check repair. The evaluator had imported its sibling's parser; the repair changed nothing, and the identical finding was waived.
+
+**Grok Build** (workers `grok-4.7`; master, reviewer and verifier `gemini-4-neon-high`), against the earlier clean Grok runs on the pre-2.0 build (n9):
+
+| Setup | Build | Score | Time (s) | Uncached in | Output | Agent calls |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| tmhcode | 2.0 | 24/24 | 599.4 | 156,638 | 103,741 | 4 |
+| tmhcode | n9 | 24/24 | 1,121.7 | 253,260 | 151,139 | 4 |
+| tmh | 2.0 (run 1) | 24/24 | 1,086.1 | 265,976 | 149,923 | 5 |
+| tmh | 2.0 (run 2) | 24/24 | 867.0 | 227,280 | 149,934 | 4 |
+| tmh | n9 | 24/24 | 594.0 | 228,208 | 100,869 | 5 |
+
+Code Mode took about half the time with 38% less uncached input. Standard mode is still slower than n9. In both 2.0 runs the three units started together, and Taskmaster's own overhead was a few seconds. The extra time came from the Grok workers producing about 50% more output tokens (thinking) than in n9. Run 1 also needed one repair, because the CLI worker excluded the failing acceptance test from its own test run.
+
+During 2.0 development an intermediate build ran calcx standard mode in about 1,300s, because contract-covered integrators no longer started early. 2.0 restores early start, and it live-syncs each landed unit only into the units that depend on it.
+
 ### Token-cut journey (n7 to n8)
 
 n5 tinydb greenfield was already around 268k uncached input (268,344 tmh, 267,608 tmhcode). n7 greenfield uncached input was higher: 289,746 on n7a tmh, up to 439,872 on n7b tmh, and 340,727 / 342,158 on the two n7 Code Mode runs.
@@ -98,7 +127,7 @@ Brownfield uncached input also fell, but by less: n7 was 368,105 / 372,240; n8 s
 
 - **Single runs, small sample.** Most cells are one run. n7a/n7b and the n8b Code Mode rerun are the only repeats. There are no medians, error bars, or timeout retries in these tables.
 - **Missing baselines.** T3 and Agy were measured only on tinydb greenfield. There is no brownfield or TB-15 baseline. TB-15 itself covers only three of six planned tasks.
-- **Runs were not filesystem-isolated.** The sandbox made other paths read-only; it did not hide them. A later Grok Build pass on the same bench tree showed agents reading hidden graders, reference solutions, and (in one case) a sibling run. A scan of the Gemini tinydb and TB-15 logs found no evidence that those runs did the same, but they were not isolated either, so a 24/24 on Gemini does not rest on a hard guarantee that the grader was unseen.
+- **Runs before 2.0 were not filesystem-isolated.** The sandbox made other paths read-only; it did not hide them. A later Grok Build pass on the same bench tree showed agents reading hidden graders, reference solutions, and (in one case) a sibling run. A scan of the Gemini tinydb and TB-15 logs found no evidence that those runs did the same, but they were not isolated either, so a 24/24 on Gemini does not rest on a hard guarantee that the grader was unseen.
 - **Estimates and cost.** Planner token estimates were often high (for example n5 tmh estimated 479,985 tokens plus 1,330,992 cache reads, and used 268,344 uncached input, 177,009 output, and 1,183,460 cache reads). Actual runs are unpriced, so this document does not report USD cost.
 - **Model-name comparison.** Effort routing and ledger `model` strings are not uniform across n5–n8b, even though every Taskmaster launch requested the same role models. Treat routed `-medium` / `-low` rows as the same requested setup, not as a different model choice.
 - **Code Mode purity.** Some Code Mode ledgers still include `read_file` or `edit_file` next to `run_code` (for example n8 tinydb tmhcode and both mdtodo Code Mode tool lists).
@@ -114,4 +143,5 @@ Brownfield uncached input also fell, but by less: n7 was 368,105 / 372,240; n8 s
 - n5 tokens: `/workspace/t3setup/h7/bench/logs/n5-tinydb-tmh.log` and `n5-tinydb-tmhcode.log`, plus the run ledgers; scores from frozen `new_tinydb.py` on the saved trees
 - Token-cut analysis (n7 breakdown; T3/Agy comparison targets in that file are superseded by the correction above): `/workspace/tm-flow-run/token-breakdown.md`
 - Coherence pass on the n8 tree: `/workspace/tm-flow/docs/coherence-review.md`
+- Taskmaster 2.0 calcx runs: `/workspace/tm-flow-run/n10-results.md`, `/workspace/tm-flow-run/n10/n10-metrics.jsonl`, `/workspace/tm-flow-run/progress-tb18.md`
 - Freezes: `/workspace/t3setup/h5/grader/README.md`, `/workspace/t3setup/h7/bench/brown/FROZEN.sha256`, `/workspace/t3setup/h7/bench/suite/FROZEN.sha256`, `/workspace/t3setup/h7/bench/suite/AUDIT-v2.md`

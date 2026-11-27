@@ -122,7 +122,7 @@ Everything that reaches the daemon lives on the **Connect** page (`/connect`, or
 
 ## Code Mode & warm code intelligence
 
-Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only planners/reviewers) receive `run_code`: a sandboxed async JavaScript runtime behind the same permission gate as their native tools, exposing `read`, `readMany`, `write`, `writeFile`, `edit`, `patch`, `applyPatch`, `tryPatch`, `test(paths?)`, `testAffected(paths?)`, `grep`, `ls`, `diff`, `symbols`, `flow`, `sh`, `check`, and `browser` (scoped strictly to the run's preview origin). Workers batch related writes in 1–2 `run_code` calls ending in targeted `test(paths)` or full `test()`, and active worktrees receive race-safe live sync of newly landed sibling files outside their owned glob. Claude Code workers use `run_code` with native edit/shell tools withheld.
+Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only planners/reviewers) receive `run_code`: a sandboxed async JavaScript runtime behind the same permission gate as their native tools, exposing `read`, `readMany`, `write`, `writeFile`, `edit`, `patch`, `applyPatch`, `tryPatch`, `test(paths?)`, `testAffected(paths?)`, `grep`, `ls`, `diff`, `symbols`, `flow`, `sh`, `check`, and `browser` (scoped strictly to the run's preview origin). Workers batch related writes in 1–2 `run_code` calls ending in targeted `test(paths)` or full `test()`, and active worktrees of dependent units receive race-safe live sync of newly landed dependency files outside their owned glob. Claude Code workers use `run_code` with native edit/shell tools withheld.
 
 Alongside Code Mode, the daemon maintains:
 
@@ -159,7 +159,7 @@ Harnesses that do not report USD costs stay unpriced by default (no model prices
 
 ## Benchmarks
 
-On a hidden-test tinydb build, Taskmaster scored 24/24 in about 410s with ~125k uncached input tokens, against 1,279s for T3 Code and 1,432s for the native Antigravity agent at the same score. Full results, methodology and limitations are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+On a hidden-test tinydb build, Taskmaster scored 24/24 in about 410s with ~125k uncached input tokens, against 1,279s for T3 Code and 1,432s for the native Antigravity agent at the same score. On calcx with 2.0 (isolated, offline, single runs, all 24/24): with Gemini workers, standard mode took 199s (TB-15: 245s) and Code Mode took 277s (TB-15: 198s, slowed by one repair). With Grok Build workers, Code Mode took 599s (pre-2.0: 1,122s) and standard mode took 867–1,086s (pre-2.0: 594s). Full results, methodology and limitations are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Develop
 

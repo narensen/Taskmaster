@@ -3,8 +3,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
+use sha2::{Digest, Sha256};
 
 /// [`git`], with the output as bytes: a file's content, which need not be text.
 pub fn git_bytes(repo: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
@@ -148,27 +150,137 @@ pub fn same_as(worktree: &Path, tree: &Path, change: &Change) -> bool {
     }
 }
 
-/// Bring a worktree kept open for a follow-up up to date with `tree`: every file that
-/// changed in `tree` since the worktree's commit is copied over (or removed). The worktree's
-/// own edits to other files stay. Only plain file writes; nothing in git moves.
-pub fn sync_worktree(worktree: &Path, tree: &Path) -> anyhow::Result<()> {
+/// One file updated or deleted in a worktree by [`sync_worktree_excluding`], together with the
+/// SHA-256 digest of the bytes written (or `None` for a deletion) so downstream ownership checks
+/// can distinguish daemon-synced sibling files from worker edits even if `tree` later moves on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncedFile {
+    pub path: String,
+    pub deleted: bool,
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// Summary of a [`sync_worktree_excluding`] pass.
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    /// Relative paths whose on-disk content changed during this sync pass.
+    pub updated: Vec<String>,
+    /// All non-excluded files represented in `base..HEAD` with their synced content digests.
+    pub snapshots: Vec<SyncedFile>,
+}
+
+static SYNC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn compile_exclude_globs(globs: &[String]) -> Option<globset::GlobSet> {
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut any = false;
+    for glob in globs {
+        for alt in tm_core::glob_alternatives(glob) {
+            let pat = alt.trim().trim_start_matches("./");
+            if pat.is_empty() {
+                continue;
+            }
+            if let Ok(compiled) = globset::Glob::new(pat) {
+                builder.add(compiled);
+                any = true;
+            }
+        }
+    }
+    if any { builder.build().ok() } else { None }
+}
+
+fn is_flow_sqlite(path: &str) -> bool {
+    let norm = path.trim_start_matches("./");
+    norm.starts_with(".flow/index.sqlite")
+        || Path::new(norm)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("index.sqlite") && norm.starts_with(".flow/"))
+}
+
+fn atomic_write_bytes(src: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let seq = SYNC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".tm-sync-{}-{seq}.tmp", std::process::id()));
+    let write_res = (|| -> anyhow::Result<()> {
+        std::fs::write(&tmp, bytes)?;
+        if let Ok(meta) = std::fs::metadata(src) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, dest)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_res
+}
+
+/// Bring `worktree` up to date with `tree` by atomically copying every file that changed in
+/// `tree` since `worktree`'s commit, skipping `.flow/index.sqlite*` and any path matching
+/// `exclude_globs` (e.g. an active worker's `owned_glob` plus independent same/later-phase
+/// sibling globs). Files whose on-disk bytes already match `tree` are left untouched so
+/// timestamps and test caches are preserved.
+pub fn sync_worktree_excluding_globs(
+    worktree: &Path,
+    tree: &Path,
+    exclude_globs: &[String],
+) -> anyhow::Result<SyncReport> {
     let base = head(worktree)?;
+    let exclude = compile_exclude_globs(exclude_globs);
     let changed = git(tree, &["diff", "--no-renames", "--name-status", "-z", &base, "HEAD"])?;
+    let mut report = SyncReport::default();
     for change in parse_name_status(&changed) {
-        if !safe_rel(&change.path) {
+        if !safe_rel(&change.path) || is_flow_sqlite(&change.path) {
+            continue;
+        }
+        if exclude.as_ref().is_some_and(|set| set.is_match(&change.path)) {
             continue;
         }
         let dest = worktree.join(&change.path);
         if change.status == 'D' {
-            let _ = std::fs::remove_file(&dest);
+            if dest.exists() {
+                let _ = std::fs::remove_file(&dest);
+                report.updated.push(change.path.clone());
+            }
+            report.snapshots.push(SyncedFile { path: change.path, deleted: true, sha256: None });
             continue;
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+        let src = tree.join(&change.path);
+        let src_bytes = match std::fs::read(&src) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let digest: [u8; 32] = Sha256::digest(&src_bytes).into();
+        let already_same = std::fs::read(&dest).ok().as_deref() == Some(src_bytes.as_slice());
+        if !already_same {
+            atomic_write_bytes(&src, &dest, &src_bytes)
+                .with_context(|| format!("cannot sync {}", change.path))?;
+            report.updated.push(change.path.clone());
         }
-        std::fs::copy(tree.join(&change.path), &dest).with_context(|| format!("cannot copy {}", change.path))?;
+        report.snapshots.push(SyncedFile { path: change.path, deleted: false, sha256: Some(digest) });
     }
-    Ok(())
+    Ok(report)
+}
+
+/// Convenience wrapper around [`sync_worktree_excluding_globs`] for a single optional exclude glob.
+pub fn sync_worktree_excluding(
+    worktree: &Path,
+    tree: &Path,
+    exclude_glob: Option<&str>,
+) -> anyhow::Result<SyncReport> {
+    let globs: Vec<String> = exclude_glob.into_iter().map(str::to_string).collect();
+    sync_worktree_excluding_globs(worktree, tree, &globs)
+}
+
+/// Bring a worktree kept open for a follow-up up to date with `tree`: every file that
+/// changed in `tree` since the worktree's commit is copied over (or removed). The worktree's
+/// own edits to other files stay. Only plain file writes; nothing in git moves.
+pub fn sync_worktree(worktree: &Path, tree: &Path) -> anyhow::Result<()> {
+    sync_worktree_excluding(worktree, tree, None).map(|_| ())
 }
 
 /// Reset a reusable worktree cleanly to `tree`'s exact `HEAD` commit and remove any untracked
@@ -690,6 +802,50 @@ mod tests {
         assert!(!wt.join(".flow/index.sqlite").exists());
         assert!(worktree_changes(&wt).unwrap().is_empty());
         assert!(reset_worktree(&repo, &repo).is_err());
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tb18_sync_worktree_excluding_preserves_owned_files_atomically() {
+        let root = std::env::temp_dir().join(format!("tm-git-sync-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap();
+        git(&repo, &["config", "user.name", "Test"]).unwrap();
+        git(&repo, &["config", "user.email", "test@example.com"]).unwrap();
+        std::fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        git(&repo, &["add", "."]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let h1 = head(&repo).unwrap();
+        add_worktree(&repo, &wt, &h1).unwrap();
+
+        // Active worker owns `pkg/cli.py` and `tests/test_cli.py`, and writes local work.
+        std::fs::write(wt.join("pkg/cli.py"), "MY_WIP = 42\n").unwrap();
+
+        // Meanwhile sibling lands `pkg/parser.py`, `pkg/cli.py` (hypothetically), and `.flow/index.sqlite`.
+        std::fs::write(repo.join("pkg/parser.py"), "def parse(s): return s\n").unwrap();
+        std::fs::write(repo.join("pkg/cli.py"), "SHOULD_NOT_OVERWRITE = 1\n").unwrap();
+        std::fs::create_dir_all(repo.join(".flow")).unwrap();
+        std::fs::write(repo.join(".flow/index.sqlite"), "binary").unwrap();
+        git(&repo, &["add", "pkg/parser.py", "pkg/cli.py", "-f", ".flow/index.sqlite"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "sibling landed"]).unwrap();
+
+        let report = sync_worktree_excluding(&wt, &repo, Some("{pkg/cli.py,tests/test_cli.py}")).unwrap();
+        assert_eq!(report.updated, vec!["pkg/parser.py".to_string()]);
+        assert_eq!(std::fs::read_to_string(wt.join("pkg/parser.py")).unwrap(), "def parse(s): return s\n");
+        assert_eq!(std::fs::read_to_string(wt.join("pkg/cli.py")).unwrap(), "MY_WIP = 42\n");
+        assert!(!wt.join(".flow/index.sqlite").exists());
+
+        // Second sync with identical bytes is a no-op (no updated paths, snapshots retained).
+        let report2 = sync_worktree_excluding(&wt, &repo, Some("{pkg/cli.py,tests/test_cli.py}")).unwrap();
+        assert!(report2.updated.is_empty());
+        assert_eq!(report2.snapshots.len(), 1);
+        assert_eq!(report2.snapshots[0].path, "pkg/parser.py");
+        assert!(report2.snapshots[0].sha256.is_some());
 
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&root);

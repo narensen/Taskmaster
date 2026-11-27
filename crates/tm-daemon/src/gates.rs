@@ -179,6 +179,28 @@ pub fn contract_mutation_sanity_with_env(
 
     let is_pytest = is_pytest_cmd(test_cmd);
     let is_cargo = is_cargo_test_cmd(test_cmd);
+    let mut copy_env: Vec<(String, String)> = extra_env.to_vec();
+    if is_pytest || is_python_cmd(test_cmd) || copy_env.iter().any(|(k, _)| k == "PYTHONPATH") {
+        // Re-root PYTHONPATH from the unmutated `worktree` to the isolated temp copy `tmp.0`
+        // so stubbed files are actually imported even when tests spawn subprocesses from other cwds.
+        let orig_abs = if worktree.is_absolute() {
+            worktree.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(worktree))
+                .unwrap_or_else(|_| worktree.to_path_buf())
+        };
+        let orig_src = orig_abs.join("src");
+        if let Some((_, val)) = copy_env.iter_mut().find(|(k, _)| k == "PYTHONPATH") {
+            let filtered: Vec<std::path::PathBuf> = std::env::split_paths(val.as_str())
+                .filter(|p| !p.as_os_str().is_empty() && p != &orig_abs && p != &orig_src)
+                .collect();
+            let rest = std::env::join_paths(&filtered).ok().and_then(|s| s.into_string().ok());
+            *val = crate::runtime::pythonpath_for_tree(&tmp.0, rest.as_deref());
+        } else {
+            crate::runtime::prepend_pythonpath(&mut copy_env, &tmp.0);
+        }
+    }
     let augmented = if is_pytest {
         augment_pytest_cmd(test_cmd)
     } else {
@@ -188,7 +210,7 @@ pub fn contract_mutation_sanity_with_env(
 
     // 1. Baseline check on the unmutated copy: if baseline fails or zero tests pass
     //    (e.g., all tests skipped via skipif), the gate is inconclusive rather than vacuous.
-    let baseline = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    let baseline = run_cmd_output_with_env(&tmp.0, &effective_refs, &copy_env)?;
     if !baseline.status.success() {
         return Ok(MutationVerdict::Inconclusive);
     }
@@ -199,7 +221,7 @@ pub fn contract_mutation_sanity_with_env(
     // 2. Replace target implementation with a failing stub and re-run.
     let target = tmp.0.join(impl_rel_path);
     std::fs::write(&target, stub_content)?;
-    let mutated = run_cmd_output_with_env(&tmp.0, &effective_refs, extra_env)?;
+    let mutated = run_cmd_output_with_env(&tmp.0, &effective_refs, &copy_env)?;
     if !mutated.status.success() {
         return Ok(MutationVerdict::Caught);
     }
@@ -207,6 +229,16 @@ pub fn contract_mutation_sanity_with_env(
         return Ok(MutationVerdict::Inconclusive);
     }
     Ok(MutationVerdict::Vacuous)
+}
+
+fn is_python_cmd(cmd: &[&str]) -> bool {
+    let Some(first) = cmd.first() else { return false };
+    let prog = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    matches!(prog, "python" | "python3" | "python.exe" | "python3.exe")
+        || prog.starts_with("python3.")
 }
 
 fn is_pytest_cmd(cmd: &[&str]) -> bool {
@@ -505,7 +537,11 @@ pub fn mutation_test_command(
 }
 
 fn run_cmd_ok(dir: &Path, cmd: &[&str]) -> anyhow::Result<bool> {
-    Ok(run_cmd_output_with_env(dir, cmd, &[])?.status.success())
+    let mut env = Vec::new();
+    if is_pytest_cmd(cmd) || is_python_cmd(cmd) {
+        crate::runtime::prepend_pythonpath(&mut env, dir);
+    }
+    Ok(run_cmd_output_with_env(dir, cmd, &env)?.status.success())
 }
 
 fn run_cmd_output_with_env(
@@ -763,8 +799,9 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
     let consumer_text = format!("{}\n{}\n{}", consumer.brief, consumer.context, consumer.done);
     let dep_text = format!("{}\n{}\n{}", dep_page.brief, dep_page.context, dep_page.done);
 
-    // If the consumer explicitly references a concrete non-contract file owned by `dep_page`
-    // (e.g. `tinydb/executor.py` or `tinydb.executor`), keep the hard dependency.
+    // If the consumer explicitly references a concrete non-contract file or directory module
+    // owned by `dep_page` (e.g. `tinydb/executor.py`, `tinydb.executor`, or wildcard dir
+    // `calcx/parser/*.py` -> `calcx.parser`), keep the hard dependency.
     let contract_paths: BTreeSet<&str> = interfaces.iter().map(|c| c.path.as_str()).collect();
     for concrete in concrete_paths_in_glob(&dep_page.owned_glob) {
         if contract_paths.contains(concrete.as_str()) || is_test_path(&concrete) {
@@ -774,34 +811,49 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
             return false;
         }
     }
+    for dir_mod in wildcard_module_prefixes_in_glob(&dep_page.owned_glob) {
+        if is_test_path(&dir_mod) {
+            continue;
+        }
+        if text_references_concrete_file(&consumer_text, &dir_mod) {
+            return false;
+        }
+    }
 
-    // Collect declared symbols and paths from locked interface contracts.
+    // Collect declared symbols and paths from non-trivial locked interface contracts
+    // (ignoring package markers such as `__init__.py` / `mod.rs` / `index.ts`).
     let mut contract_symbols: BTreeSet<String> = BTreeSet::new();
     for c in &interfaces {
-        contract_symbols.extend(extract_declared_symbols(&c.content));
+        if !is_package_marker_path(&c.path) {
+            contract_symbols.extend(extract_declared_symbols(&c.content));
+        }
     }
 
     // Check whether a locked interface contract covers `dep_page` (symbol matching dep id or stem)
-    // or both `dep_page` and `consumer` coordinate through the same locked contract path/symbol.
+    // or both `dep_page` and `consumer` coordinate through the same non-trivial locked contract.
     let dep_tokens = dep_identity_tokens(dep_page);
     let contract_covers_dep = contract_symbols.iter().any(|sym| {
         let low = sym.to_ascii_lowercase();
         dep_tokens.iter().any(|tok| tok.len() >= 3 && low.contains(tok.as_str()))
     });
     let consumer_mentions_contract = interfaces.iter().any(|c| {
-        consumer_text.contains(&c.path)
-            || c.path
-                .strip_suffix(".py")
-                .map(|s| s.replace('/', "."))
-                .is_some_and(|m| !m.is_empty() && consumer_text.contains(&m))
+        !is_package_marker_path(&c.path)
+            && (consumer_text.contains(&c.path)
+                || c.path
+                    .strip_suffix(".py")
+                    .map(|s| s.replace('/', "."))
+                    .is_some_and(|m| !m.is_empty() && consumer_text.contains(&m)))
     }) || contract_symbols.iter().any(|sym| sym.len() >= 3 && consumer_text.contains(sym.as_str()));
 
     if contract_covers_dep && consumer_mentions_contract {
         return true;
     }
 
-    // Both producer and consumer explicitly reference the same locked contract file or symbol.
+    // Both producer and consumer explicitly reference the same non-trivial locked contract file or symbol.
     let shared_contract_path = interfaces.iter().any(|c| {
+        if is_package_marker_path(&c.path) {
+            return false;
+        }
         let mod_name = c.path.strip_suffix(".py").map(|s| s.replace('/', "."));
         let in_dep = dep_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && dep_text.contains(m));
         let in_con = consumer_text.contains(&c.path) || mod_name.as_deref().is_some_and(|m| !m.is_empty() && consumer_text.contains(m));
@@ -811,6 +863,33 @@ pub fn dependency_is_contract_only(plan: &Plan, consumer: &tm_core::PagePlan, de
         sym.len() >= 3 && dep_text.contains(sym.as_str()) && consumer_text.contains(sym.as_str())
     });
     shared_contract_path || shared_contract_sym
+}
+
+fn is_package_marker_path(path: &str) -> bool {
+    matches!(
+        Path::new(path).file_name().and_then(|n| n.to_str()),
+        Some("__init__.py" | "mod.rs" | "lib.rs" | "index.ts" | "index.js")
+    )
+}
+
+fn wildcard_module_prefixes_in_glob(glob: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for alt in tm_core::glob_alternatives(glob) {
+        let p = alt.trim().trim_start_matches("./");
+        if !p.contains(['*', '?', '[', '{']) {
+            continue;
+        }
+        let prefix: Vec<&str> = p
+            .split('/')
+            .take_while(|seg| !seg.contains(['*', '?', '[', '{']))
+            .collect();
+        // Require at least two segments (e.g. `calcx/parser/*.py` -> `calcx/parser`), avoiding
+        // bare top-level package names like `src` or `calcx`.
+        if prefix.len() >= 2 {
+            out.push(prefix.join("/"));
+        }
+    }
+    out
 }
 
 pub(crate) fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
@@ -823,6 +902,10 @@ pub(crate) fn concrete_paths_in_glob(glob: &str) -> Vec<String> {
 
 fn text_references_concrete_file(text: &str, path: &str) -> bool {
     if text.contains(path) {
+        return true;
+    }
+    let dotted_dir = path.replace('/', ".");
+    if path.contains('/') && !path.contains('.') && text.contains(&dotted_dir) {
         return true;
     }
     if let Some(stem) = path.strip_suffix(".py") {
@@ -2445,5 +2528,128 @@ def test_isolated_and_catches_stub():
         assert!(!q.find("added", 5).unwrap().nodes.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tb18_dependency_is_contract_only_allows_shared_contract_integrator_and_rejects_concrete_or_marker_only() {
+        // 1. calcx-shaped plan: multi-dep `cli` sharing a non-trivial locked contract
+        //    (`calcx/contract.py`) with `frontend` and `evaluator` IS contract-only so `cli`
+        //    starts immediately in parallel (live-synced + parked until deps land).
+        let calcx_plan = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![
+                ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+                ContractFile {
+                    path: "calcx/contract.py".into(),
+                    content: "class Token:\n    pass\nclass Expr:\n    pass\n".into(),
+                    phase: 0,
+                },
+                ContractFile {
+                    path: "tests/test_calcx_contract.py".into(),
+                    content: "def test_cli(): pass\n".into(),
+                    phase: 0,
+                },
+            ],
+            pages: vec![
+                PagePlan {
+                    id: "frontend".into(),
+                    owned_glob: "{calcx/lexer.py,calcx/parser.py}".into(),
+                    brief: "Tokenize and parse into Token and Expr from calcx/contract.py.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "evaluator".into(),
+                    owned_glob: "calcx/evaluator.py".into(),
+                    brief: "Evaluate Expr from calcx/contract.py.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "{calcx/cli.py,calcx/__main__.py}".into(),
+                    brief: "Build REPL and CLI using Token and Expr from calcx/contract.py.".into(),
+                    depends_on: vec!["frontend".into(), "evaluator".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(dependency_is_contract_only(&calcx_plan, &calcx_plan.pages[2], "frontend"));
+        assert!(dependency_is_contract_only(&calcx_plan, &calcx_plan.pages[2], "evaluator"));
+
+        // 2. Concrete non-contract file reference (`calcx/parser.py`) keeps the hard dependency!
+        let mut concrete_ref = calcx_plan.clone();
+        concrete_ref.pages[2].brief = "Import parse from calcx/parser.py and use calcx/contract.py.".into();
+        assert!(!dependency_is_contract_only(&concrete_ref, &concrete_ref.pages[2], "frontend"));
+        assert!(dependency_is_contract_only(&concrete_ref, &concrete_ref.pages[2], "evaluator"));
+
+        // 3. Wildcard glob producer referenced by dotted module path (`calcx.parser`) is NOT contract-only.
+        let wildcard_ref = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "class ParserProtocol:\n    pass\n".into(),
+                phase: 0,
+            }],
+            pages: vec![
+                PagePlan {
+                    id: "parser".into(),
+                    owned_glob: "calcx/parser/*.py".into(),
+                    brief: "Implement ParserProtocol.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "calcx/cli.py".into(),
+                    brief: "Import parse from calcx.parser and use ParserProtocol.".into(),
+                    depends_on: vec!["parser".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!dependency_is_contract_only(&wildcard_ref, &wildcard_ref.pages[1], "parser"));
+
+        // 4. Sharing ONLY a package marker (`calcx/__init__.py`) is NOT contract-only.
+        let marker_only = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![ContractFile {
+                path: "calcx/__init__.py".into(),
+                content: "class SharedMarker:\n    pass\n".into(),
+                phase: 0,
+            }],
+            pages: vec![
+                PagePlan {
+                    id: "frontend".into(),
+                    owned_glob: "calcx/parser.py".into(),
+                    brief: "Implement frontend in calcx/__init__.py using SharedMarker.".into(),
+                    ..Default::default()
+                },
+                PagePlan {
+                    id: "cli".into(),
+                    owned_glob: "calcx/cli.py".into(),
+                    brief: "Build CLI using calcx/__init__.py and SharedMarker.".into(),
+                    depends_on: vec!["frontend".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!dependency_is_contract_only(&marker_only, &marker_only.pages[1], "frontend"));
+
+        // 5. Multi-dep integrator with NO shared contract mention at all is NOT contract-only.
+        let unshared = Plan {
+            kind: tm_core::ProjectKind::Cli,
+            contracts: vec![ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "class Token:\n    pass\n".into(),
+                phase: 0,
+            }],
+            pages: vec![
+                PagePlan { id: "frontend".into(), owned_glob: "calcx/parser.py".into(), brief: "Parse expressions.".into(), ..Default::default() },
+                PagePlan { id: "cli".into(), owned_glob: "calcx/cli.py".into(), brief: "Build CLI.".into(), depends_on: vec!["frontend".into()], ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        assert!(!dependency_is_contract_only(&unshared, &unshared.pages[1], "frontend"));
     }
 }

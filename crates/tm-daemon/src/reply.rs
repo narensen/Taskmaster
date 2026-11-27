@@ -833,7 +833,7 @@ fn format_json_error(candidate: &str, err: &serde_json::Error) -> String {
 
 /// Parse a JSON object from `text`, trying strict JSON first and then deterministic local repair.
 /// Returns `missing_msg` only when no JSON object exists; otherwise reports exact line/column + snippet.
-fn parse_json_object_lenient(text: &str, missing_msg: &str) -> anyhow::Result<Value> {
+pub(crate) fn parse_json_object_lenient(text: &str, missing_msg: &str) -> anyhow::Result<Value> {
     if let Some(val @ Value::Object(_)) = last_json(text, '{', '}') {
         return Ok(val);
     }

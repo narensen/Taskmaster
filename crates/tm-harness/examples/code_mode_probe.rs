@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         code_mode: true,
         shell: None,
         permission_mode: None,
+        native_search: false,
         hold: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);

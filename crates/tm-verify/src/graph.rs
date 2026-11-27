@@ -152,7 +152,7 @@ impl ImportGraph {
 }
 
 /// Transitive `depends_on` closure for every page in `plan`.
-fn transitive_depends_on(plan: &Plan) -> BTreeMap<&str, BTreeSet<&str>> {
+pub fn transitive_depends_on(plan: &Plan) -> BTreeMap<&str, BTreeSet<&str>> {
     let mut direct: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for page in &plan.pages {
         let entry = direct.entry(page.id.as_str()).or_default();

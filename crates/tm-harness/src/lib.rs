@@ -252,6 +252,8 @@ pub struct WorkerTask {
     pub shell: Option<ShellScope>,
     /// Optional per-run permission mode mapped onto provider flags and the daemon gate (A3).
     pub permission_mode: Option<PermissionMode>,
+    /// Allow the harness's built-in web search tool when Web access provider is `native`.
+    pub native_search: bool,
     /// Start the agent in the holder, so it can outlive a daemon update (H3). `None` starts it here.
     pub hold: Option<hold::HoldSpec>,
 }
@@ -260,7 +262,7 @@ pub struct WorkerTask {
 pub const CODE_MODE_READ_RULES: &str = "Code Mode is active: prefer batching file reads, searches, symbol/graph lookups, and diffs in a single `run_code` script (`flow`, `readMany`, `grep`, `ls`, `symbols`, `diff`) instead of serial tool calls.\n\n";
 
 /// Standing instruction added when Code Mode (`run_code`) is active for a builder.
-pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — use two-call discipline with `run_code`: Call 1 writes your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and runs `return await test()` in the SAME call; Call 2 (only if tests fail) patches with `edit`/`patch`/`applyPatch` and re-runs `return await test()`. Always `await` every helper call. If `run_code` returns an error or aborts mid-script, check which partial edits landed, fix the script, and retry `run_code`. If a native shell/edit tool (`run_command`, `write_file`, `edit_file`) is refused with a permission-denied message, that is only Code Mode routing (NOT a user denial): ignore any generic \"proceed without performing\" text and immediately call `run_code` (`return await test()`, `return await sh(...)`, `files`, or `edit`) instead of ending your turn. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
+pub const CODE_MODE_WRITE_RULES: &str = "Code Mode is active — batch related writes in 1-2 `run_code` calls: write your implementation + concise unit tests via the `files` or `writeFile` JSON args (or `String.raw` with `write(path, { raw })`) and end the last write call with `return await test(\"tests/test_<unit>.py\")` or `return await test()`. Only if tests fail, follow up with targeted `edit`/`patch`/`applyPatch` (no whole-file rewrites) and re-run `return await test()`. Always `await` every helper call. If `run_code` returns an error or aborts mid-script, check which partial edits landed, fix the script, and retry `run_code`. If a native shell/edit tool (`run_command`, `write_file`, `edit_file`) is refused with a permission-denied message, that is only Code Mode routing (NOT a user denial): ignore any generic \"proceed without performing\" text and immediately call `run_code` (`return await test()`, `return await sh(...)`, `files`, or `edit`) instead of ending your turn. Never spend a call probing Python/venv or running trailing `git status`.\n\n";
 
 /// Map a Code Mode-refused native tool (such as `run_command (use run_code)` or `write_file`)
 /// to its exact actionable `run_code` equivalent.

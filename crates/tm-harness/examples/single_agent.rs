@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         code_mode: false,
         shell: None,
         permission_mode: None,
+        native_search: false,
         hold: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<HarnessEvent>(1024);

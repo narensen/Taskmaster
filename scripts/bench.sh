@@ -13,6 +13,8 @@
 # `build` leaves planning out of the timing, so variants are compared on the same plan.
 # `full` and `single` keep the project they built and add its "dir" and its UI "score".
 set -euo pipefail
+# Benchmarks run offline so web search/fetch never introduces non-determinism or online spoilers.
+export TASKMASTER_OFFLINE=1
 root=$(cd "$(dirname "$0")/.." && pwd)
 daemon=${TM_DAEMON:-$root/target/release/tm-daemon}
 [ -x "$daemon" ] || { echo "build it first: cargo build --release -p tm-daemon" >&2; exit 1; }
@@ -34,7 +36,7 @@ case $cmd in
     prompt=$1; shift
     mkdir -p "$dir"
     p=$(fresh)
-    "$daemon" "$p" --prompt-file "$prompt" --commons "$p/.commons" "$@" >/dev/null 2>"$dir/plan.log" || true
+    "$daemon" "$p" --offline --prompt-file "$prompt" --commons "$p/.commons" "$@" >/dev/null 2>"$dir/plan.log" || true
     cp "$p/.taskmaster/runs/current/plan.json" "$dir/plan.json"
     cp "$prompt" "$dir/prompt.txt"
     printf '%s\n' "$@" > "$dir/roles"
@@ -56,7 +58,7 @@ case $cmd in
     printf '{"checker":{"enabled":%s},"code_mode":{"enabled":%s}}\n' "$checker" "$code" > "$p/.taskmaster/config.json"
     start=$(date +%s.%N)
     ok=true
-    "$daemon" "$p" --plan "$dir/plan.json" --yes --commons "$p/.commons" "${roles[@]}" "$@" >"$dir/$label.out" 2>"$dir/$label.log" || ok=false
+    "$daemon" "$p" --offline --plan "$dir/plan.json" --yes --commons "$p/.commons" "${roles[@]}" "$@" >"$dir/$label.out" 2>"$dir/$label.log" || ok=false
     end=$(date +%s.%N)
     python3 - "$p/.taskmaster/runs/current/ledger.jsonl" "$name" "$label" "$start" "$end" "$ok" >> "$root/bench/results.jsonl" <<'PY'
 import json, sys
@@ -87,7 +89,7 @@ PY
     p=$(fresh)
     start=$(date +%s.%N)
     ok=true
-    "$daemon" "$p" --prompt-file "$prompt" --yes --commons "$p/.commons" "$@" >"$dir/$label.out" 2>"$dir/$label.log" || ok=false
+    "$daemon" "$p" --offline --prompt-file "$prompt" --yes --commons "$p/.commons" "$@" >"$dir/$label.out" 2>"$dir/$label.log" || ok=false
     end=$(date +%s.%N)
     score=$(score "$p")
     python3 - "$p/.taskmaster/runs/current/ledger.jsonl" "$name" "$label" "$start" "$end" "$ok" "$p" "$score" >> "$root/bench/results.jsonl" <<'PY'

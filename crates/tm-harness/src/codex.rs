@@ -70,6 +70,9 @@ impl Codex {
         if let Some(effort) = &task.effort {
             args.extend(["-c".into(), format!("model_reasoning_effort={effort:?}")]);
         }
+        if task.native_search && resume.is_none() {
+            args.extend(["-c".into(), "web_search=\"live\"".into()]);
+        }
         if let Some(dict) = &task.dictionary {
             // TOML string values; `{:?}` quotes and escapes them.
             args.extend(["-c".into(), format!("mcp_servers.{}.url={:?}", dict.name, dict.url)]);
@@ -582,6 +585,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: Some(crate::hold::HoldSpec { holder: holder.clone(), key: "p/r/page:c".into(), meta: json!({}) }),
         };
         let gate: Arc<dyn PermissionGate> = Arc::new(crate::gate::WorktreeGate::new(&dir, vec![]));
@@ -664,6 +668,7 @@ mod tests {
             code_mode: true,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let stateless = harness.args_with(&task, "initial", false, None);
@@ -700,11 +705,20 @@ mod tests {
             code_mode: true,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let args = harness.args_with(&task, "build", false, None);
         assert!(args.windows(2).any(|w| w == ["--disable", "shell_tool"]), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]), "{args:?}");
+
+        let mut search_task = task.clone();
+        search_task.native_search = true;
+        let search_args = harness.args_with(&search_task, "build", false, None);
+        assert!(
+            search_args.windows(2).any(|w| w == ["-c", "web_search=\"live\""]),
+            "expected native_search to pass live web_search config to codex: {search_args:?}"
+        );
 
         // Full access opens Codex's own sandbox for a builder with its own tools, and only then.
         let mut own_tools = task.clone();
@@ -761,6 +775,7 @@ mod tests {
             code_mode: false,
             shell: None,
             permission_mode: None,
+            native_search: false,
             hold: None,
         };
         let gate: Arc<dyn PermissionGate> = Arc::new(crate::gate::WorktreeGate::new(&dir, vec![]));
@@ -793,6 +808,7 @@ mod tests {
                 code_mode,
                 shell: None,
                 permission_mode: None,
+            native_search: false,
                 hold: None,
             };
             let args = harness.args_with(&task, "build", false, None);

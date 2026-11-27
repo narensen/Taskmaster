@@ -64,7 +64,7 @@ impl Default for WebRoleMatrix {
     fn default() -> Self {
         Self {
             planner: RoleWebPolicy { search: true, fetch: true },
-            worker: RoleWebPolicy { search: false, fetch: true },
+            worker: RoleWebPolicy { search: true, fetch: true },
             reviewer: RoleWebPolicy { search: false, fetch: true },
             verifier: RoleWebPolicy { search: false, fetch: false },
         }
@@ -78,18 +78,27 @@ impl Default for WebRoleMatrix {
 pub struct WebAccessSettings {
     /// Master switch for agent internet access. Local-first `docs()` always works offline.
     pub enabled: bool,
-    /// Search provider id: `searxng`, `brave`, `tavily`, `exa`, or `native`.
+    /// Search provider id: `native` (default), `searxng`, `brave`, `tavily`, or `exa`.
     pub provider: String,
     /// Optional override search endpoint (used by `searxng`; empty falls back to `search.endpoint`).
     pub endpoint: String,
     /// Per-role switches.
     pub roles: WebRoleMatrix,
     /// Additional domains workers are allowed to fetch without prompting.
+    /// When empty and `roles.worker.fetch` is true, workers may fetch public SSRF-safe HTTPS
+    /// URLs up to `worker_max_fetches` per worker. When non-empty, workers are restricted to
+    /// the project-derived + configured allowlist (off-list domains prompt in `risky` mode).
     pub allowlist: Vec<String>,
     /// Maximum `web_search` calls per plan for the planner.
     pub planner_max_searches: usize,
     /// Maximum `web_fetch` calls per plan for the planner.
     pub planner_max_fetches: usize,
+    /// Maximum `web_fetch` calls per worker agent (prevents runaway fetch loops when allowlist is empty).
+    pub worker_max_fetches: usize,
+    /// Maximum harness-native web search calls for the planner (independent of `planner_max_searches`).
+    pub native_search_max_planner: usize,
+    /// Maximum harness-native web search calls per worker agent.
+    pub native_search_max_worker: usize,
     /// Maximum response size in bytes for `web_fetch`.
     pub max_fetch_bytes: usize,
     /// Content-addressed cache TTL in seconds.
@@ -101,13 +110,16 @@ pub struct WebAccessSettings {
 impl Default for WebAccessSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            provider: "searxng".into(),
+            enabled: true,
+            provider: "native".into(),
             endpoint: String::new(),
             roles: WebRoleMatrix::default(),
             allowlist: Vec::new(),
             planner_max_searches: 5,
             planner_max_fetches: 8,
+            worker_max_fetches: 5,
+            native_search_max_planner: 5,
+            native_search_max_worker: 3,
             max_fetch_bytes: 2 * 1024 * 1024,
             cache_ttl_secs: 24 * 3600,
             cache_max_mb: 128,
@@ -116,14 +128,14 @@ impl Default for WebAccessSettings {
 }
 
 impl WebAccessSettings {
-    pub const PROVIDERS: &[&str] = &["searxng", "brave", "tavily", "exa", "native"];
+    pub const PROVIDERS: &[&str] = &["native", "searxng", "brave", "tavily", "exa"];
 
     pub fn provider_norm(&self) -> String {
         let p = self.provider.trim().to_ascii_lowercase();
         if Self::PROVIDERS.contains(&p.as_str()) {
             p
         } else {
-            "searxng".into()
+            "native".into()
         }
     }
 
@@ -1665,6 +1677,7 @@ impl WebRole {
 struct BudgetCounters {
     planner_searches: HashMap<String, usize>,
     planner_fetches: HashMap<String, usize>,
+    worker_fetches: HashMap<(String, String), usize>,
 }
 
 /// Daemon MCP extension exposing `web_search`, `web_fetch`, `advisories`, and `docs`.
@@ -1892,19 +1905,34 @@ impl WebTools {
             return mcp_err(&reason);
         }
 
-        // Planner fetch budget check (Item 1.3)
+        // Planner / worker fetch budget checks (Item 1.3 + tb18 #6).
+        // Only check here; increment after `fetch_pipeline` succeeds so SSRF/egress rejections
+        // and local cache hits never silently consume fetch quota.
         if role == WebRole::Planner && self.settings.planner_max_fetches > 0 {
-            let mut budgets = self.budgets.lock().unwrap();
-            let used = budgets.planner_fetches.entry(grant.run.clone()).or_insert(0);
-            if *used >= self.settings.planner_max_fetches {
+            let budgets = self.budgets.lock().unwrap();
+            let used = budgets.planner_fetches.get(&grant.run).copied().unwrap_or(0);
+            if used >= self.settings.planner_max_fetches {
                 let msg = format!(
                     "Planner fetch budget reached ({}/{} fetches used for this plan). Draft the plan from what you already read.",
-                    *used, self.settings.planner_max_fetches
+                    used, self.settings.planner_max_fetches
                 );
+                drop(budgets);
                 self.record_ledger(grant, role, "web_fetch", false, started.elapsed().as_secs_f64(), vec![msg.clone()]);
                 return mcp_err(&msg);
             }
-            *used += 1;
+        } else if role == WebRole::Worker && self.settings.worker_max_fetches > 0 {
+            let budgets = self.budgets.lock().unwrap();
+            let key = (grant.run.clone(), grant.agent());
+            let used = budgets.worker_fetches.get(&key).copied().unwrap_or(0);
+            if used >= self.settings.worker_max_fetches {
+                let msg = format!(
+                    "Worker fetch budget reached ({}/{} fetches used for this unit). Continue with what you already read.",
+                    used, self.settings.worker_max_fetches
+                );
+                drop(budgets);
+                self.record_ledger(grant, role, "web_fetch", false, started.elapsed().as_secs_f64(), vec![msg.clone()]);
+                return mcp_err(&msg);
+            }
         }
 
         // Check content-addressed cache before touching network (Item 1.2)
@@ -1930,6 +1958,13 @@ impl WebTools {
         // Execute multi-hop SSRF-checked fetch pipeline
         match self.fetch_pipeline(grant, role, &agent, parsed).await {
             Ok(page) => {
+                if role == WebRole::Planner && self.settings.planner_max_fetches > 0 {
+                    let mut budgets = self.budgets.lock().unwrap();
+                    *budgets.planner_fetches.entry(grant.run.clone()).or_insert(0) += 1;
+                } else if role == WebRole::Worker && self.settings.worker_max_fetches > 0 {
+                    let mut budgets = self.budgets.lock().unwrap();
+                    *budgets.worker_fetches.entry((grant.run.clone(), grant.agent())).or_insert(0) += 1;
+                }
                 let _ = self.cache.put(&page);
                 let framed = frame_untrusted(&page.final_url, &page.markdown);
                 self.live.push(
@@ -1981,10 +2016,29 @@ impl WebTools {
                     .await
             }
             WebRole::Worker => {
-                if policy.fetch && host_matches_allowlist(&parsed.host, &self.worker_allowlist) {
+                if !policy.fetch {
+                    return self
+                        .live
+                        .approvals
+                        .ask_fetch(
+                            &self.live,
+                            &grant.run,
+                            agent,
+                            "web_fetch",
+                            &parsed.raw,
+                            &format!("worker fetch is disabled for `{}`", parsed.host),
+                        )
+                        .await;
+                }
+                // Empty configured allowlist = capped public HTTPS fetch guarded by HTTPS-only,
+                // egress policy, pinned-DNS SSRF checks, and prompt-injection framing (tb18 #6).
+                if self.settings.allowlist.is_empty()
+                    || host_matches_allowlist(&parsed.host, &self.worker_allowlist)
+                {
                     return true;
                 }
-                // Off-allowlist fetch: denied in `never` mode, asks for approval in `risky` mode (Item 1.3).
+                // Explicit allowlist is configured and this domain is off-list: denied in `never`
+                // mode, asks for approval in `risky` mode (Item 1.3).
                 self.live
                     .approvals
                     .ask_fetch(
@@ -2663,6 +2717,8 @@ mod tests {
 
         let settings = WebAccessSettings {
             enabled: true,
+            provider: "searxng".into(),
+            allowlist: vec!["react.dev".into()],
             planner_max_searches: 1,
             ..Default::default()
         };
@@ -2936,6 +2992,93 @@ mod tests {
             tools.call(&worker, "flow_query", &json!({ "op": "find", "query": "x" })).await.is_none(),
             "WebTools must not dispatch flow_query after FlowTools extraction"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tb18_native_default_and_empty_allowlist_capped_ssrf_fetch() {
+        // 1. Default WebAccessSettings: enabled, provider=native, worker search=true, verifier offline.
+        let def = WebAccessSettings::default();
+        assert!(def.enabled);
+        assert_eq!(def.provider, "native");
+        assert_eq!(def.provider_norm(), "native");
+        assert!(def.is_native_passthrough());
+        assert!(def.roles.planner.search && def.roles.planner.fetch);
+        assert!(def.roles.worker.search && def.roles.worker.fetch);
+        assert!(!def.roles.reviewer.search && def.roles.reviewer.fetch);
+        assert!(!def.roles.verifier.search && !def.roles.verifier.fetch);
+        assert_eq!(def.worker_max_fetches, 5);
+        assert_eq!(def.native_search_max_planner, 5);
+        assert_eq!(def.native_search_max_worker, 3);
+        // Unknown provider falls back to "native".
+        let bogus = WebAccessSettings { provider: "unknown-xyz".into(), ..Default::default() };
+        assert_eq!(bogus.provider_norm(), "native");
+
+        // 2. Empty worker allowlist permits capped public HTTPS fetches with SSRF guard enforced.
+        let dir = temp_project("empty-allowlist-cap");
+        let store = Arc::new(FileStore::in_project(&dir));
+        let live = Arc::new(Live::new(store.clone()));
+        let records = Records::new(store);
+        let mut settings = WebAccessSettings::default();
+        settings.allowlist.clear();
+        settings.worker_max_fetches = 2;
+
+        let mut transport = FixtureTransport::new();
+        for url in [
+            "https://docs.python.org/3/library/sqlite3.html",
+            "https://fastapi.tiangolo.com/tutorial/",
+            "https://example.org/third",
+        ] {
+            transport.responses.insert(
+                url.into(),
+                RawHttpResponse {
+                    status: 200,
+                    content_type: "text/plain".into(),
+                    location: None,
+                    body: format!("Docs for {url}").into_bytes(),
+                },
+            );
+        }
+        let cache = WebCache::new(dir.join(".cache-web"), 3600, 1024 * 1024);
+        let tools = WebTools::with_backends(
+            dir.clone(),
+            settings,
+            Arc::new(NativePassthroughProvider),
+            Arc::new(transport),
+            cache,
+            live,
+            records,
+        );
+        let worker = Grant { run: "r-cap".into(), page: "api".into(), unit: String::new() };
+
+        // SSRF / non-HTTPS MUST still be rejected even with empty allowlist.
+        let ssrf = tools.call(&worker, "web_fetch", &json!({ "url": "https://127.0.0.1/secret" })).await.unwrap();
+        assert_eq!(ssrf["isError"], true, "loopback must be blocked by SSRF guard: {ssrf}");
+        let plain = tools.call(&worker, "web_fetch", &json!({ "url": "http://example.org/plain" })).await.unwrap();
+        assert_eq!(plain["isError"], true, "plain http must be rejected: {plain}");
+
+        // First two public HTTPS fetches succeed and are framed as untrusted.
+        let f1 = tools
+            .call(&worker, "web_fetch", &json!({ "url": "https://docs.python.org/3/library/sqlite3.html" }))
+            .await
+            .unwrap();
+        assert_eq!(f1["isError"], false, "{f1}");
+        assert!(f1["content"][0]["text"].as_str().unwrap().contains("<untrusted_web_content"));
+
+        let f2 = tools
+            .call(&worker, "web_fetch", &json!({ "url": "https://fastapi.tiangolo.com/tutorial/" }))
+            .await
+            .unwrap();
+        assert_eq!(f2["isError"], false, "{f2}");
+
+        // Third fetch hits the worker_max_fetches cap (2/2).
+        let f3 = tools
+            .call(&worker, "web_fetch", &json!({ "url": "https://example.org/third" }))
+            .await
+            .unwrap();
+        assert_eq!(f3["isError"], true, "3rd fetch must hit worker_max_fetches cap: {f3}");
+        assert!(f3["content"][0]["text"].as_str().unwrap().contains("Worker fetch budget reached (2/2"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

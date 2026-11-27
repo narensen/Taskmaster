@@ -284,6 +284,7 @@ async fn ask(
         code_mode: false,
         shell: None,
         permission_mode: None,
+        native_search: false,
         hold: None,
     };
     let (tx, mut rx) = mpsc::channel(256);

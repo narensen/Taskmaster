@@ -45,6 +45,8 @@ pub struct Settings {
     pub sandbox: SandboxSettings,
     /// Agent internet access, per-role switches, allowlist, budgets, and cache (Phase 1).
     pub web_access: crate::web_access::WebAccessSettings,
+    /// Threshold-gated read-only brownfield LLM scope-scout extractor (tb18 #7).
+    pub scout: ScoutSettings,
     /// Provider usage meter settings (O4). OAuth polling is opt-in and off by default.
     pub usage: UsageSettings,
     /// When the daemon settles finished runs on its own (A8).
@@ -85,6 +87,25 @@ pub struct LabsSettings {
 pub struct UsageSettings {
     /// Opt-in OAuth usage polling. Off by default; CLI-reported rate-limit events are always read.
     pub oauth_polling: bool,
+}
+
+/// Threshold-gated read-only brownfield LLM scope-scout extractor settings (tb18 #7).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScoutSettings {
+    /// Enable the `-low` effort read-only brownfield scout on repos at or above `min_files`.
+    pub enabled: bool,
+    /// Minimum source files required before invoking the LLM scout (smaller repos use deterministic packing).
+    pub min_files: usize,
+}
+
+impl Default for ScoutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_files: crate::scout::DEFAULT_MIN_FILES,
+        }
+    }
 }
 
 /// Prices Taskmaster knows without a settings file: Grok Build's, as the benchmark's grader
@@ -165,6 +186,20 @@ pub const DEFAULT_WARM_IDLE_SECS: u64 = 600;
 
 fn default_true() -> bool {
     true
+}
+
+/// True when the environment forces offline mode (`TASKMASTER_OFFLINE=1|true|on|yes` or
+/// `TASKMASTER_WEB_ACCESS=0|false|off|no`), disabling all agent web search and fetch.
+pub fn offline_env_enabled() -> bool {
+    let is_truthy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+    let is_falsy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no");
+    if std::env::var("TASKMASTER_OFFLINE").ok().is_some_and(|v| is_truthy(&v)) {
+        return true;
+    }
+    if std::env::var("TASKMASTER_WEB_ACCESS").ok().is_some_and(|v| is_falsy(&v)) {
+        return true;
+    }
+    false
 }
 
 /// Resolve effective effort routing from saved settings plus `TASKMASTER_EFFORT_ROUTING`
@@ -354,11 +389,16 @@ impl Settings {
     /// The project's file if it has one, otherwise the one in the home directory.
     pub fn load(project: &Path) -> anyhow::Result<Self> {
         let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".taskmaster/config.json"));
+        let mut settings = Settings::default();
         for path in [Some(project.join(".taskmaster/config.json")), home].into_iter().flatten() {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            return serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", path.display()));
+            settings = serde_json::from_str(&text).with_context(|| format!("{} is not a settings file", path.display()))?;
+            break;
         }
-        Ok(Settings::default())
+        if offline_env_enabled() {
+            settings.web_access.enabled = false;
+        }
+        Ok(settings)
     }
 
     /// The role choices the person saved, and only those: no role is filled in for them.
@@ -523,5 +563,17 @@ mod tests {
         assert_eq!(with_cli["custom-model-high"].input, 3.0);
         assert_eq!(with_cli["custom-model-low"].output, 2.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tb18_example_config_sets_native_web_access_defaults() {
+        let example: Settings = serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        assert!(example.web_access.enabled);
+        assert_eq!(example.web_access.provider_norm(), "native");
+        assert!(example.web_access.roles.planner.search && example.web_access.roles.planner.fetch);
+        assert!(example.web_access.roles.worker.search && example.web_access.roles.worker.fetch);
+        assert!(!example.web_access.roles.verifier.search && !example.web_access.roles.verifier.fetch);
+        assert!(example.scout.enabled);
+        assert_eq!(example.scout.min_files, crate::scout::DEFAULT_MIN_FILES);
     }
 }

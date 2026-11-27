@@ -82,6 +82,7 @@ tm-daemon serve . --lan                      # also reachable from the local net
 tm-daemon serve . --auto-resume              # resume unfinished runs on daemon startup
 tm-daemon . --prompt "A notes app with a list and an editor."
 tm-daemon . --yes                            # approve the plan and build it
+tm-daemon . --offline --yes                  # run strictly offline (disables web search/fetch; also TASKMASTER_OFFLINE=1)
 tm-daemon . --worker auto --yes              # auto-route workers from the local scorecard
 tm-daemon report .                           # inspect run cost, tokens, and outcomes
 tm-daemon eval --suite bench/suite --check-only
@@ -109,24 +110,24 @@ Everything that reaches the daemon lives on the **Connect** page (`/connect`, or
 
 ## Web access & local-first docs
 
-Off by default (`Settings → Web access`). Worker sandboxes keep `--unshare-net`; all web traffic goes through the daemon so every request is cached, budgeted, and logged in the egress audit log and run transcript.
+**On by default** with `provider: "native"` (`Settings → Web access`). Pass `--offline` or set `TASKMASTER_OFFLINE=1` (used automatically by benchmarks and `tm-daemon eval`) to disable all web access. Provider-native search is capped per role (planner 5, worker 3) and recorded in the run transcript and ledger, while raw harness `web_fetch` stays denied so every fetch goes through the daemon's SSRF-hardened MCP `web_fetch` (cached, budgeted, audited, and framed as untrusted data). Code Mode's `WarmNode` stays `--unshare-net`.
 
-- **Local-first `docs(package, symbol?)`** — always available offline. Reads READMEs and type definitions directly from `node_modules`, Python `site-packages`, or `~/.cargo/registry/src` at the project's locked version before falling back to search.
-- **`web_search`** — supports **SearXNG**, **Brave Search**, **Tavily**, **Exa**, or **Native** provider passthrough (allowing a harness's built-in search tool per role through the permission gate). API keys are stored in the OS keychain vault and redacted from logs and exports.
+- **Local-first `docs(package, symbol?)`** — always available offline (pruned from worker tool lists on stdlib-only repos). Reads READMEs and type definitions directly from `node_modules`, Python `site-packages`, or `~/.cargo/registry/src` at the project's locked version before falling back to search.
+- **`web_search`** — defaults to **Native** provider passthrough (harness built-in search gated and capped per role; plumbed for ACP harnesses, Claude Code `--allowedTools WebSearch`, and Codex). Also supports **SearXNG**, **Brave Search**, **Tavily**, and **Exa** with API keys stored in the OS keychain vault and redacted from logs and exports.
 - **SSRF-safe `web_fetch`** — HTTPS only, pinned DNS resolution to stop DNS rebinding, blocks loopback/RFC 1918/link-local/metadata/internal addresses on every redirect hop, enforces response size and content-type limits, extracts markdown from HTML and text from PDFs, and caches pages under `$XDG_CACHE_HOME/taskmaster/web`.
-- **OSV security `advisories`** — queries `api.osv.dev` for package vulnerabilities during reviews and dependency checks.
-- **Per-role permissions & budgets** — Planner researches up to a configurable search/fetch cap and writes concise decisions (with source URL and version) into `PROJECT.md`; Workers fetch only from a project-derived + custom domain allowlist (off-list domains trigger an approval prompt in `risky` mode); Reviewers check security advisories; Verifiers get no web access.
+- **OSV security `advisories`** — queries `api.osv.dev` for package vulnerabilities during reviews and dependency checks (pruned on stdlib-only worker units).
+- **Per-role permissions & budgets** — Planner researches unfamiliar third-party APIs (up to 5 searches / 8 fetches) and writes concise decisions into `PROJECT.md`; Workers get capped native search (3) and SSRF-safe `web_fetch` (up to 5 per unit on public HTTPS URLs when `allowlist` is empty, or restricted to the project-derived + custom allowlist when configured); Reviewers check security advisories; Verifiers remain strictly offline.
 - **Prompt-injection framing** — strips HTML comments, hidden elements, and zero-width characters, flags imperative injection patterns, wraps results in untrusted provenance tags, and prevents raw web content from entering the workers' shared prefix.
 - **Per-run Web sources view** — Run View displays every agent's searches, fetched URLs, cache hits, local docs lookups, advisory checks, injection warnings, and planner research decisions.
 
 ## Code Mode & warm code intelligence
 
-Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only planners/reviewers) receive `run_code`: a sandboxed async JavaScript runtime behind the same permission gate as their native tools, exposing `read`, `readMany`, `write`, `edit`, `patch`, `applyPatch`, `tryPatch`, `testAffected`, `grep`, `ls`, `diff`, `symbols`, `sh`, `test`, `check`, and `browser` (scoped strictly to the run's preview origin). Claude Code workers use Claude Code's native code mode.
+Code Mode is **on by default** (`code_mode.enabled`). Workers (and read-only planners/reviewers) receive `run_code`: a sandboxed async JavaScript runtime behind the same permission gate as their native tools, exposing `read`, `readMany`, `write`, `writeFile`, `edit`, `patch`, `applyPatch`, `tryPatch`, `test(paths?)`, `testAffected(paths?)`, `grep`, `ls`, `diff`, `symbols`, `flow`, `sh`, `check`, and `browser` (scoped strictly to the run's preview origin). Workers batch related writes in 1–2 `run_code` calls ending in targeted `test(paths)` or full `test()`, and active worktrees of dependent units receive race-safe live sync of newly landed dependency files outside their owned glob. Claude Code workers use `run_code` with native edit/shell tools withheld.
 
 Alongside Code Mode, the daemon maintains:
 
 - **Warm LSP pool** — keeps language servers (`typescript-language-server`, `pyright`/`basedpyright`, `rust-analyzer`) warm per run tree for instant `diagnostics`, `outline`, `definition`, and `references`, feeding diagnostics straight back after writes.
-- **Codebase Atlas & context packs** — deterministic repo map and per-unit import-graph context packs keep prompts small and prompt-cache hit rates high.
+- **Codebase Atlas, `.flow` packing & brownfield scope scout** — deterministic `.flow` repo summaries (with exported method signatures and test outlines), relevance-ranked owned-file pre-injection, and a compact Codebase Atlas keep prompts small and prompt-cache hit rates high. On larger brownfield repos (`>= 25` source files, configurable via `scout.enabled` and `scout.min_files`), a cheap, `-low` effort, read-only, offline scope scout writes an ephemeral `.taskmaster/runs/<id>/scope.json` that is deterministically hydrated from `.flow` before planning (falling back silently to deterministic packing on any error).
 - **Difficulty-aware routing & hedging** — easy units run at low effort, hard units can start directly on the Mid tier or race best-of-N within budget, and stalled/repeating repairs escalate immediately.
 
 ## Recursive self-improvement
@@ -158,7 +159,7 @@ Harnesses that do not report USD costs stay unpriced by default (no model prices
 
 ## Benchmarks
 
-On a hidden-test tinydb build, Taskmaster scored 24/24 in about 410s with ~125k uncached input tokens, against 1,279s for T3 Code and 1,432s for the native Antigravity agent at the same score. Full results, methodology and limitations are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+On a hidden-test tinydb build, Taskmaster scored 24/24 in about 410s with ~125k uncached input tokens, against 1,279s for T3 Code and 1,432s for the native Antigravity agent at the same score. On calcx with 2.0 (isolated, offline, single runs, all 24/24): with Gemini workers, standard mode took 199s (TB-15: 245s) and Code Mode took 277s (TB-15: 198s, slowed by one repair). With Grok Build workers, Code Mode took 599s (pre-2.0: 1,122s) and standard mode took 867–1,086s (pre-2.0: 594s). Full results, methodology and limitations are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Develop
 

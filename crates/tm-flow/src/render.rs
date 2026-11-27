@@ -12,8 +12,11 @@ use crate::update::ensure_fresh;
 pub const DEFAULT_UNIT_MAP_BUDGET: usize = 6_000;
 /// Larger character budget for repairs and integrator units (~3k tokens).
 pub const REPAIR_UNIT_MAP_BUDGET: usize = 12_000;
+/// Larger character budget for brownfield workers editing existing owned files (~4k tokens,
+/// leaving up to ~12 KB for full owned-file and target-symbol source pre-injection).
+pub const BROWNFIELD_UNIT_MAP_BUDGET: usize = 16_000;
 /// Default character budget for a brownfield planner's `.flow` repo summary + touched-symbol map.
-pub const PLANNER_REPO_SUMMARY_BUDGET: usize = 6_000;
+pub const PLANNER_REPO_SUMMARY_BUDGET: usize = 10_000;
 
 /// True when `unit_id` imports or calls symbols from 3 or more distinct other units.
 pub fn is_integrator_unit(tree: &Path, unit_id: &str) -> bool {
@@ -368,7 +371,10 @@ pub fn unit_map(
     Ok(out)
 }
 
-const MAX_PREINJECT_TARGETS: usize = 16;
+const MAX_PREINJECT_TARGETS: usize = 24;
+const MAX_OWNED_FILE_PREINJECT_CHARS: usize = 6_000;
+const MAX_SYMBOL_PREINJECT_CHARS: usize = 2_400;
+const MAX_PREINJECT_SOURCE_CHARS: usize = 12_000;
 
 /// Pre-inject concise `flow_query` results (`node` + `1-hop neighbors` + `callers`) when a unit
 /// edits existing code (brownfield runs, repairs, or later-wave units referencing already-built
@@ -509,13 +515,60 @@ pub fn preinjected_context(
         }
     }
 
-    // Append bounded on-disk source snippets for targeted/owned symbols within remaining budget
-    // so brownfield workers can edit directly without calling `read_file` on injected spans.
+    // Append token-budgeted, relevance-ranked on-disk source for owned files, mentioned target
+    // symbols, and 1-hop callers/callees within the remaining budget (up to ~12 KB source total)
+    // so brownfield workers can edit directly without calling `read_file` on already-packed code.
     let remaining_for_src = budget_chars.saturating_sub(out.len());
     if remaining_for_src >= 140 {
+        let src_header = "### Target symbol source (already read from disk — do NOT call read_file on these spans):\n";
+        let mut src_buf = String::new();
+        let mut covered_files: BTreeSet<String> = BTreeSet::new();
+        let mut included_ids: BTreeSet<&str> = BTreeSet::new();
+        let max_src_bytes = remaining_for_src.min(MAX_PREINJECT_SOURCE_CHARS);
+
+        // Pass 1: Pack full existing owned files (production before tests, task-mentioned first)
+        // when they fit cleanly in the remaining budget, avoiding redundant per-symbol slices.
+        let mut owned_disk_files: Vec<(u8, String)> = owned_file_set
+            .iter()
+            .filter(|rel| tree.join(rel).is_file())
+            .map(|rel| {
+                let is_test = tm_core::is_test_path(rel);
+                let mentioned = !task_text.trim().is_empty() && path_mentioned_in_text(task_text, rel);
+                let prio = match (is_test, mentioned) {
+                    (false, true) => 0,
+                    (false, false) => 1,
+                    (true, true) => 2,
+                    (true, false) => 3,
+                };
+                (prio, rel.clone())
+            })
+            .collect();
+        owned_disk_files.sort();
+        for (_, rel) in owned_disk_files {
+            let Ok(text) = std::fs::read_to_string(tree.join(&rel)) else {
+                continue;
+            };
+            let trimmed = text.trim_end();
+            if trimmed.is_empty() || trimmed.len() > MAX_OWNED_FILE_PREINJECT_CHARS {
+                continue;
+            }
+            let line_count = trimmed.lines().count().max(1);
+            let entry = format!("- {rel}:1-{line_count} (owned file):\n```\n{trimmed}\n```\n");
+            let header_len = if src_buf.is_empty() { src_header.len() } else { 0 };
+            if header_len + src_buf.len() + entry.len() <= max_src_bytes
+                && out.len() + header_len + src_buf.len() + entry.len() <= budget_chars
+            {
+                src_buf.push_str(&entry);
+                covered_files.insert(rel);
+            }
+        }
+
+        // Pass 2: Rank individual symbols (owned files too large for Pass 1 -> mentioned symbols
+        // -> 1-hop neighbors of mentioned/owned targets) and fill remaining source budget.
         let mut src_candidates: Vec<(u8, &Node)> = Vec::new();
+        let mut candidate_ids: BTreeSet<&str> = BTreeSet::new();
         for target in targets.iter().take(written) {
-            if target.span[0] == 0 || target.path.is_empty() {
+            if target.span[0] == 0 || target.path.is_empty() || covered_files.contains(&target.path) {
                 continue;
             }
             let is_owned = owned_file_set.contains(&target.path);
@@ -534,7 +587,31 @@ pub fn preinjected_context(
                 (true, false) => 2,
                 (false, false) => 3,
             };
-            src_candidates.push((prio, target));
+            if candidate_ids.insert(target.id.as_str()) {
+                src_candidates.push((prio, target));
+            }
+        }
+        // Pull direct 1-hop callers/callees at lower priority (3) when budget allows.
+        for target in targets.iter().take(written.min(8)) {
+            if let Ok(Some(detail)) = q.node(&target.id) {
+                for edge in detail.outgoing.iter().chain(detail.incoming.iter()) {
+                    if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::Inherits | EdgeKind::Implements) {
+                        continue;
+                    }
+                    if let Some(peer) = node_by_id.get(edge.peer_id.as_str()).copied()
+                        && peer.status == NodeStatus::Built
+                        && peer.kind != NodeKind::File
+                        && peer.kind != NodeKind::Unit
+                        && peer.span[0] > 0
+                        && !peer.path.is_empty()
+                        && !tm_core::is_test_path(&peer.path)
+                        && !covered_files.contains(&peer.path)
+                        && candidate_ids.insert(peer.id.as_str())
+                    {
+                        src_candidates.push((3, peer));
+                    }
+                }
+            }
         }
         src_candidates.sort_by(|(pa, a), (pb, b)| {
             pa.cmp(pb)
@@ -542,16 +619,18 @@ pub fn preinjected_context(
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| a.span[0].cmp(&b.span[0]))
         });
-        let src_header = "### Target symbol source (already read from disk — do NOT call read_file on these spans):\n";
-        let mut src_buf = String::new();
-        let mut included_parents: BTreeSet<&str> = BTreeSet::new();
-        let mut src_count = 0usize;
-        for (_, target) in src_candidates {
-            if src_count >= 4 {
-                break;
-            }
-            if target.parent.as_deref().is_some_and(|p| included_parents.contains(p)) {
+        for (prio, target) in src_candidates {
+            if covered_files.contains(&target.path)
+                || target.parent.as_deref().is_some_and(|p| included_ids.contains(p))
+            {
                 continue;
+            }
+            let header_len = if src_buf.is_empty() { src_header.len() } else { 0 };
+            let avail_now = max_src_bytes
+                .min(budget_chars.saturating_sub(out.len()))
+                .saturating_sub(header_len + src_buf.len());
+            if avail_now < 120 {
+                break;
             }
             let Ok(Some(slice)) = q.source(&target.id) else {
                 continue;
@@ -559,10 +638,22 @@ pub fn preinjected_context(
             if slice.code.trim().is_empty() {
                 continue;
             }
-            let body = if slice.code.len() <= 900 {
+            let per_sym_cap = if prio <= 1 {
+                MAX_SYMBOL_PREINJECT_CHARS
+            } else if prio == 2 {
+                1_600
+            } else {
+                900
+            };
+            let overhead = slice.path.len() + qualified_label(target).len() + 36;
+            let body_cap = per_sym_cap.min(avail_now.saturating_sub(overhead));
+            if body_cap < 64 {
+                continue;
+            }
+            let body = if slice.code.len() <= body_cap {
                 slice.code
             } else {
-                let mut end = 900;
+                let mut end = body_cap.saturating_sub(18);
                 while end > 0 && !slice.code.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -577,13 +668,13 @@ pub fn preinjected_context(
                 qualified_label(target),
                 body,
             );
-            let header_len = if src_buf.is_empty() { src_header.len() } else { 0 };
-            if out.len() + header_len + src_buf.len() + entry.len() > budget_chars {
+            if header_len + src_buf.len() + entry.len() > max_src_bytes
+                || out.len() + header_len + src_buf.len() + entry.len() > budget_chars
+            {
                 continue;
             }
             src_buf.push_str(&entry);
-            included_parents.insert(target.id.as_str());
-            src_count += 1;
+            included_ids.insert(target.id.as_str());
         }
         if !src_buf.is_empty() {
             out.push_str(src_header);
@@ -690,15 +781,40 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
         }
     }
 
-    // 2. Repository modules & symbols overview (production files before tests).
-    let mut file_paths: Vec<&str> = files_to_syms.keys().copied().collect();
-    file_paths.sort_by(|a, b| {
-        tm_core::is_test_path(a)
-            .cmp(&tm_core::is_test_path(b))
-            .then_with(|| a.cmp(b))
-    });
-    let mut overview_lines: Vec<String> = Vec::with_capacity(file_paths.len());
-    for path in file_paths {
+    // 2. Repository modules & exported signatures overview (production files), plus
+    //    a dedicated existing test-files outline so planners know what tests already exist.
+    let mut children_by_parent: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
+    for &n in &built_nodes {
+        if let Some(parent_id) = n.parent.as_deref()
+            && n.kind != NodeKind::File
+            && n.kind != NodeKind::Unit
+        {
+            children_by_parent.entry(parent_id).or_default().push(n);
+        }
+    }
+    for list in children_by_parent.values_mut() {
+        list.sort_by(|a, b| {
+            (!a.exported)
+                .cmp(&(!b.exported))
+                .then_with(|| a.span[0].cmp(&b.span[0]))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+
+    let mut prod_paths: Vec<&str> = Vec::new();
+    let mut test_paths: Vec<&str> = Vec::new();
+    for &path in files_to_syms.keys() {
+        if tm_core::is_test_path(path) {
+            test_paths.push(path);
+        } else {
+            prod_paths.push(path);
+        }
+    }
+    prod_paths.sort();
+    test_paths.sort();
+
+    let mut overview_lines: Vec<String> = Vec::with_capacity(prod_paths.len());
+    for path in prod_paths {
         let syms = files_to_syms.get(path).map(Vec::as_slice).unwrap_or(&[]);
         let mut top: Vec<&Node> = syms.iter().copied().filter(|n| n.parent.is_none()).collect();
         top.sort_by(|a, b| {
@@ -712,14 +828,8 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
         } else {
             let shown: Vec<String> = top
                 .iter()
-                .take(10)
-                .map(|n| {
-                    if n.span[0] > 0 && n.span[1] >= n.span[0] {
-                        format!("{} (L{}-{})", n.name, n.span[0], n.span[1])
-                    } else {
-                        n.name.clone()
-                    }
-                })
+                .take(12)
+                .map(|n| format_repo_symbol_with_methods(n, children_by_parent.get(n.id.as_str()).map(Vec::as_slice).unwrap_or(&[])))
                 .collect();
             let extra = top.len().saturating_sub(shown.len());
             let suffix = if extra > 0 {
@@ -727,14 +837,43 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
             } else {
                 String::new()
             };
-            overview_lines.push(format!("- {path}: {}{suffix}\n", shown.join(", ")));
+            overview_lines.push(format!("- {path}: {}{suffix}\n", shown.join("; ")));
+        }
+    }
+
+    let mut test_outline_lines: Vec<String> = Vec::with_capacity(test_paths.len());
+    for path in test_paths {
+        let syms = files_to_syms.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let mut tests: Vec<&Node> = syms
+            .iter()
+            .copied()
+            .filter(|n| n.parent.is_none() && !n.name.starts_with('_'))
+            .collect();
+        tests.sort_by(|a, b| a.span[0].cmp(&b.span[0]).then_with(|| a.id.cmp(&b.id)));
+        if tests.is_empty() {
+            test_outline_lines.push(format!("- {path}\n"));
+        } else {
+            let shown: Vec<&str> = tests.iter().take(10).map(|n| n.name.as_str()).collect();
+            let extra = tests.len().saturating_sub(shown.len());
+            let suffix = if extra > 0 {
+                format!(", +{extra} more")
+            } else {
+                String::new()
+            };
+            test_outline_lines.push(format!("- {path}: {}{suffix}\n", shown.join(", ")));
         }
     }
 
     let header = "## Repository summary (.flow)\n";
     let touched_title = "Touched / prompt-matched symbols (signatures, callers & 1-hop neighbors):\n";
     let overview_title = "Modules & symbols:\n";
+    let tests_title = "Existing test files:\n";
     let avail = budget_chars.saturating_sub(header.len());
+    let tests_need: usize = if test_outline_lines.is_empty() {
+        0
+    } else {
+        tests_title.len() + test_outline_lines.iter().map(String::len).sum::<usize>()
+    };
     let overview_need: usize = if overview_lines.is_empty() {
         0
     } else {
@@ -745,13 +884,16 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
     } else {
         touched_title.len() + touched_blocks.iter().map(String::len).sum::<usize>()
     };
+    let reserved_tests = tests_need.min((avail * 18) / 100);
     let touched_cap = if touched_need == 0 {
         0
-    } else if touched_need + overview_need <= avail {
+    } else if touched_need + overview_need + tests_need <= avail {
         touched_need
     } else {
-        let min_overview = overview_need.min((avail * 40) / 100);
-        avail.saturating_sub(min_overview).min(touched_need)
+        let min_overview = overview_need.min((avail * 42) / 100);
+        avail
+            .saturating_sub(min_overview + reserved_tests)
+            .min(touched_need)
     };
 
     let mut out = String::with_capacity(budget_chars.min(4096));
@@ -791,7 +933,14 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
         }
     }
 
-    let overview_cap = budget_chars.saturating_sub(out.len());
+    let remaining_after_touched = budget_chars.saturating_sub(out.len());
+    let overview_cap = if tests_need == 0 {
+        remaining_after_touched
+    } else if overview_need + tests_need <= remaining_after_touched {
+        overview_need
+    } else {
+        remaining_after_touched.saturating_sub(reserved_tests.min(remaining_after_touched / 3))
+    };
     if overview_cap >= overview_title.len() && !overview_lines.is_empty() {
         let mut sec = String::with_capacity(overview_cap);
         sec.push_str(overview_title);
@@ -824,6 +973,31 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
         }
     }
 
+    let tests_cap = budget_chars.saturating_sub(out.len());
+    if tests_cap >= tests_title.len() && !test_outline_lines.is_empty() {
+        let mut sec = String::with_capacity(tests_cap);
+        sec.push_str(tests_title);
+        let mut written = 0usize;
+        for line in &test_outline_lines {
+            let remaining_after = test_outline_lines.len().saturating_sub(written + 1);
+            let reserve = if remaining_after > 0 { 26 } else { 0 };
+            if sec.len() + line.len() + reserve > tests_cap {
+                break;
+            }
+            sec.push_str(line);
+            written += 1;
+        }
+        if written > 0 {
+            if written < test_outline_lines.len() {
+                let note = format!("... (+{} more test files)\n", test_outline_lines.len() - written);
+                if sec.len() + note.len() <= tests_cap {
+                    sec.push_str(&note);
+                }
+            }
+            out.push_str(&sec);
+        }
+    }
+
     if out.len() <= header.len() {
         return Ok(String::new());
     }
@@ -842,6 +1016,75 @@ pub fn repo_summary(tree: &Path, prompt: &str, budget_chars: usize) -> anyhow::R
         }
     }
     Ok(out)
+}
+
+fn format_compact_signature(node: &Node, max_chars: usize) -> String {
+    let raw = node.sig.trim();
+    if raw.is_empty() {
+        return node.name.clone();
+    }
+    let mut s = raw;
+    for prefix in [
+        "export default ",
+        "export async function ",
+        "export function ",
+        "export class ",
+        "export interface ",
+        "export type ",
+        "export const ",
+        "pub async fn ",
+        "pub fn ",
+        "pub struct ",
+        "pub enum ",
+        "pub trait ",
+        "async def ",
+        "def ",
+        "class ",
+        "async function ",
+        "function ",
+        "interface ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "func ",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim();
+            break;
+        }
+    }
+    let s = s.trim_end_matches([':', '{']).trim();
+    if s.is_empty() || !s.starts_with(node.name.as_str()) {
+        return node.name.clone();
+    }
+    clip_inline(s, max_chars)
+}
+
+fn format_repo_symbol_with_methods(node: &Node, methods: &[&Node]) -> String {
+    let sig = format_compact_signature(node, 84);
+    let span_part = if node.span[0] > 0 && node.span[1] >= node.span[0] {
+        format!(" (L{}-{})", node.span[0], node.span[1])
+    } else {
+        String::new()
+    };
+    let pub_methods: Vec<String> = methods
+        .iter()
+        .copied()
+        .filter(|m| m.exported && !m.name.starts_with("__"))
+        .take(6)
+        .map(|m| format_compact_signature(m, 56))
+        .collect();
+    if pub_methods.is_empty() {
+        format!("{sig}{span_part}")
+    } else {
+        let total_pub = methods
+            .iter()
+            .filter(|m| m.exported && !m.name.starts_with("__"))
+            .count();
+        let extra = total_pub.saturating_sub(pub_methods.len());
+        let suffix = if extra > 0 { format!(", +{extra}") } else { String::new() };
+        format!("{sig}{span_part} [methods: {}{suffix}]", pub_methods.join(", "))
+    }
 }
 
 fn path_mentioned_in_text(text: &str, rel_path: &str) -> bool {
@@ -1402,6 +1645,60 @@ mod tests {
         let tight = repo_summary(&dir, "Update StoreEngine.persist_row", 280).unwrap();
         assert!(!tight.is_empty());
         assert!(tight.len() <= 280, "tight len {} exceeded 280:\n{tight}", tight.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tb18_brownfield_repo_summary_includes_signatures_and_preinject_ranks_owned_source() {
+        let dir = temp_repo("tb18-brownfield");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("tinydb/engine.py"),
+            "class QueryEngine:\n    def execute(self, sql: str, limit: int = 100) -> list:\n        return []\n    def explain(self, sql: str) -> str:\n        return sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tinydb/helpers.py"),
+            "def fmt_row(cols: list, sep: str = '|') -> str:\n    return sep.join(cols)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/test_engine.py"),
+            "def test_select_limit():\n    assert True\ndef test_explain_plan():\n    assert True\n",
+        )
+        .unwrap();
+        build(&dir).unwrap();
+
+        assert_eq!(PLANNER_REPO_SUMMARY_BUDGET, 10_000);
+        let summary = repo_summary(&dir, "Add ORDER BY support to QueryEngine.execute", PLANNER_REPO_SUMMARY_BUDGET).unwrap();
+        assert!(summary.contains("methods:"), "expected exported class method signatures:\n{summary}");
+        assert!(summary.contains("execute(self, sql: str, limit: int = 100)"), "{summary}");
+        assert!(summary.contains("fmt_row(cols: list, sep: str = '|')"), "{summary}");
+        assert!(summary.contains("Existing test files:"), "expected test outline section:\n{summary}");
+        assert!(summary.contains("tests/test_engine.py: test_select_limit, test_explain_plan"), "{summary}");
+        assert!(summary.len() <= PLANNER_REPO_SUMMARY_BUDGET);
+
+        // Pre-injected context packs full owned file (>900 bytes) within BROWNFIELD_UNIT_MAP_BUDGET.
+        let big_body = (0..30)
+            .map(|i| format!("    def helper_{i}(self, x: int) -> int:\n        return x + {i}\n"))
+            .collect::<String>();
+        let big_file = format!("class BigService:\n{big_body}");
+        assert!(big_file.len() > 1200);
+        std::fs::write(dir.join("tinydb/big.py"), &big_file).unwrap();
+        build(&dir).unwrap();
+
+        let pre = preinjected_context(
+            &dir,
+            "big",
+            &["tinydb/big.py".into()],
+            "Modify BigService.helper_25",
+            12_000,
+        )
+        .unwrap();
+        assert!(pre.contains("owned file"), "expected full owned file injection:\n{pre}");
+        assert!(pre.contains("def helper_29"), "must not truncate at old 900B cap:\n{pre}");
+        assert!(pre.len() <= 12_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

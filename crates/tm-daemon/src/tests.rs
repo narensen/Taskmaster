@@ -1091,7 +1091,9 @@ async fn an_empty_project_is_planned_without_tools_and_told_to_decide() {
     let world = World::new(Mode::Plan);
     // Long enough for the full planning pass rather than the small one.
     let prompt = format!("Build page a with a greeting. {}", "It is a card with a title, a short line of text, and a button. ".repeat(5));
-    let outcome = run(prompt_config(&tmp.0, &prompt, true), &world).await.unwrap();
+    let mut cfg = prompt_config(&tmp.0, &prompt, true);
+    cfg.offline = true;
+    let outcome = run(cfg, &world).await.unwrap();
     assert_eq!(outcome, Outcome::Finished { ok: true });
     let first = &planner_calls(&world)[0];
     assert!(first.contains("Plan this product and lock its contracts."), "{first}");
@@ -12064,7 +12066,7 @@ async fn tok9_warm_planner_session_repairs_and_local_contract_compaction_avoids_
 
 #[tokio::test]
 async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_spec() {
-    let run_probe = |tmp: &Tmp, code_mode: bool| {
+    let run_probe = |tmp: &Tmp, code_mode: bool, offline: bool| {
         let root = tmp.0.clone();
         async move {
             let plan = Plan {
@@ -12125,17 +12127,26 @@ async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_sp
             cfg.runtime_checks = false;
             cfg.code_mode = code_mode;
             cfg.browser = false;
+            cfg.offline = offline;
             assert_eq!(drive(cfg, harnesses).await.unwrap(), Outcome::Finished { ok: true });
             (listed_tools.lock().unwrap().clone(), captured_brief.lock().unwrap().clone())
         }
     };
 
-    // 1. Stdlib-only greenfield worker: cite/index/search/set_status/docs are all pruned.
+    // 1. Offline stdlib-only greenfield worker: cite/index/search/set_status/docs/advisories/web_fetch all pruned.
     let tmp_stdlib = seeded("tok10-stdlib");
-    let (tools_off, brief_off) = run_probe(&tmp_stdlib, false).await;
+    let (tools_off, brief_off) = run_probe(&tmp_stdlib, false, true).await;
     let names_off: Vec<&str> = tools_off.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert_eq!(names_off, vec!["flow_query"], "stdlib non-code worker should only see flow_query: {names_off:?}");
-    assert!(!brief_off.contains("for local-first API docs"), "brief should not advertise pruned docs tool");
+    assert_eq!(names_off, vec!["flow_query"], "offline stdlib non-code worker should only see flow_query: {names_off:?}");
+    assert!(!brief_off.contains("for installed package APIs"), "brief should not advertise pruned docs tool");
+
+    // 1b. Online (default) stdlib-only worker: still prunes `docs` and `advisories` while keeping `web_fetch`.
+    let tmp_stdlib_online = seeded("tok10-stdlib-online");
+    let (tools_online, brief_online) = run_probe(&tmp_stdlib_online, false, false).await;
+    let names_online: Vec<&str> = tools_online.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names_online.contains(&"flow_query") && names_online.contains(&"web_fetch"), "{names_online:?}");
+    assert!(!names_online.contains(&"docs") && !names_online.contains(&"advisories"), "stdlib online worker must still prune docs/advisories: {names_online:?}");
+    assert!(!brief_online.contains("for installed package APIs"), "brief must not advertise pruned docs tool");
 
     // 2. Project with external npm deps + Code Mode: keeps `docs` and trimmed `run_code`, still prunes dict & set_status.
     let tmp_deps = seeded("tok10-deps");
@@ -12143,7 +12154,7 @@ async fn tok10_worker_mcp_tools_list_prunes_unused_schemas_and_trims_run_code_sp
     git(&tmp_deps.0, &["add", "."]);
     git(&tmp_deps.0, &["commit", "-q", "-m", "deps"]);
     let has_node = crate::code::CodeTools::new(None).is_some();
-    let (tools_deps, _) = run_probe(&tmp_deps, has_node).await;
+    let (tools_deps, _) = run_probe(&tmp_deps, has_node, false).await;
     let names_deps: Vec<&str> = tools_deps.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names_deps.contains(&"docs"), "project with external deps should keep docs: {names_deps:?}");
     assert!(names_deps.contains(&"flow_query"), "{names_deps:?}");
@@ -13584,7 +13595,7 @@ async fn fix_n9_code_mode_dedupes_prompt_enforces_repair_run_code_and_saves_toke
     let (_, framed_off) = &briefs_off[0];
     assert!(raw_on.contains("Code Mode is on"));
     assert!(
-        !framed_on.contains("Code Mode is active — use two-call discipline"),
+        !framed_on.contains("Code Mode is active —"),
         "framed_brief_for must not duplicate CODE_MODE_WRITE_RULES when CODE_MODE_GUIDE is present"
     );
     let overhead_bytes = framed_on.len().saturating_sub(framed_off.len()) + schema_on.saturating_sub(schema_off);
@@ -14020,4 +14031,1043 @@ async fn fix_n9_independent_disjoint_units_share_wave_and_overlapping_units_seri
     cfg2.browser = false;
     assert_eq!(drive(cfg2, harnesses2).await.unwrap(), Outcome::Finished { ok: true });
     assert_eq!(h2.peak.load(Ordering::SeqCst), 1, "units sharing owned files must not run concurrently");
+}
+
+#[tokio::test]
+async fn tb18_early_started_integrator_receives_landed_siblings_and_passes_test() {
+    use std::sync::atomic::AtomicBool;
+    struct LiveSyncHarness {
+        started: Arc<tokio::sync::Barrier>,
+        saw_sibling: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Harness for LiveSyncHarness {
+        fn id(&self) -> &'static str {
+            "tb18-live-sync"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            // Wait until both units have started in parallel (contract-only early start).
+            tokio::time::timeout(Duration::from_secs(3), self.started.wait())
+                .await
+                .expect("early-started integrator must overlap with sibling");
+            if task.brief.contains("Build unit `parser`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(task.cwd.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:parser\n".into() }).await;
+            } else if task.brief.contains("Build unit `cli`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                // Write our owned file first; live sync must NOT overwrite it.
+                std::fs::write(
+                    task.cwd.join("calcx/cli.py"),
+                    "from calcx.parser import parse\ndef run() -> int:\n    return parse('x')\n",
+                )?;
+                // Poll briefly for `calcx/parser.py` to be live-synced by Driver::settle once `parser` lands.
+                for _ in 0..100 {
+                    if task.cwd.join("calcx/parser.py").is_file() {
+                        let content = std::fs::read_to_string(task.cwd.join("calcx/parser.py"))?;
+                        if content.contains("return 42") {
+                            self.saw_sibling.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // Our owned file must remain intact.
+                assert!(std::fs::read_to_string(task.cwd.join("calcx/cli.py"))?.contains("def run()"));
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let tmp = repo("tb18-live-sync");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+            ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "from typing import Protocol\nclass ParserProtocol(Protocol):\n    def parse(self, expr: str) -> int: ...\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "parser".into(),
+                owned_glob: "calcx/parser.py".into(),
+                brief: "Implement ParserProtocol from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "calcx/cli.py".into(),
+                brief: "Build CLI against ParserProtocol from calcx/contract.py.".into(),
+                depends_on: vec!["parser".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let h = Arc::new(LiveSyncHarness {
+        started: Arc::new(tokio::sync::Barrier::new(2)),
+        saw_sibling: Arc::new(AtomicBool::new(false)),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h.clone() };
+    let mut cfg = config(&tmp.0, plan, true, 2);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(
+        h.saw_sibling.load(Ordering::SeqCst),
+        "active cli worktree must receive parser.py via live sync when parser lands"
+    );
+}
+
+#[test]
+fn tb18_code_mode_guide_allows_one_to_two_write_calls_and_targeted_test() {
+    let guide = crate::engine::code_mode_guide("claude");
+    assert!(guide.contains("1-2 write calls"), "{guide}");
+    assert!(!guide.contains("Call 1 (write + test in one call)"), "{guide}");
+    assert!(guide.contains("test(paths?)"), "{guide}");
+    assert!(guide.contains("testAffected(paths?)"), "{guide}");
+    assert!(guide.contains("Skip probing Python/venv"), "{guide}");
+    assert!(guide.contains("no whole-file rewrites"), "{guide}");
+    assert!(guide.contains("mcp__dictionary__run_code"), "{guide}");
+
+    assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("1-2 `run_code` calls"));
+    assert!(tm_harness::CODE_MODE_WRITE_RULES.contains("Never spend a call probing Python/venv"));
+}
+
+#[tokio::test]
+async fn tb18_brownfield_planner_gets_atlas_and_rich_flow_summary() {
+    let tmp = seeded("tb18-brownfield-planner");
+    std::fs::create_dir_all(tmp.0.join("app")).unwrap();
+    std::fs::create_dir_all(tmp.0.join("tests")).unwrap();
+    std::fs::write(
+        tmp.0.join("app/storage.py"),
+        "class RecordStore:\n    def put_item(self, key: str, value: bytes) -> None:\n        pass\n    def get_item(self, key: str) -> bytes:\n        return b''\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("app/api.py"),
+        "from app.storage import RecordStore\n\ndef fetch_record(store: RecordStore, key: str) -> bytes:\n    return store.get_item(key)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.0.join("tests/test_storage.py"),
+        "def test_put_and_get():\n    assert True\n",
+    )
+    .unwrap();
+    git_out(&tmp.0, &["add", "."]);
+    git_out(&tmp.0, &["commit", "-m", "existing app"]);
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    struct CapturePlanner {
+        captured: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Harness for CapturePlanner {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.captured.lock().unwrap().push(task.brief.clone());
+            let plan = serde_json::json!({
+                "kind": "library",
+                "summary": "Add TTL support to RecordStore and API",
+                "contracts": [],
+                "units": [
+                    {
+                        "id": "storage",
+                        "owned_glob": "app/storage.py",
+                        "brief": "Add ttl_secs parameter to RecordStore.put_item.",
+                        "done": "pytest passes"
+                    }
+                ],
+                "dictionary": []
+            });
+            let _ = events.send(HarnessEvent::Text { text: plan.to_string() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let h = Arc::new(CapturePlanner { captured: captured.clone() });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h };
+    let mut cfg = Config::new(&tmp.0);
+    cfg.prompt = Some(
+        "Extend the existing RecordStore architecture across storage, API, and migration paths with per-key TTL expiration, \
+         background compaction, metrics reporting, and backwards-compatible test coverage across existing storage and api suites."
+            .into(),
+    );
+    cfg.yes = false;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    cfg.parallel = 2;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert!(matches!(outcome, Outcome::NeedsApproval { .. }), "{outcome:?}");
+
+    let brief = captured.lock().unwrap().first().cloned().expect("planner brief");
+    assert!(brief.contains("## Repository summary (.flow)"), "{brief}");
+    assert!(brief.contains("put_item(self, key: str, value: bytes)"), "planner brief should include method signatures:\n{brief}");
+    assert!(brief.contains("Existing test files:"), "planner brief should include existing test outline:\n{brief}");
+    assert!(brief.contains("tests/test_storage.py: test_put_and_get"), "{brief}");
+    assert!(brief.contains("## Codebase Atlas"), "brownfield planner brief should include compact Atlas:\n{brief}");
+    assert!(brief.contains("Import hubs:"), "{brief}");
+}
+
+#[tokio::test]
+async fn tb18_fresh_planner_keeps_dictionary_for_web_fetch_and_verifier_stays_offline() {
+    #[derive(Default)]
+    struct Captured {
+        planner_has_dict: Option<bool>,
+        planner_native_search: Option<bool>,
+        planner_brief: String,
+    }
+    struct ProbeHarness {
+        cap: Arc<Mutex<Captured>>,
+        emit_search: bool,
+    }
+    #[async_trait]
+    impl Harness for ProbeHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            {
+                let mut c = self.cap.lock().unwrap();
+                c.planner_has_dict = Some(task.dictionary.is_some());
+                c.planner_native_search = Some(task.native_search);
+                c.planner_brief = task.brief.clone();
+            }
+
+            if self.emit_search {
+                // Verify gate allows native search and emits transcript + ledger entry.
+                let req = tm_harness::PermissionRequest {
+                    tool: "WebSearch".into(),
+                    kind: tm_harness::ToolKind::Fetch,
+                    paths: vec![],
+                    command: None,
+                    url: None,
+                };
+                let allowed = gate.decide(&req) == tm_harness::Decision::Allow;
+                let _ = events
+                    .send(HarnessEvent::ToolCall {
+                        id: "ns1".into(),
+                        name: "WebSearch".into(),
+                        input: serde_json::json!({ "query": "fastapi 0.115 lifespan" }),
+                    })
+                    .await;
+                let _ = events
+                    .send(HarnessEvent::PermissionDecided { tool: "WebSearch".into(), allowed })
+                    .await;
+            }
+            let plan = serde_json::json!({
+                "kind": "server",
+                "summary": "FastAPI service",
+                "contracts": [],
+                "units": [{ "id": "api", "owned_glob": "app/main.py", "brief": "Write app.", "done": "pytest passes" }],
+                "dictionary": []
+            });
+            let _ = events.send(HarnessEvent::Text { text: plan.to_string() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    // 1. Fresh greenfield project with default (online native) web access: planner MUST keep
+    //    `dictionary: Some(...)` so it can call `web_fetch` / `docs`, AND `native_search == true`,
+    //    AND native search calls appear in both live web activity and `ledger.jsonl`.
+    let tmp_on = repo("tb18-fresh-planner-online");
+    let cap_on = Arc::new(Mutex::new(Captured::default()));
+    let h_on = Arc::new(ProbeHarness { cap: cap_on.clone(), emit_search: true });
+    let harnesses_on = Harnesses { master: h_on.clone(), mid: h_on.clone(), worker: h_on.clone(), reviewer: h_on.clone(), verifier: h_on };
+    let full_prompt = format!(
+        "Build a FastAPI 0.115 service with async lifespan hooks, SQLite persistence, Pydantic v2 schemas, \
+         background job scheduling, rate limiting, and full pytest coverage across multiple endpoints. {}",
+        "Include structured logging, migrations, health probes, and typed error handlers. ".repeat(4)
+    );
+    let mut cfg_on = Config::new(&tmp_on.0);
+    cfg_on.run_id = "online-plan".into();
+    cfg_on.prompt = Some(full_prompt.clone());
+    cfg_on.yes = false;
+    cfg_on.checks = false;
+    cfg_on.runtime_checks = false;
+    cfg_on.code_mode = false;
+    cfg_on.browser = false;
+    let out_on = drive(cfg_on, harnesses_on).await.unwrap();
+    assert!(matches!(out_on, Outcome::NeedsApproval { .. }), "{out_on:?}");
+    {
+        let c = cap_on.lock().unwrap();
+        assert_eq!(c.planner_has_dict, Some(true), "fresh online planner must keep dictionary for web_fetch");
+        assert_eq!(c.planner_native_search, Some(true), "fresh online planner must have native_search enabled");
+        assert!(c.planner_brief.contains("Research phase"), "{brief}", brief = c.planner_brief);
+    }
+    let records = Records::files(&tmp_on.0);
+    let ledger = records.ledger("online-plan").unwrap();
+    assert!(
+        ledger.iter().any(|e| e.harness == "web-access" && e.model.as_deref() == Some("WebSearch:native") && e.ok),
+        "native search call must be recorded in ledger: {ledger:#?}"
+    );
+
+    // 2. Fresh greenfield project with `offline = true`: planner gets `dictionary: None`, `native_search: false`,
+    //    and no Research phase hint.
+    let tmp_off = repo("tb18-fresh-planner-offline");
+    let cap_off = Arc::new(Mutex::new(Captured::default()));
+    let h_off = Arc::new(ProbeHarness { cap: cap_off.clone(), emit_search: false });
+    let harnesses_off = Harnesses { master: h_off.clone(), mid: h_off.clone(), worker: h_off.clone(), reviewer: h_off.clone(), verifier: h_off };
+    let mut cfg_off = Config::new(&tmp_off.0);
+    cfg_off.run_id = "offline-plan".into();
+    cfg_off.prompt = Some(full_prompt);
+    cfg_off.yes = false;
+    cfg_off.offline = true;
+    cfg_off.checks = false;
+    cfg_off.runtime_checks = false;
+    cfg_off.code_mode = false;
+    cfg_off.browser = false;
+    let out_off = drive(cfg_off, harnesses_off).await.unwrap();
+    assert!(matches!(out_off, Outcome::NeedsApproval { .. }), "{out_off:?}");
+    {
+        let c = cap_off.lock().unwrap();
+        assert_eq!(c.planner_has_dict, Some(false), "offline fresh planner should omit dictionary");
+        assert_eq!(c.planner_native_search, Some(false), "offline fresh planner must not enable native_search");
+        assert!(!c.planner_brief.contains("Research phase"), "offline brief must omit Research phase");
+    }
+}
+
+#[tokio::test]
+async fn tb18_brownfield_scout_runs_above_threshold_writes_scope_json_and_falls_back_silently_on_error() {
+    #[derive(Default)]
+    struct Log {
+        calls: Vec<(String, Option<String>, bool, bool, String)>, // (role_tag_guess, effort, read_only, native_search, brief)
+    }
+    struct ScoutAndPlannerHarness {
+        log: Arc<Mutex<Log>>,
+        fail_scout: bool,
+    }
+    #[async_trait]
+    impl Harness for ScoutAndPlannerHarness {
+        fn id(&self) -> &'static str {
+            "antigravity"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            let is_scout = task.brief.contains("brownfield scope scout");
+            {
+                let mut l = self.log.lock().unwrap();
+                l.calls.push((
+                    if is_scout { "scout".into() } else { "planner".into() },
+                    task.effort.clone(),
+                    task.read_only,
+                    task.native_search,
+                    task.brief.clone(),
+                ));
+            }
+            if is_scout {
+                if self.fail_scout {
+                    return Err(anyhow::anyhow!("simulated scout timeout"));
+                }
+                let out = serde_json::json!({
+                    "frozen_interfaces": ["py:pkg/mod_0.py#fn_0"],
+                    "modify_targets": [{ "id": "py:pkg/mod_1.py#fn_1", "note": "add ttl support" }],
+                    "new_files": ["pkg/ttl.py"],
+                    "test_conventions": "pytest under tests/"
+                });
+                let _ = events.send(HarnessEvent::Text { text: out.to_string() }).await;
+                return Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.001), denied: 0, freed: None, requests: Some(1) });
+            }
+            let plan = serde_json::json!({
+                "kind": "library",
+                "summary": "Add TTL support",
+                "contracts": [],
+                "units": [{ "id": "mod1", "owned_glob": "pkg/mod_1.py", "brief": "Update fn_1.", "done": "pytest passes" }],
+                "dictionary": []
+            });
+            let _ = events.send(HarnessEvent::Text { text: plan.to_string() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let make_big_repo = |name: &str, count: usize| {
+        let tmp = seeded(name);
+        std::fs::create_dir_all(tmp.0.join("pkg")).unwrap();
+        for i in 0..count {
+            std::fs::write(
+                tmp.0.join(format!("pkg/mod_{i}.py")),
+                format!("def fn_{i}(x: int) -> int:\n    return x + {i}\n"),
+            )
+            .unwrap();
+        }
+        git_out(&tmp.0, &["add", "."]);
+        git_out(&tmp.0, &["commit", "-q", "-m", "seed brownfield"]);
+        tmp
+    };
+
+    let big_prompt = format!(
+        "Extend the existing pkg/mod_1.py architecture with TTL caching, expiration sweeps, and metrics. {}",
+        "Keep existing public APIs backwards compatible and add thorough unit tests. ".repeat(4)
+    );
+
+    // 1. Above threshold (>= 25 source files): scout runs at `-low` effort, read-only, offline,
+    //    writes ephemeral `.taskmaster/runs/<id>/scope.json`, and hydrates into planner brief.
+    let tmp_big = make_big_repo("tb18-scout-big", 26);
+    let log_big = Arc::new(Mutex::new(Log::default()));
+    let h_big = Arc::new(ScoutAndPlannerHarness { log: log_big.clone(), fail_scout: false });
+    let harnesses_big = Harnesses { master: h_big.clone(), mid: h_big.clone(), worker: h_big.clone(), reviewer: h_big.clone(), verifier: h_big };
+    let mut cfg = Config::new(&tmp_big.0);
+    cfg.run_id = "scout-ok".into();
+    cfg.prompt = Some(big_prompt.clone());
+    cfg.yes = false;
+    cfg.offline = true;
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+    let out = drive(cfg, harnesses_big).await.unwrap();
+    assert!(matches!(out, Outcome::NeedsApproval { .. }), "{out:?}");
+
+    let calls = log_big.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 2, "expected scout then planner, got: {}", calls.len());
+    assert_eq!(calls[0].0, "scout");
+    assert_eq!(calls[0].1.as_deref(), Some("low"), "scout must run at low effort");
+    assert!(calls[0].2, "scout must be read_only");
+    assert!(!calls[0].3, "scout must be offline (native_search=false)");
+    assert_eq!(calls[1].0, "planner");
+    assert!(calls[1].4.contains("## Brownfield scope brief (scout, hydrated from .flow)"), "{}", calls[1].4);
+    assert!(calls[1].4.contains("py:pkg/mod_1.py#fn_1"), "{}", calls[1].4);
+    assert!(calls[1].4.contains("add ttl support"), "{}", calls[1].4);
+    assert!(crate::scout::scope_path(&tmp_big.0, "scout-ok").is_file(), "ephemeral scope.json must be written");
+
+    // 2. Below threshold (3 files < 25): scout is skipped completely!
+    let tmp_small = make_big_repo("tb18-scout-small", 3);
+    let log_small = Arc::new(Mutex::new(Log::default()));
+    let h_small = Arc::new(ScoutAndPlannerHarness { log: log_small.clone(), fail_scout: false });
+    let harnesses_small = Harnesses { master: h_small.clone(), mid: h_small.clone(), worker: h_small.clone(), reviewer: h_small.clone(), verifier: h_small };
+    let mut cfg_small = Config::new(&tmp_small.0);
+    cfg_small.run_id = "scout-skip".into();
+    cfg_small.prompt = Some(big_prompt.clone());
+    cfg_small.yes = false;
+    cfg_small.offline = true;
+    cfg_small.checks = false;
+    cfg_small.runtime_checks = false;
+    cfg_small.code_mode = false;
+    cfg_small.browser = false;
+    let out_small = drive(cfg_small, harnesses_small).await.unwrap();
+    assert!(matches!(out_small, Outcome::NeedsApproval { .. }), "{out_small:?}");
+    let calls_small = log_small.lock().unwrap().calls.clone();
+    assert_eq!(calls_small.len(), 1, "small repo must skip scout");
+    assert_eq!(calls_small[0].0, "planner");
+    assert!(!crate::scout::scope_path(&tmp_small.0, "scout-skip").exists());
+
+    // 3. Scout error/timeout falls back silently to deterministic `.flow` packing and planning succeeds.
+    let tmp_err = make_big_repo("tb18-scout-err", 26);
+    let log_err = Arc::new(Mutex::new(Log::default()));
+    let h_err = Arc::new(ScoutAndPlannerHarness { log: log_err.clone(), fail_scout: true });
+    let harnesses_err = Harnesses { master: h_err.clone(), mid: h_err.clone(), worker: h_err.clone(), reviewer: h_err.clone(), verifier: h_err };
+    let mut cfg_err = Config::new(&tmp_err.0);
+    cfg_err.run_id = "scout-fallback".into();
+    cfg_err.prompt = Some(big_prompt);
+    cfg_err.yes = false;
+    cfg_err.offline = true;
+    cfg_err.checks = false;
+    cfg_err.runtime_checks = false;
+    cfg_err.code_mode = false;
+    cfg_err.browser = false;
+    let out_err = drive(cfg_err, harnesses_err).await.unwrap();
+    assert!(matches!(out_err, Outcome::NeedsApproval { .. }), "planner must succeed despite scout failure: {out_err:?}");
+    let calls_err = log_err.lock().unwrap().calls.clone();
+    assert_eq!(calls_err.len(), 2);
+    assert_eq!(calls_err[0].0, "scout");
+    assert_eq!(calls_err[1].0, "planner");
+    assert!(calls_err[1].4.contains("## Repository summary (.flow)"), "deterministic summary must still be present");
+    assert!(!calls_err[1].4.contains("## Brownfield scope brief"), "failed scout must not inject partial brief");
+}
+
+#[test]
+fn tb18_grok_code_mode_guide_includes_single_search_tool_hint() {
+    for id in ["grok", "grok-build"] {
+        let guide = crate::engine::code_mode_guide(id);
+        assert!(
+            guide.contains("call `search_tool` once for `dictionary__run_code`"),
+            "{id} guide must instruct a single search_tool lookup: {guide}"
+        );
+        assert!(
+            guide.contains("await flow(...)"),
+            "{id} guide must point Grok at flow() inside run_code: {guide}"
+        );
+        assert!(
+            guide.contains("instead of searching separately for `dictionary__flow_query`"),
+            "{id} guide must discourage redundant flow_query discovery: {guide}"
+        );
+    }
+    for other in ["antigravity", "claude", "codex", "opencode"] {
+        let guide = crate::engine::code_mode_guide(other);
+        assert!(
+            !guide.contains("search_tool"),
+            "non-Grok harness `{other}` must not get Grok-only search_tool hint: {guide}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tb18_live_sync_reaches_only_dependents_and_isolates_independent_siblings() {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::AtomicBool;
+
+    // 1. End-to-end `drive`: independent same-phase units A (`frontend`) and B (`evaluator`) plus
+    //    integrator C (`cli`, depends_on: [frontend, evaluator]) all start concurrently.
+    //    When A lands: C's active worktree gets `calcx/parser.py`, while B's active worktree does NOT.
+    struct SiblingIsolationHarness {
+        started: Arc<tokio::sync::Barrier>,
+        c_saw_a_notify: Arc<tokio::sync::Notify>,
+        c_saw_a: Arc<AtomicBool>,
+        c_saw_b: Arc<AtomicBool>,
+        b_saw_a: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Harness for SiblingIsolationHarness {
+        fn id(&self) -> &'static str {
+            "tb18-live-sync-dependents"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            tokio::time::timeout(Duration::from_secs(5), self.started.wait())
+                .await
+                .expect("A, B, and early-started C must overlap concurrently");
+            if task.brief.contains("Build unit `frontend`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(task.cwd.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n")?;
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:frontend\n".into() }).await;
+            } else if task.brief.contains("Build unit `evaluator`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(task.cwd.join("calcx/evaluator.py"), "def eval_val(x: int) -> int:\n    return x + 1\n")?;
+                // Wait until A has landed AND C has observed A's live-synced file, so `Driver::settle`
+                // for A has definitively finished executing its live-sync loop.
+                tokio::time::timeout(Duration::from_secs(5), self.c_saw_a_notify.notified())
+                    .await
+                    .expect("C should observe A landing");
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                if task.cwd.join("calcx/parser.py").exists() {
+                    self.b_saw_a.store(true, Ordering::SeqCst);
+                }
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:evaluator\n".into() }).await;
+            } else if task.brief.contains("Build unit `cli`") {
+                std::fs::create_dir_all(task.cwd.join("calcx"))?;
+                std::fs::write(
+                    task.cwd.join("calcx/cli.py"),
+                    "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run() -> int:\n    return eval_val(parse('x'))\n",
+                )?;
+                for _ in 0..150 {
+                    if task.cwd.join("calcx/parser.py").is_file()
+                        && std::fs::read_to_string(task.cwd.join("calcx/parser.py"))?.contains("return 42")
+                    {
+                        self.c_saw_a.store(true, Ordering::SeqCst);
+                        self.c_saw_a_notify.notify_waiters();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                for _ in 0..150 {
+                    if task.cwd.join("calcx/evaluator.py").is_file()
+                        && std::fs::read_to_string(task.cwd.join("calcx/evaluator.py"))?.contains("return x + 1")
+                    {
+                        self.c_saw_b.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            }
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+    }
+
+    let tmp = repo("tb18-live-sync-dependents");
+    let plan = Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+            ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "from typing import Protocol\nclass FrontendProtocol(Protocol):\n    def parse(self, expr: str) -> int: ...\nclass EvaluatorProtocol(Protocol):\n    def eval_val(self, x: int) -> int: ...\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "frontend".into(),
+                owned_glob: "calcx/parser.py".into(),
+                brief: "Implement FrontendProtocol from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "evaluator".into(),
+                owned_glob: "calcx/evaluator.py".into(),
+                brief: "Implement EvaluatorProtocol from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "calcx/cli.py".into(),
+                brief: "Wire FrontendProtocol and EvaluatorProtocol from calcx/contract.py.".into(),
+                depends_on: vec!["frontend".into(), "evaluator".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let h = Arc::new(SiblingIsolationHarness {
+        started: Arc::new(tokio::sync::Barrier::new(3)),
+        c_saw_a_notify: Arc::new(tokio::sync::Notify::new()),
+        c_saw_a: Arc::new(AtomicBool::new(false)),
+        c_saw_b: Arc::new(AtomicBool::new(false)),
+        b_saw_a: Arc::new(AtomicBool::new(false)),
+    });
+    let harnesses = Harnesses { master: h.clone(), mid: h.clone(), worker: h.clone(), reviewer: h.clone(), verifier: h.clone() };
+    let mut cfg = config(&tmp.0, plan.clone(), true, 3);
+    cfg.checks = false;
+    cfg.runtime_checks = false;
+    cfg.code_mode = false;
+    cfg.browser = false;
+
+    let outcome = drive(cfg, harnesses).await.unwrap();
+    assert_eq!(outcome, Outcome::Finished { ok: true });
+    assert!(h.c_saw_a.load(Ordering::SeqCst), "dependent C (`cli`) must receive A's file via live sync");
+    assert!(h.c_saw_b.load(Ordering::SeqCst), "dependent C (`cli`) must receive B's file via live sync");
+    assert!(
+        !h.b_saw_a.load(Ordering::SeqCst),
+        "independent same-phase sibling B (`evaluator`) must NOT receive A's (`frontend`) files"
+    );
+
+    // 2. Direct `live_sync_dependents` + `sync_exclude_globs` check:
+    //    - Verifies exact log messages (C and transitive D get `live-synced`, B gets none).
+    //    - Verifies `mark_dep_landed` and `dirty` are untouched on non-dependent B.
+    //    - Verifies even when a unit depends on an independent `core` unit (not `frontend`),
+    //      syncing `core` still excludes `frontend`'s files from its worktree.
+    let tmp2 = repo("tb18-live-sync-direct");
+    std::fs::create_dir_all(tmp2.0.join("calcx")).unwrap();
+    std::fs::write(tmp2.0.join("calcx/__init__.py"), "").unwrap();
+    git_out(&tmp2.0, &["add", "."]);
+    git_out(&tmp2.0, &["commit", "-q", "-m", "base"]);
+
+    let wt_b = tmp2.0.parent().unwrap().join("tb18-live-sync-direct-wt-b");
+    let wt_c = tmp2.0.parent().unwrap().join("tb18-live-sync-direct-wt-c");
+    let wt_d = tmp2.0.parent().unwrap().join("tb18-live-sync-direct-wt-d");
+    for wt in [&wt_b, &wt_c, &wt_d] {
+        let _ = std::fs::remove_dir_all(wt);
+        git_out(&tmp2.0, &["worktree", "add", "--detach", "-q", wt.to_str().unwrap(), "HEAD"]);
+    }
+
+    let mut plan2 = plan;
+    plan2.pages.push(PagePlan {
+        id: "core".into(),
+        owned_glob: "calcx/core.py".into(),
+        brief: "Core helpers.".into(),
+        ..Default::default()
+    });
+    // Let `evaluator` depend ONLY on `core` (still independent of `frontend`), and add transitive `app -> cli`.
+    plan2.pages.iter_mut().find(|p| p.id == "evaluator").unwrap().depends_on = vec!["core".into()];
+    plan2.pages.push(PagePlan {
+        id: "app".into(),
+        owned_glob: "calcx/app.py".into(),
+        brief: "Top-level app wiring cli.".into(),
+        depends_on: vec!["cli".into()],
+        ..Default::default()
+    });
+
+    let sync_b = crate::code::WorktreeSync::new(
+        wt_b.clone(),
+        tmp2.0.clone(),
+        crate::engine::sync_exclude_globs(Some(&plan2), "evaluator", "calcx/evaluator.py"),
+        BTreeSet::from(["core".to_string()]),
+    );
+    let sync_c = crate::code::WorktreeSync::new(
+        wt_c.clone(),
+        tmp2.0.clone(),
+        crate::engine::sync_exclude_globs(Some(&plan2), "cli", "calcx/cli.py"),
+        BTreeSet::from(["frontend".to_string(), "evaluator".to_string()]),
+    );
+    let sync_d = crate::code::WorktreeSync::new(
+        wt_d.clone(),
+        tmp2.0.clone(),
+        crate::engine::sync_exclude_globs(Some(&plan2), "app", "calcx/app.py"),
+        BTreeSet::from(["frontend".to_string(), "evaluator".to_string(), "cli".to_string()]),
+    );
+    let mut active_syncs = HashMap::new();
+    active_syncs.insert("evaluator".to_string(), vec![sync_b.clone()]);
+    active_syncs.insert("cli".to_string(), vec![sync_c.clone()]);
+    active_syncs.insert("app".to_string(), vec![sync_d.clone()]);
+
+    // Land `frontend` in main tree.
+    std::fs::write(tmp2.0.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n").unwrap();
+    git_out(&tmp2.0, &["add", "calcx/parser.py"]);
+    git_out(&tmp2.0, &["commit", "-q", "-m", "land frontend"]);
+
+    let logs = crate::engine::live_sync_dependents(Some(&plan2), "frontend", &active_syncs);
+    assert!(wt_c.join("calcx/parser.py").is_file(), "direct dependent C must receive A's file");
+    assert!(wt_d.join("calcx/parser.py").is_file(), "transitive dependent D must receive A's file");
+    assert!(!wt_b.join("calcx/parser.py").exists(), "independent sibling B must NOT receive A's file");
+    assert!(!sync_b.is_dirty(), "independent sibling B must not be marked dirty");
+    assert_eq!(sync_b.pending_deps(), vec!["core".to_string()], "B's pending_deps must stay untouched");
+    assert_eq!(sync_c.pending_deps(), vec!["evaluator".to_string()], "C must mark frontend landed");
+    assert!(
+        logs.iter().any(|l| l.contains("live-synced") && l.contains("into active `cli` worktree")),
+        "expected live-sync log for C: {logs:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("live-synced") && l.contains("into active `app` worktree")),
+        "expected live-sync log for transitive D: {logs:?}"
+    );
+    assert!(
+        !logs.iter().any(|l| l.contains("`evaluator`")),
+        "must NOT emit any live-synced log for independent sibling B: {logs:?}"
+    );
+
+    // Even when `core` later lands and syncs into `evaluator`, `frontend`'s `calcx/parser.py`
+    // remains excluded from `evaluator`'s worktree.
+    std::fs::write(tmp2.0.join("calcx/core.py"), "CONST = 1\n").unwrap();
+    git_out(&tmp2.0, &["add", "calcx/core.py"]);
+    git_out(&tmp2.0, &["commit", "-q", "-m", "land core"]);
+
+    let logs_core = crate::engine::live_sync_dependents(Some(&plan2), "core", &active_syncs);
+    assert!(wt_b.join("calcx/core.py").is_file(), "B must receive its real dependency `core`");
+    assert!(
+        !wt_b.join("calcx/parser.py").exists(),
+        "syncing `core` into B must still exclude unrelated same-phase sibling `frontend`"
+    );
+    assert!(
+        logs_core.iter().any(|l| l.contains("from `core` into active `evaluator` worktree")),
+        "expected live-sync log for `core` -> `evaluator`: {logs_core:?}"
+    );
+
+    for wt in [&wt_b, &wt_c, &wt_d] {
+        let _ = git_out(&tmp2.0, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(wt);
+    }
+}
+
+#[tokio::test]
+async fn tb18_parked_early_integrator_waits_for_deps_before_acceptance_and_repair() {
+    use crate::FileStore;
+    use crate::live::Live;
+    use std::sync::atomic::AtomicBool;
+    use tm_core::WorkerOutcome;
+    use tm_harness::{Freed, Session};
+
+    let Some(py_mm) = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        return;
+    };
+
+    struct RepairableCliSession {
+        worktree: PathBuf,
+        follow_count: Arc<AtomicUsize>,
+        saw_synced_deps_on_repair: Arc<AtomicBool>,
+        last_prompt: Arc<Mutex<String>>,
+    }
+    #[async_trait]
+    impl Session for RepairableCliSession {
+        async fn follow_up(
+            &mut self,
+            text: String,
+            events: mpsc::Sender<HarnessEvent>,
+            _timeout: Duration,
+        ) -> anyhow::Result<RunSummary> {
+            self.follow_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_prompt.lock().unwrap() = text;
+            let has_parser = self.worktree.join("calcx/parser.py").is_file();
+            let has_eval = self.worktree.join("calcx/evaluator.py").is_file();
+            if has_parser && has_eval {
+                self.saw_synced_deps_on_repair.store(true, Ordering::SeqCst);
+            }
+            // Fix the bug in `calcx/cli.py`.
+            std::fs::write(
+                self.worktree.join("calcx/cli.py"),
+                "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run_cli() -> int:\n    return eval_val(parse('x'))\n",
+            )?;
+            let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+            Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) })
+        }
+        async fn close(self: Box<Self>) -> Freed {
+            Freed::default()
+        }
+    }
+
+    struct EarlyFinishCliHarness {
+        started: Arc<tokio::sync::Barrier>,
+        cli_done_tx: tokio::sync::watch::Sender<bool>,
+        cli_done_rx: tokio::sync::watch::Receiver<bool>,
+        cli_buggy_first: bool,
+        cli_fresh_calls: Arc<AtomicUsize>,
+        cli_follow_calls: Arc<AtomicUsize>,
+        saw_synced_deps_on_repair: Arc<AtomicBool>,
+        last_repair_prompt: Arc<Mutex<String>>,
+    }
+    #[async_trait]
+    impl Harness for EarlyFinishCliHarness {
+        fn id(&self) -> &'static str {
+            "tb18-parked-integrator"
+        }
+        async fn run(
+            &self,
+            task: WorkerTask,
+            gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> anyhow::Result<RunSummary> {
+            self.run_kept(task, gate, events).await.0
+        }
+        async fn run_kept(
+            &self,
+            task: WorkerTask,
+            _gate: Arc<dyn PermissionGate>,
+            events: mpsc::Sender<HarnessEvent>,
+        ) -> (anyhow::Result<RunSummary>, Option<Box<dyn Session>>) {
+            if task.brief.contains("Build unit `cli`") {
+                let n = self.cli_fresh_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // All 3 units start concurrently in wave 1 via shared `calcx/contract.py`.
+                    tokio::time::timeout(Duration::from_secs(5), self.started.wait())
+                        .await
+                        .expect("frontend, evaluator, and early-started cli must overlap");
+                }
+                let _ = std::fs::create_dir_all(task.cwd.join("calcx"));
+                let body = if self.cli_buggy_first {
+                    "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run_cli() -> int:\n    _ = (parse, eval_val)\n    return 999\n"
+                } else {
+                    "from calcx.parser import parse\nfrom calcx.evaluator import eval_val\ndef run_cli() -> int:\n    return eval_val(parse('x'))\n"
+                };
+                let _ = std::fs::write(task.cwd.join("calcx/cli.py"), body);
+                let _ = std::fs::write(
+                    task.cwd.join("calcx/__main__.py"),
+                    "from calcx.cli import run_cli\nprint(run_cli())\n",
+                );
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:cli\n".into() }).await;
+                let _ = self.cli_done_tx.send(true);
+                let session: Box<dyn Session> = Box::new(RepairableCliSession {
+                    worktree: task.cwd.clone(),
+                    follow_count: self.cli_follow_calls.clone(),
+                    saw_synced_deps_on_repair: self.saw_synced_deps_on_repair.clone(),
+                    last_prompt: self.last_repair_prompt.clone(),
+                });
+                return (
+                    Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) }),
+                    Some(session),
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), self.started.wait())
+                .await
+                .expect("frontend, evaluator, and early-started cli must overlap");
+            // Wait until `cli` has ALREADY finished its worker turn (plus a grace margin so any
+            // unparked driver would prematurely run acceptance check & fail `cli` right here).
+            let mut rx = self.cli_done_rx.clone();
+            tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|&done| done))
+                .await
+                .expect("cli should finish first")
+                .expect("watch channel open");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = std::fs::create_dir_all(task.cwd.join("calcx"));
+            if task.brief.contains("Build unit `frontend`") {
+                let _ = std::fs::write(task.cwd.join("calcx/parser.py"), "def parse(expr: str) -> int:\n    return 42\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:frontend\n".into() }).await;
+            } else if task.brief.contains("Build unit `evaluator`") {
+                let _ = std::fs::write(task.cwd.join("calcx/evaluator.py"), "def eval_val(x: int) -> int:\n    return x + 1\n");
+                let _ = events.send(HarnessEvent::Text { text: "RELEASE unit:evaluator\n".into() }).await;
+            }
+            (
+                Ok(RunSummary { ok: true, usage: Usage::default(), cost_usd: Some(0.01), denied: 0, freed: None, requests: Some(1) }),
+                None,
+            )
+        }
+    }
+
+    let make_plan = || Plan {
+        kind: tm_core::ProjectKind::Cli,
+        contracts: vec![
+            ContractFile { path: "calcx/__init__.py".into(), content: "".into(), phase: 0 },
+            ContractFile {
+                path: "calcx/contract.py".into(),
+                content: "class Token:\n    pass\nclass Expr:\n    pass\n".into(),
+                phase: 0,
+            },
+            ContractFile {
+                path: "tests/test_calcx_contract.py".into(),
+                content: "from calcx.cli import run_cli\n\ndef test_calcx():\n    got = run_cli()\n    assert got == 43, f'expected 43, got {got}'\n\nif __name__ == '__main__':\n    test_calcx()\n".into(),
+                phase: 0,
+            },
+        ],
+        pages: vec![
+            PagePlan {
+                id: "frontend".into(),
+                owned_glob: "calcx/parser.py".into(),
+                brief: "Parse Token into Expr from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "evaluator".into(),
+                owned_glob: "calcx/evaluator.py".into(),
+                brief: "Evaluate Expr from calcx/contract.py.".into(),
+                ..Default::default()
+            },
+            PagePlan {
+                id: "cli".into(),
+                owned_glob: "{calcx/cli.py,calcx/__main__.py}".into(),
+                brief: "Build CLI using Token and Expr from calcx/contract.py.".into(),
+                depends_on: vec!["frontend".into(), "evaluator".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let seed_offline_venv = |project: &Path, run_id: &str| -> bool {
+        let venv = crate::run_directory(project, run_id).join("venv");
+        let _ = std::fs::create_dir_all(venv.parent().unwrap());
+        let ok = std::process::Command::new("python3")
+            .args(["-m", "venv", &venv.display().to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return false;
+        }
+        let pytest_pkg = venv.join(format!("lib/python{py_mm}/site-packages/pytest"));
+        std::fs::create_dir_all(&pytest_pkg).unwrap();
+        std::fs::write(pytest_pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            pytest_pkg.join("__main__.py"),
+            "import runpy\nrunpy.run_path('tests/test_calcx_contract.py', run_name='__main__')\n",
+        )
+        .unwrap();
+        std::fs::write(venv.join(".taskmaster-deps"), crate::runtime::python_stamp(project)).unwrap();
+        true
+    };
+
+    // Sub-case A: Early-started `cli` finishes first while `frontend` & `evaluator` are still
+    // building -> parked (no premature acceptance check, no CheckFailed, no repair), checked once
+    // both deps land, passes acceptance + final verify (incl. import-boundary rule) with 0 repairs!
+    let tmp_ok = repo("tb18-parked-ok");
+    if !seed_offline_venv(&tmp_ok.0, "parked-ok") {
+        return;
+    }
+    let store_ok = Arc::new(FileStore::in_project(&tmp_ok.0));
+    let live_ok = Arc::new(Live::new(store_ok.clone()));
+    let (cli_done_tx_ok, cli_done_rx_ok) = tokio::sync::watch::channel(false);
+    let h_ok = Arc::new(EarlyFinishCliHarness {
+        started: Arc::new(tokio::sync::Barrier::new(3)),
+        cli_done_tx: cli_done_tx_ok,
+        cli_done_rx: cli_done_rx_ok,
+        cli_buggy_first: false,
+        cli_fresh_calls: Arc::new(AtomicUsize::new(0)),
+        cli_follow_calls: Arc::new(AtomicUsize::new(0)),
+        saw_synced_deps_on_repair: Arc::new(AtomicBool::new(false)),
+        last_repair_prompt: Arc::new(Mutex::new(String::new())),
+    });
+    let harnesses_ok = Harnesses { master: h_ok.clone(), mid: h_ok.clone(), worker: h_ok.clone(), reviewer: h_ok.clone(), verifier: h_ok.clone() };
+    let mut cfg_ok = config(&tmp_ok.0, make_plan(), true, 3);
+    cfg_ok.run_id = "parked-ok".into();
+    cfg_ok.store = Some(store_ok.clone());
+    cfg_ok.live = Some(live_ok.clone());
+    cfg_ok.checks = false;
+    cfg_ok.runtime_checks = true;
+    cfg_ok.code_mode = false;
+    cfg_ok.browser = false;
+    cfg_ok.offline = true;
+    let out_ok = drive(cfg_ok, harnesses_ok).await.unwrap();
+    assert_eq!(out_ok, Outcome::Finished { ok: true });
+    assert_eq!(h_ok.cli_fresh_calls.load(Ordering::SeqCst), 1, "passing parked cli must run once with zero repairs");
+    assert_eq!(h_ok.cli_follow_calls.load(Ordering::SeqCst), 0, "passing parked cli must not be sent to repair");
+
+    let events_ok = Records::files(&tmp_ok.0).events("parked-ok").unwrap();
+    assert!(
+        !events_ok.iter().any(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::CheckFailed { .. } } if page == "cli")),
+        "parked cli must never record CheckFailed while deps were unlanded: {events_ok:?}"
+    );
+    let idx_front = events_ok.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "frontend")).unwrap();
+    let idx_eval = events_ok.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "evaluator")).unwrap();
+    let idx_cli = events_ok.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "cli")).unwrap();
+    assert!(idx_cli > idx_front && idx_cli > idx_eval, "cli must settle Passed strictly after both deps landed");
+
+    // Sub-case B: Early-started `cli` has a real bug -> still parked while deps are unlanded (no
+    // premature failure), then fails acceptance ONCE after both deps land, gets repaired ONCE on
+    // the SAME open session with synced dep files present in its worktree, and passes!
+    let tmp_fix = repo("tb18-parked-repair");
+    if !seed_offline_venv(&tmp_fix.0, "parked-repair") {
+        return;
+    }
+    let store_fix = Arc::new(FileStore::in_project(&tmp_fix.0));
+    let live_fix = Arc::new(Live::new(store_fix.clone()));
+    let (cli_done_tx_fix, cli_done_rx_fix) = tokio::sync::watch::channel(false);
+    let h_fix = Arc::new(EarlyFinishCliHarness {
+        started: Arc::new(tokio::sync::Barrier::new(3)),
+        cli_done_tx: cli_done_tx_fix,
+        cli_done_rx: cli_done_rx_fix,
+        cli_buggy_first: true,
+        cli_fresh_calls: Arc::new(AtomicUsize::new(0)),
+        cli_follow_calls: Arc::new(AtomicUsize::new(0)),
+        saw_synced_deps_on_repair: Arc::new(AtomicBool::new(false)),
+        last_repair_prompt: Arc::new(Mutex::new(String::new())),
+    });
+    let harnesses_fix = Harnesses { master: h_fix.clone(), mid: h_fix.clone(), worker: h_fix.clone(), reviewer: h_fix.clone(), verifier: h_fix.clone() };
+    let mut cfg_fix = config(&tmp_fix.0, make_plan(), true, 3);
+    cfg_fix.run_id = "parked-repair".into();
+    cfg_fix.store = Some(store_fix.clone());
+    cfg_fix.live = Some(live_fix.clone());
+    cfg_fix.checks = false;
+    cfg_fix.runtime_checks = true;
+    cfg_fix.code_mode = false;
+    cfg_fix.browser = false;
+    cfg_fix.offline = true;
+    let out_fix = drive(cfg_fix, harnesses_fix).await.unwrap();
+    assert_eq!(out_fix, Outcome::Finished { ok: true });
+    assert_eq!(h_fix.cli_fresh_calls.load(Ordering::SeqCst), 1, "cli must only start one fresh session");
+    assert_eq!(h_fix.cli_follow_calls.load(Ordering::SeqCst), 1, "failing parked cli must get exactly one same-session repair");
+    assert!(
+        h_fix.saw_synced_deps_on_repair.load(Ordering::SeqCst),
+        "repaired cli's worktree must already contain synced frontend & evaluator files"
+    );
+    let repair_msg = h_fix.last_repair_prompt.lock().unwrap().clone();
+    assert!(repair_msg.contains("expected 43, got 999"), "repair prompt must include real post-dep failure (not ImportError): {repair_msg}");
+
+    let events_fix = Records::files(&tmp_fix.0).events("parked-repair").unwrap();
+    let f_front = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "frontend")).unwrap();
+    let f_eval = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "evaluator")).unwrap();
+    let f_cli_fail = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::CheckFailed { .. } } if page == "cli")).unwrap();
+    let f_cli_pass = events_fix.iter().position(|e| matches!(e, Event::WorkerFinished { page, outcome: WorkerOutcome::Passed } if page == "cli")).unwrap();
+    assert!(
+        f_cli_fail > f_front && f_cli_fail > f_eval && f_cli_pass > f_cli_fail,
+        "cli CheckFailed must occur ONLY after both deps landed, followed by Passed"
+    );
 }

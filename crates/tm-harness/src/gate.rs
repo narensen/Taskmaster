@@ -1,6 +1,8 @@
 //! The permission gate: the daemon's answer to "may this worker do that?".
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
@@ -66,6 +68,10 @@ pub struct WorktreeGate {
     fetch_hosts: Vec<String>,
     /// Allow the harness's built-in web search tool when provider is set to `native`.
     native_search: bool,
+    /// Optional cap on native web search calls for this gate (independent of MCP search budgets).
+    native_search_cap: Option<usize>,
+    /// Shared counter tracking native search calls allowed through this gate.
+    native_search_used: Arc<AtomicUsize>,
     /// Full-access per-run permission mode: bypass confinement refusals for non-read-only tasks.
     full_access: bool,
 }
@@ -84,6 +90,8 @@ impl WorktreeGate {
             shell: false,
             fetch_hosts: Vec::new(),
             native_search: false,
+            native_search_cap: None,
+            native_search_used: Arc::new(AtomicUsize::new(0)),
             full_access: false,
         }
     }
@@ -109,6 +117,13 @@ impl WorktreeGate {
     /// Allow the harness's native web search tool (used when Web access provider is `native`).
     pub fn with_native_search(mut self) -> Self {
         self.native_search = true;
+        self
+    }
+
+    /// Allow the harness's native web search tool up to `max` calls (0 = unlimited).
+    pub fn with_native_search_cap(mut self, max: usize) -> Self {
+        self.native_search = true;
+        self.native_search_cap = (max > 0).then_some(max);
         self
     }
 
@@ -230,6 +245,23 @@ impl PermissionGate for WorktreeGate {
             return Decision::Allow;
         }
         if self.native_search && is_native_search_tool(request) {
+            if let Some(cap) = self.native_search_cap {
+                let mut cur = self.native_search_used.load(Ordering::Acquire);
+                loop {
+                    if cur >= cap {
+                        return Decision::Deny;
+                    }
+                    match self.native_search_used.compare_exchange_weak(
+                        cur,
+                        cur + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Decision::Allow,
+                        Err(next) => cur = next,
+                    }
+                }
+            }
             return Decision::Allow;
         }
         if self.allowed_tool_prefixes.iter().any(|p| request.tool.starts_with(p.as_str())) {
@@ -256,12 +288,10 @@ impl PermissionGate for WorktreeGate {
     }
 }
 
-/// True when `request` invokes a harness's built-in web search tool (never edits or shell).
-fn is_native_search_tool(request: &PermissionRequest) -> bool {
-    if matches!(request.kind, ToolKind::Edit | ToolKind::Execute | ToolKind::Browser) {
-        return false;
-    }
-    let norm = request.tool.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+/// True when `tool_name` names a harness's built-in web search tool (never fetch/edit/shell).
+/// Shared between [`WorktreeGate`] and daemon transcript/ledger accounting.
+pub fn is_native_search_tool_name(tool_name: &str) -> bool {
+    let norm = tool_name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
     matches!(
         norm.as_str(),
         "web_search"
@@ -271,7 +301,24 @@ fn is_native_search_tool(request: &PermissionRequest) -> bool {
             | "bing_search"
             | "brave_search"
             | "internet_search"
+            | "x_search"
+            | "live_search"
+            | "online_search"
+            | "grok_search"
+            | "gemini_search"
+            | "duckduckgo_search"
+            | "perplexity_search"
+            | "tavily_search"
+            | "exa_search"
     )
+}
+
+/// True when `request` invokes a harness's built-in web search tool (never edits, fetch, or shell).
+fn is_native_search_tool(request: &PermissionRequest) -> bool {
+    if matches!(request.kind, ToolKind::Edit | ToolKind::Execute | ToolKind::Browser) {
+        return false;
+    }
+    is_native_search_tool_name(&request.tool)
 }
 
 /// Whether `url` is on `origin` (`scheme://host:port`), or is a path on it.
@@ -502,5 +549,29 @@ mod tests {
         assert_eq!(g.decide(&repo_read), Decision::Deny);
         assert_eq!(g.decide(&state_read), Decision::Allow);
         assert_eq!(g.decide(&dict_call), Decision::Allow);
+    }
+
+    #[test]
+    fn tb18_native_search_cap_enforced_and_native_fetch_denied() {
+        let g = gate().read_only().with_native_search_cap(2);
+        let grok_search = request("x_search", ToolKind::Fetch, &[]);
+        let gemini_search = request("live_search", ToolKind::Fetch, &[]);
+        let third_search = request("WebSearch", ToolKind::Fetch, &[]);
+        assert_eq!(g.decide(&grok_search), Decision::Allow);
+        assert_eq!(g.decide(&gemini_search), Decision::Allow);
+        assert_eq!(g.decide(&third_search), Decision::Deny, "cap of 2 must deny 3rd native search");
+        assert!(g.risk(&third_search).is_none(), "capped native search must deny without interactive prompt");
+
+        // Local native fetch tools MUST remain denied even with native_search enabled.
+        for fetch_tool in ["WebFetch", "web_fetch", "read_url_content", "fetch_url"] {
+            let fetch_req = PermissionRequest {
+                tool: fetch_tool.into(),
+                kind: ToolKind::Fetch,
+                paths: vec![],
+                command: None,
+                url: Some("https://example.com".into()),
+            };
+            assert_eq!(g.decide(&fetch_req), Decision::Deny, "{fetch_tool} must remain denied");
+        }
     }
 }
